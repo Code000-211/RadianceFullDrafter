@@ -1862,6 +1862,104 @@ __global__ __launch_bounds__(NTHR) void gather_kernel(
     }
 }
 
+/* EIGHT COLUMNS A LANE, the same sums. gather_kernel gives a lane one column, so every ye load is
+ * one u16 a lane and 64 bytes a wave instruction, and its runtime-trip slot loop issues them one
+ * behind each accumulate: 254 GB/s at a prefill chunk. Here a lane owns 8 contiguous bf16 (one
+ * 16-byte load a slot, 512 B a wave instruction) and a batch of kGatherBatch slots is loaded
+ * before any of it is summed.
+ *
+ * BIT-IDENTICAL: each column still starts at 0, adds `wj * x` for ascending j over the live slots
+ * only, in the same expression (so the same contraction), and narrows through the same epilogue.
+ * The launcher takes this form only for top_k <= kGatherSlots (the LDS slot table) and n, every
+ * pitch and every base 16-byte aligned; anything else is gather_kernel, unchanged. */
+constexpr uint32_t kGatherBatch = 16;
+
+__device__ __forceinline__ uint16_t gather_lane_u16(const uint4& v, uint32_t k) {
+    const uint32_t w = k < 2 ? v.x : k < 4 ? v.y : k < 6 ? v.z : v.w;
+    return (uint16_t)((k & 1) ? (w >> 16) : (w & 0xFFFFu));
+}
+
+template <uint32_t NTHR>
+__global__ __launch_bounds__(NTHR) void gather_vec_kernel(
+    const uint16_t* __restrict__ ye, const uint16_t* __restrict__ ew,
+    const int32_t* __restrict__ inv, uint16_t* __restrict__ y,
+    uint32_t M, uint32_t n, uint32_t top_k, uint32_t ye_ld, uint32_t ew_ld, uint32_t y_ld,
+    const int32_t* __restrict__ sorted, uint32_t T,
+    const uint16_t* __restrict__ sh, const uint16_t* __restrict__ sg,
+    uint32_t sh_ld, uint32_t sg_ld, int sig) {
+    __shared__ int32_t s_i[kGatherSlots];
+    __shared__ float   s_w[kGatherSlots];
+    const uint32_t t = blockIdx.x;
+    if (t >= M) return;
+    float gate = 0.0f;
+    if (sh) {
+        const float v0 = bf16_to_f32(sg[(size_t)t * sg_ld]);
+        gate = sig ? (1.0f / (1.0f + __expf(-v0))) : v0;
+    }
+    /* The slot table, filled exactly as gather_kernel's `cached` forms fill it. */
+    if (sorted) {
+        for (uint32_t j = threadIdx.x; j < top_k; j += NTHR) s_i[j] = -1;
+        __syncthreads();
+        const int32_t lo = (int32_t)(t * top_k), hi = lo + (int32_t)top_k;
+        for (uint32_t i = threadIdx.x; i < T; i += NTHR) {
+            const int32_t f = sorted[i];
+            if (f >= lo && f < hi) s_i[f - lo] = (int32_t)i;
+        }
+        for (uint32_t j = threadIdx.x; j < top_k; j += NTHR)
+            s_w[j] = bf16_to_f32(ew[(size_t)t * ew_ld + j]);
+    } else {
+        for (uint32_t j = threadIdx.x; j < top_k; j += NTHR) {
+            s_i[j] = inv[t * top_k + j];
+            s_w[j] = bf16_to_f32(ew[(size_t)t * ew_ld + j]);
+        }
+    }
+    __syncthreads();
+    const uint32_t n8 = n / 8;
+    for (uint32_t c8 = blockIdx.y * NTHR + threadIdx.x; c8 < n8; c8 += NTHR * gridDim.y) {
+        const uint32_t c = c8 * 8;
+        float acc[8];
+#pragma unroll
+        for (uint32_t k = 0; k < 8; ++k) acc[k] = 0.0f;
+        for (uint32_t j0 = 0; j0 < top_k; j0 += kGatherBatch) {
+            /* Every load of the batch first; `i` is uniform across the block, so the predicate is
+             * a scalar branch and a dead slot issues nothing. */
+            int32_t iv[kGatherBatch];
+            uint4   xv[kGatherBatch];
+#pragma unroll
+            for (uint32_t p = 0; p < kGatherBatch; ++p) {
+                iv[p] = (j0 + p < top_k) ? s_i[j0 + p] : -1;
+                xv[p] = iv[p] >= 0 ? *(const uint4*)(ye + (size_t)iv[p] * ye_ld + c)
+                                   : make_uint4(0, 0, 0, 0);
+            }
+#pragma unroll
+            for (uint32_t p = 0; p < kGatherBatch; ++p) {
+                if (iv[p] < 0) continue;
+                const float wj = s_w[j0 + p];
+#pragma unroll
+                for (uint32_t k = 0; k < 8; ++k)
+                    acc[k] += wj * bf16_to_f32(gather_lane_u16(xv[p], k));
+            }
+        }
+        uint16_t o[8];
+        if (!sh) {
+#pragma unroll
+            for (uint32_t k = 0; k < 8; ++k) o[k] = f32_to_bf16(acc[k]);
+        } else {
+            /* The folded shared arm, both narrows as in gather_kernel. */
+            const uint4 sv = *(const uint4*)(sh + (size_t)t * sh_ld + c);
+#pragma unroll
+            for (uint32_t k = 0; k < 8; ++k) {
+                const uint16_t g = f32_to_bf16(acc[k]);
+                const uint16_t p = f32_to_bf16(bf16_to_f32(gather_lane_u16(sv, k)) * gate);
+                o[k] = f32_to_bf16(bf16_to_f32(p) + bf16_to_f32(g));
+            }
+        }
+        *(uint4*)(y + (size_t)t * y_ld + c) =
+            make_uint4((uint32_t)o[0] | ((uint32_t)o[1] << 16), (uint32_t)o[2] | ((uint32_t)o[3] << 16),
+                       (uint32_t)o[4] | ((uint32_t)o[5] << 16), (uint32_t)o[6] | ((uint32_t)o[7] << 16));
+    }
+}
+
 /* ================================================================== scale_rows
  *
  * y[m, i] = x[m, i] * act(s[m]). One workgroup a row, grid-strided along the row, and the scalar
@@ -2838,6 +2936,40 @@ extern "C" int r4d_rad_moe_gather(const RadArgs* a, RadStream s) {
         else if (act && std::strcmp(act, "none"))  return R4D_NO(RAD_E_UNSUPPORTED);
     }
 
+    /* EIGHT COLUMNS A LANE when every row is 16-byte aligned and the slots fit the LDS table
+     * (gather_vec_kernel; the same bits). 160 threads tile this model's n = 2560 in two blocks a
+     * token; a small M keeps 64 so a decode step still spreads over enough workgroups. */
+    const bool vec = top_k <= (long long)kGatherSlots && n % 8 == 0 && ye_ld % 8 == 0 &&
+                     y_ld % 8 == 0 && r4d_aligned(ye->data, 16) && r4d_aligned(Y->data, 16) &&
+                     (!sh || (sh_ld % 8 == 0 && r4d_aligned(sh->data, 16)));
+    if (vec) {
+        const long long n8 = n / 8;
+        const bool wide = M >= 256 && n8 % 160 == 0;
+        const unsigned nt = wide ? 160u : 64u;
+        const unsigned gv = (unsigned)((n8 + nt - 1) / nt);
+        if (wide)
+            hipLaunchKernelGGL((gather_vec_kernel<160>), dim3((unsigned)M, gv), dim3(160), 0,
+                               (hipStream_t)s,
+                               (const uint16_t*)ye->data, (const uint16_t*)ew->data, inv,
+                               (uint16_t*)Y->data, (uint32_t)M, (uint32_t)n, (uint32_t)top_k,
+                               (uint32_t)ye_ld, (uint32_t)ew_ld, (uint32_t)y_ld,
+                               self ? (const int32_t*)sorted->data : nullptr, (uint32_t)T,
+                               sh ? (const uint16_t*)sh->data : nullptr,
+                               sh ? (const uint16_t*)sg->data : nullptr,
+                               (uint32_t)sh_ld, (uint32_t)sg_ld, sig);
+        else
+            hipLaunchKernelGGL((gather_vec_kernel<64>), dim3((unsigned)M, gv), dim3(64), 0,
+                               (hipStream_t)s,
+                               (const uint16_t*)ye->data, (const uint16_t*)ew->data, inv,
+                               (uint16_t*)Y->data, (uint32_t)M, (uint32_t)n, (uint32_t)top_k,
+                               (uint32_t)ye_ld, (uint32_t)ew_ld, (uint32_t)y_ld,
+                               self ? (const int32_t*)sorted->data : nullptr, (uint32_t)T,
+                               sh ? (const uint16_t*)sh->data : nullptr,
+                               sh ? (const uint16_t*)sg->data : nullptr,
+                               (uint32_t)sh_ld, (uint32_t)sg_ld, sig);
+        R4D_MOE_CHK();
+        return RAD_OK;
+    }
     const unsigned gy = (unsigned)((n + 255) / 256);
     hipLaunchKernelGGL((gather_kernel<256>), dim3((unsigned)M, gy), dim3(256), 0, (hipStream_t)s,
                        (const uint16_t*)ye->data, (const uint16_t*)ew->data, inv,
