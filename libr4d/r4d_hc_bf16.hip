@@ -343,6 +343,52 @@ void hc_write_kernel(const unsigned short* __restrict__ y, const unsigned short*
     }
 }
 
+/* EIGHT bf16 A LANE, the same element update. hc_write_kernel moves one u16 a lane, 64 B a wave
+ * instruction, and reaches ~81% of bandwidth at a prefill chunk. Here a lane owns 8 contiguous
+ * columns: one 16-byte load of y, then every stream's 16-byte load of h before any of them is
+ * updated and stored back. Each element is still `f2bf(bf2f(h) + s_g[c] * v)`, so the same bits.
+ * The launcher takes it only when n, both pitches and both bases are 16-byte aligned. */
+__device__ __forceinline__ unsigned short hcw_u16(const uint4& v, int k) {
+    const unsigned w = k < 2 ? v.x : k < 4 ? v.y : k < 6 ? v.z : v.w;
+    return (unsigned short)((k & 1) ? (w >> 16) : (w & 0xFFFFu));
+}
+
+__global__ __launch_bounds__(kThreads)
+void hc_write_vec_kernel(const unsigned short* __restrict__ y, const unsigned short* __restrict__ inj,
+                         unsigned short* __restrict__ h,
+                         long rows, long n, int hc, long yrow, long irow, long hrow) {
+    const long r = blockIdx.y;
+    if (r >= rows) return;
+    __shared__ float s_g[kHcMax];
+    if ((int)threadIdx.x < hc) s_g[threadIdx.x] = bf2f(inj[r * irow + threadIdx.x]);
+    __syncthreads();
+    const unsigned short* yp = y + r * yrow;
+    unsigned short*       hp = h + r * hrow;
+    const long n8 = n / 8;
+    for (long i8 = (long)blockIdx.x * blockDim.x + threadIdx.x; i8 < n8;
+         i8 += (long)gridDim.x * blockDim.x) {
+        const long i = i8 * 8;
+        const uint4 yv = *(const uint4*)(yp + i);
+        uint4 hv[kHcMax];
+#pragma unroll
+        for (int c = 0; c < kHcMax; ++c)
+            if (c < hc) hv[c] = *(const uint4*)(hp + (long)c * n + i);
+#pragma unroll
+        for (int c = 0; c < kHcMax; ++c) {
+            if (c >= hc) break;
+            unsigned short o[8];
+#pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                const float v = bf2f(hcw_u16(yv, k));
+                o[k] = f2bf(bf2f(hcw_u16(hv[c], k)) + s_g[c] * v);
+            }
+            *(uint4*)(hp + (long)c * n + i) =
+                make_uint4((unsigned)o[0] | ((unsigned)o[1] << 16), (unsigned)o[2] | ((unsigned)o[3] << 16),
+                           (unsigned)o[4] | ((unsigned)o[5] << 16), (unsigned)o[6] | ((unsigned)o[7] << 16));
+        }
+    }
+}
+
 /* A WAVE'S DOT PRODUCT OF THE LDS VECTOR WITH A CONTIGUOUS bf16 ROW, at 512 bytes a load and in
  * the ORDER THE SCALAR FORM SUMMED IN.
  *
@@ -3214,6 +3260,18 @@ static int rad_hc_write_body(const RadArgs* a, const R4dSink& sk) {
     const long long irow = r4d_rows_pitch(inj, hc, &irows);
     if (yrow < 0 || irow < 0 || yrows < rows || irows < rows) return R4D_NO(RAD_E_STRIDE);
 
+    /* Eight bf16 a lane when every row is 16-byte aligned (hc_write_vec_kernel, the same bits).
+     * The block is the fewest whole waves that split a row evenly: n = 2560 is 2 x 160. */
+    if (n % 8 == 0 && yrow % 8 == 0 && hrow % 8 == 0 && r4d_aligned(y->data, 16) &&
+        r4d_aligned(h->data, 16)) {
+        const long long n8 = n / 8;
+        const unsigned vb = (unsigned)((n8 + kThreads - 1) / kThreads);
+        const unsigned nt = (unsigned)(((n8 + vb - 1) / vb + kWave - 1) / kWave * kWave);
+        return R4D_EMIT(sk, hc_write_vec_kernel, dim3(vb, (unsigned)rows), dim3(nt), 0,
+                        (const unsigned short*)y->data,
+                        (const unsigned short*)inj->data, (unsigned short*)h->data,
+                        (long)rows, (long)n, (int)hc, (long)yrow, (long)irow, (long)hrow);
+    }
     const unsigned blocks = (unsigned)((n + kThreads - 1) / kThreads);
     return R4D_EMIT(sk, hc_write_kernel, dim3(blocks, (unsigned)rows), dim3(kThreads), 0,
                     (const unsigned short*)y->data,
