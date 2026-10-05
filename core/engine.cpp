@@ -23,6 +23,7 @@
 #include <atomic>
 #include <chrono>
 #include <csignal>
+#include <sys/mman.h>
 #include <cstring>
 #include <cstdint>
 #include <cstdlib>
@@ -84,6 +85,11 @@ Engine::~Engine() {
     table_copies_.clear();
     for (void* p : card_copies_) rad_dev_free(p, RAD_MEM_HOST_MAPPED);
     card_copies_.clear();
+    for (const ShmCopy& s : shm_copies_) {
+        rad_dev_host_unregister(s.ptr);
+        munmap(s.ptr, s.bytes);
+    }
+    shm_copies_.clear();
     rad_tools_registry().close();
 }
 

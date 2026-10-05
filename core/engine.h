@@ -135,6 +135,8 @@ private:
      * after the ranks that read them are gone. */
     std::vector<TableCopy> table_copies_;
     std::vector<void*> card_copies_;
+    struct ShmCopy { void* ptr; size_t bytes; };
+    std::vector<ShmCopy> shm_copies_;
     std::vector<std::pair<const void*, void*>> table_copy_of_;
     int load_weights();
     int configure_kv();

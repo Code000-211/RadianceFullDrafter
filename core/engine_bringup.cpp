@@ -29,6 +29,7 @@
 #include <sys/statvfs.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <dirent.h>
 
 #include <cstring>
 #include <fstream>
@@ -378,17 +379,64 @@ int Engine::copy_table(const uint8_t* src, int64_t n, int64_t foff, bool card, v
     const auto t0 = std::chrono::steady_clock::now();
     void* base = nullptr;
     if (card) {
-        base = rad_dev_alloc(n, RAD_MEM_HOST_MAPPED);
+        const char* shm_env = std::getenv("RADIANCE_PLE_SHM");
+        const bool enable_shm = !shm_env || (std::strcmp(shm_env, "0") != 0 &&
+                                             std::strcmp(shm_env, "off") != 0 &&
+                                             std::strcmp(shm_env, "false") != 0);
+        if (enable_shm) {
+            uint64_t model_hash = 14695981039346656037ULL;
+            for (char c : cfg_.model) {
+                model_hash ^= (uint8_t)c;
+                model_hash *= 1099511628211ULL;
+            }
+            char hash_str[32];
+            std::snprintf(hash_str, sizeof(hash_str), "%016llx", (unsigned long long)model_hash);
+            DIR* dir = opendir("/dev/shm");
+            if (dir) {
+                struct dirent* de;
+                while ((de = readdir(dir)) != nullptr) {
+                    std::string fn = de->d_name;
+                    if (fn.rfind("rad_shm_", 0) == 0 && fn.find(hash_str) != std::string::npos &&
+                        fn.size() > 6 && fn.rfind(".ready") == fn.size() - 6) {
+                        std::string bin_name = fn.substr(0, fn.size() - 6);
+                        std::string bin_path = "/dev/shm/" + bin_name;
+                        struct stat st_bin{};
+                        if (stat(bin_path.c_str(), &st_bin) == 0 && st_bin.st_size == (off_t)n) {
+                            int fd = open(bin_path.c_str(), O_RDWR);
+                            if (fd >= 0) {
+                                void* p = mmap(nullptr, (size_t)n, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+                                close(fd);
+                                if (p != MAP_FAILED) {
+                                    madvise(p, (size_t)n, MADV_HUGEPAGE);
+                                    if (rad_dev_host_register(p, n, 0) == RAD_OK) {
+                                        base = p;
+                                        shm_copies_.push_back({ p, (size_t)n });
+                                        RAD_INFO("placement: n-gram table attached from persistent shm cache in %.2f s (instant restart)",
+                                                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+                                        break;
+                                    }
+                                    munmap(p, (size_t)n);
+                                }
+                            }
+                        }
+                    }
+                }
+                closedir(dir);
+            }
+        }
         if (!base) {
-            *why = fmt("pinning %s: %s", humanb(n).c_str(), rad_dev_last_error());
-            return RAD_E_NOMEM;
+            base = rad_dev_alloc(n, RAD_MEM_HOST_MAPPED);
+            if (!base) {
+                *why = fmt("pinning %s: %s", humanb(n).c_str(), rad_dev_last_error());
+                return RAD_E_NOMEM;
+            }
+            const int rc = table_copy_fill(*file_, src, n, foff, static_cast<uint8_t*>(base), why);
+            if (rc != RAD_OK) {
+                rad_dev_free(base, RAD_MEM_HOST_MAPPED);
+                return rc;
+            }
+            card_copies_.push_back(base);
         }
-        const int rc = table_copy_fill(*file_, src, n, foff, static_cast<uint8_t*>(base), why);
-        if (rc != RAD_OK) {
-            rad_dev_free(base, RAD_MEM_HOST_MAPPED);
-            return rc;
-        }
-        card_copies_.push_back(base);
     } else {
         TableCopy tc;
         const int rc = table_copy_make(*file_, src, n, foff, &tc, why);
