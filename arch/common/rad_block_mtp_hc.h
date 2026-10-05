@@ -563,24 +563,6 @@ inline void MtpHcBlock::step(RadCtx* c, const RadBatch* batch) const {
         RAD_ISSUE_N(c, op_dsel, L, RAD_B(w.hw), praw(batch->draft_out_ids, RAD_I32, L),
                     brows(w.hin, L));
         RAD_ISSUE_N(c, op_dback, L, brows(w.hin, L), brows(w.hw, L));
-    }
-
-    hc_mlp.read(c, L, 0, L);
-    if (r < 0) {
-        RadBatch b_draft = *batch;
-        b_draft.n_tok = L;
-        mlp.step(c, &b_draft);
-    } else {
-        mlp.step(c, batch);
-    }
-    hc_mlp.write(c, L, 0, L);
-
-    /* THE CARRY:
-     * When r < 0, carry the post-MoE anchor state to w.hin for round 2 if depth > 1.
-     * In subsequent rounds r < depth, carry w.hw to w.hin for round r + 1. */
-    if (r < 0) {
-        if (depth > 1)
-            RAD_ISSUE_N(c, op_carry, L, brows(w.hw, L), brows(w.hin, L));
     } else if (r < depth) {
         RAD_ISSUE_N(c, op_carry, T, brows(w.hw, T), brows(w.hin, T));
     }
