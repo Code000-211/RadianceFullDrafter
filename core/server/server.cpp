@@ -787,7 +787,9 @@ HttpResponse Server::streaming_completion(const HttpRequest& req, OaiRequest& r)
              * is ordinary text in a completion, and holding it back at the end drops it. */
             size_t safe = g.text.size();
             if (!g.closed) {
-                if (maxstop > 1) safe = safe > maxstop - 1 ? safe - (maxstop - 1) : 0;
+                /* FF01: Detokenizer already holds back partial stop prefixes (tokenizer.cpp:1495-1506).
+                 * Only apply fallback holdback if g.detok is absent. */
+                if (!g.detok && maxstop > 1) safe = safe > maxstop - 1 ? safe - (maxstop - 1) : 0;
                 safe = json_stable_prefix(std::string_view(g.text.data(), safe));
                 if (safe <= g.emitted) continue;
             }

@@ -321,6 +321,7 @@ struct PCBinding final : IPrefixCache {
     PC* m;
     /* Scratch for a request's media keys, reused so a text request's lookup allocates nothing. */
     mutable std::vector<MMContentKey> mm_;
+    mutable std::vector<int32_t> blk_;
     explicit PCBinding(PC* p) : m(p) {}
 
     CacheHit lookup(const Request& r,
@@ -394,14 +395,22 @@ private:
         const int64_t np = (int64_t)r.prompt.size(), no = (int64_t)r.output.size();
         const int64_t have = np + no;
         const int64_t n_blocks = (pos < have ? pos : have) / bs;
-        std::vector<int32_t> blk((size_t)bs);
         for (int64_t b = 0; b < n_blocks; ++b) {
             const int64_t base = b * bs;
-            for (int64_t j = 0; j < bs; ++j) {
-                const int64_t k = base + j;
-                blk[(size_t)j] = k < np ? r.prompt[(size_t)k] : r.output[(size_t)(k - np)];
+            const int32_t* ptr = nullptr;
+            if (base + bs <= np) {
+                ptr = r.prompt.data() + base;
+            } else if (base >= np) {
+                ptr = r.output.data() + (base - np);
+            } else {
+                if ((int64_t)blk_.size() < bs) blk_.resize((size_t)bs);
+                for (int64_t j = 0; j < bs; ++j) {
+                    const int64_t k = base + j;
+                    blk_[(size_t)j] = k < np ? r.prompt[(size_t)k] : r.output[(size_t)(k - np)];
+                }
+                ptr = blk_.data();
             }
-            h = chain_block_hash(h, blk.data(), (int32_t)bs, mm_.data(), (int32_t)mm_.size(), base);
+            h = chain_block_hash(h, ptr, (int32_t)bs, mm_.data(), (int32_t)mm_.size(), base);
         }
         return h;
     }

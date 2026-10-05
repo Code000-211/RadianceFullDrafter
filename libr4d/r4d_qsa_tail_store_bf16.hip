@@ -46,7 +46,7 @@
 
 namespace {
 
-constexpr int kThreads = 256;
+constexpr int kThreads = 128;
 
 __global__ __launch_bounds__(kThreads) void qsa_tail_store_kernel(
     const uint16_t* __restrict__ k, const int32_t* __restrict__ pos,
@@ -54,19 +54,18 @@ __global__ __launch_bounds__(kThreads) void qsa_tail_store_kernel(
     uint16_t* __restrict__ state,
     int T, int n, int ring, int seqs, int k_ld, int s_slot, int s_row, int sidx_ld) {
 
-    const int t = (int)blockIdx.x;
-    if (t >= T) return;
+    const int r = (int)blockIdx.x;
+    const int s = (int)blockIdx.y;
+    if (s >= seqs || r >= ring) return;
 
-    /* The sequence this token belongs to. A linear scan of at most `seqs + 1` boundaries, done
-     * redundantly by every thread rather than once into LDS: it is a handful of compares against
-     * a broadcast load, and a barrier would cost more than it saves. */
-    int s = -1;
-    for (int i = 0; i < seqs; ++i)
-        if (t >= cu[i] && t < cu[i + 1]) { s = i; break; }
-    if (s < 0) return;
-
-    /* Only the last `ring` tokens of this sequence's chunk -- see the header. */
-    if (t < cu[s + 1] - ring) return;
+    /* Only the last `ring` tokens of this sequence's chunk -- see the header.
+     * CTAs are launched on a (ring, seqs) 2D grid, indexing directly into the sequence's
+     * tail window [cu[s + 1] - ring, cu[s + 1]) instead of launching T CTAs and discarding
+     * non-writing prefill tokens via a linear scan. */
+    const int s_start = cu[s];
+    const int s_end = cu[s + 1];
+    const int t = s_end - ring + r;
+    if (t < s_start || t >= s_end || t >= T) return;
 
     /* COLUMN 0 IS THE COMMITTED SLOT. -1 is the pad a sequence with no state carries, and every
      * kernel that reads a state row already tests for it. */
@@ -96,7 +95,7 @@ static int r4d_qsa_tail_store_bf16_emit(long k, long pos, long cu, long sidx, lo
     if (!k_ld) k_ld = n;
     if (!s_row) s_row = n;
     if (!sidx_ld) sidx_ld = 1;
-    emit_rc = R4D_EMIT(sk, qsa_tail_store_kernel, dim3((unsigned)T), dim3(kThreads), 0, (const uint16_t*)k, (const int32_t*)pos,
+    emit_rc = R4D_EMIT(sk, qsa_tail_store_kernel, dim3((unsigned)ring, (unsigned)seqs), dim3(kThreads), 0, (const uint16_t*)k, (const int32_t*)pos,
                        (const int32_t*)cu, (const int32_t*)sidx, (uint16_t*)state, T, n, ring,
                        seqs, k_ld, s_slot, s_row, sidx_ld);
     return emit_rc == RAD_OK && (sk.desc || hipGetLastError() == hipSuccess) ? 0 : -4;

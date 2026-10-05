@@ -120,6 +120,11 @@ __device__ __forceinline__ uint32_t fkey(float f) {
     return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
 }
 
+__device__ __forceinline__ float unfkey(uint32_t key) {
+    const uint32_t u = (key & 0x80000000u) ? (key & 0x7fffffffu) : ~key;
+    return __builtin_bit_cast(float, u);
+}
+
 // The wave's largest (key, ~index), by an xor butterfly on r4d_xor_lane's exchange. A maximum of
 // integers has one answer in any order.
 __device__ __forceinline__ unsigned long long wave_max_u64(unsigned long long b) {
@@ -490,6 +495,7 @@ __device__ uint32_t radix_select(const float* __restrict__ row, uint32_t n, uint
     return prefix;
 }
 
+template <bool PAIR_ONLY = false>
 __global__ __launch_bounds__(kTopkThreads) void topk_kernel(
     const float* __restrict__ lg, const SP* __restrict__ sp,
     int32_t* __restrict__ ci, float* __restrict__ cv, uint32_t* __restrict__ pr,
@@ -513,8 +519,10 @@ __global__ __launch_bounds__(kTopkThreads) void topk_kernel(
     if (sp[m].flags & SP_GREEDY) {
         uint32_t* __restrict__ gp = pr ? pr + (size_t)m * pr_ld : nullptr;
         for (uint32_t r = threadIdx.x; r < n_cand; r += kTopkThreads) {
-            oi[r] = -1;
-            ov[r] = -INFINITY;
+            if (!PAIR_ONLY) {
+                oi[r] = -1;
+                ov[r] = -INFINITY;
+            }
             if (gp) {
                 gp[2 * r]     = 0xffffffffu;
                 gp[2 * r + 1] = __builtin_bit_cast(uint32_t, -INFINITY);
@@ -662,9 +670,11 @@ __global__ __launch_bounds__(kTopkThreads) void topk_kernel(
         const bool live = r < got && r < k;
         const unsigned long long e = live ? shared_cand[r] : 0ull;
         const uint32_t loc = (uint32_t)(~(uint32_t)(e & 0xffffffffull));
-        const float    val = live ? row[loc] : -INFINITY;
-        oi[r] = live ? (int32_t)loc : -1;
-        ov[r] = val;
+        const float    val = live ? unfkey((uint32_t)(e >> 32)) : -INFINITY;
+        if (!PAIR_ONLY) {
+            oi[r] = live ? (int32_t)loc : -1;
+            ov[r] = val;
+        }
         if (op) {
             // 0xffffffff is the hole: the merge tests the id as a SIGNED int and drops it when
             // negative, which is the same convention ci carries as -1.
@@ -685,6 +695,7 @@ enum { NR_TOPP = 0, NR_MINP, NR_TYPICAL, NR_XTC };
 __global__ __launch_bounds__(kThreads) void narrow_kernel(
     int32_t* __restrict__ ci, float* __restrict__ cv, const SP* __restrict__ sp,
     uint32_t n_cand, uint32_t ci_ld, uint32_t cv_ld, int which) {
+    extern __shared__ float lds_exp[];
     __shared__ float red[kWaves];
     __shared__ float sh_mx, sh_inv, sh_H;
     __shared__ int   sh_cut_bits, sh_have_cut, sh_last, sh_above;
@@ -720,8 +731,15 @@ __global__ __launch_bounds__(kThreads) void narrow_kernel(
 
     // The other three need the normalised probabilities.
     float sum = 0.0f;
-    for (uint32_t i = threadIdx.x; i < n_cand; i += kThreads)
-        if (oi[i] >= 0) sum += expf(ov[i] - mx);
+    for (uint32_t i = threadIdx.x; i < n_cand; i += kThreads) {
+        if (oi[i] >= 0) {
+            const float e = expf(ov[i] - mx);
+            if (which == NR_TOPP) lds_exp[i] = e;
+            sum += e;
+        } else {
+            if (which == NR_TOPP) lds_exp[i] = 0.0f;
+        }
+    }
     sum = block_sum(sum, red);
     if (threadIdx.x == 0) sh_inv = sum > 0.0f ? 1.0f / sum : 0.0f;
     __syncthreads();
@@ -745,7 +763,7 @@ __global__ __launch_bounds__(kThreads) void narrow_kernel(
             uint32_t cut = n_cand;
             for (uint32_t i = 0; i < n_cand; ++i) {
                 if (oi[i] < 0) continue;
-                cum += expf(ov[i] - mx) * inv;
+                cum += lds_exp[i] * inv;
                 if (cum >= p.top_p) { cut = i + 1; break; }   // always keep at least one
             }
             sh_cut = cut;
@@ -852,8 +870,9 @@ __global__ __launch_bounds__(kThreads) void narrow_kernel(
 __global__ __launch_bounds__(kThreads) void pick_kernel(
     const int32_t* __restrict__ ci, const float* __restrict__ cv, const SP* __restrict__ sp,
     int32_t* __restrict__ tok, uint32_t n_cand, uint32_t ci_ld, uint32_t cv_ld) {
+    extern __shared__ float lds_exp[];
     __shared__ float red[kWaves];
-    __shared__ float sh_mx, sh_inv;
+    __shared__ float sh_inv;
 
     const uint32_t m = blockIdx.x;
     if (sp[m].flags & SP_GREEDY) return;
@@ -867,10 +886,17 @@ __global__ __launch_bounds__(kThreads) void pick_kernel(
     if (mx == -INFINITY) { if (threadIdx.x == 0) tok[m] = -1; return; }
 
     float sum = 0.0f;
-    for (uint32_t i = threadIdx.x; i < n_cand; i += kThreads)
-        if (oi[i] >= 0) sum += expf(ov[i] - mx);
+    for (uint32_t i = threadIdx.x; i < n_cand; i += kThreads) {
+        if (oi[i] >= 0) {
+            const float e = expf(ov[i] - mx);
+            lds_exp[i] = e;
+            sum += e;
+        } else {
+            lds_exp[i] = 0.0f;
+        }
+    }
     sum = block_sum(sum, red);
-    if (threadIdx.x == 0) { sh_mx = mx; sh_inv = sum > 0.0f ? 1.0f / sum : 0.0f; }
+    if (threadIdx.x == 0) sh_inv = sum > 0.0f ? 1.0f / sum : 0.0f;
     __syncthreads();
     if (threadIdx.x != 0) return;
 
@@ -882,7 +908,7 @@ __global__ __launch_bounds__(kThreads) void pick_kernel(
         if (id < 0) continue;
         const float v = ov[i];
         if (v > -INFINITY) last = id;
-        cum += expf(v - sh_mx) * sh_inv;
+        cum += lds_exp[i] * sh_inv;
         if (u < cum) { chosen = id; break; }
     }
     tok[m] = chosen >= 0 ? chosen : last;
@@ -935,9 +961,11 @@ __global__ __launch_bounds__(kTopkThreads) void merge_topk_kernel(
     }
     __syncthreads();
 
+    const bool is_tp2_runs = runs && (n_in == 2 * n_cand) && (pad == n_in);
     for (uint32_t sz = first; sz <= pad; sz <<= 1) {
         for (uint32_t st = sz >> 1; st > 0; st >>= 1) {
-            for (uint32_t t = threadIdx.x; t < pad; t += kTopkThreads) {
+            const uint32_t limit = (is_tp2_runs && st < n_cand) ? n_cand : pad;
+            for (uint32_t t = threadIdx.x; t < limit; t += kTopkThreads) {
                 const uint32_t partner = t ^ st;
                 if (partner <= t) continue;
                 const bool up = (t & sz) == 0;
@@ -1064,12 +1092,21 @@ static int r4d_sample_topk_f32(long lg, long params, long cand_idx, long cand_va
     if (!cv_ld) cv_ld = n_cand;
     if (!pr_ld) pr_ld = 2 * n_cand;
     const uint32_t pad = host_pow2((uint32_t)n_cand);
-    hipLaunchKernelGGL(topk_kernel, dim3((uint32_t)M), dim3(kTopkThreads),
-                       pad * sizeof(unsigned long long), (hipStream_t)stream,
-                       (const float*)lg, (const SP*)params, (int32_t*)cand_idx, (float*)cand_val,
-                       (uint32_t*)pairs,
-                       (uint32_t)n_vocab, (uint32_t)n_cand, (uint32_t)lg_ld, (uint32_t)ci_ld,
-                       (uint32_t)cv_ld, (uint32_t)pr_ld, (int32_t)vocab_off, pad);
+    if (pairs) {
+        hipLaunchKernelGGL((topk_kernel<true>), dim3((uint32_t)M), dim3(kTopkThreads),
+                           pad * sizeof(unsigned long long), (hipStream_t)stream,
+                           (const float*)lg, (const SP*)params, (int32_t*)cand_idx, (float*)cand_val,
+                           (uint32_t*)pairs,
+                           (uint32_t)n_vocab, (uint32_t)n_cand, (uint32_t)lg_ld, (uint32_t)ci_ld,
+                           (uint32_t)cv_ld, (uint32_t)pr_ld, (int32_t)vocab_off, pad);
+    } else {
+        hipLaunchKernelGGL((topk_kernel<false>), dim3((uint32_t)M), dim3(kTopkThreads),
+                           pad * sizeof(unsigned long long), (hipStream_t)stream,
+                           (const float*)lg, (const SP*)params, (int32_t*)cand_idx, (float*)cand_val,
+                           (uint32_t*)pairs,
+                           (uint32_t)n_vocab, (uint32_t)n_cand, (uint32_t)lg_ld, (uint32_t)ci_ld,
+                           (uint32_t)cv_ld, (uint32_t)pr_ld, (int32_t)vocab_off, pad);
+    }
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
 
@@ -1083,7 +1120,8 @@ static int r4d_sample_narrow_f32(long cand_idx, long cand_val, long params, int 
     if (which < 0 || which > 3) return -3;
     if (!ci_ld) ci_ld = n_cand;
     if (!cv_ld) cv_ld = n_cand;
-    hipLaunchKernelGGL(narrow_kernel, dim3((uint32_t)M), dim3(kThreads), 0, (hipStream_t)stream,
+    const size_t narrow_lds = (which == NR_TOPP) ? (size_t)n_cand * sizeof(float) : 0;
+    hipLaunchKernelGGL(narrow_kernel, dim3((uint32_t)M), dim3(kThreads), narrow_lds, (hipStream_t)stream,
                        (int32_t*)cand_idx, (float*)cand_val, (const SP*)params,
                        (uint32_t)n_cand, (uint32_t)ci_ld, (uint32_t)cv_ld, which);
     return hipGetLastError() == hipSuccess ? 0 : -4;
@@ -1095,7 +1133,8 @@ static int r4d_sample_pick_f32(long cand_idx, long cand_val, long params, long t
     if (M <= 0 || n_cand <= 0) return -2;
     if (!ci_ld) ci_ld = n_cand;
     if (!cv_ld) cv_ld = n_cand;
-    hipLaunchKernelGGL(pick_kernel, dim3((uint32_t)M), dim3(kThreads), 0, (hipStream_t)stream,
+    const size_t pick_lds = (size_t)n_cand * sizeof(float);
+    hipLaunchKernelGGL(pick_kernel, dim3((uint32_t)M), dim3(kThreads), pick_lds, (hipStream_t)stream,
                        (const int32_t*)cand_idx, (const float*)cand_val, (const SP*)params,
                        (int32_t*)tok, (uint32_t)n_cand, (uint32_t)ci_ld, (uint32_t)cv_ld);
     return hipGetLastError() == hipSuccess ? 0 : -4;

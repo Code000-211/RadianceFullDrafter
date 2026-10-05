@@ -26,6 +26,36 @@ int Ctx::init(const CtxDesc& d) {
     record_passes_ = d.record_passes;
     residency_ = d.residency;
     kv_        = d.kv;
+    for (auto& b : kv_) {
+        if (!b.base) continue;
+        int32_t max_slot = -1;
+        for (int32_t s : b.layer_slot) {
+            if (s > max_slot) max_slot = s;
+        }
+        if (max_slot >= 0) {
+            b.layer_tensor.resize((size_t)(max_slot + 1));
+            for (int32_t s = 0; s <= max_slot; ++s) {
+                RadTensor tt{};
+                std::memset(&tt, 0, sizeof tt);
+                const int64_t off = (int64_t)s * b.layer_stride;
+                tt.data = static_cast<char*>(b.base) + off;
+                tt.dtype = b.dtype;
+                if (b.rank) {
+                    tt.rank = b.rank;
+                    for (uint32_t d = 0; d < b.rank; ++d) tt.shape[d] = b.shape[d];
+                    rad_tensor_pack(&tt);
+                } else {
+                    tt.rank = 1;
+                    tt.shape[0] = b.layer_stride
+                                      ? b.layer_stride * 8 /
+                                            (rad_dtype_bits(b.dtype) ? rad_dtype_bits(b.dtype) : 8)
+                                      : 0;
+                    tt.stride[0] = 1;
+                }
+                b.layer_tensor[(size_t)s] = tt;
+            }
+        }
+    }
     arch_step_ = d.arch_step;
     profiling_ = d.profile_ops;
 
@@ -205,13 +235,14 @@ int Ctx::bind_arena() {
 
 int Ctx::bind_buffers() {
     Program& P = *program_;
-    buf_tmpl_.assign(P.buffers.size(), RadTensor{});
+    std::vector<RadTensor> t0(P.buffers.size(), RadTensor{});
     buf_bits_.assign(P.buffers.size(), 0);
     buf_host_.assign(P.buffers.size(), 0);
+    buf_dense_.assign(P.buffers.size(), 0);
 
     for (size_t i = 1; i < P.buffers.size(); ++i) {
         BufferInfo& bi = P.buffers[i];
-        RadTensor&  t  = buf_tmpl_[i];
+        RadTensor&  t  = t0[i];
 
         t.dtype = bi.decl.dtype;
         t.rank  = bi.decl.rank;
@@ -238,9 +269,12 @@ int Ctx::bind_buffers() {
         bi.ptr  = t.data;
         buf_bits_[i] = rad_dtype_bits(bi.decl.dtype);
         buf_host_[i] = bi.decl.domain == RAD_DOMAIN_HOST ? 1 : 0;
+        buf_dense_[i] = (t.rank >= 1 && rad_tensor_is_contiguous(&t)) ? 1 : 0;
     }
-    level_tmpl_.assign(1, buf_tmpl_);
+    level_tmpl_.clear();
+    level_tmpl_.push_back(std::move(t0));
     level_ = 0;
+    buf_tmpl_ = level_tmpl_[0];
     return RAD_OK;
 }
 
@@ -274,6 +308,7 @@ int Ctx::add_level(int64_t rows, const std::vector<int64_t>& offset,
         r.data = arena_.base() + offset[i];
     }
     level_tmpl_.push_back(std::move(t));
+    buf_tmpl_ = level_tmpl_[(size_t)level_];
     return (int)level_tmpl_.size() - 1;
 }
 
@@ -336,9 +371,8 @@ int Ctx::bind_ops() {
     Program& P = *program_;
 
     plans_.assign(P.ops.size(), OpPlan{});
-    unflushed_.clear();
-    unflushed_.reserve(P.ops.size());
-    for (uint32_t i = 1; i < (uint32_t)P.ops.size(); ++i) unflushed_.push_back(i);
+    first_issued_.clear();
+    first_issued_.reserve(P.ops.size());
     op_domain_ = std::vector<std::atomic<uint8_t>>(P.ops.size());
     band_table_.clear();
     issue_table_.clear();
@@ -611,12 +645,14 @@ int Ctx::bind_routing() {
  * contiguous rows of the bank, and then the bank's event. Called at the end of every pass. */
 int Ctx::route_flush() {
     if (route_bank_ < 0 || route_lo_ > route_hi_) return RAD_OK;
-    const int64_t n_layer = (int64_t)route_.size();
-    const int64_t off = ((int64_t)route_bank_ * n_layer + route_lo_) * route_n_expert_;
-    const int64_t n = (int64_t)(route_hi_ - route_lo_ + 1) * route_n_expert_;
-    RAD_TRY(rad_memcpy_async(route_pool_ + off, route_dev_ + (int64_t)route_lo_ * route_n_expert_,
-                             n * (int64_t)sizeof(int32_t), stream_));
-    RAD_TRY(rad_event_record(route_done_[route_bank_], stream_));
+    if (route_d2h_ || std::getenv("RADIANCE_DEBUG_ROUTING") != nullptr) {
+        const int64_t n_layer = (int64_t)route_.size();
+        const int64_t off = ((int64_t)route_bank_ * n_layer + route_lo_) * route_n_expert_;
+        const int64_t n = (int64_t)(route_hi_ - route_lo_ + 1) * route_n_expert_;
+        RAD_TRY(rad_memcpy_async(route_pool_ + off, route_dev_ + (int64_t)route_lo_ * route_n_expert_,
+                                 n * (int64_t)sizeof(int32_t), stream_));
+        RAD_TRY(rad_event_record(route_done_[route_bank_], stream_));
+    }
     route_lo_ = 1;
     route_hi_ = 0;
     return RAD_OK;
@@ -1037,7 +1073,7 @@ void Ctx::tape_drop(PassTape& t) {
 
 /* Issues the pass for real, through the architecture, recording it. Returns 1 when `out` holds a
  * tape, 0 when the pass ran but cannot be recorded. */
-int Ctx::record_pass(const RadBatch* b, uint64_t key, PassTape* out) {
+int Ctx::record_pass(const RadBatch* b, uint64_t key, PassTape* out, bool compare_only) {
     *out = PassTape{};
     out->key = key;
     if (tape_begin() < 0) { arch_step_(this, b); return 0; }
@@ -1049,7 +1085,7 @@ int Ctx::record_pass(const RadBatch* b, uint64_t key, PassTape* out) {
     arch_step_(this, b);
     tape_cut();
     rec_ = nullptr;
-    RadTape t = tape_end(step_status_ >= 0);
+    RadTape t = tape_end(step_status_ >= 0, compare_only);
     if (!t) {
         if (step_status_ >= 0) {
             tape_refused_.push_back(key);
@@ -1072,7 +1108,7 @@ int Ctx::record_pass(const RadBatch* b, uint64_t key, PassTape* out) {
         return 0;
     }
     const int bit = b->draft_pass + 8;
-    if (rank_ == 0 && bit >= 0 && bit < 64 && !(tape_told_ & (1ull << bit))) {
+    if (!compare_only && rank_ == 0 && bit >= 0 && bit < 64 && !(tape_told_ & (1ull << bit))) {
         tape_told_ |= 1ull << bit;
         RAD_INFO("recorded pass: draft pass %d at %lld token(s) -- %d records, %d of the %d "
                  "dispatches unordered behind the one before; %zu host op(s), "
@@ -1201,17 +1237,43 @@ bool Ctx::tapes_agree(const PassTape& a, const PassTape& b, std::string* why) {
 
 int Ctx::play_pass(PassTape& t) {
     const int l0 = lane_;
+    int play_from = -1;
+    int play_to = -1;
+
+    auto flush_play = [&]() -> int {
+        if (play_from >= 0 && play_to > play_from) {
+            const int rc = tape_play(t.dev, play_from, play_to);
+            play_from = play_to = -1;
+            if (rc < 0) {
+                step_fail_ = fmt("a recorded pass could not be submitted: %s",
+                                 rad_dev_last_error());
+                return rc;
+            }
+        }
+        return RAD_OK;
+    };
+
     for (const TapeStep& st : t.steps) {
         int rc = RAD_OK;
         switch (st.kind) {
         case kTapePlay:
-            rc = tape_play(t.dev, st.a, st.b);
-            if (rc < 0) step_fail_ = fmt("a recorded pass could not be submitted: %s",
-                                         rad_dev_last_error());
+            if (play_from < 0) {
+                play_from = st.a;
+                play_to = st.b;
+            } else if (st.a == play_to) {
+                play_to = st.b;
+            } else {
+                rc = flush_play();
+                if (rc < 0) break;
+                play_from = st.a;
+                play_to = st.b;
+            }
             break;
         case kTapeTable: {
             WeightTable& wt = wtabs_[(size_t)st.a];
             if (wt.full || !wt.pend.empty()) {
+                rc = flush_play();
+                if (rc < 0) break;
                 lane_ = st.lane;
                 rc = table_refresh((rad_op)st.b, st.opd, wt);
                 lane_ = l0;
@@ -1219,6 +1281,8 @@ int Ctx::play_pass(PassTape& t) {
             break;
         }
         case kTapeHost: {
+            rc = flush_play();
+            if (rc < 0) break;
             TapeHost& th = t.host[(size_t)st.a];
             lane_ = st.lane;
             rc = host_join_wait(th.drain);
@@ -1241,6 +1305,11 @@ int Ctx::play_pass(PassTape& t) {
             if (step_status_ >= 0) step_status_ = rc;
             return rc;
         }
+    }
+    const int rc = flush_play();
+    if (rc < 0) {
+        if (step_status_ >= 0) step_status_ = rc;
+        return rc;
     }
     n_issues_ += t.issues;
     ar_calls_.fetch_add(t.ar_calls, std::memory_order_relaxed);
@@ -1282,7 +1351,7 @@ int Ctx::run_pass(const RadBatch* b) {
         /* The check: issue the pass for real, recording it, and compare. The first comparison
          * comes before the tape is ever played, and then one every kAuditPlays plays. */
         PassTape fresh;
-        if (!record_pass(b, key, &fresh)) return RAD_OK;
+        if (!record_pass(b, key, &fresh, /*compare_only=*/true)) return RAD_OK;
         std::string why;
         if (!tapes_agree(*t, fresh, &why)) {
             tape_drop(*t);
@@ -1371,7 +1440,7 @@ int Ctx::run_step(const RadBatch* b) {
         staging_ = false;
     }
     {
-        const int rf = route_flush();
+        const int rf = (!b || b->draft_pass == 0) ? route_flush() : RAD_OK;
         if (rf < 0 && step_status_ >= 0) step_status_ = rf;
     }
 
@@ -1382,20 +1451,13 @@ int Ctx::run_step(const RadBatch* b) {
 }
 
 /* WHICH DECLARED OPS THE RUN PHASE HAS ACTUALLY ISSUED, copied out of the per-step plans into the
- * Program the graph dump reads. Walks only the ops not yet seen issued and drops each one as it
- * fires, so the cost falls away within a few steps to the ops that have never fired -- and those
- * are exactly what a reader of this field is looking for. Shrinking in place, so no allocation on
- * the step path. */
+ * Program the graph dump reads. Copies flags for ops issued for the first time during the step. */
 void Ctx::flush_issued() {
-    size_t w = 0;
-    for (size_t r = 0; r < unflushed_.size(); ++r) {
-        const uint32_t i = unflushed_[r];
-        if (i < plans_.size() && i < program_->ops.size() && plans_[i].issued)
+    for (uint32_t i : first_issued_) {
+        if (i < program_->ops.size())
             program_->ops[i].issued = true;
-        else
-            unflushed_[w++] = i;
     }
-    unflushed_.resize(w);
+    first_issued_.clear();
 }
 
 }  /* namespace rad */

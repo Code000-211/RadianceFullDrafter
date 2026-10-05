@@ -125,6 +125,9 @@ public:
     const std::vector<int32_t>&   special_ids() const { return special_; }
     const VocabBuild&             build() const { return b_; }
 
+    /* Pre-decoded piece for this token id (FF05). */
+    const std::string& decoded_piece(int32_t id) const;
+
     /* The byte a RAD_TT_BYTE token stands for, or -1. Both spellings are recognised: SPM's
      * "<0xF0>" and byte-level BPE's single mapped codepoint. */
     int32_t token_byte(int32_t id) const;
@@ -136,6 +139,7 @@ private:
     std::unordered_map<uint64_t, int32_t>    merge_rank_;   /* (lhs id << 32 | rhs id) -> rank */
     std::vector<int32_t> special_;                          /* ids the pre-splitter must isolate */
     std::vector<int32_t> byte_of_;                          /* id -> byte, or -1 */
+    std::vector<std::string> decoded_pieces_;               /* id -> pre-decoded piece (FF05) */
     /* Every token that ends a generation, not just the one the header had room for. Built in
      * load(); see the comment there for why a container's `eos` alone is not the whole set. */
     std::vector<int32_t> eog_;

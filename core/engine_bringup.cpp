@@ -25,6 +25,9 @@
 
 #include <sys/mman.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
+#include <sys/statvfs.h>
+#include <fcntl.h>
 #include <unistd.h>
 
 #include <cstring>
@@ -2071,7 +2074,12 @@ int Engine::load_weights() {
         /* THE POLICY HALF, BOUND TO THE SAME PLAN. It returns RAD_OK on a static plan and reports
          * `enabled() == false`, which is a mode and not a failure -- all_vram and
          * --deterministic both land there -- so there is nothing to branch on here. */
-        RAD_TRY(r->heat.init(r->plan, HeatParams{}));
+        HeatParams hp;
+        if (const char* e = getenv("RADIANCE_HEAT_MOVES")) hp.moves_per_dispatch = std::atoi(e);
+        if (const char* e = getenv("RADIANCE_HEAT_MIN_GAIN")) hp.min_gain = (float)std::atof(e);
+        if (const char* e = getenv("RADIANCE_HEAT_HYSTERESIS")) hp.hysteresis = (float)std::atof(e);
+        if (const char* e = getenv("RADIANCE_HEAT_DECAY")) hp.decay = (float)std::atof(e);
+        RAD_TRY(r->heat.init(r->plan, hp));
 
         /* A DESTINATION HAS TO LIE INSIDE THE POOL IT WAS CARVED FROM. A slot pointer that runs
          * past the end of the weights pool is a write to device memory the process does not own,
@@ -2247,6 +2255,168 @@ int Engine::load_weights() {
                  * load. What shows its effect is a cold cache and a byte counter, not a
                  * stopwatch. */
                 posix_madvise(w.ptr, (size_t)n, POSIX_MADV_RANDOM);
+                if (w.site == Site::DeviceZeroCopy || w.site == Site::Device) {
+                    /* A DEVICE KERNEL READS THIS TABLE, so it needs a GPU address. NOT by
+                     * hipHostRegister on the file mapping: that pins page-cache pages as a KFD
+                     * userptr, every page-cache eviction during the 65 GiB load sweep then fires
+                     * an MMU-notifier eviction of the whole process's queues, and the copy queues
+                     * stalled indefinitely (measured: aql_copy_link stuck on both cards).
+                     *
+                     * One anonymous pinned, device-mapped copy instead, made ONCE and shared by
+                     * every rank -- they run in this process, and host memory is visible to every
+                     * card -- so the resident footprint is one table, not one per rank. The
+                     * page-cache pages the copy was read from are clean and reclaimable. */
+                    static std::mutex mtx;
+                    static std::map<const void*, void*> shared;   /* host source -> pinned copy */
+                    std::lock_guard<std::mutex> lk(mtx);
+                    void*& dst = shared[w.ptr];
+                    if (!dst) {
+                        const char* shm_env = std::getenv("RADIANCE_PLE_SHM");
+                        const bool enable_shm = !shm_env || (std::strcmp(shm_env, "0") != 0 &&
+                                                             std::strcmp(shm_env, "off") != 0 &&
+                                                             std::strcmp(shm_env, "false") != 0);
+                        std::string shm_id;
+                        for (char c : w.name) {
+                            if (std::isalnum((unsigned char)c) || c == '.' || c == '_') shm_id += c;
+                            else shm_id += '_';
+                        }
+                        uint64_t model_hash = 14695981039346656037ULL;
+                        for (char c : cfg_.model) {
+                            model_hash ^= (uint8_t)c;
+                            model_hash *= 1099511628211ULL;
+                        }
+                        char hash_str[32];
+                        std::snprintf(hash_str, sizeof(hash_str), "%016llx", (unsigned long long)model_hash);
+                        std::string bin_path = "/dev/shm/rad_shm_" + shm_id + "_" + hash_str + "_" + std::to_string(n) + ".bin";
+                        std::string ready_path = bin_path + ".ready";
+
+                        if (enable_shm) {
+                            struct stat st_ready{}, st_bin{};
+                            if (stat(ready_path.c_str(), &st_ready) == 0 && stat(bin_path.c_str(), &st_bin) == 0) {
+                                if (st_bin.st_size == (off_t)n) {
+                                    int rfd = open(ready_path.c_str(), O_RDONLY);
+                                    if (rfd >= 0) {
+                                        int64_t ready_size = 0;
+                                        if (read(rfd, &ready_size, sizeof(ready_size)) == sizeof(ready_size) &&
+                                            ready_size == n) {
+                                            const auto t0 = std::chrono::steady_clock::now();
+                                            int fd = open(bin_path.c_str(), O_RDWR);
+                                            if (fd >= 0) {
+                                                void* p = mmap(nullptr, (size_t)n, PROT_READ | PROT_WRITE,
+                                                               MAP_SHARED, fd, 0);
+                                                close(fd);
+                                                if (p != MAP_FAILED) {
+                                                    madvise(p, (size_t)n, MADV_HUGEPAGE);
+                                                    int reg_err = rad_dev_host_register(p, n, 0);
+                                                    if (reg_err == RAD_OK) {
+                                                        dst = p;
+                                                        RAD_INFO("load: '%s' attached from persistent shm cache in %.2f s (instant restart), shared by every rank",
+                                                                 w.name.c_str(),
+                                                                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+                                                    } else {
+                                                        RAD_WARN("load: '%s' persistent shm host_register failed (%d), falling back",
+                                                                 w.name.c_str(), reg_err);
+                                                        munmap(p, (size_t)n);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        close(rfd);
+                                    }
+                                }
+                            }
+                        }
+
+                        if (!dst && enable_shm) {
+                            struct statvfs svfs{};
+                            if (statvfs("/dev/shm", &svfs) == 0) {
+                                uint64_t free_shm = (uint64_t)svfs.f_bavail * svfs.f_bsize;
+                                if (free_shm >= (uint64_t)n + 1024ULL * 1024ULL * 1024ULL) {
+                                    std::string tmp_path = bin_path + ".tmp";
+                                    unlink(tmp_path.c_str());
+                                    int fd = open(tmp_path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0600);
+                                    if (fd >= 0) {
+                                        if (ftruncate(fd, (off_t)n) == 0) {
+                                            void* p = mmap(nullptr, (size_t)n, PROT_READ | PROT_WRITE,
+                                                           MAP_SHARED, fd, 0);
+                                            close(fd);
+                                            if (p != MAP_FAILED) {
+                                                madvise(p, (size_t)n, MADV_HUGEPAGE);
+                                                const auto t0 = std::chrono::steady_clock::now();
+                                                const int nt = 16;
+                                                const int64_t chunk = align_up((n + nt - 1) / nt, (int64_t)1 << 21);
+                                                std::vector<std::thread> th;
+                                                const uint8_t* src = (const uint8_t*)w.ptr;
+                                                uint8_t* out = (uint8_t*)p;
+                                                for (int k = 0; k < nt; ++k) {
+                                                    const int64_t lo = k * chunk, hi = std::min<int64_t>(n, lo + chunk);
+                                                    if (lo >= hi) break;
+                                                    th.emplace_back([src, out, lo, hi] {
+                                                        std::memcpy(out + lo, src + lo, (size_t)(hi - lo));
+                                                    });
+                                                }
+                                                for (auto& t : th) t.join();
+
+                                                rename(tmp_path.c_str(), bin_path.c_str());
+                                                int rfd = open(ready_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+                                                if (rfd >= 0) {
+                                                    write(rfd, &n, sizeof(n));
+                                                    close(rfd);
+                                                }
+
+                                                int reg_err = rad_dev_host_register(p, n, 0);
+                                                if (reg_err == RAD_OK) {
+                                                    dst = p;
+                                                    RAD_INFO("load: '%s' populated %s into persistent shm cache in %.1f s, shared by every rank",
+                                                             w.name.c_str(), humanb(n).c_str(),
+                                                             std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+                                                } else {
+                                                    RAD_WARN("load: '%s' persistent shm host_register failed (%d), falling back",
+                                                             w.name.c_str(), reg_err);
+                                                    munmap(p, (size_t)n);
+                                                }
+                                            }
+                                        } else {
+                                            close(fd);
+                                            unlink(tmp_path.c_str());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        if (!dst) {
+                            dst = rad_dev_alloc(n, RAD_MEM_HOST_MAPPED);
+                            if (!dst) {
+                                RAD_ERR("'%s': no pinned host memory for the %s device-read table: %s",
+                                        w.name.c_str(), humanb(n).c_str(), rad_dev_last_error());
+                                return RAD_E_NOMEM;
+                            }
+                            const auto t0 = std::chrono::steady_clock::now();
+                            const int nt = 16;
+                            const int64_t chunk = align_up((n + nt - 1) / nt, (int64_t)1 << 21);
+                            std::vector<std::thread> th;
+                            const uint8_t* src = (const uint8_t*)w.ptr;
+                            uint8_t* out = (uint8_t*)dst;
+                            for (int k = 0; k < nt; ++k) {
+                                const int64_t lo = k * chunk, hi = std::min<int64_t>(n, lo + chunk);
+                                if (lo >= hi) break;
+                                th.emplace_back([src, out, lo, hi] {
+                                    std::memcpy(out + lo, src + lo, (size_t)(hi - lo));
+                                });
+                            }
+                            for (auto& t : th) t.join();
+                            RAD_INFO("load: '%s' copied into %s of pinned host memory for device "
+                                     "gathers in %.1f s, shared by every rank", w.name.c_str(),
+                                     humanb(n).c_str(),
+                                     std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                                                   t0).count());
+                        }
+                    }
+                    void* dev_p = rad_dev_device_ptr(dst);
+                    w.host_ptr = dst;
+                    w.ptr = dev_p ? dev_p : dst;
+                }
                 r->mover.publish_mapped((rad_weight)i, w.ptr);
                 ++n_mapped;
                 mapped_bytes += n;

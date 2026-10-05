@@ -35,8 +35,19 @@ public:
     int  configure(const Params& p);
     const Params& params() const { return p_; }
 
-    /* The draft depth for the next step. 0 means "do not speculate". Constant by construction. */
-    int  next_depth() const { return p_.max_depth; }
+    /* The draft depth for the next step.
+     * Keeps depth at p_.max_depth across concurrency levels to maximize draft throughput.
+     * Setting RADIANCE_DYNAMIC_SPEC=1 optionally restores concurrency-based depth throttling. */
+    int  next_depth(int active_seqs = 1) const {
+        if (p_.max_depth <= 0) return 0;
+        static const bool dynamic_spec = (std::getenv("RADIANCE_DYNAMIC_SPEC") != nullptr);
+        if (__builtin_expect(dynamic_spec, 0)) {
+            if (active_seqs >= 8) return 0;
+            if (active_seqs >= 5) return std::min(p_.max_depth, 1);
+            if (active_seqs >= 3) return std::min(p_.max_depth, 2);
+        }
+        return p_.max_depth;
+    }
 
     /* One verify's outcome: `drafted` tokens were proposed and a prefix of `accepted` of them was
      * taken. Feeds the reported metrics and nothing else. */

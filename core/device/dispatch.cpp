@@ -393,6 +393,12 @@ void  rad_dev_free(void* p, int kind) {
 }
 void* rad_dev_host_ptr(void* p)                   { return dev()->host_ptr(p); }
 void* rad_dev_device_ptr(void* p)                 { return dev()->device_ptr(p); }
+int  rad_dev_host_register(void* p, int64_t bytes, unsigned flags) {
+    return dev()->host_register ? dev()->host_register(p, bytes, flags) : RAD_OK;
+}
+int  rad_dev_host_unregister(void* p) {
+    return dev()->host_unregister ? dev()->host_unregister(p) : RAD_OK;
+}
 
 int  rad_stream_create(RadStream* out, int hi)    { return dev()->stream_create(out, hi); }
 void rad_stream_destroy(RadStream s)              { dev()->stream_destroy(s); }
@@ -409,7 +415,11 @@ int     dev_vram_used(int device, int64_t* out) {
 int     tape_begin()           { return dev()->tape_begin ? dev()->tape_begin() : RAD_E_UNSUPPORTED; }
 int     tape_mark()            { return dev()->tape_mark ? dev()->tape_mark() : RAD_E_UNSUPPORTED; }
 void    tape_pause(bool on)    { if (dev()->tape_pause) dev()->tape_pause(on ? 1 : 0); }
-RadTape tape_end(bool keep)    { return dev()->tape_end ? dev()->tape_end(keep ? 1 : 0) : nullptr; }
+RadTape tape_end(bool keep, bool compare_only) {
+    if (!dev()->tape_end) return nullptr;
+    const int k = !keep ? 0 : (compare_only ? 2 : 1);
+    return dev()->tape_end(k);
+}
 int     tape_len(RadTape t)    { return dev()->tape_len ? dev()->tape_len(t) : RAD_E_UNSUPPORTED; }
 int     tape_play(RadTape t, int from, int to) {
     return dev()->tape_play ? dev()->tape_play(t, from, to) : RAD_E_UNSUPPORTED;

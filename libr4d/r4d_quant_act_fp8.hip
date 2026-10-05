@@ -37,6 +37,7 @@
 #include "r4d_fp8_args.h"
 #include "r4d_fp8_wmma.h"
 #include "r4d_fwht.h"
+#include "r4d_q8.h"
 
 namespace {
 
@@ -81,10 +82,19 @@ __global__ __launch_bounds__(kThreads) void quant_act_fp8_kernel(
         const uint32_t c0 = kb * kGroup + lane * 4u;
         float v[4];
         float m = 0.0f;
+        if (__builtin_expect(c0 + 4 <= K, 1)) {
+            uint64_t raw;
+            __builtin_memcpy(&raw, x + xrow + c0, sizeof(raw));
+            v[0] = __uint_as_float(((uint32_t)(uint16_t)raw) << 16);
+            v[1] = __uint_as_float(((uint32_t)(uint16_t)(raw >> 16)) << 16);
+            v[2] = __uint_as_float(((uint32_t)(uint16_t)(raw >> 32)) << 16);
+            v[3] = __uint_as_float(((uint32_t)(uint16_t)(raw >> 48)) << 16);
+        } else {
 #pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            const uint32_t c = c0 + (uint32_t)j;
-            v[j] = c < K ? __uint_as_float((uint32_t)x[xrow + c] << 16) : 0.0f;
+            for (int j = 0; j < 4; ++j) {
+                const uint32_t c = c0 + (uint32_t)j;
+                v[j] = c < K ? __uint_as_float((uint32_t)x[xrow + c] << 16) : 0.0f;
+            }
         }
         // The whole wave has to be inside the row for this, which is why the rotated launcher
         // refuses a K that is not a multiple of the group: a partial block would rotate real
@@ -97,23 +107,7 @@ __global__ __launch_bounds__(kThreads) void quant_act_fp8_kernel(
         const float sc = m > 0.0f ? m * (1.0f / kTop) : 1.0f;
         if (lane == 0) s[(size_t)row * s_ld + kb] = sc;
         const float inv = 1.0f / sc;
-        int pk = 0;
-        if constexpr (I8) {
-            uint32_t b = 0;
-#pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                const int c = (int)rintf(fminf(fmaxf(v[j] * inv, -127.0f), 127.0f));
-                b |= ((uint32_t)c & 0xFFu) << (8 * j);
-            }
-            pk = (int)b;
-        } else {
-            pk = __builtin_amdgcn_cvt_pk_fp8_f32(fminf(fmaxf(v[0] * inv, -448.0f), 448.0f),
-                                                 fminf(fmaxf(v[1] * inv, -448.0f), 448.0f), pk,
-                                                 false);
-            pk = __builtin_amdgcn_cvt_pk_fp8_f32(fminf(fmaxf(v[2] * inv, -448.0f), 448.0f),
-                                                 fminf(fmaxf(v[3] * inv, -448.0f), 448.0f), pk,
-                                                 true);
-        }
+        const uint32_t pk = q8_pack4<I8>(v[0], v[1], v[2], v[3], inv);
         // A ragged last group is written zero-padded rather than partially: the padding lanes hold
         // zeros, which quantise to zeros, and the GEMM's own bounds guard is what stops them
         // reaching an accumulator. A partial store would be a second code path for a case no dense

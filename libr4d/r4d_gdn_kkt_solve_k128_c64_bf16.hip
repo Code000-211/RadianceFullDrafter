@@ -270,8 +270,9 @@ void r4d_gdn_kkt_solve_kernel(const unsigned short* __restrict__ k,
       v8f Y = (v8f){0, 0, 0, 0, 0, 0, 0, 0};
 #pragma unroll
       for (int sk = 0; sk < 2; ++sk)
-        Y = mma(frag(&s.A[0][0], AP, 32 + mt * 16, sk * 16, lane),
-                fragT(&s.A[0][0], AP, nt * 16, sk * 16, lane), Y);
+        if (sk >= nt)
+          Y = mma(frag(&s.A[0][0], AP, 32 + mt * 16, sk * 16, lane),
+                  fragT(&s.A[0][0], AP, nt * 16, sk * 16, lane), Y);
       *(uint2*)(&s.TMP[nt * 16 + lo][mt * 16 + 8 * hi])     = f2bf4(Y[0], Y[1], Y[2], Y[3]);
       *(uint2*)(&s.TMP[nt * 16 + lo][mt * 16 + 8 * hi + 4]) = f2bf4(Y[4], Y[5], Y[6], Y[7]);
     }
@@ -282,8 +283,9 @@ void r4d_gdn_kkt_solve_kernel(const unsigned short* __restrict__ k,
       v8f Z = (v8f){0, 0, 0, 0, 0, 0, 0, 0};
 #pragma unroll
       for (int sk = 0; sk < 2; ++sk)
-        Z = mma(frag(&s.A[0][0], AP, 32 + mt * 16, 32 + sk * 16, lane),
-                frag(&s.TMP[0][0], 36, nt * 16, sk * 16, lane), Z);
+        if (sk <= mt)
+          Z = mma(frag(&s.A[0][0], AP, 32 + mt * 16, 32 + sk * 16, lane),
+                  frag(&s.TMP[0][0], 36, nt * 16, sk * 16, lane), Z);
       const int i = 32 + mt * 16 + 8 * hi;
       const int j = nt * 16 + lo;
 #pragma unroll
@@ -300,7 +302,8 @@ void r4d_gdn_kkt_solve_kernel(const unsigned short* __restrict__ k,
         *(uint4*)(op + (size_t)r * orow + c8) = *(const uint4*)(&s.A[r][c8]);
       }
     }
-    if (hh + 1 < HG_RATIO) BAR();
+    // R4-04: Redundant end-of-head barrier removed. The next iteration hh+1 writes only
+    // disjoint fields s.gb/s.bt and then hits BAR() before overwriting s.A.
   }
 }
 

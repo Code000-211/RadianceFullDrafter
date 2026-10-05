@@ -142,7 +142,9 @@ __global__ __launch_bounds__(256) void r4d_qk_norm_rope_gate_kernel(
   // which is exactly why it is easy to leave out here: the failure is a 1% scatter of elements
   // that reads like a rounding difference and is not one. r4d_selftest's byte-equality row catches
   // it.
-  __syncthreads();
+  // AG03: Only K-heads (isk) rotate in-place (in == out). For Q-heads (!isk), in is QG
+  // and out is QO, so they write to a completely disjunct buffer with zero aliasing risk.
+  if (isk) __syncthreads();
   if (t < HD) {
     out[t] = __float2bfloat16(res);
     // `gate_out` is OPTIONAL in the schema, and a caller that already reads the gate straight out

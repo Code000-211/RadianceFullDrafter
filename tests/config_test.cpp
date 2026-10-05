@@ -830,7 +830,26 @@ TEST(usage_names_every_flag_it_documents) {
                            "--max-stop-strings", "--http-threads", "--max-body-mib", "--no-cors",
                            "--image-max-pixels", "--video-fps", "--max-source-pixels" })
         CHECK(text.find(f) != std::string::npos);
+    CHECK(text.find("--ple-backend") != std::string::npos);
     CHECK(text.size() > 1000);
+}
+
+TEST(ple_backend_takes_device_or_host) {
+    Config c;
+    CHECK_EQ(c.ple_backend, std::string("device"));
+    CHECK_EQ(parse({ "--ple-backend", "host" }, &c), RAD_OK);
+    CHECK_EQ(c.ple_backend, std::string("host"));
+    CHECK_EQ(parse({ "--ple-backend", "cpu" }, &c), RAD_OK);
+    CHECK_EQ(c.ple_backend, std::string("host"));
+    CHECK_EQ(parse({ "--ple-backend", "nvme" }, &c), RAD_OK);
+    CHECK_EQ(c.ple_backend, std::string("host"));
+    CHECK_EQ(parse({ "--ple-backend", "device" }, &c), RAD_OK);
+    CHECK_EQ(c.ple_backend, std::string("device"));
+    CHECK_EQ(parse({ "--ple-backend", "gpu" }, &c), RAD_OK);
+    CHECK_EQ(c.ple_backend, std::string("device"));
+    CHECK_EQ(parse({ "--ple-storage", "host" }, &c), RAD_OK);
+    CHECK_EQ(c.ple_backend, std::string("host"));
+    CHECK_EQ(parse({ "--ple-backend", "invalid" }, &c), RAD_E_INVAL);
 }
 
 RAD_TEST_MAIN()

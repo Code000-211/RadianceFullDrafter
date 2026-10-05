@@ -117,12 +117,6 @@ __global__ __launch_bounds__(kThr) void sample_kernel(
 
   auto lg = [&](uint32_t v) { return col[(size_t)v * row_stride]; };
 
-  const float m = reduce_max(sh, [&] {
-    float best = -INFINITY;
-    for (uint32_t v = tid; v < vocab; v += kThr) best = fmaxf(best, lg(v));
-    return best;
-  }());
-
   // ---- temperature 0 is greedy, and stays a real path ------------------------------------------
   //
   // Kept here rather than special-cased by the caller so that a request asking for determinism gets
@@ -131,9 +125,23 @@ __global__ __launch_bounds__(kThr) void sample_kernel(
   if (!(temperature > 0.0f)) {
     float bv = -INFINITY;
     uint32_t bi = 0xFFFFFFFFu;
-    for (uint32_t v = tid; v < vocab; v += kThr) {
-      const float x = lg(v);
-      if (x > bv || (x == bv && v < bi)) { bv = x; bi = v; }
+    const bool v4 = row_stride == 1 && ((uintptr_t)col & 15u) == 0 && (vocab & 3u) == 0;
+    if (v4) {
+      const float4* const col4 = (const float4*)col;
+      const uint32_t v4_len = vocab >> 2;
+      for (uint32_t j = tid; j < v4_len; j += kThr) {
+        const float4 x4 = col4[j];
+        const uint32_t i0 = j << 2;
+        if (x4.x > bv || (x4.x == bv && (i0 + 0u) < bi)) { bv = x4.x; bi = i0 + 0u; }
+        if (x4.y > bv || (x4.y == bv && (i0 + 1u) < bi)) { bv = x4.y; bi = i0 + 1u; }
+        if (x4.z > bv || (x4.z == bv && (i0 + 2u) < bi)) { bv = x4.z; bi = i0 + 2u; }
+        if (x4.w > bv || (x4.w == bv && (i0 + 3u) < bi)) { bv = x4.w; bi = i0 + 3u; }
+      }
+    } else {
+      for (uint32_t v = tid; v < vocab; v += kThr) {
+        const float x = lg(v);
+        if (x > bv || (x == bv && v < bi)) { bv = x; bi = v; }
+      }
     }
     sh.red[tid] = bv;
     sh.red_i[tid] = bi;
@@ -158,6 +166,12 @@ __global__ __launch_bounds__(kThr) void sample_kernel(
     }
     return;
   }
+
+  const float m = reduce_max(sh, [&] {
+    float best = -INFINITY;
+    for (uint32_t v = tid; v < vocab; v += kThr) best = fmaxf(best, lg(v));
+    return best;
+  }());
 
   const float inv_t = 1.0f / temperature;
   float zs = 0.0f;

@@ -435,8 +435,13 @@ struct Fixture {
     FakePC  pc;
     Scheduler sch;
     std::vector<void*> owned;
+    RadStream stream = nullptr;
 
-    ~Fixture() { sch.fini(); for (void* p : owned) std::free(p); }
+    ~Fixture() {
+        sch.fini();
+        if (stream) rad_stream_destroy(stream);
+        for (void* p : owned) std::free(p);
+    }
 
     void build(int64_t blocks = 4096, int64_t states = 64, int64_t max_tok = 512) {
         g_gdn_ki = RadKernelInfo{};
@@ -522,8 +527,9 @@ struct Fixture {
     }
 
     int start() {
+        if (!stream) rad_stream_create(&stream, 0);
         std::vector<BatchBuilder::RankIO> rio;
-        rio.push_back({ 0, nullptr, &prog });
+        rio.push_back({ 0, stream, &prog });
         return sch.init(prog, cfg, &kv, &pc, rio);
     }
 
@@ -1533,8 +1539,9 @@ TEST(a_sequence_back_in_a_row_it_left_is_restaged_whole) {
         if (w > 0) kvg.g[i].sidx_width = w;
     }
     BatchBuilder bb;
+    if (!f.stream) rad_stream_create(&f.stream, 0);
     std::vector<BatchBuilder::RankIO> rio;
-    rio.push_back({ 0, nullptr, &f.prog });
+    rio.push_back({ 0, f.stream, &f.prog });
     CHECK_OK(bb.init(f.prog, f.cfg, geo, kvg, rio));
 
     for (uint64_t id = 1; id <= 3; ++id) {

@@ -142,6 +142,7 @@ int     r4d_rad_attn_decode_gq_h256_gqa6_bf16_describe(const RadArgs*, RadStream
 
 /* -- gated delta net (r4d_gdn_*.hip) -- */
 int r4d_rad_gdn_chunk_scan      (const RadArgs*, RadStream);
+int64_t r4d_rad_gdn_chunk_scan_scratch(const RadArgs*);
 int r4d_rad_gdn_conv_prep       (const RadArgs*, RadStream);
 int r4d_rad_gdn_conv_update     (const RadArgs*, RadStream);
 int r4d_rad_gdn_kkt_solve       (const RadArgs*, RadStream);
@@ -226,6 +227,7 @@ int     r4d_rad_router_topk        (const RadArgs*, RadStream);
 int     r4d_rad_moe_scatter        (const RadArgs*, RadStream);
 int     r4d_rad_router_topk_scatter(const RadArgs*, RadStream);
 int r4d_rad_router_topk_scatter_describe(const RadArgs*, RadStream, RadLaunchDesc*, int, int*);
+int64_t r4d_rad_router_topk_scatter_scratch(const RadArgs*);
 int64_t r4d_rad_moe_scatter_scratch(const RadArgs*);
 int     r4d_rad_moe_gemm_q         (const RadArgs*, RadStream);
 /* Scratch for the run map the prefill form is aligned by. Zero in the decode band and zero for a
@@ -368,8 +370,7 @@ int r4d_rad_relayout_mxfp4(const RadParam*, int, int, const RadEncoding*, const 
  * fatal issue, not a slow one. `logits_gemm` is declared with them. */
 int r4d_rad_embed_lookup    (const RadArgs*, RadStream);
 int r4d_rad_embed_lookup_describe(const RadArgs*, RadStream, RadLaunchDesc*, int, int*);
-/* The quantised gather (embed_lookup_q): the n-gram table's, where a card reads the table -- in
- * VRAM, or in pinned host memory over the link. */
+/* The quantised gather (embed_lookup_q): the n-gram table's, where a card reads the table. */
 int r4d_rad_embed_lookup_q  (const RadArgs*, RadStream);
 int r4d_rad_embed_lookup_q_describe(const RadArgs*, RadStream, RadLaunchDesc*, int, int*);
 int r4d_rad_ngram_ids       (const RadArgs*, RadStream);

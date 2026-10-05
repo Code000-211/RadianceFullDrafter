@@ -587,42 +587,57 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
              * the data pointer is already arena_base + BufferInfo::arena_offset. */
             tt = buf_tmpl_[bh];
             touches_host |= buf_host_[bh] != 0;
-            if (o.offset) {
-                int64_t d;
-                if (!byte_delta(buf_bits_[bh], o.offset, &d))
-                    return abort_step_msg(h, RAD_E_ALIGN,
-                                          fmt("operand %d offsets buffer '%s' by %lld elements, "
-                                              "which is not a whole number of bytes in %s", i,
+            if (o.offset == 0 && o.cols <= 0 && buf_dense_[bh]) {
+                if (o.rows > 0) {
+                    if (o.rows > buf_tmpl_[bh].shape[0]) {
+                        tt.shape[0] = o.rows;
+                        return abort_step_msg(h, RAD_E_SHAPE,
+                                              fmt("operand %d reaches past buffer '%s': %s at offset "
+                                                  "%lld, declared %s", i,
+                                                  program_->buffers[bh].name.c_str(),
+                                                  opd_shape_str(tt).c_str(), (long long)o.offset,
+                                                  opd_shape_str(buf_tmpl_[bh]).c_str()));
+                    }
+                    tt.shape[0] = o.rows;
+                }
+            } else {
+                if (o.offset) {
+                    int64_t d;
+                    if (!byte_delta(buf_bits_[bh], o.offset, &d))
+                        return abort_step_msg(h, RAD_E_ALIGN,
+                                              fmt("operand %d offsets buffer '%s' by %lld elements, "
+                                                  "which is not a whole number of bytes in %s", i,
+                                                  program_->buffers[bh].name.c_str(),
+                                                  (long long)o.offset,
+                                                  rad_dtype_name(tt.dtype)));
+                    tt.data = static_cast<char*>(tt.data) + d;
+                }
+                /* rows > 0 narrows dim 0, which is how a prefill chunk of `rows` tokens issues against
+                 * a buffer the plan sized at max_tok. The strides do not change and must not: they are
+                 * products of the trailing dimensions, so shortening the outermost one leaves every
+                 * one of them correct. That is the whole reason the narrowing is dim 0 only. */
+                if (o.rows > 0) tt.shape[0] = o.rows;
+                narrow_cols(o, &tt);
+                /* AND IT HAS TO FIT THE BUFFER IT NAMES. Narrowing dim 0 is how a chunk of `rows`
+                 * tokens issues against a plan sized at max_tok, and the arrow points one way only:
+                 * an operand may name FEWER rows than the declaration, never more.
+                 *
+                 * A read past the end is uninitialised memory. A WRITE past the end is another
+                 * buffer's bytes, and the arena packs by liveness -- so what it lands on is whatever
+                 * the planner put there, which changes with the graph. That is the worst shape of
+                 * bug this runtime can have: it is silent, it is not reproducible across a config
+                 * change, and the model can stay correct for as long as the victim happens to be
+                 * dead. The canonical shape of it is a MoE expert plane declared at max_tok rows while
+                 * the gated quantiser writes rows*top_k of them, which nothing notices until some
+                 * later op happens to read the buffer the overrun lands on. */
+                if (!operand_fits(tt, o.offset, buf_tmpl_[bh]))
+                    return abort_step_msg(h, RAD_E_SHAPE,
+                                          fmt("operand %d reaches past buffer '%s': %s at offset "
+                                              "%lld, declared %s", i,
                                               program_->buffers[bh].name.c_str(),
-                                              (long long)o.offset,
-                                              rad_dtype_name(tt.dtype)));
-                tt.data = static_cast<char*>(tt.data) + d;
+                                              opd_shape_str(tt).c_str(), (long long)o.offset,
+                                              opd_shape_str(buf_tmpl_[bh]).c_str()));
             }
-            /* rows > 0 narrows dim 0, which is how a prefill chunk of `rows` tokens issues against
-             * a buffer the plan sized at max_tok. The strides do not change and must not: they are
-             * products of the trailing dimensions, so shortening the outermost one leaves every
-             * one of them correct. That is the whole reason the narrowing is dim 0 only. */
-            if (o.rows > 0) tt.shape[0] = o.rows;
-            narrow_cols(o, &tt);
-            /* AND IT HAS TO FIT THE BUFFER IT NAMES. Narrowing dim 0 is how a chunk of `rows`
-             * tokens issues against a plan sized at max_tok, and the arrow points one way only:
-             * an operand may name FEWER rows than the declaration, never more.
-             *
-             * A read past the end is uninitialised memory. A WRITE past the end is another
-             * buffer's bytes, and the arena packs by liveness -- so what it lands on is whatever
-             * the planner put there, which changes with the graph. That is the worst shape of
-             * bug this runtime can have: it is silent, it is not reproducible across a config
-             * change, and the model can stay correct for as long as the victim happens to be
-             * dead. The canonical shape of it is a MoE expert plane declared at max_tok rows while
-             * the gated quantiser writes rows*top_k of them, which nothing notices until some
-             * later op happens to read the buffer the overrun lands on. */
-            if (!operand_fits(tt, o.offset, buf_tmpl_[bh]))
-                return abort_step_msg(h, RAD_E_SHAPE,
-                                      fmt("operand %d reaches past buffer '%s': %s at offset "
-                                          "%lld, declared %s", i,
-                                          program_->buffers[bh].name.c_str(),
-                                          opd_shape_str(tt).c_str(), (long long)o.offset,
-                                          opd_shape_str(buf_tmpl_[bh]).c_str()));
             /* AND THE OP HAS TO BE INSIDE THE BUFFER'S PLANNED LIFETIME.
              *
              * rad_op_reads/rad_op_writes are what the buffer plan is computed from, and they are
@@ -773,31 +788,13 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
                                       ? b.layer_slot[(size_t)o.offset]
                                       : -1;
             const int64_t off   = layer * b.layer_stride;
-            if (layer < 0 || (b.bytes && off + b.layer_stride > b.bytes))
+            if (layer < 0 || (b.bytes && off + b.layer_stride > b.bytes) ||
+                (size_t)layer >= b.layer_tensor.size())
                 return abort_step_msg(h, RAD_E_INVAL,
                                       fmt("operand %d asks KV group %u for layer %lld, which is "
                                           "outside the %lld bytes it was allocated", i, g,
                                           (long long)o.offset, (long long)b.bytes));
-            std::memset(&tt, 0, sizeof tt);
-            tt.data  = static_cast<char*>(b.base) + off;
-            tt.dtype = b.dtype;
-            /* THE OPERAND CARRIES THE LAYER'S SHAPE, not a flat byte span. The binding composed it
-             * at load out of the plugin's declaration and the block manager's decisions, because
-             * neither half alone is enough (core/runtime/ctx.h says which numbers and why). Every
-             * libr4d shim refuses a flat span -- `if (kv->rank != 4) return RAD_E_SHAPE` -- and
-             * refuses correctly: a paged cache walked as one dimension is not a cache. */
-            if (b.rank) {
-                tt.rank = b.rank;
-                for (uint32_t d = 0; d < b.rank; ++d) tt.shape[d] = b.shape[d];
-                rad_tensor_pack(&tt);
-            } else {
-                tt.rank      = 1;
-                tt.shape[0]  = b.layer_stride
-                                   ? b.layer_stride * 8 /
-                                         (rad_dtype_bits(b.dtype) ? rad_dtype_bits(b.dtype) : 8)
-                                   : 0;
-                tt.stride[0] = 1;
-            }
+            tt = b.layer_tensor[(size_t)layer];
             if (o.rows > 0) tt.shape[0] = o.rows;
             break;
         }
@@ -813,7 +810,10 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
      * instance init() returned, the rank and the world size -- was filled in at prepare and has
      * not changed. args.t already points at tbuf_. */
     ip.args.n_t = n_opd;
-    p.issued    = true;
+    if (!p.issued) {
+        p.issued = true;
+        first_issued_.push_back(h);
+    }
     ++n_issues_;
 
     /* RADIANCE_DEBUG_ARGSHA -- see the note by the digest. Pass 1 only, so the sequence compared

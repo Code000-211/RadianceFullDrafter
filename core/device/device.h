@@ -103,6 +103,8 @@ struct DeviceBackend {
     void  (*free)(void* p, int kind);
     void* (*host_ptr)(void* p);
     void* (*device_ptr)(void* p);
+    int   (*host_register)(void* p, int64_t bytes, unsigned flags);
+    int   (*host_unregister)(void* p);
 
     int   (*stream_create)(RadStream* out, int high_priority);
     void  (*stream_destroy)(RadStream s);
@@ -238,7 +240,7 @@ bool    tape_supported();
 int     tape_begin();
 int     tape_mark();
 void    tape_pause(bool on);
-RadTape tape_end(bool keep);
+RadTape tape_end(bool keep, bool compare_only = false);
 int     tape_len(RadTape t);
 int     tape_play(RadTape t, int from, int to);
 int     tape_diff(RadTape a, RadTape b, std::string* why);
@@ -264,7 +266,7 @@ bool    dev_integrated(int device);
  * consecutive packets on a queue, one carries the barrier bit, so a packet having been launched
  * still proves that everything more than that many packets before it has completed -- which is
  * what the backend's argument slots and a tape's own lifetime are reclaimed on. */
-constexpr int kTapeOverlapRun = 6;
+constexpr int kTapeOverlapRun = 32;
 
 /* ------------------------------------------------------------------ the allocation ledger
  * What rad_dev_alloc has handed out, by RAD_MEM_* kind, since the process started. See the

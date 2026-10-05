@@ -167,14 +167,38 @@ __device__ __forceinline__ uint4 e4m3x8_bf16(const unsigned char* __restrict__ c
 constexpr long kHc8Step = kWave * 16;
 
 __device__ __forceinline__ float hc8_dot16(const unsigned short* __restrict__ sv, uint4 c) {
-    float wf[16], nf[16];
-    e4m3x8(c.x, c.y, wf);
-    e4m3x8(c.z, c.w, wf + 8);
-    bf16x8(*(const uint4*)sv, nf);
-    bf16x8(*(const uint4*)(sv + 8), nf + 8);
+    const uint4 s0 = *(const uint4*)sv;
+    const uint4 s1 = *(const uint4*)(sv + 8);
+
+    const v2f a0 = __builtin_amdgcn_cvt_pk_f32_fp8((int)c.x, false);
+    const v2f a1 = __builtin_amdgcn_cvt_pk_f32_fp8((int)c.x, true);
+    const v2f a2 = __builtin_amdgcn_cvt_pk_f32_fp8((int)c.y, false);
+    const v2f a3 = __builtin_amdgcn_cvt_pk_f32_fp8((int)c.y, true);
+
+    const v2f a4 = __builtin_amdgcn_cvt_pk_f32_fp8((int)c.z, false);
+    const v2f a5 = __builtin_amdgcn_cvt_pk_f32_fp8((int)c.z, true);
+    const v2f a6 = __builtin_amdgcn_cvt_pk_f32_fp8((int)c.w, false);
+    const v2f a7 = __builtin_amdgcn_cvt_pk_f32_fp8((int)c.w, true);
+
     float p = 0.0f;
-#pragma unroll
-    for (int t = 0; t < 16; ++t) p = fmaf(wf[t], nf[t], p);
+    p = fmaf(a0.x, __uint_as_float(s0.x << 16), p);
+    p = fmaf(a0.y, __uint_as_float(s0.x & 0xffff0000u), p);
+    p = fmaf(a1.x, __uint_as_float(s0.y << 16), p);
+    p = fmaf(a1.y, __uint_as_float(s0.y & 0xffff0000u), p);
+    p = fmaf(a2.x, __uint_as_float(s0.z << 16), p);
+    p = fmaf(a2.y, __uint_as_float(s0.z & 0xffff0000u), p);
+    p = fmaf(a3.x, __uint_as_float(s0.w << 16), p);
+    p = fmaf(a3.y, __uint_as_float(s0.w & 0xffff0000u), p);
+
+    p = fmaf(a4.x, __uint_as_float(s1.x << 16), p);
+    p = fmaf(a4.y, __uint_as_float(s1.x & 0xffff0000u), p);
+    p = fmaf(a5.x, __uint_as_float(s1.y << 16), p);
+    p = fmaf(a5.y, __uint_as_float(s1.y & 0xffff0000u), p);
+    p = fmaf(a6.x, __uint_as_float(s1.z << 16), p);
+    p = fmaf(a6.y, __uint_as_float(s1.z & 0xffff0000u), p);
+    p = fmaf(a7.x, __uint_as_float(s1.w << 16), p);
+    p = fmaf(a7.y, __uint_as_float(s1.w & 0xffff0000u), p);
+
     return p;
 }
 
@@ -192,7 +216,7 @@ __device__ __forceinline__ float hc8_dot_down(const unsigned short* __restrict__
         for (int u = 0; u < kU; ++u) {
             const long e = j + (long)u * kHc8Step + lane * 16;
             c[u] = *(const uint4*)(wr + e);
-            s[u] = sr[e / r4d_hc8::kDownGroup];
+            s[u] = sr[(size_t)e >> 7];
         }
 #pragma unroll
         for (int u = 0; u < kU; ++u) {
@@ -202,7 +226,7 @@ __device__ __forceinline__ float hc8_dot_down(const unsigned short* __restrict__
     }
     for (; j < K; j += kHc8Step) {
         const long e = j + lane * 16;
-        acc = fmaf(hc8_dot16(sv + e, *(const uint4*)(wr + e)), sr[e / r4d_hc8::kDownGroup], acc);
+        acc = fmaf(hc8_dot16(sv + e, *(const uint4*)(wr + e)), sr[(size_t)e >> 7], acc);
     }
     return acc;
 }
@@ -227,14 +251,35 @@ __device__ __forceinline__ void hc8_dot_up(const float* __restrict__ sd, long lr
 #pragma unroll
     for (int i = 0; i < kUpMaxQ; ++i) {
         if (i >= nq) break;
-        float wf[16];
-        e4m3x8(c[i].x, c[i].y, wf);
-        e4m3x8(c[i].z, c[i].w, wf + 8);
+        const v2f a0 = __builtin_amdgcn_cvt_pk_f32_fp8((int)c[i].x, false);
+        const v2f a1 = __builtin_amdgcn_cvt_pk_f32_fp8((int)c[i].x, true);
+        const v2f a2 = __builtin_amdgcn_cvt_pk_f32_fp8((int)c[i].y, false);
+        const v2f a3 = __builtin_amdgcn_cvt_pk_f32_fp8((int)c[i].y, true);
+        const v2f a4 = __builtin_amdgcn_cvt_pk_f32_fp8((int)c[i].z, false);
+        const v2f a5 = __builtin_amdgcn_cvt_pk_f32_fp8((int)c[i].z, true);
+        const v2f a6 = __builtin_amdgcn_cvt_pk_f32_fp8((int)c[i].w, false);
+        const v2f a7 = __builtin_amdgcn_cvt_pk_f32_fp8((int)c[i].w, true);
 #pragma unroll
         for (int r = 0; r < RG; ++r) {
             const float* dr = sd + (long)r * lr + k0 + 16 * i;
-#pragma unroll
-            for (int t = 0; t < 16; ++t) acc[r] = fmaf(wf[t], dr[t], acc[r]);
+            float p = acc[r];
+            p = fmaf(a0.x, dr[0], p);
+            p = fmaf(a0.y, dr[1], p);
+            p = fmaf(a1.x, dr[2], p);
+            p = fmaf(a1.y, dr[3], p);
+            p = fmaf(a2.x, dr[4], p);
+            p = fmaf(a2.y, dr[5], p);
+            p = fmaf(a3.x, dr[6], p);
+            p = fmaf(a3.y, dr[7], p);
+            p = fmaf(a4.x, dr[8], p);
+            p = fmaf(a4.y, dr[9], p);
+            p = fmaf(a5.x, dr[10], p);
+            p = fmaf(a5.y, dr[11], p);
+            p = fmaf(a6.x, dr[12], p);
+            p = fmaf(a6.y, dr[13], p);
+            p = fmaf(a7.x, dr[14], p);
+            p = fmaf(a7.y, dr[15], p);
+            acc[r] = p;
         }
     }
     const float sc = ((const float*)(wr + lr))[q4];
@@ -2569,16 +2614,20 @@ void mtp_enter_tiled_kernel(const unsigned short* __restrict__ h, const unsigned
     for (int rb = wave; rb < RT; rb += kWaves * kSsRows) {
         const unsigned short* p[kSsRows];
         int nr = 0;
-        for (int rr = rb; rr < RT && nr < kSsRows; rr += kWaves, ++nr) {
+        for (int rr = rb; rr < RT && nr < kSsRows; rr += kWaves) {
             const long Ri = r0 + rr;
-            const long rt = (Ri < R) ? Ri / hc : rows - 1, kt = (Ri < R) ? Ri % hc : 0;
+            if (Ri >= R) break;
+            const long rt = Ri / hc, kt = Ri % hc;
             p[nr] = h + rt * hrow + (flat ? 0 : kt * n);
+            ++nr;
         }
-        float ss[kSsRows];
-        sumsq(p, nr, hlen, ss);
-        if (lane == 0)
-            for (int k = 0; k < nr; ++k)
-                s_rs[rb + k * kWaves] = __frsqrt_rn(ss[k] / (float)hlen + eps);
+        if (nr > 0) {
+            float ss[kSsRows];
+            sumsq(p, nr, hlen, ss);
+            if (lane == 0)
+                for (int k = 0; k < nr; ++k)
+                    s_rs[rb + k * kWaves] = __frsqrt_rn(ss[k] / (float)hlen + eps);
+        }
     }
     /* The tile's tokens: those of its real rows, and `rows - 1` for the padding rows past R,
      * which is the last real row's token -- so the tile's tokens are [t0, t1]. */
@@ -2597,7 +2646,7 @@ void mtp_enter_tiled_kernel(const unsigned short* __restrict__ h, const unsigned
     __syncthreads();
     for (int rr = tid; rr < RT; rr += kThreads) {
         const long Ri = r0 + rr;
-        s_re[rr] = s_et[((Ri < R) ? Ri / hc : rows - 1) - t0];
+        s_re[rr] = (Ri < R) ? s_et[Ri / hc - t0] : 0.0f;
     }
     __syncthreads();
 
@@ -2651,13 +2700,15 @@ void mtp_enter_tiled_kernel(const unsigned short* __restrict__ h, const unsigned
             if (idx >= RT * (kTKT / 8)) break;
             const int rr = idx / (kTKT / 8), k8 = (idx % (kTKT / 8)) * 8;
             const long Ri = r0 + rr;
-            const long rt = (Ri < R) ? Ri / hc : rows - 1, kt = (Ri < R) ? Ri % hc : 0;
-            ap[a].h   = *(const uint4*)(h + rt * hrow + kt * n + k0 + k8);
-            ap[a].e   = *(const uint4*)(e + rt * erow + k0 + k8);
-            ap[a].wh0 = *(const float4*)(wh + kt * n + k0 + k8);
-            ap[a].wh1 = *(const float4*)(wh + kt * n + k0 + k8 + 4);
-            ap[a].we0 = *(const float4*)(we + k0 + k8);
-            ap[a].we1 = *(const float4*)(we + k0 + k8 + 4);
+            if (Ri < R) {
+                const long rt = Ri / hc, kt = Ri % hc;
+                ap[a].h   = *(const uint4*)(h + rt * hrow + kt * n + k0 + k8);
+                ap[a].e   = *(const uint4*)(e + rt * erow + k0 + k8);
+                ap[a].wh0 = *(const float4*)(wh + kt * n + k0 + k8);
+                ap[a].wh1 = *(const float4*)(wh + kt * n + k0 + k8 + 4);
+                ap[a].we0 = *(const float4*)(we + k0 + k8);
+                ap[a].we1 = *(const float4*)(we + k0 + k8 + 4);
+            }
         }
 #pragma unroll
         for (int b = 0; b < kBI; ++b) {
@@ -2678,20 +2729,26 @@ void mtp_enter_tiled_kernel(const unsigned short* __restrict__ h, const unsigned
             const int idx = tid + a * kThreads;
             if (idx >= RT * (kTKT / 8)) break;
             const int rr = idx / (kTKT / 8), k8 = (idx % (kTKT / 8)) * 8;
-            const float sc = s_rs[rr], se = s_re[rr];
-            union { uint4 v; unsigned short s[8]; } in, out;
-            const float wp[8] = { ap[a].wh0.x, ap[a].wh0.y, ap[a].wh0.z, ap[a].wh0.w,
-                                  ap[a].wh1.x, ap[a].wh1.y, ap[a].wh1.z, ap[a].wh1.w };
-            const float wq[8] = { ap[a].we0.x, ap[a].we0.y, ap[a].we0.z, ap[a].we0.w,
-                                  ap[a].we1.x, ap[a].we1.y, ap[a].we1.z, ap[a].we1.w };
-            in.v = ap[a].h;
+            const long Ri = r0 + rr;
+            if (Ri < R) {
+                const float sc = s_rs[rr], se = s_re[rr];
+                union { uint4 v; unsigned short s[8]; } in, out;
+                const float wp[8] = { ap[a].wh0.x, ap[a].wh0.y, ap[a].wh0.z, ap[a].wh0.w,
+                                      ap[a].wh1.x, ap[a].wh1.y, ap[a].wh1.z, ap[a].wh1.w };
+                const float wq[8] = { ap[a].we0.x, ap[a].we0.y, ap[a].we0.z, ap[a].we0.w,
+                                      ap[a].we1.x, ap[a].we1.y, ap[a].we1.z, ap[a].we1.w };
+                in.v = ap[a].h;
 #pragma unroll
-            for (int q = 0; q < 8; ++q) out.s[q] = f2bf(bf2f(in.s[q]) * sc * (wp[q] + wadd));
-            *(uint4*)(sAh + rr * kTAP + k8) = out.v;
-            in.v = ap[a].e;
+                for (int q = 0; q < 8; ++q) out.s[q] = f2bf(bf2f(in.s[q]) * sc * (wp[q] + wadd));
+                *(uint4*)(sAh + rr * kTAP + k8) = out.v;
+                in.v = ap[a].e;
 #pragma unroll
-            for (int q = 0; q < 8; ++q) out.s[q] = f2bf(bf2f(in.s[q]) * se * (wq[q] + wadd));
-            *(uint4*)(sAe + rr * kTAP + k8) = out.v;
+                for (int q = 0; q < 8; ++q) out.s[q] = f2bf(bf2f(in.s[q]) * se * (wq[q] + wadd));
+                *(uint4*)(sAe + rr * kTAP + k8) = out.v;
+            } else {
+                *(uint4*)(sAh + rr * kTAP + k8) = make_uint4(0, 0, 0, 0);
+                *(uint4*)(sAe + rr * kTAP + k8) = make_uint4(0, 0, 0, 0);
+            }
         }
 #pragma unroll
         for (int b = 0; b < kBI; ++b) {

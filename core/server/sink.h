@@ -75,6 +75,7 @@ public:
 
     /* Returns false only on overflow, which also marks the request failed. */
     bool push(int32_t token, float logprob = 0.0f);
+    bool push_span(const int32_t* tokens, size_t n, const float* logprobs = nullptr);
 
     /* Terminal. Idempotent -- the first call wins, so a cancel racing a natural stop does not
      * produce two finish reasons. */
@@ -177,6 +178,9 @@ private:
  * sink is legal and means nobody is listening -- an offline or benchmark request. */
 inline bool sink_push(void* s, int32_t token, float logprob = 0.0f) {
     return s ? static_cast<Sink*>(s)->push(token, logprob) : true;
+}
+inline bool sink_push_span(void* s, const int32_t* tokens, size_t n, const float* logprobs = nullptr) {
+    return s ? static_cast<Sink*>(s)->push_span(tokens, n, logprobs) : true;
 }
 inline void sink_finish(void* s, Finish f) {
     if (s) static_cast<Sink*>(s)->finish(f);

@@ -144,7 +144,15 @@ void merge_heap(std::vector<BpeSym>& syms, const MergeTable& merges) {
     std::vector<Node> node(n);
     for (size_t i = 0; i < n; ++i)
         node[i] = { (int32_t)i - 1, i + 1 < n ? (int32_t)(i + 1) : -1, 0, true };
-    std::priority_queue<Cand> heap;
+    std::vector<Cand> initial_cands;
+    initial_cands.reserve(n);
+    for (size_t i = 0; i + 1 < n; ++i) {
+        int32_t m = -1;
+        const uint32_t rank = merges.find(syms[i].id, syms[i + 1].id, &m);
+        if (rank != UINT32_MAX)
+            initial_cands.push_back({ rank, (uint32_t)i, (uint32_t)(i + 1), node[i].ver, node[i + 1].ver, m });
+    }
+    std::priority_queue<Cand> heap(std::less<Cand>{}, std::move(initial_cands));
     auto offer = [&](int32_t l, int32_t r) {
         if (l < 0 || r < 0) return;
         int32_t m = -1;
@@ -152,7 +160,6 @@ void merge_heap(std::vector<BpeSym>& syms, const MergeTable& merges) {
         if (rank == UINT32_MAX) return;
         heap.push({ rank, (uint32_t)l, (uint32_t)r, node[l].ver, node[r].ver, m });
     };
-    for (size_t i = 0; i + 1 < n; ++i) offer((int32_t)i, (int32_t)(i + 1));
     while (!heap.empty()) {
         const Cand c = heap.top();
         heap.pop();

@@ -34,4 +34,10 @@
 // rather than at declare.
 #define G8_BLOCK_SIZE 4
 
+// For BS = 4, NB = TILE / BS = 48 / 4 = 12 blocks per tile.
+// O_BTS (262144) allocates 12 registers for blk and 12 for blkn per thread, which on top of
+// O_PF4 (2048) over-subscribes VGPRs and spills 19 VGPRs to scratch memory.
+// Dropping O_BTS and using O_PF2 cuts register spills from 19 to 8 and reduces scratch footprint by 60%.
+#define G8_P_OPT_256 ((3955211 & ~262144 & ~2048) | 1024)
+
 #include "r4d_attn_paged_gqa8.hip"

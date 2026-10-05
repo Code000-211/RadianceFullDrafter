@@ -183,7 +183,7 @@ int Engine::issue_serial_drafter(int step, const RadBatch* b, StepOut& so) {
     /* Pass 0, then rounds 2..rounds: round 1 has no pass of its own. */
     for (int rd = 0; rd <= rounds; rd += rd == 0 ? 2 : 1) {
         if (rd > 0 && n <= 0) break;
-        const auto tA = std::chrono::steady_clock::now();
+        const auto tA = stg ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         const RadBatch* db = sched_.serial_batch(rd, step);
         if (!db) { if (rd == 0) continue; break; }
         /* PASS 0 IS THE HISTORY PASS: the head attends to its own K and V, nothing else in the
@@ -194,7 +194,7 @@ int Engine::issue_serial_drafter(int step, const RadBatch* b, StepOut& so) {
          * proposal buffer on the card. */
         const int drafted = rd == 0 ? (int)db->n_draft_out : n;
         RAD_TRY(advance_all(rd == 0 ? ADV_HIST : ADV_ROUND, rd, rd > 0));
-        const auto tB = std::chrono::steady_clock::now();
+        const auto tB = stg ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 
         /* GREEDY, AND NOT THE REQUEST'S SAMPLER. A draft is a proposal the target then verifies
          * greedily (core/sample/accept.h), so sampling it at the request's temperature would
@@ -211,7 +211,7 @@ int Engine::issue_serial_drafter(int step, const RadBatch* b, StepOut& so) {
             }
         }
 
-        const auto tC = std::chrono::steady_clock::now();
+        const auto tC = stg ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         issue_what_.store(kIssueAll, std::memory_order_release);
         step_batch_.store(db, std::memory_order_release);
         /* THE TWO CROSSINGS ARE NOT THE SAME MEASUREMENT and timing them together hides which.
@@ -219,9 +219,9 @@ int Engine::issue_serial_drafter(int step, const RadBatch* b, StepOut& so) {
          * in and returns as soon as it has notified, which prices the wake. The second WAITS for
          * them to finish issuing the pass, so it prices the ISSUE. */
         barrier_->arrive_and_wait();
-        const auto tC2 = std::chrono::steady_clock::now();
+        const auto tC2 = stg ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         barrier_->arrive_and_wait();
-        const auto tD = std::chrono::steady_clock::now();
+        const auto tD = stg ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 
         int st = step_status_.load(std::memory_order_acquire);
         if (st < 0) {

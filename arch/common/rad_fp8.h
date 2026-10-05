@@ -626,7 +626,7 @@ inline int GateQuantFP8::declare(RadBuilder* b, const Geom& g, rad_buf gate_up, 
                { gate_up }, { a.x });
         return op ? RAD_OK : RAD_E_INVAL;
     }
-    if (!gate_up || !a.x || !a.cq() || !a.cs() || n <= 0) return RAD_E_INVAL;
+    if (!gate_up || (want_x && !a.x) || !a.cq() || !a.cs() || n <= 0) return RAD_E_INVAL;
     /* The rotated codes are a four-bit expert's operand, which reads E4M3 only. */
     if (rot && a.q8_fed) return RAD_E_INVAL;
     const char* opname = rot ? "gated_had_quant_fp8" : "gated_quant_fp8";

@@ -231,11 +231,15 @@ CacheHit PrefixCache::lookup(const std::vector<int32_t>& tokens,
     ++stats_.lookups;
 
     const int64_t n_full = (int64_t)tokens.size() / block_size_;
-    std::vector<BlockHash> hs = chain_all(tokens, mm, n_full);
+    std::vector<BlockHash> hs;
+    hs.reserve((size_t)std::min<int64_t>(n_full, 64));
 
     int64_t matched = 0;
-    for (; matched < n_full; ++matched) {
-        auto it = map_.find(hs[(size_t)matched]);
+    BlockHash parent;
+    for (int64_t b = 0; b < n_full; ++b) {
+        parent = chain_block_hash(parent, tokens.data() + b * block_size_, (int32_t)block_size_,
+                                  mm.data(), (int32_t)mm.size(), b * block_size_);
+        auto it = map_.find(parent);
         if (it == map_.end()) break;
         /* AN ENTRY THE TIERS HOLD IS NOT A HIT, and this is the guard that makes demotion safe at
          * all. Moving an entry off the device releases its KV blocks; the map keeps the entry so
@@ -250,10 +254,12 @@ CacheHit PrefixCache::lookup(const std::vector<int32_t>& tokens,
         /* Compare the token ids, not just the hash. A 128-bit collision is improbable; serving one
          * conversation's context to another is not a failure anybody would ever diagnose, so it is
          * made impossible rather than unlikely. */
-        const int32_t* src = tokens.data() + matched * block_size_;
+        const int32_t* src = tokens.data() + b * block_size_;
         if ((int64_t)it->second.tokens.size() != block_size_ ||
             std::memcmp(it->second.tokens.data(), src, (size_t)block_size_ * sizeof(int32_t)) != 0)
             break;
+        hs.push_back(parent);
+        ++matched;
     }
 
     /* At least one token must remain for the step to compute a logit from. A full hit is backed

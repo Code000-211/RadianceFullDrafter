@@ -950,12 +950,43 @@ __global__ __launch_bounds__(MW * kWave) void gemm_fp8a8_kernel(
             const uint32_t rlo = m0, rhi = min(m0 + FM, rows);
             const float* const w0 = (const float*)Y;
             uint16_t* const cy = (uint16_t*)C;
-            for (uint32_t idx = tid; idx < (rhi - rlo) * nb; idx += MW * kWave) {
-                const uint32_t r = rlo + idx / nb, col = idx % nb;
-                const size_t o = AW ? (size_t)col * rows + r : (size_t)r * nb + col;
-                float acc = 0.0f;
-                for (uint32_t z = 0; z < gridDim.z; ++z) acc += w0[(size_t)z * rows * nb + o];
-                cy[o] = f32_to_bf16(acc);
+            const uint32_t nr = rhi - rlo;
+            if (AW && nb >= 4 && (nr & 7u) == 0u) {
+                const uint32_t nr8 = nr >> 3;
+                const uint32_t total_chunks = nr8 * nb;
+                const size_t stride_z = (size_t)rows * nb;
+                for (uint32_t cidx = tid; cidx < total_chunks; cidx += MW * kWave) {
+                    const uint32_t col = cidx / nr8;
+                    const uint32_t r = rlo + (cidx % nr8) * 8u;
+                    const size_t o = (size_t)col * rows + r;
+                    float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+                    const float4* p_cur = (const float4*)(w0 + o);
+                    float4 v0 = p_cur[0];
+                    float4 v1 = p_cur[1];
+                    for (uint32_t z = 1; z < gridDim.z; ++z) {
+                        const float4* p_next = (const float4*)(w0 + (size_t)z * stride_z + o);
+                        float4 next_v0 = p_next[0];
+                        float4 next_v1 = p_next[1];
+                        acc[0] += v0.x; acc[1] += v0.y; acc[2] += v0.z; acc[3] += v0.w;
+                        acc[4] += v1.x; acc[5] += v1.y; acc[6] += v1.z; acc[7] += v1.w;
+                        v0 = next_v0;
+                        v1 = next_v1;
+                    }
+                    acc[0] += v0.x; acc[1] += v0.y; acc[2] += v0.z; acc[3] += v0.w;
+                    acc[4] += v1.x; acc[5] += v1.y; acc[6] += v1.z; acc[7] += v1.w;
+                    __attribute__((aligned(16))) uint16_t hy[8];
+#pragma unroll
+                    for (uint32_t t = 0; t < 8; ++t) hy[t] = f32_to_bf16(acc[t]);
+                    *(uint4*)(cy + o) = *(const uint4*)hy;
+                }
+            } else {
+                for (uint32_t idx = tid; idx < nr * nb; idx += MW * kWave) {
+                    const uint32_t r = rlo + idx / nb, col = idx % nb;
+                    const size_t o = AW ? (size_t)col * rows + r : (size_t)r * nb + col;
+                    float acc = 0.0f;
+                    for (uint32_t z = 0; z < gridDim.z; ++z) acc += w0[(size_t)z * rows * nb + o];
+                    cy[o] = f32_to_bf16(acc);
+                }
             }
         }
     }

@@ -297,7 +297,9 @@ void r4d_attn_decode_kernel(const R4DArgs a, int splits)
         if (BTS && ti + 1 < t_hi) {
             load_bt((ti + 1) * NB, blkn);
         }
-        if (LDSB) lds_barrier(); else __syncthreads();
+        if (ti > t_lo) {
+            if (LDSB) lds_barrier(); else __syncthreads();
+        }
 
         if (KLDS) {
             #pragma unroll 1
@@ -394,12 +396,14 @@ void r4d_attn_decode_kernel(const R4DArgs a, int splits)
             if (wave_any(smax > m_ref + PGROW)) {
                 const float rmax  = fmaxf(smax, swap16(smax));
                 const float mnew  = fmaxf(fmaxf(m_ref, rmax), -3.0e38f);
-                const float alpha = ex2(m_ref - mnew);
-                #pragma unroll
-                for (int dt = 0; dt < NKS; ++dt)
+                if (ti > t_lo || mt > 0) {
+                    const float alpha = ex2(m_ref - mnew);
                     #pragma unroll
-                    for (int e = 0; e < 8; ++e) acc[dt][e] *= alpha;
-                l_i *= alpha;
+                    for (int dt = 0; dt < NKS; ++dt)
+                        #pragma unroll
+                        for (int e = 0; e < 8; ++e) acc[dt][e] *= alpha;
+                    l_i *= alpha;
+                }
                 m_ref = mnew;
                 off   = PSHIFT - mnew;
             }

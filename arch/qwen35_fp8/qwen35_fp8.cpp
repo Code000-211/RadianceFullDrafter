@@ -847,7 +847,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         m.b_ecnt    = decl_b(b, nm.f("moe_cnt"),    RAD_I32,     {mc.n_expert},
                              RAD_BUF_PERSIST);
         m.b_egu     = decl_b(b, nm.f("moe_gate_up"), g.act_dtype, {K, 2 * mc.n_ff_exp});
-        m.a_eff.x   = decl_b(b, nm.f("moe_ffn"),    g.act_dtype, {K, mc.n_ff_exp});
+        if (mc.expert_bf16)
+            m.a_eff.x = decl_b(b, nm.f("moe_ffn"),    g.act_dtype, {K, mc.n_ff_exp});
         m.a_eff.q   = decl_b(b, nm.f("moe_ffn.q"),  RAD_F8E4M3,  {K, mc.n_ff_exp});
         m.a_eff.s   = decl_b(b, nm.f("moe_ffn.s"),  RAD_F32,     {K, fp8_blocks(mc.n_ff_exp)});
         m.b_edn     = decl_b(b, nm.f("moe_down"),   g.act_dtype, {K, g.n_embd});

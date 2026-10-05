@@ -4775,29 +4775,31 @@ static void qsa_perf(const Plugin& pl, int64_t ctx, int64_t M, int iters) {
      * in different orders, so the comparison is a tolerance on the live plane -- and the -inf of
      * an absent block has to match exactly, which a tolerance on finite values would not see. */
     if (pl.pin_qsa) {
-        std::vector<float> plane[2];
-        const char* label[2] = { "qsa_score_bf16 scalar form", "qsa_score_bf16 matrix form" };
-        for (int f = 0; f < 2; ++f) {
+        std::vector<float> plane[3];
+        const char* label[3] = { "qsa_score_bf16 scalar form", "qsa_score_bf16 matrix form", "qsa_score_bf16 packed matrix form" };
+        for (int f = 0; f < 3; ++f) {
             pl.pin_qsa(f + 1);
             run("qsa_score_bf16", label[f], score_args(), score_params, score_bytes);
             plane[f].resize((size_t)(M * nb));
             st_memcpy(plane[f].data(), d_sc, plane[f].size() * 4, hipMemcpyDeviceToHost);
         }
         pl.pin_qsa(0);
-        double maxrel = 0.0, num = 0.0, den = 0.0;
-        long long inf_mismatch = 0;
-        for (int64_t m = 0; m < M; ++m)
-            for (int64_t b = 0; b < live; ++b) {
-                const float a = plane[0][(size_t)(m * nb + b)], c = plane[1][(size_t)(m * nb + b)];
-                if (std::isinf(a) || std::isinf(c)) { inf_mismatch += (a != c); continue; }
-                const double d = (double)a - (double)c;
-                num += d * d;
-                den += (double)a * a;
-                const double sc = std::fabs((double)a) > 1e-3 ? std::fabs((double)a) : 1e-3;
-                maxrel = std::max(maxrel, std::fabs(d) / sc);
-            }
-        std::printf("  forms agree to rel_l2 %.3e, max rel %.3e, %lld -inf mismatches\n",
-                    den > 0 ? std::sqrt(num / den) : 0.0, maxrel, inf_mismatch);
+        for (int cmp = 1; cmp <= 2; ++cmp) {
+            double maxrel = 0.0, num = 0.0, den = 0.0;
+            long long inf_mismatch = 0;
+            for (int64_t m = 0; m < M; ++m)
+                for (int64_t b = 0; b < live; ++b) {
+                    const float a = plane[0][(size_t)(m * nb + b)], c = plane[cmp][(size_t)(m * nb + b)];
+                    if (std::isinf(a) || std::isinf(c)) { inf_mismatch += (a != c); continue; }
+                    const double d = (double)a - (double)c;
+                    num += d * d;
+                    den += (double)a * a;
+                    const double sc = std::fabs((double)a) > 1e-3 ? std::fabs((double)a) : 1e-3;
+                    maxrel = std::max(maxrel, std::fabs(d) / sc);
+                }
+            std::printf("  form 1 vs %s agree to rel_l2 %.3e, max rel %.3e, %lld -inf mismatches\n",
+                        label[cmp], den > 0 ? std::sqrt(num / den) : 0.0, maxrel, inf_mismatch);
+        }
     }
     run("qsa_score_bf16", "qsa_score_bf16 (pages scattered)", score_args(), score_params,
         score_bytes);
@@ -10212,13 +10214,13 @@ static void device_phase(const Plugin& pl) {
         if (!g_case) std::printf("\nthe QSA block score, against the formula it implements\n");
         /* EVERY FORM THE ROW HAS: the launcher picks one by shape, and a form the rule does not
          * pick for these shapes is the one another model's shape would get. */
-        for (int f = pl.pin_qsa ? 1 : 0; f <= (pl.pin_qsa ? 2 : 0); ++f) {
+        for (int f = pl.pin_qsa ? 1 : 0; f <= (pl.pin_qsa ? 3 : 0); ++f) {
             if (pl.pin_qsa) {
                 pl.pin_qsa(f);
-                std::printf("      qsa_score, %s form\n", f == 1 ? "scalar" : "matrix");
+                std::printf("      qsa_score, %s form\n", f == 1 ? "scalar" : (f == 2 ? "matrix" : "packed matrix"));
             }
             qsa_score_case(pl);
-            qsa_score_rows_case(pl);
+            if (f <= 2) qsa_score_rows_case(pl);
         }
         if (pl.pin_qsa) pl.pin_qsa(0);
     }

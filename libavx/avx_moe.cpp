@@ -595,10 +595,12 @@ AVX_KERNEL(logit_rerank) {
     const int64_t K    = p_int(a, "n_embd", 0);
     const int64_t NV   = p_int(a, "n_vocab", 0);
     const int64_t voff = p_int(a, "vocab_off", 0);
+    const int64_t R_pairs = (pairs && pairs->rank >= 2 && pairs->shape[1] > 0) ? pairs->shape[1] : R;
     if (R <= 0 || K <= 0 || NV <= 0) return RAD_E_SHAPE;
     const int64_t M = numel(x) / K;
     if (M <= 0 || numel(in) < M * R) return RAD_E_SHAPE;
     if (numel(idx) < M * R || numel(val) < M * R) return RAD_E_SHAPE;
+    if (pairs && numel(pairs) < M * R_pairs * 2) return RAD_E_SHAPE;
     if (numel(w) < NV * K) return RAD_E_SHAPE;
 
     AVX_PARALLEL_FOR_IF(M * R * K >= AVX_PAR_MIN)
@@ -636,8 +638,8 @@ AVX_KERNEL(logit_rerank) {
             if (best >= 0) used[best] = 1;
             st_int_dt(idx->dtype, idx->data, rowoff(idx, m, R) + o * laststride(idx), oid);
             stt(val, rowoff(val, m, R) + o * laststride(val), ov);
-            if (pairs) {
-                float* p = (float*)pairs->data + (m * R + o) * 2;
+            if (pairs && o < R_pairs) {
+                float* p = (float*)pairs->data + (m * R_pairs + o) * 2;
                 std::memcpy(p, &oid, sizeof oid);
                 p[1] = ov;
             }
@@ -707,13 +709,14 @@ AVX_KERNEL(row_topk_merge) {
     const RadTensor *g = &a->t[0], *idx = &a->t[1], *val = &a->t[2];
     const int64_t R = p_int(a, "R", 1);
     const int64_t W = p_int(a, "world_size", 1);
+    const int64_t ld = (idx && idx->rank >= 2 && idx->shape[idx->rank - 1] > R) ? idx->shape[idx->rank - 1] : R;
     if (R <= 0 || W <= 0) return RAD_E_SHAPE;
     /* The rows are the OPERAND'S, not the parameter's: `M` is declared as a band ceiling and the
      * gathered plane is narrowed to the rows this step actually has. */
     const int64_t M = numel(g) / (W * R * 2);
     if (M <= 0) return RAD_E_SHAPE;
     if (g->dtype != RAD_F32 || numel(g) < M * W * R * 2) return RAD_E_SHAPE;
-    if (numel(idx) < M * R || numel(val) < M * R) return RAD_E_SHAPE;
+    if (numel(idx) < M * ld || numel(val) < M * ld) return RAD_E_SHAPE;
 
     AVX_PARALLEL_FOR_IF(M * W * R * R >= 4096)
     for (int64_t m = 0; m < M; ++m) {
@@ -733,9 +736,9 @@ AVX_KERNEL(row_topk_merge) {
                 if (best < 0 || v > bv || (v == bv && id < bid)) { best = c; bv = v; bid = id; }
             }
             if (best >= 0) used[best] = 1;
-            st_int_dt(idx->dtype, idx->data, rowoff(idx, m, R) + r * laststride(idx),
+            st_int_dt(idx->dtype, idx->data, rowoff(idx, m, ld) + r * laststride(idx),
                       best >= 0 ? (int64_t)bid : -1);
-            stt(val, rowoff(val, m, R) + r * laststride(val), best >= 0 ? bv : -INFINITY);
+            stt(val, rowoff(val, m, ld) + r * laststride(val), best >= 0 ? bv : -INFINITY);
         }
     }
     return RAD_OK;

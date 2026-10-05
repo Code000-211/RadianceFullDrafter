@@ -24,12 +24,18 @@ __device__ __forceinline__ constexpr float q8_top() {
 template <bool I8>
 __device__ __forceinline__ uint32_t q8_pack4(float a, float b, float c, float d, float inv) {
     if constexpr (I8) {
-        const int ia = (int)rintf(fminf(fmaxf(a * inv, -127.0f), 127.0f));
-        const int ib = (int)rintf(fminf(fmaxf(b * inv, -127.0f), 127.0f));
-        const int ic = (int)rintf(fminf(fmaxf(c * inv, -127.0f), 127.0f));
-        const int id = (int)rintf(fminf(fmaxf(d * inv, -127.0f), 127.0f));
-        return ((uint32_t)ia & 0xFFu) | (((uint32_t)ib & 0xFFu) << 8) |
-               (((uint32_t)ic & 0xFFu) << 16) | (((uint32_t)id & 0xFFu) << 24);
+        constexpr float kMagic = 12582912.0f;
+        const float qa = fminf(fmaxf(a * inv, -127.0f), 127.0f);
+        const float qb = fminf(fmaxf(b * inv, -127.0f), 127.0f);
+        const float qc = fminf(fmaxf(c * inv, -127.0f), 127.0f);
+        const float qd = fminf(fmaxf(d * inv, -127.0f), 127.0f);
+        const uint32_t ua = __float_as_uint(qa + kMagic);
+        const uint32_t ub = __float_as_uint(qb + kMagic);
+        const uint32_t uc = __float_as_uint(qc + kMagic);
+        const uint32_t ud = __float_as_uint(qd + kMagic);
+        const uint32_t p0 = __builtin_amdgcn_perm(ub, ua, 0x0c0c0400u);
+        const uint32_t p1 = __builtin_amdgcn_perm(ud, uc, 0x0c0c0400u);
+        return __builtin_amdgcn_perm(p1, p0, 0x05040100u);
     } else {
         int pk = 0;
         pk = __builtin_amdgcn_cvt_pk_fp8_f32(fminf(fmaxf(a * inv, -448.0f), 448.0f),

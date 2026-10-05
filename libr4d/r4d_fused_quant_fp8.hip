@@ -139,18 +139,37 @@ __device__ __forceinline__ void norm_quant_row(
         if (c0 < n) {
             float g[4];
             uint16_t x[4];
+            const uint64_t* __restrict__ nr64 = (const uint64_t*)(const void*)nr;
+            const uint64_t x_raw = nr64[c0 >> 2];
+            __builtin_memcpy(x, &x_raw, sizeof(x));
+
+            if constexpr (WF32) {
+                const float4* __restrict__ w4 = (const float4*)w;
+                const float4 gw = w4[c0 >> 2];
+                g[0] = gw.x; g[1] = gw.y; g[2] = gw.z; g[3] = gw.w;
+            } else {
+                const uint64_t* __restrict__ w64 = (const uint64_t*)w;
+                const uint64_t gw_raw = w64[c0 >> 2];
+                uint16_t gw[4];
+                __builtin_memcpy(gw, &gw_raw, sizeof(gw));
 #pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                g[j] = WF32 ? ((const float*)w)[c0 + j] : bf2f(((const uint16_t*)w)[c0 + j]);
-                x[j] = nr[c0 + j];
+                for (int j = 0; j < 4; ++j) g[j] = bf2f(gw[j]);
             }
+
+            uint16_t hb[4];
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
                 // THE BF16 ROUND TRIP IS THE POINT.  The unfused quantiser reads these bytes, not
                 // the f32 that produced them.
                 const uint16_t h = f2bf(bf2f(x[j]) * rs * (g[j] + wadd));
-                if (yr) yr[c0 + j] = h;
+                hb[j] = h;
                 v[j] = bf2f(h);
+            }
+            if (yr) {
+                uint64_t* __restrict__ yr64 = (uint64_t*)(void*)yr;
+                uint64_t h_raw;
+                __builtin_memcpy(&h_raw, hb, sizeof(h_raw));
+                yr64[c0 >> 2] = h_raw;
             }
         }
         quant_group(v, s, qr, s_row + kb, c0, n, lane);
@@ -247,18 +266,26 @@ __global__ __launch_bounds__(1024) void gated_quant_fp8_kernel(
         // norm_quant_row.
         if (c0 < n) {
             uint16_t gb[4], ub[4];
-#pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                gb[j] = gr[c0 + j];
-                ub[j] = gr[n + c0 + j];
-            }
+            const uint64_t* __restrict__ gr64 = (const uint64_t*)(const void*)gr;
+            const uint64_t g_raw = gr64[c0 >> 2];
+            const uint64_t u_raw = gr64[(n + c0) >> 2];
+            __builtin_memcpy(gb, &g_raw, sizeof(gb));
+            __builtin_memcpy(ub, &u_raw, sizeof(ub));
+
+            uint16_t hb[4];
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
                 const float g = bf2f(gb[j]);
                 const float a = ACT == 0 ? g / (1.0f + expf(-g)) : 1.0f / (1.0f + expf(-g));
                 const uint16_t h = f2bf(a * bf2f(ub[j]));
-                if (yr) yr[c0 + j] = h;
+                hb[j] = h;
                 v[j] = bf2f(h);
+            }
+            if (yr) {
+                uint64_t* __restrict__ yr64 = (uint64_t*)(void*)yr;
+                uint64_t h_raw;
+                __builtin_memcpy(&h_raw, hb, sizeof(h_raw));
+                yr64[c0 >> 2] = h_raw;
             }
         }
         // The rotated launcher refuses an n that is not a multiple of the group, so no block that
@@ -298,11 +325,14 @@ __global__ __launch_bounds__(1024) void gate_quant_fp8_kernel(
         // norm_quant_row.
         if (c0 < n) {
             uint16_t gb[4], xb[4];
-#pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                gb[j] = gr[c0 + j];
-                xb[j] = xr[c0 + j];
-            }
+            const uint64_t* __restrict__ gr64 = (const uint64_t*)(const void*)gr;
+            const uint64_t* __restrict__ xr64 = (const uint64_t*)(const void*)xr;
+            const uint64_t g_raw = gr64[c0 >> 2];
+            const uint64_t x_raw = xr64[c0 >> 2];
+            __builtin_memcpy(gb, &g_raw, sizeof(gb));
+            __builtin_memcpy(xb, &x_raw, sizeof(xb));
+
+            uint16_t hb[4];
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
                 const float gv = bf2f(gb[j]);
@@ -316,8 +346,14 @@ __global__ __launch_bounds__(1024) void gate_quant_fp8_kernel(
                 const uint16_t ab =
                     f2bf(ACT == 0 ? gv / (1.0f + expf(-gv)) : 1.0f / (1.0f + expf(-gv)));
                 const uint16_t h = f2bf(bf2f(ab) * bf2f(xb[j]));
-                if (yr) yr[c0 + j] = h;
+                hb[j] = h;
                 v[j] = bf2f(h);
+            }
+            if (yr) {
+                uint64_t* __restrict__ yr64 = (uint64_t*)(void*)yr;
+                uint64_t h_raw;
+                __builtin_memcpy(&h_raw, hb, sizeof(h_raw));
+                yr64[c0 >> 2] = h_raw;
             }
         }
         quant_group<I8>(v, s, qr, (size_t)row * s_ld + kb, c0, n, lane);

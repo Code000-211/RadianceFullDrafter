@@ -224,7 +224,15 @@ int KVManager::plan_groups(const std::vector<KVGroupInfo>& groups, const Config&
                  * side of the bargain is that both are ZEROED when the slot is handed out (a zero
                  * factor replays as the identity, which is what the first step after a prefill
                  * needs) and that state_index is wide enough to name them. */
-                p.state_copies = cfg.n_spec > 0 ? 2 : 1;
+                /* QSA tail only ever uses copy 0 (rollback is via its enlarged ring). */
+                const bool is_qsa_tail = (g.name.find("tail") != std::string::npos) ||
+                                         (g.decl.n_head_kv == 1 && g.decl.state_dim[0] > 0 &&
+                                          g.name.find("qsa") != std::string::npos);
+                if (is_qsa_tail) {
+                    p.state_copies = 1;
+                } else {
+                    p.state_copies = cfg.n_spec > 0 ? 2 : 1;
+                }
             }
             if (p.bytes_per_state <= 0) {
                 RAD_ERR("KV group '%s': per-sequence state computes to 0", p.name.c_str());
@@ -1477,23 +1485,30 @@ int KVManager::checkpoint_copy(const int32_t* state_slots, int n_slots, int32_t 
     int64_t off = 0;
     for (size_t g = 0; g < plans_.size(); ++g) {
         const KVGroupPlan& p = plans_[g];
-        if (!p.stateful()) continue;
+        if (!p.stateful() || p.n_layers <= 0) continue;
         const int32_t slot = state_slots[g];
         if (slot < 0) return RAD_E_STATE;          /* no state to save, or none to restore into */
         const int64_t nbytes = p.layer_bytes_per_state();
-        for (int64_t l = 0; l < p.n_layers; ++l) {
-            void* st = state_ptr((int32_t)g, (int32_t)l, slot);
-            if (!st) return RAD_E_STATE;
-            if (off + nbytes > checkpoint_bytes_) {
-                RAD_ERR("checkpoint slot %d holds %lld bytes and this sequence's linear state "
-                        "needs more than that; configure() sized it from the same plans, so the "
-                        "two have gone out of step", (int)ck_slot, (long long)checkpoint_bytes_);
-                return RAD_E_STATE;
-            }
-            RAD_TRY(save ? rad_memcpy_async(ck + off, st, nbytes, s)
-                         : rad_memcpy_async(st, ck + off, nbytes, s));
-            off += nbytes;
+        void* st0 = state_ptr((int32_t)g, 0, slot);
+        if (!st0) return RAD_E_STATE;
+        const int64_t group_bytes = nbytes * p.n_layers;
+        if (off + group_bytes > checkpoint_bytes_) {
+            RAD_ERR("checkpoint slot %d holds %lld bytes and this sequence's linear state "
+                    "needs more than that; configure() sized it from the same plans, so the "
+                    "two have gone out of step", (int)ck_slot, (long long)checkpoint_bytes_);
+            return RAD_E_STATE;
         }
+        if (p.n_layers == 1 || p.layer_stride() == nbytes) {
+            RAD_TRY(save ? rad_memcpy_async(ck + off, st0, group_bytes, s)
+                         : rad_memcpy_async(st0, ck + off, group_bytes, s));
+        } else {
+            const int64_t spitch = save ? p.layer_stride() : nbytes;
+            const int64_t dpitch = save ? nbytes : p.layer_stride();
+            const void* src = save ? st0 : (ck + off);
+            void* dst = save ? (ck + off) : st0;
+            RAD_TRY(rad_memcpy_2d_async(dst, dpitch, src, spitch, nbytes, p.n_layers, s));
+        }
+        off += group_bytes;
     }
     return RAD_OK;
 }

@@ -71,10 +71,18 @@ using std::max;
 #endif
 #define G8_MAX_DECODE_ROWS 64       // q_len * gqa a single decode workgroup can hold: q_len <= 8
 
+#ifndef G8_P_NWARPS
 #define G8_P_NWARPS 24
+#endif
+#ifndef G8_P_TILE
 #define G8_P_TILE   48
+#endif
+#ifndef G8_P_OPT_256
 #define G8_P_OPT_256 3955211
+#endif
+#ifndef G8_P_OPT_128
 #define G8_P_OPT_128 3430923        // the same set without O_KWIDE; see the header
+#endif
 #define G8_D_TILE   16
 #define G8_D_OPT    3429947
 #define G8_D_JPB     2

@@ -81,6 +81,8 @@ static const Flag g_flags[] = {
     { "--prefix-cache-disk-mib", "N",   "and copy them on to disk under --prefix-cache-dir, up to N MiB,\n"
     "                                    so a full host tier gives slots up for nothing. Holds\n"
     "                                    conversation content unencrypted. 0 is off" },
+    { "--ple-backend",        "MODE",   "PLE table backend: device/gpu (default, zero-copy from host RAM/SHM)\n"
+    "                                    or host/cpu/nvme (original CPU AVX sparse reads from NVMe)" },
 
     { "--placement",          "MODE",   "all_vram | layer_offload | expert_tiered | auto" },
     { "--deterministic",      nullptr,  "pin placement to the plan the loader made, so the resident\n"
@@ -347,6 +349,7 @@ static bool parse_template_kwargs(const char* v, std::map<std::string, std::stri
  * flag is an error naming it, not a warning: a typo in a budget flag is the difference between
  * the plan you asked for and one the planner invented. */
 int config_parse(int argc, char** argv, Config* c) {
+    bool ple_backend_explicit = false;
     auto need = [&](int& i) -> const char* {
         if (i + 1 >= argc) { RAD_ERR("%s needs an argument", argv[i]); return nullptr; }
         return argv[++i];
@@ -414,6 +417,20 @@ int config_parse(int argc, char** argv, Config* c) {
         else if (S("--prefix-cache-host-mib"))     { if (!(v = need(i))) return RAD_E_INVAL; c->prefix_cache_host_mib = atoll(v); }
         else if (S("--prefix-cache-dir"))          { if (!(v = need(i))) return RAD_E_INVAL; c->prefix_cache_dir = v; }
         else if (S("--prefix-cache-disk-mib"))     { if (!(v = need(i))) return RAD_E_INVAL; c->prefix_cache_disk_mib = atoll(v); }
+        else if (S("--ple-backend") || S("--ple-storage") || S("--ple-mode")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            ple_backend_explicit = true;
+            if (!std::strcmp(v, "device") || !std::strcmp(v, "gpu") ||
+                !std::strcmp(v, "shm") || !std::strcmp(v, "zerocopy") || !std::strcmp(v, "zero-copy")) {
+                c->ple_backend = "device";
+            } else if (!std::strcmp(v, "host") || !std::strcmp(v, "cpu") ||
+                       !std::strcmp(v, "nvme") || !std::strcmp(v, "mmap")) {
+                c->ple_backend = "host";
+            } else {
+                RAD_ERR("--ple-backend takes device|gpu or host|cpu|nvme, not '%s'", v);
+                return RAD_E_INVAL;
+            }
+        }
         else if (S("--placement"))             { if (!(v = need(i))) return RAD_E_INVAL; c->placement = v; }
         else if (S("--deterministic"))         c->deterministic = true;
         else if (S("--checkpoint-interval"))   { if (!(v = need(i))) return RAD_E_INVAL; c->checkpoint_interval = atoll(v); }
@@ -672,6 +689,22 @@ int config_parse(int argc, char** argv, Config* c) {
         const char* e = getenv("RADIANCE_KERNELS");
         if (e && *e) c->kernel_hierarchy = split_commas(e);
     }
+    if (!ple_backend_explicit) {
+        const char* ple_env = getenv("RADIANCE_PLE_BACKEND");
+        if (!ple_env) ple_env = getenv("RADIANCE_PLE_STORAGE");
+        if (!ple_env) ple_env = getenv("RADIANCE_PLE_MODE");
+        if (ple_env && *ple_env) {
+            if (!std::strcmp(ple_env, "host") || !std::strcmp(ple_env, "cpu") ||
+                !std::strcmp(ple_env, "nvme") || !std::strcmp(ple_env, "mmap")) {
+                c->ple_backend = "host";
+            } else if (!std::strcmp(ple_env, "device") || !std::strcmp(ple_env, "gpu") ||
+                       !std::strcmp(ple_env, "shm") || !std::strcmp(ple_env, "zerocopy") || !std::strcmp(ple_env, "zero-copy")) {
+                c->ple_backend = "device";
+            }
+        }
+    }
+    if (c->ple_backend.empty()) c->ple_backend = "device";
+    setenv("RADIANCE_PLE_BACKEND", c->ple_backend.c_str(), 1);
     /* AND THERE IS NO BUILT-IN DEFAULT, deliberately. Naming a library here -- the RDNA4 one, say
      * -- would make the core carry the name of one card's kernels, and on any other machine that
      * name matches nothing: the engine would warn about a library that is not installed and then

@@ -51,6 +51,8 @@ void  rad_dev_free(void* p, int kind);
  * hand the same allocation to both sides (spec §5.1). Null if the kind has no such view. */
 void* rad_dev_host_ptr(void* p);
 void* rad_dev_device_ptr(void* p);
+int   rad_dev_host_register(void* p, int64_t bytes, unsigned flags);
+int   rad_dev_host_unregister(void* p);
 
 int  rad_stream_create(RadStream* out, int high_priority);
 void rad_stream_destroy(RadStream s);

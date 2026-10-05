@@ -299,6 +299,23 @@ inline int MtpHcBlock::declare(RadBuilder* b, Names& nm, const Geom& geom, int l
                               false, false, kArNone, hc_attn.op_ar_write != 0));
     if (src.qsa.qk_proj)
         RAD_ARCH_TRY(qsa.declare(b, nm, g, l, src.qsa, w.qsa, w.attn.h, qsa_bk));
+    /* ---- draft round 1's anchor selection (RadBatch::draft_out_ids):
+     * Gathered into the carry, one row a drafting sequence in round order, and copied back
+     * to the front of `hw` for the mixer and MoE.
+     * Declared BEFORE hc_mlp and mlp so the buffer planner treats w.hin as live across the MoE
+     * layer, preventing any MoE transient buffers from aliasing over the carry! */
+    op_dsel = rw(b, RAD_OP(b, "gather_rows",
+                    RAD_PARAMS(RAD_RANGE("M", 1, g.max_logit_rows), RAD_INT("n", HN),
+                               RAD_STR("dtype", g.dtype)),
+                    RAD_NOWEIGHTS),
+                {w.hw}, {w.hin});
+    op_dback = rw(b, RAD_OP(b, "cast",
+                     RAD_PARAMS(RAD_RANGE("M", 1, g.max_logit_rows), RAD_INT("n", HN),
+                                RAD_STR("from", g.dtype), RAD_STR("to", g.dtype)),
+                     RAD_NOWEIGHTS),
+                 {w.hin}, {w.hw});
+    if (!op_dsel || !op_dback) return RAD_E_INVAL;
+
     /* The rotated expert input rides in this read, as it does on the trunk. */
     HyperConn::Config mcfg = hc;
     HyperConn::Wire   mwire{w.hw, w.x, w.inj};
@@ -328,21 +345,6 @@ inline int MtpHcBlock::declare(RadBuilder* b, Names& nm, const Geom& geom, int l
                                 RAD_STR("from", g.dtype), RAD_STR("to", g.dtype)),
                      RAD_NOWEIGHTS),
                  {w.hw}, {w.hin});
-    /* ---- draft round 1's rows out of a history pass (RadBatch::draft_out_ids): gathered into the
-     * carry, one row a drafting sequence in round order, and copied back to the front of `hw` for
-     * the mixer. Two ops and not one because a gather in place could overwrite a row another
-     * sequence has yet to read. */
-    op_dsel = rw(b, RAD_OP(b, "gather_rows",
-                    RAD_PARAMS(RAD_RANGE("M", 1, g.max_logit_rows), RAD_INT("n", HN),
-                               RAD_STR("dtype", g.dtype)),
-                    RAD_NOWEIGHTS),
-                {w.hw}, {w.hin});
-    op_dback = rw(b, RAD_OP(b, "cast",
-                     RAD_PARAMS(RAD_RANGE("M", 1, g.max_logit_rows), RAD_INT("n", HN),
-                                RAD_STR("from", g.dtype), RAD_STR("to", g.dtype)),
-                     RAD_NOWEIGHTS),
-                 {w.hin}, {w.hw});
-    if (!op_dsel || !op_dback) return RAD_E_INVAL;
 
     /* ---- the head's own mixer: the connection with no write half, which collapses its wide
      * stream to the one hidden state the lm_head reads. No fp8 twin -- that input is bf16. */
@@ -561,6 +563,24 @@ inline void MtpHcBlock::step(RadCtx* c, const RadBatch* batch) const {
         RAD_ISSUE_N(c, op_dsel, L, RAD_B(w.hw), praw(batch->draft_out_ids, RAD_I32, L),
                     brows(w.hin, L));
         RAD_ISSUE_N(c, op_dback, L, brows(w.hin, L), brows(w.hw, L));
+    }
+
+    hc_mlp.read(c, L, 0, L);
+    if (r < 0) {
+        RadBatch b_draft = *batch;
+        b_draft.n_tok = L;
+        mlp.step(c, &b_draft);
+    } else {
+        mlp.step(c, batch);
+    }
+    hc_mlp.write(c, L, 0, L);
+
+    /* THE CARRY:
+     * When r < 0, carry the post-MoE anchor state to w.hin for round 2 if depth > 1.
+     * In subsequent rounds r < depth, carry w.hw to w.hin for round r + 1. */
+    if (r < 0) {
+        if (depth > 1)
+            RAD_ISSUE_N(c, op_carry, L, brows(w.hw, L), brows(w.hin, L));
     } else if (r < depth) {
         RAD_ISSUE_N(c, op_carry, T, brows(w.hw, T), brows(w.hin, T));
     }

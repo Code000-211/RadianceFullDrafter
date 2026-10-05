@@ -217,25 +217,26 @@ __global__ __launch_bounds__(R4D_TOPK_WAVE * R4D_TOPK_WPB) void r4d_rowtopk_stag
 // pad indistinguishable from this rank's first real token.  The pair plane says -1 instead, which
 // is the sentinel the merge drops -- and a sentinel rather than -INFINITY, because a masked logit
 // legitimately takes that value.
+template <int PT2>
 __global__ __launch_bounds__(R4D_TOPK_WAVE) void r4d_rowtopk_stage2_kernel(
     const unsigned long long* __restrict__ P, float* __restrict__ OV, int* __restrict__ OI,
     float* __restrict__ OP, int off, int R, int n) {
   const int m = blockIdx.x;
   const int lane = threadIdx.x;
 
-  unsigned long long t[R4D_TOPK_PT2];
+  unsigned long long t[PT2];
 #pragma unroll
-  for (int q = 0; q < R4D_TOPK_PT2; q++) t[q] = 0ull;
+  for (int q = 0; q < PT2; q++) t[q] = 0ull;
 
   // THE KEY DECIDES, NOT THE FLOAT, as in stage 1 -- see tk_insert.  A chunk that handed on a NaN
   // among its top-RC handed on one fewer real candidate, so dropping the NaN here can leave the row
   // short of R, and the pad that fills the gap is what the merge reports as id -1.  An empty slot's
   // key is 0 and never places.
   const unsigned long long* p = P + (size_t)m * n;
-  for (int i = lane; i < n; i += R4D_TOPK_WAVE) tk_insert<R4D_TOPK_PT2>(t, p[i]);
+  for (int i = lane; i < n; i += R4D_TOPK_WAVE) tk_insert<PT2>(t, p[i]);
 
   for (int r = 0; r < R; r++) {
-    const unsigned long long w = tk_round<R4D_TOPK_PT2>(t);
+    const unsigned long long w = tk_round<PT2>(t);
     if (lane == 0) {
       // A chunk that ran out of candidates wrote a zero key, and a zero key must not read back as
       // a real column: it is an empty slot and says so.
@@ -301,9 +302,24 @@ static int rowtopk_bf16_sharded_emit(long y, long partial, long outv, long outi,
   }
 #undef R4D_TK_S1
   if (emit_rc != RAD_OK) return emit_rc;
-  return R4D_EMIT(sk, r4d_rowtopk_stage2_kernel, dim3(M), dim3(R4D_TOPK_WAVE), 0,
-                  (const unsigned long long*)partial, (float*)outv, (int*)outi,
-                  (float*)outp, off, R, nch * RC);
+#define R4D_TK_S2(PT2) emit_rc = R4D_EMIT(sk, (r4d_rowtopk_stage2_kernel<PT2>), dim3(M), dim3(R4D_TOPK_WAVE), 0, \
+                                          (const unsigned long long*)partial, (float*)outv, (int*)outi,          \
+                                          (float*)outp, off, R, nch * RC)
+  if (R <= 1) {
+    R4D_TK_S2(1);
+  } else if (R <= 2) {
+    R4D_TK_S2(2);
+  } else if (R <= 4) {
+    R4D_TK_S2(4);
+  } else if (R <= 8) {
+    R4D_TK_S2(8);
+  } else if (R <= 16) {
+    R4D_TK_S2(16);
+  } else {
+    R4D_TK_S2(32);
+  }
+#undef R4D_TK_S2
+  return emit_rc;
 }
 
 void r4d_rowtopk_bf16_sharded(long y, long partial, long outv, long outi, long outp,
@@ -336,9 +352,11 @@ __device__ __forceinline__ unsigned long long tk_key_f32(float v, unsigned id) {
 }
 
 __global__ __launch_bounds__(R4D_TOPK_WAVE) void r4d_rowtopk_merge_kernel(
-    const float* __restrict__ G, float* __restrict__ OV, int* __restrict__ OI, int R, int n) {
+    const float* __restrict__ G, float* __restrict__ OV, int* __restrict__ OI, int R, int n,
+    int ld = 0) {
   const int m = blockIdx.x;
   const int lane = threadIdx.x;
+  const int out_stride = (ld > 0) ? ld : R;
 
   unsigned long long t[R4D_TOPK_PT2];
 #pragma unroll
@@ -355,20 +373,21 @@ __global__ __launch_bounds__(R4D_TOPK_WAVE) void r4d_rowtopk_merge_kernel(
   for (int r = 0; r < R; r++) {
     const unsigned long long w = tk_round<R4D_TOPK_PT2>(t);
     if (lane == 0) {
-      OV[(size_t)m * R + r] = w ? tk_val(w) : -INFINITY;
-      OI[(size_t)m * R + r] = w ? tk_idx(w) : -1;
+      OV[(size_t)m * out_stride + r] = w ? tk_val(w) : -INFINITY;
+      OI[(size_t)m * out_stride + r] = w ? tk_idx(w) : -1;
     }
   }
 }
 
-void r4d_rowtopk_merge(long gathered, long outv, long outi, int M, int R, int W, long stream) {
+void r4d_rowtopk_merge(long gathered, long outv, long outi, int M, int R, int W, long stream,
+                       int ld) {
   if (M < 1 || R < 1 || W < 1) throw std::runtime_error("r4d rowtopk_merge: M, R and W must be >= 1");
   // R <= PT2 is what makes this exact whatever the candidates look like -- a lane can hold the
   // whole answer -- so it is checked rather than clamped, the same as stage 2's.
   if (R > R4D_TOPK_PT2) throw std::runtime_error("r4d rowtopk_merge: R must be 1..32");
   hipLaunchKernelGGL(r4d_rowtopk_merge_kernel, dim3(M), dim3(R4D_TOPK_WAVE), 0,
                      (hipStream_t)stream, (const float*)gathered, (float*)outv, (int*)outi,
-                     R, W * R);
+                     R, W * R, ld);
 }
 
 // ============================================================== logit_rerank
@@ -405,7 +424,7 @@ template <bool I8>
 __global__ __launch_bounds__(R4D_TOPK_WAVE * R4D_RERANK_WPB) void r4d_logit_rerank_kernel(
     const unsigned short* __restrict__ X, const int* __restrict__ IN,
     const unsigned char* __restrict__ W, int* __restrict__ OI, float* __restrict__ OV,
-    float* __restrict__ OP, int R, long K, long voff, long nv, long w_ld) {
+    float* __restrict__ OP, int R, long K, long voff, long nv, long w_ld, int R_pairs = 0) {
   __shared__ float s_sc[R4D_TOPK_PT2];
   __shared__ int   s_id[R4D_TOPK_PT2];
 
@@ -413,6 +432,7 @@ __global__ __launch_bounds__(R4D_TOPK_WAVE * R4D_RERANK_WPB) void r4d_logit_rera
   const int  lane = threadIdx.x & (R4D_TOPK_WAVE - 1);
   const int  wv   = threadIdx.x / R4D_TOPK_WAVE;
   const unsigned short* const xr = X + (size_t)m * K;
+  const int  np   = (R_pairs > 0) ? R_pairs : R;
 
   for (int r = wv; r < R; r += R4D_RERANK_WPB) {
     const int  gid = IN[(size_t)m * R + r];
@@ -450,8 +470,8 @@ __global__ __launch_bounds__(R4D_TOPK_WAVE * R4D_RERANK_WPB) void r4d_logit_rera
       const int   i = w ? tk_idx(w) : -1;
       OV[(size_t)m * R + r] = v;
       OI[(size_t)m * R + r] = i;
-      if (OP) {
-        float* const p = OP + ((size_t)m * R + r) * 2;
+      if (OP && r < np) {
+        float* const p = OP + ((size_t)m * np + r) * 2;
         __builtin_memcpy(p, &i, sizeof i);
         p[1] = v;
       }
@@ -461,7 +481,7 @@ __global__ __launch_bounds__(R4D_TOPK_WAVE * R4D_RERANK_WPB) void r4d_logit_rera
 
 static int logit_rerank_emit(long x, long idx_in, long head, long outi, long outv, long outp,
                              int M, int R, long K, long voff, long nv, const R4dSink& sk,
-                             bool i8 = false) {
+                             bool i8 = false, int R_pairs = 0) {
   const long w_ld = r4d_fp8::lm_row_bytes(K);
   if (M < 1 || R < 1 || K < 1 || nv < 1) return -1;
   // R <= PT2 is what makes the re-sort exact whatever the scores look like -- one lane holds the
@@ -470,16 +490,16 @@ static int logit_rerank_emit(long x, long idx_in, long head, long outi, long out
 #define R4D_RERANK_EMIT(I8)                                                                     \
   R4D_EMIT(sk, r4d_logit_rerank_kernel<I8>, dim3(M), dim3(R4D_TOPK_WAVE * R4D_RERANK_WPB), 0,    \
            (const unsigned short*)x, (const int*)idx_in, (const unsigned char*)head, (int*)outi,  \
-           (float*)outv, (float*)outp, R, K, voff, nv, w_ld)
+           (float*)outv, (float*)outp, R, K, voff, nv, w_ld, R_pairs)
   const int rc = i8 ? R4D_RERANK_EMIT(true) : R4D_RERANK_EMIT(false);
 #undef R4D_RERANK_EMIT
   return rc;
 }
 
 void r4d_logit_rerank(long x, long idx_in, long head, long outi, long outv, long outp,
-                      int M, int R, long K, long voff, long nv, long stream) {
+                      int M, int R, long K, long voff, long nv, long stream, int R_pairs) {
   if (logit_rerank_emit(x, idx_in, head, outi, outv, outp, M, R, K, voff, nv,
-                        r4d_stream_sink((RadStream)(uintptr_t)stream)) != RAD_OK)
+                        r4d_stream_sink((RadStream)(uintptr_t)stream), false, R_pairs) != RAD_OK)
     throw std::runtime_error("r4d logit_rerank: refused or failed to launch");
 }
 
@@ -602,14 +622,15 @@ extern "C" int r4d_rad_rowtopk_merge(const RadArgs* a, RadStream s) {
     const long long M = (g->rank >= 1) ? g->shape[0] : r4d_geti_or(a, "M", 0);
     const long long R = r4d_geti_or(a, "R", 0);
     const long long W = r4d_geti_or(a, "world_size", 0);
+    const int ld = (idx && idx->rank >= 2 && idx->shape[1] > R) ? (int)idx->shape[1] : (int)R;
     if (M < 1 || R < 1 || W < 1) return R4D_NO(RAD_E_SHAPE);
     if (R > 32) return R4D_NO(RAD_E_SHAPE);
     if (r4d_numel(g) < M * W * R * 2) return R4D_NO(RAD_E_SHAPE);
-    if (r4d_numel(idx) < M * R || r4d_numel(val) < M * R) return R4D_NO(RAD_E_SHAPE);
+    if (r4d_numel(idx) < M * ld || r4d_numel(val) < M * ld) return R4D_NO(RAD_E_SHAPE);
 
     R4D_TRY("rowtopk_merge",
         r4d_rowtopk_merge(r4d_addr(g), r4d_addr(val), r4d_addr(idx), (int)M, (int)R, (int)W,
-                          (long)(uintptr_t)s));
+                          (long)(uintptr_t)s, ld));
     return RAD_OK;
 }
 
@@ -643,18 +664,19 @@ static int rad_logit_rerank(const RadArgs* a, const R4dSink& sk, bool i8) {
     const long long NV   = r4d_geti_or(a, "n_vocab", 0);
     const long long R    = r4d_geti_or(a, "R", 0);
     const long long voff = r4d_geti_or(a, "vocab_off", 0);
+    const int R_pairs    = (pr && pr->rank >= 2 && pr->shape[1] > 0) ? (int)pr->shape[1] : (int)R;
     if (K < 1 || NV < 1 || R < 1) return R4D_NO(RAD_E_SHAPE);
     if (R > 32) return R4D_NO(RAD_E_SHAPE);
     const long long M = (x->rank >= 1) ? x->shape[0] : r4d_geti_or(a, "M", 0);
     if (M < 1) return R4D_NO(RAD_E_SHAPE);
     if (r4d_numel(x) < M * K || r4d_numel(in) < M * R) return R4D_NO(RAD_E_SHAPE);
     if (r4d_numel(idx) < M * R || r4d_numel(val) < M * R) return R4D_NO(RAD_E_SHAPE);
-    if (pr && r4d_numel(pr) < M * R * 2) return R4D_NO(RAD_E_SHAPE);
+    if (pr && r4d_numel(pr) < M * R_pairs * 2) return R4D_NO(RAD_E_SHAPE);
     if (K % 128) return R4D_NO(RAD_E_SHAPE);   /* the scale block; lm_row_bytes assumes it */
 
     if (logit_rerank_emit(r4d_addr(x), r4d_addr(in), r4d_addr(w), r4d_addr(idx), r4d_addr(val),
                           pr ? r4d_addr(pr) : 0, (int)M, (int)R, (long)K, (long)voff, (long)NV,
-                          sk, i8) != RAD_OK)
+                          sk, i8, R_pairs) != RAD_OK)
         return R4D_NO(RAD_E_DEVICE);
     return RAD_OK;
 }

@@ -33,6 +33,7 @@
 #include "device/device.h"
 
 #include <atomic>
+#include <span>
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -178,6 +179,7 @@ struct KVPoolBinding {
     std::vector<int32_t> layer_slot;
     uint32_t rank = 0;              /* 0 when the group has no plan: the operand stays a flat span */
     int64_t  shape[RAD_MAX_RANK] = {0};
+    std::vector<RadTensor> layer_tensor;
 };
 
 struct CtxDesc {
@@ -297,6 +299,9 @@ public:
     /* Told by the drain, so the ring knows which banks are still owed a reader. */
     void              mark_credited(int layer, int bank);
     const RadRouting* last_routing(int layer) const;
+    void              set_route_d2h(bool on) { route_d2h_ = on; }
+    bool              route_d2h() const { return route_d2h_; }
+    int               route_flush();
 
     /* ---------------------------------------------------------- the placement seam */
     /* Change an op's execution site. Refuses with RAD_E_NOKERNEL, naming the op and the band, if
@@ -541,13 +546,13 @@ private:
                   int rec1);
     int  haz_mark(PassTape& t);
 
-    static constexpr size_t  kTapes      = 24;     /* recorded passes kept, least recently used out */
+    static constexpr size_t  kTapes      = 96;     /* recorded passes kept, least recently used out */
     static constexpr int64_t kAuditPlays = 1024;
 
     std::vector<PassTape> tapes_;
     uint64_t              tape_clock_ = 0;
     /* Keys seen once, and keys recorded once and not yet verified. */
-    uint64_t              tape_seen_[32] = {};
+    uint64_t              tape_seen_[128] = {};
     size_t                tape_seen_at_ = 0;
     std::vector<uint64_t> tape_refused_;       /* keys whose pass could not be recorded */
     uint64_t              tape_told_ = 0;      /* draft passes whose first recording was logged */
@@ -559,7 +564,7 @@ private:
 
     uint64_t pass_key(const RadBatch* b) const;
     int      run_pass(const RadBatch* b);
-    int      record_pass(const RadBatch* b, uint64_t key, PassTape* out);
+    int      record_pass(const RadBatch* b, uint64_t key, PassTape* out, bool compare_only = false);
     int      play_pass(PassTape& t);
     void     tape_cut();                        /* while recording: close the current play step */
     void     tape_drop(PassTape& t);
@@ -733,11 +738,12 @@ private:
     /* Prebuilt tensor templates, indexed by handle. A buffer's template already carries its arena
      * pointer, dtype, shape and packed strides; a weight's already carries WeightInfo::ptr. An
      * issue copies one and patches at most the data pointer and dim 0. */
-    std::vector<RadTensor> buf_tmpl_;
+    std::span<const RadTensor> buf_tmpl_;
     std::vector<int32_t>   buf_bits_;
     std::vector<uint8_t>   buf_host_;   /* per handle: a RAD_DOMAIN_HOST buffer */
-    /* Every level's templates; `buf_tmpl_` is a copy of the active one, so the issue path reads
-     * one vector whatever level it is at. */
+    std::vector<uint8_t>   buf_dense_;  /* per handle: 1 if contiguous packed with offset=0 and default cols */
+    /* Every level's templates; `buf_tmpl_` points into the active one, so the issue path reads
+     * one span whatever level it is at. */
     std::vector<std::vector<RadTensor>> level_tmpl_;
     int                    level_ = 0;
     std::vector<RadTensor> w_tmpl_;
@@ -746,10 +752,8 @@ private:
     std::vector<uint32_t>  waited_gen_;   /* the generation we last made the stream wait on */
 
     std::vector<OpPlan>                 plans_;
-    /* THE OPS NOT YET SEEN ISSUED. flush_issued walks this rather than every op, and drops each
-     * index as it fires, so the per-step cost falls to the ops that have never fired -- which
-     * after a few steps is only the ones that never will, and those are the point. */
-    std::vector<uint32_t>               unflushed_;
+    /* Ops issued for the first time during the current step, flushed to Program at step end. */
+    std::vector<uint32_t>               first_issued_;
     std::vector<int64_t>                band_table_;
     std::vector<IssuePlan>              issue_table_;
     std::vector<std::atomic<uint8_t>>   op_domain_;   /* sized once, never resized */
@@ -766,7 +770,7 @@ private:
     RadEvent               route_done_[kRouteBanks] = {};
     /* The layers this pass reported into `route_bank_`, as [lo, hi]; lo > hi when none. */
     int                    route_bank_ = -1, route_lo_ = 1, route_hi_ = 0;
-    int                    route_flush();
+    bool                   route_d2h_ = true;
 
     /* Profiling. Off by default; when on it restores synchronisations that change the mover's slot
      * supply, so a profiled run is not comparable against an unprofiled one (spec §16). */

@@ -410,8 +410,106 @@ __global__ __launch_bounds__(kMxWaves * kWave) void qsa_score_mx_kernel(
     }
 }
 
-/* WHICH FORM A LAUNCH TAKES: 0 is the rule below, 1 pins the scalar form, 2 the matrix form. A
- * test hook, like r4d_gemm_fp8a8_pin_mw -- r4d_selftest compares the two on one input. */
+/* ================================================================== the packed matrix form
+ *
+ * PACKED MATRIX FORM FOR DECODE SHAPES:
+ * 4 queries x 4 heads packed into the 16 columns of a single WMMA tile (col = 4*h + q_idx).
+ *
+ * Sequences are strictly segregated: blockIdx.y maps to sequence s.
+ * Matrix A is loaded ONLY from sequence s's block table, and Matrix B is loaded ONLY
+ * from sequence s's queries (q_start = cu[s], count <= 4).
+ * This eliminates all cross-sequence contamination and ballot searching.
+ *
+ * Within the wave, the 4 heads are reduced into lanes 0..3 via two DPP instructions:
+ *   s = r4d_dpp_xor_add<0x168>(s);  // XOR 8
+ *   s = r4d_dpp_xor_add<0x164>(s);  // XOR 4
+ * Each lane col < q_cnt then writes its accumulated score directly to out[q0 + col].
+ * Instruction count drops by 4x (8 vs 32 WMMAs per tile), VGPR pressure drops by 4x (32 vs 128 VGPRs).
+ */
+__global__ __launch_bounds__(kMxWaves * kWave) void qsa_score_packed_mx_kernel(
+    const unsigned short* __restrict__ q, const unsigned short* __restrict__ bk,
+    const int32_t* __restrict__ bt, const int32_t* __restrict__ cu,
+    const int32_t* __restrict__ nc, float* __restrict__ out,
+    int M, int nb, int nseq, int tpw, int q_ld, int bk_ld, int bt_ld, int out_ld, int vec,
+    int m_offset) {
+
+    const int lane = threadIdx.x & (kWave - 1), wave = threadIdx.x >> 5;
+    const int half = lane >> 4, col = lane & 15;
+    const int seq = (int)blockIdx.y;
+    if (seq >= nseq) return;
+
+    const int q_start_all = cu[seq] - m_offset;
+    const int q_end_all   = cu[seq + 1] - m_offset;
+    const int q_start = q_start_all < 0 ? 0 : q_start_all;
+    const int q_end   = q_end_all > M ? M : q_end_all;
+    if (q_start >= q_end) return;
+
+    const int nbs  = nc[seq] < nb ? nc[seq] : nb;
+    const int wb0  = ((int)blockIdx.x * kMxWaves + wave) * tpw * 16;
+    if (wb0 >= nbs) return;
+    const int bend = wb0 + tpw * 16 < nbs ? wb0 + tpw * 16 : nbs;
+
+    const float inv = rsqrtf((float)(kMxKS * 16));
+    const int32_t* tab = bt + (size_t)seq * bt_ld;
+
+    for (int q0 = q_start; q0 < q_end; q0 += 4) {
+        const int q_cnt = q_end - q0 < 4 ? q_end - q0 : 4;
+
+        /* Operand B: 4 queries x 4 heads in 16 columns.
+         * head = col >> 2 (0..3), q_idx = col & 3 (0..3) */
+        const int head  = col >> 2;
+        const int q_idx = col & 3;
+        const bool q_live = (q_idx < q_cnt);
+        const int qr = q_live ? (q0 + q_idx) : q0;
+        const unsigned short* qp = q + (size_t)qr * q_ld + (size_t)head * (kMxKS * 16) + 4 * half;
+        v8bf qf[kMxKS];
+#pragma unroll
+        for (int ks = 0; ks < kMxKS; ++ks) qf[ks] = fragP(qp + ks * 16);
+
+        for (int b0 = wb0; b0 < bend; b0 += 16) {
+            const int b  = b0 + col;
+            const int pg = b < bend ? tab[b] : -1;
+            const unsigned short* kp = bk + (size_t)(pg >= 0 ? pg : 0) * bk_ld + 4 * half;
+            v8bf kf[kMxKS];
+#pragma unroll
+            for (int ks = 0; ks < kMxKS; ++ks) kf[ks] = fragP(kp + ks * 16);
+
+            const unsigned absent = (unsigned)__ballot(pg < 0) & 0xFFFFu;
+
+            v8f acc;
+#pragma unroll
+            for (int e = 0; e < 8; ++e) acc[e] = 0.0f;
+
+#pragma unroll
+            for (int ks = 0; ks < kMxKS; ++ks) acc = mma(kf[ks], qf[ks], acc);
+
+            float v[8];
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                float s = fmaxf(acc[e], 0.0f);
+                s = r4d_dpp_xor_add<0x168>(s);
+                s = r4d_dpp_xor_add<0x164>(s);
+                v[e] = ((absent >> (8 * half + e)) & 1u) ? -INFINITY : s * inv;
+            }
+
+            if (col < q_cnt) {
+                const int q_row = q0 + col;
+                float* op = out + (size_t)q_row * out_ld + b0 + 8 * half;
+                if (vec && b0 + 16 <= bend) {
+                    *(float4*)op       = make_float4(v[0], v[1], v[2], v[3]);
+                    *(float4*)(op + 4) = make_float4(v[4], v[5], v[6], v[7]);
+                } else {
+#pragma unroll
+                    for (int e = 0; e < 8; ++e)
+                        if (b0 + 8 * half + e < bend) op[e] = v[e];
+                }
+            }
+        }
+    }
+}
+
+/* WHICH FORM A LAUNCH TAKES: 0 is the rule below, 1 pins the scalar form, 2 the matrix form,
+ * 3 the packed matrix form. A test hook, like r4d_gemm_fp8a8_pin_mw. */
 int g_qsa_form = 0;
 
 }  // namespace
@@ -441,11 +539,23 @@ static int r4d_qsa_score_bf16_emit(long q, long bk, long bt, long cu, long nc, l
      * workgroup past the live end exits on its first compare, which is what `nb` inside the kernel
      * is bounded to. The QUERY axis is tiled the same way and for the same reason: a tile whose
      * first row is past the batch ends on its `cu` scan. */
-    /* THE MATRIX FORM WHENEVER IT IS BUILT FOR THE SHAPE: 128 dims and at most four heads, which
-     * is what fits the query rows in registers. The scalar form serves every other width and head
-     * count the op admits. */
     const bool mx_fits = n == kMxKS * 16 && heads <= 4;
+    const bool mx_packed_fits = n == kMxKS * 16 && heads == 4 && (M <= 4 * nseq);
+    if (g_qsa_form == 3 && !mx_packed_fits) return -3;
     if (g_qsa_form == 2 && !mx_fits) return -3;
+    const bool use_packed = (g_qsa_form == 3) || (g_qsa_form == 0 && mx_packed_fits);
+    if (use_packed) {
+        const long long tiles = (nb + 15) / 16;
+        long long tpw = (tiles * nseq + kMxWavesTarget - 1) / kMxWavesTarget;
+        if (tpw < kMxMinTiles) tpw = kMxMinTiles;
+        const unsigned gx = (unsigned)((tiles + tpw * kMxWaves - 1) / (tpw * kMxWaves));
+        const int vec = (out_ld % 4 == 0) && ((out & 15) == 0);
+        emit_rc = R4D_EMIT(sk, qsa_score_packed_mx_kernel, dim3(gx, (unsigned)nseq), dim3(kMxWaves * kWave),
+                           0, (const unsigned short*)q, (const unsigned short*)bk,
+                           (const int32_t*)bt, (const int32_t*)cu, (const int32_t*)nc,
+                           (float*)out, M, nb, nseq, (int)tpw, q_ld, bk_ld, bt_ld, out_ld, vec, m_offset);
+        return emit_rc == RAD_OK && (sk.desc || hipGetLastError() == hipSuccess) ? 0 : -4;
+    }
     const bool mx = g_qsa_form == 1 ? false : mx_fits;
     if (mx) {
         /* THE BLOCK RANGE A WAVE OWNS is sized so the grid holds about kMxWavesTarget waves, and

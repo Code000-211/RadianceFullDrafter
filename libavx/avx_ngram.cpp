@@ -321,11 +321,12 @@ const TableFile* table_file(const uint8_t* p, long long n, int* err) {
  * memory once a row lands in it. */
 struct RowCache {
     static constexpr int      kWays = 8;
-    static constexpr uint64_t kRows = 1ull << 19;
+    static constexpr uint64_t kDefaultRows = 1ull << 27;
     enum : uint64_t { EMPTY = 0, LOADING = 1, READY = 2 };
 
     const TableFile*       tf       = nullptr;
     long long              n        = 0;
+    uint64_t               rows     = 0;
     uint64_t               set_mask = 0;
     std::atomic<uint64_t>* word     = nullptr;
     std::atomic<uint8_t>*  ref      = nullptr;
@@ -412,11 +413,21 @@ RowCache* row_cache(const TableFile* tf, long long n) {
     auto c = std::make_unique<RowCache>();
     c->tf       = tf;
     c->n        = n;
-    c->set_mask = RowCache::kRows / RowCache::kWays - 1;
-    c->word     = anon_array<std::atomic<uint64_t>>(RowCache::kRows);
-    c->ref      = anon_array<std::atomic<uint8_t>>(RowCache::kRows);
-    c->hand     = anon_array<std::atomic<uint8_t>>(RowCache::kRows / RowCache::kWays);
-    c->data     = anon_array<uint8_t>(RowCache::kRows * (size_t)n);
+    uint64_t total_rows = RowCache::kDefaultRows;
+    if (const char* env = std::getenv("RADIANCE_PLE_CACHE_ROWS")) {
+        long long v = std::strtoll(env, nullptr, 0);
+        if (v >= 65536) {
+            uint64_t p = 65536;
+            while (p < (uint64_t)v) p <<= 1;
+            total_rows = p;
+        }
+    }
+    c->rows     = total_rows;
+    c->set_mask = total_rows / RowCache::kWays - 1;
+    c->word     = anon_array<std::atomic<uint64_t>>(total_rows);
+    c->ref      = anon_array<std::atomic<uint8_t>>(total_rows);
+    c->hand     = anon_array<std::atomic<uint8_t>>(total_rows / RowCache::kWays);
+    c->data     = anon_array<uint8_t>(total_rows * (size_t)n);
     if (!c->word || !c->ref || !c->hand || !c->data) return nullptr;
     caches.push_back(std::move(c));
     return caches.back().get();

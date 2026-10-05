@@ -426,6 +426,7 @@ public:
     void block_end();
 
     const StepPlan&      plan() const { return plan_; }
+    const StepPlan&      plan_next() const { return plan_next_; }
     const ChunkGeometry& geometry() const { return geo_; }
     DraftController&     draft() { return draft_; }
     SchedMetrics         metrics() const;
@@ -498,6 +499,8 @@ private:
     SchedMetrics         scratch_m_;
     std::vector<ReqStat> scratch_reqs_;
     int64_t              pub_at_us_ = 0;
+    std::atomic<bool>    pub_dirty_{true};
+    mutable std::atomic<bool> observer_demand_{false};
 
     std::vector<std::unique_ptr<SchedReq>> reqs_;   /* by slot */
     std::vector<int32_t> free_slots_;

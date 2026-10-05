@@ -285,4 +285,7 @@ __device__ __forceinline__ void stage8_store(uint8_t* __restrict__ lds, uint32_t
     }
 }
 
+constexpr uint32_t kMoeFusedDecodeMaxTokens = 16;
+constexpr uint32_t kMoeFusedDecodeMaxInter  = 384;
+
 }  // namespace r4d_fp8

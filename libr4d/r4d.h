@@ -480,9 +480,9 @@ void r4d_rowtopk_bf16_sharded(long y, long partial, long outv, long outi, long o
 // id, float value) pairs with rank r's at [r*R, (r+1)*R), written in the same (`outv`, `outi`)
 // form the two stages above write.  Id -1 is a pad and is dropped; ties break on the LOWER id, so
 // the answer equals a top-R over the unsharded plane rather than merely approximating it.
-void r4d_rowtopk_merge(long gathered, long outv, long outi, int M, int R, int W, long stream);
+void r4d_rowtopk_merge(long gathered, long outv, long outi, int M, int R, int W, long stream, int ld = 0);
 void r4d_logit_rerank(long x, long idx_in, long head, long outi, long outv, long outp,
-                      int M, int R, long K, long voff, long nv, long stream);
+                      int M, int R, long K, long voff, long nv, long stream, int R_pairs = 0);
 int  r4d_rowtopk_bf16_chunks(int N, int NCH);
 
 // 2-BIT weight, 8-bit activation, for the DFlash2 draft head.  Unsigned 2-bit codes in the byte's

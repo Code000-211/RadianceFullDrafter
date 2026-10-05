@@ -311,7 +311,9 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
         if (BTS && ti + 1 < ntiles) {
             load_bt((ti + 1) * NB, blkn);
         }
-        if (LDSB) lds_barrier(); else __syncthreads();
+        if (ti > 0) {
+            if (LDSB) lds_barrier(); else __syncthreads();
+        }
         fetchK(k0, blk);
         if (!GPREV) fetchV(k0, blk);
         storeV();              // V first: its data is already in registers, so it covers K's wait
@@ -363,12 +365,14 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
             if (wave_any(smax > m_ref + PGROW)) {
                 const float rmax  = fmaxf(smax, swap16(smax));
                 const float mnew  = fmaxf(fmaxf(m_ref, rmax), -3.0e38f);
-                const float alpha = ex2(m_ref - mnew);
-                #pragma unroll
-                for (int dt = 0; dt < NKS; ++dt)
+                if (ti > 0 || mt > 0) {
+                    const float alpha = ex2(m_ref - mnew);
                     #pragma unroll
-                    for (int e = 0; e < 8; ++e) acc[dt][e] *= alpha;
-                l_i *= alpha;
+                    for (int dt = 0; dt < NKS; ++dt)
+                        #pragma unroll
+                        for (int e = 0; e < 8; ++e) acc[dt][e] *= alpha;
+                    l_i *= alpha;
+                }
                 m_ref = mnew;
                 off   = PSHIFT - mnew;
             }

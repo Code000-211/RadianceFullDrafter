@@ -476,6 +476,27 @@ __global__ __launch_bounds__(R4D_W4A8_BOUNDS(NPW)) void r4d_gemm_w4a8_nt_m64_ker
   // k loop.
   const int ncols = WV * NPW;
   const int nthreads = WV * SK * WAVE32;
+
+  // AT SK == 1 THERE IS NOTHING TO REDUCE: lane already holds the finished value.
+  if (SK == 1) {
+    if (n0 >= N) return;
+#pragma unroll
+    for (int j = 0; j < NPW; j++) {
+      const int n = (nt0 + j) * 16 + (lane & 15);
+      if (n >= N) continue;
+#pragma unroll
+      for (int i = 0; i < MT; i++) {
+        const int mb = (mt0 + i) * 16 + 8 * (lane >> 4);
+#pragma unroll
+        for (int e = 0; e < 8; e++) {
+          const int m = mb + e;
+          if (m < M) C[(size_t)m * N + n] = (__hip_bfloat16)(acc[j][i][e] * Ascale[m] * 0.0625f);
+        }
+      }
+    }
+    return;
+  }
+
 #pragma unroll
   for (int i = 0; i < MT; i++) {
     __syncthreads();

@@ -192,6 +192,28 @@ __global__ void r4d_gemm_mxfp4a8_nt_m64_kernel(
 
   // Reduce the SK partial sums in LDS, one M tile at a time so the buffer stays WV*NPW*SK*256.
   const int ncols = WV * NPW;
+
+  // AT SK == 1 THERE IS NOTHING TO REDUCE: lane already holds the finished value.
+  if (SK == 1) {
+    if (nt0 * 16 >= N) return;
+#pragma unroll
+    for (int j = 0; j < NPW; j++) {
+      const int n = (nt0 + j) * 16 + (lane & 15);
+      if (n >= N) continue;
+#pragma unroll
+      for (int i = 0; i < MT; i++) {
+        const int mb = (mt0 + i) * 16 + 8 * (lane >> 4);
+#pragma unroll
+        for (int e = 0; e < 8; e++) {
+          const int m = mb + e;
+          if (m < M) C[(size_t)m * N + n] =
+              (__hip_bfloat16)(acc[j][i][e] * __int_as_float((int)Wref[n] << 23) * As[m]);
+        }
+      }
+    }
+    return;
+  }
+
 #pragma unroll
   for (int i = 0; i < MT; i++) {
     __syncthreads();

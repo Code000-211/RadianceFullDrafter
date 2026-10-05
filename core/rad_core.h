@@ -643,6 +643,12 @@ struct Config {
      * of its own; the container is the file. */
     bool    weights_disk_tier = false;
 
+    /* PLE table backend: "device" (GPU zero-copy from pinned host RAM / SHM, default)
+     * or "host" (original CPU AVX sparse O_DIRECT reads from NVMe, 0 B pinned RAM).
+     * Flag: --ple-backend device|host (aliases: --ple-storage, --ple-mode).
+     * Env: RADIANCE_PLE_BACKEND=device|host. */
+    std::string ple_backend = "device";
+
     std::string placement = "auto";    /* all_vram | layer_offload | expert_tiered | auto */
     /* --embedding-placement and --ngram-placement, as asked (TablePlacement says what each tier
      * is), and what Engine::plan resolved them to before any rank planned: never Auto. */

@@ -408,12 +408,14 @@ bool module_load(Module* m, int ord, const ModuleImage& im, std::string* why) {
         hsa_executable_create_alt(HSA_PROFILE_FULL, HSA_DEFAULT_FLOAT_ROUNDING_MODE_DEFAULT, nullptr,
                                   &ex) != HSA_STATUS_SUCCESS) {
         m->load_err[ord] = "could not create an executable for the code object";
-    } else if (hsa_executable_load_agent_code_object(ex, d.agent, rd, nullptr, nullptr) !=
-                   HSA_STATUS_SUCCESS ||
-               hsa_executable_freeze(ex, nullptr) != HSA_STATUS_SUCCESS) {
-        m->load_err[ord] = "the code object did not load on " + d.isa;
     } else {
-        m->exec[ord] = ex;
+        hsa_status_t ld_st = hsa_executable_load_agent_code_object(ex, d.agent, rd, nullptr, nullptr);
+        hsa_status_t fr_st = (ld_st == HSA_STATUS_SUCCESS) ? hsa_executable_freeze(ex, nullptr) : HSA_STATUS_ERROR;
+        if (ld_st != HSA_STATUS_SUCCESS || fr_st != HSA_STATUS_SUCCESS) {
+            m->load_err[ord] = fmt("the code object did not load on %s (load=%d freeze=%d)", d.isa.c_str(), (int)ld_st, (int)fr_st);
+        } else {
+            m->exec[ord] = ex;
+        }
     }
     if (!m->load_err[ord].empty()) { *why = m->load_err[ord]; return false; }
     return true;
@@ -732,15 +734,18 @@ inline uint16_t header(hsa_packet_type_t type, int acq, int rel, bool barrier = 
 }
 
 /* Whether the packet at `idx` must acquire at system scope, and the bookkeeping if it does. */
-inline int acquire_scope(Stream* s, uint64_t idx, bool forced) {
-    const uint64_t ep = G().host_epoch.load(std::memory_order_acquire);
+inline int acquire_scope(Stream* s, uint64_t idx, bool forced, uint64_t ep) {
     const bool lap = (int64_t)idx - s->last_sys_acq >= (int64_t)(kQueuePackets / 2);
-    if (forced || lap || s->epoch != ep) {
+    if (__builtin_expect(forced || lap || s->epoch != ep, 0)) {
         s->last_sys_acq = (int64_t)idx;
         s->epoch = ep;
         return HSA_FENCE_SCOPE_SYSTEM;
     }
     return HSA_FENCE_SCOPE_AGENT;
+}
+
+inline int acquire_scope(Stream* s, uint64_t idx, bool forced) {
+    return acquire_scope(s, idx, forced, G().host_epoch.load(std::memory_order_acquire));
 }
 
 int barrier(Stream* s, hsa_signal_t dep, hsa_signal_t done, int acq, int rel,
@@ -823,7 +828,7 @@ int dispatch(Stream* s, const KernelRec* k, dim3 g, dim3 b, void** args, size_t 
  * decided now, as dispatch() decides it. The argument blocks were written to VRAM when the tape
  * was made, so there is nothing to fence before the header. A reserve that would wait for room
  * rings first: the packet processor only takes packets the doorbell has announced. */
-constexpr int kPlayRing = 64;
+constexpr int kPlayRing = 32;
 
 /* WHERE THIS THREAD'S PLAYS LAST LEFT EACH QUEUE. A queue found further on has had packets put on
  * it that no recording saw -- a weight-table patch or a mover wait between two played stretches,
@@ -835,11 +840,28 @@ struct PlayLeft { uint32_t q = UINT32_MAX; uint64_t wr = 0; };
 constexpr int kPlayLeft = 8;
 thread_local PlayLeft t_left[kPlayLeft];
 
+#if defined(__x86_64__) || defined(_M_X64)
+__attribute__((target("avx2")))
+static inline void copy_aql_payload_avx2(void* dst, const void* src) {
+    const char* s = static_cast<const char*>(src);
+    char* d = static_cast<char*>(dst);
+    __m256i v0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + 4));
+    __m256i v1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + 32));
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(d + 4), v0);
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(d + 32), v1);
+}
+#endif
+
 struct PlayRun {
+    Tape*    tape = nullptr;
     Stream*  s = nullptr;
     uint64_t next = 0;        /* the write index after the last packet written */
     int      unrung = 0;
     bool     foreign = true;  /* the next packet's queue has packets this thread did not play */
+    uint64_t epoch = 0;
+
+    explicit PlayRun(Tape* t = nullptr) : tape(t) {}
+    ~PlayRun() { end(); }
 
     void ring() {
         if (!unrung) return;
@@ -850,6 +872,13 @@ struct PlayRun {
     void end() {
         if (!s) return;
         ring();
+        if (tape) {
+            bool found = false;
+            for (auto& l : tape->last) {
+                if (l.first == s->id) { l.second = s->wr - 1; found = true; break; }
+            }
+            if (!found) tape->last.emplace_back(s->id, s->wr - 1);
+        }
         int i = 0, empty = -1;
         while (i < kPlayLeft && t_left[i].q != s->id) {
             if (t_left[i].q == UINT32_MAX && empty < 0) empty = i;
@@ -869,24 +898,35 @@ struct PlayRun {
      * it must carry -- a record riding on this dispatch; see a_tape_play. */
     int put(const TapeRec& r, uint64_t* out_idx, hsa_signal_t done = hsa_signal_t{0},
             int rel_min = HSA_FENCE_SCOPE_NONE) {
-        if (s != r.s) {
+        if (__builtin_expect(s != r.s, 0)) {
             end();
             s = r.s;
             s->lock();
             foreign = moved(s);
+            epoch = G().host_epoch.load(std::memory_order_acquire);
         }
         const uint64_t idx = s->wr;
-        if (idx + kReserveMargin - s->rd > s->mask + 1) {
+        if (__builtin_expect(idx + kReserveMargin - s->rd > s->mask + 1, 0)) {
             ring();
             uint64_t got = 0;
             const int rc = reserve(s, &got);
             if (rc < 0) return rc;
         }
         auto* p = static_cast<hsa_kernel_dispatch_packet_t*>(s->q->base_address) + (idx & s->mask);
+#if defined(__x86_64__) || defined(_M_X64)
+        static const bool has_avx2 = __builtin_cpu_supports("avx2");
+        if (has_avx2) {
+            copy_aql_payload_avx2(p, &r.pkt);
+        } else {
+            std::memcpy(reinterpret_cast<char*>(p) + 4, reinterpret_cast<const char*>(&r.pkt) + 4,
+                        sizeof(hsa_kernel_dispatch_packet_t) - 4);
+        }
+#else
         std::memcpy(reinterpret_cast<char*>(p) + 4, reinterpret_cast<const char*>(&r.pkt) + 4,
                     sizeof(hsa_kernel_dispatch_packet_t) - 4);
+#endif
         if (done.handle) p->completion_signal = done;
-        const int acq = acquire_scope(s, idx, (r.fence & kFenceAcquireSystem) != 0);
+        const int acq = acquire_scope(s, idx, (r.fence & kFenceAcquireSystem) != 0, epoch);
         int rel = (r.fence & kFenceReleaseSystem) ? HSA_FENCE_SCOPE_SYSTEM : HSA_FENCE_SCOPE_AGENT;
         if (rel < rel_min) rel = rel_min;
         /* A record riding on the dispatch keeps the bit: its completion signal stands for
@@ -899,7 +939,7 @@ struct PlayRun {
         s->wr = idx + 1;
         next = idx + 1;
         *out_idx = idx;
-        if (++unrung >= kPlayRing) ring();
+        if (__builtin_expect(++unrung >= kPlayRing, 0)) ring();
         return RAD_OK;
     }
 };
@@ -1220,7 +1260,12 @@ struct SigPool {
 };
 
 SigPool& pool() {
-    static SigPool* p = new SigPool();
+    static SigPool* p = [] {
+        auto* sp = new SigPool();
+        sp->free[0].reserve(1024);
+        sp->free[1].reserve(1024);
+        return sp;
+    }();
     return *p;
 }
 
@@ -1247,7 +1292,7 @@ Sig* sig_get(bool irq) {
      * reads every signal's value and every waiter's queue out of memory the device writes. The
      * walk is kept for when the front is not done -- the host plays a step while the card is
      * still on the one before, and the records that step retired are then still in flight. */
-    while (p.free[irq].empty() && !p.retiring.empty() && reusable(p.retiring.front())) {
+    while (!p.retiring.empty() && reusable(p.retiring.front())) {
         Sig* g = p.retiring.front();
         p.retiring.pop_front();
         g->waiters.clear();
@@ -1283,7 +1328,12 @@ Sig* sig_get(bool irq) {
 void sig_retire(Sig* g) {
     SigPool& p = pool();
     std::lock_guard<std::mutex> lk(p.mu);
-    p.retiring.push_back(g);
+    if (reusable(g)) {
+        g->waiters.clear();
+        p.free[g->irq].push_back(g);
+    } else {
+        p.retiring.push_back(g);
+    }
 }
 
 struct Event {
@@ -1377,6 +1427,11 @@ int a_event_wait(RadStream rs, RadEvent re) {
     Event* e = ev_of(re);
     Stream* s = ours(rs);
     if (!e || !s) { device_set_error("rad_event_wait: null or foreign argument"); return RAD_E_INVAL; }
+    std::lock_guard<std::mutex> lk(e->mu);
+    if (!e->cur) return RAD_OK;               /* never recorded: nothing to wait for */
+    for (const auto& w : e->cur->waiters) {
+        if (w.first == s->id) return RAD_OK;
+    }
     if (capturing()) {
         TapeRec r;
         r.kind = kTapeWait;
@@ -1384,8 +1439,6 @@ int a_event_wait(RadStream rs, RadEvent re) {
         r.ev = re;
         t_tape->rec.push_back(r);
     }
-    std::lock_guard<std::mutex> lk(e->mu);
-    if (!e->cur) return RAD_OK;               /* never recorded: nothing to wait for */
     uint64_t idx = 0;
     /* A producer on this stream's own card wrote through the L2 this stream reads, so the acquire
      * need only reach the card; one on another card, or the host, needs the system's. */
@@ -1504,7 +1557,7 @@ RadTape a_tape_end(int keep) {
             return nullptr;
         }
     }
-    if (!t->karg_host.empty()) {
+    if (keep == 1 && !t->karg_host.empty()) {
         void* ka = nullptr;
         if (hsa_amd_memory_pool_allocate(G().dev[(size_t)ord].vram, t->karg_host.size(), 0, &ka) !=
                 HSA_STATUS_SUCCESS ||
@@ -1552,9 +1605,13 @@ int a_tape_play(RadTape rt, int from, int to) {
         device_set_error("rad tape: play of a null tape or of records [%d, %d)", from, to);
         return RAD_E_INVAL;
     }
+    if (!t->karg_host.empty() && !t->karg) {
+        device_set_error("cannot play an audit-only tape");
+        return RAD_E_STATE;
+    }
     ++t_tape_pause;
     int rc = RAD_OK;
-    PlayRun run;
+    PlayRun run(t);
     for (int i = from; i < to && rc >= 0; ++i) {
         const TapeRec& r = t->rec[(size_t)i];
         if (r.kind == kTapeDispatch) {
@@ -1577,10 +1634,6 @@ int a_tape_play(RadTape rt, int from, int to) {
             uint64_t idx = 0;
             rc = run.put(r, &idx, g ? g->h : hsa_signal_t{0}, rel);
             if (rc < 0) break;
-            bool found = false;
-            for (auto& l : t->last)
-                if (l.first == r.s->id) { l.second = idx; found = true; break; }
-            if (!found) t->last.emplace_back(r.s->id, idx);
             if (g) {
                 /* Announced before the event names it, as the record's own path does: another
                  * queue is about to wait on it. The event's lock is taken with no queue held. */
@@ -1998,7 +2051,8 @@ int a_vmem_commit(void* addr, int64_t bytes) {
     }
     std::lock_guard<std::mutex> lk(g_vres_mu);
     g_vmaps[(uintptr_t)addr] = h;
-    loc_forget();   /* the range is backed now, and no longer only reserved */
+    /* R3-22: RESERVED_ADDR is never inserted into t_loc, so backing an unmapped range
+     * cannot invalidate existing valid entries for other living allocations. */
     return RAD_OK;
 }
 

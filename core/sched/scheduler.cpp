@@ -196,6 +196,7 @@ int Scheduler::add_locked(std::unique_ptr<Request> r) {
     if (waiting_.capacity() < waiting_.size() + (size_t)cfg_.max_seqs + 1)
         waiting_.reserve(waiting_.size() + (size_t)cfg_.max_seqs + 1);
     queue_insert(waiting_, slot);
+    pub_dirty_.store(true, std::memory_order_relaxed);
     return RAD_OK;
 }
 
@@ -237,7 +238,7 @@ int Scheduler::set_draft(uint64_t id, const int32_t* tokens, int n) {
         return RAD_OK;
     }
 
-    int cap = draft_.next_depth();
+    int cap = draft_.next_depth((int)running_.size());
     if (s.req->max_tokens > 0) {
         const int64_t rem = (int64_t)s.req->max_tokens - (int64_t)s.req->output.size();
         const int64_t max_d = rem > 1 ? rem - 1 : 0;
@@ -368,6 +369,7 @@ void Scheduler::close_request(SchedReq& s, ReqState st, const char* reason, bool
      * to the sink, and the HTTP thread is waiting on exactly it. */
     if (st == ReqState::Failed && status < 0) server::sink_fail(s.req->sink, status, why);
     else server::sink_finish(s.req->sink, finish_of(st, s.req->finish_reason));
+    pub_dirty_.store(true, std::memory_order_relaxed);
 }
 
 int Scheduler::cancel(uint64_t id) {
@@ -882,7 +884,32 @@ const RadBatch* Scheduler::step() {
      * into the state and the model is then conditioned on text it never emitted: fluent, and
      * drifting, so it surfaces as concurrent requests disagreeing with the same requests run
      * alone rather than as anything failing. */
-    const int depth = draft_.next_depth();
+    int n_running_dec = 0;
+    for (size_t k = 0; k < running_.size(); ++k) {
+        int32_t sl = running_[k];
+        const SchedReq& sr = *reqs_[(size_t)sl];
+        const Request& req = *sr.req;
+        const int64_t tgt = sr.seq_len();
+        const bool is_pf = (req.n_computed < (int64_t)req.prompt.size()) ||
+                           (req.n_computed + 1 < tgt);
+        if (!is_pf) n_running_dec++;
+    }
+    const int depth = draft_.next_depth(n_running_dec);
+
+    /* C1: Reserve token budget for running decode requests so that a long prefill chunk
+     * doesn't exhaust the token budget and starve active decoders in concurrent workloads. */
+    int64_t decode_reserved = 0;
+    for (size_t k = 0; k < running_.size(); ++k) {
+        int32_t sl = running_[k];
+        const SchedReq& sr = *reqs_[(size_t)sl];
+        const Request& req = *sr.req;
+        const int64_t tgt = sr.seq_len();
+        const bool is_pf = (req.n_computed < (int64_t)req.prompt.size()) ||
+                           (req.n_computed + 1 < tgt);
+        if (!is_pf) {
+            decode_reserved += (1 + (req.may_speculate ? depth : 0));
+        }
+    }
 
     /* ---------------------------------------------------------- running requests first */
     /* Continuous batching: a request already holding blocks is served before a new one is let in,
@@ -901,7 +928,11 @@ const RadBatch* Scheduler::step() {
         int64_t ckpt = -1;
         int64_t want;
         if (prefill) {
-            want = plan_chunk(r.n_computed, target, budget, &ckpt);
+            int64_t pf_budget = budget;
+            if (decode_reserved > 0 && budget > decode_reserved) {
+                pf_budget = budget - decode_reserved;
+            }
+            want = plan_chunk(r.n_computed, target, pf_budget, &ckpt);
         } else {
             /* A verify step is 1 + n_draft query rows, which is why attention kernels take a
              * query length rather than assuming one (spec §10). */
@@ -920,8 +951,18 @@ const RadBatch* Scheduler::step() {
             if (ctx_limit_ > 0 && s.n_draft > spare) s.n_draft = spare > 0 ? (int32_t)spare : 0;
             want = 1 + s.n_draft;
             if (want > budget) want = 0;
+            const int64_t dec_demand = 1 + (r.may_speculate ? depth : 0);
+            decode_reserved = std::max<int64_t>(0, decode_reserved - dec_demand);
         }
-        if (want <= 0) break;   /* the budget is spent; the rest of running_ waits a step */
+        if (want <= 0) {
+            if (prefill && budget > 0) {
+                /* Prefill could not take a legal quantum with remaining budget; continue to see
+                 * if subsequent decode requests can use the remaining budget. */
+                ++i;
+                continue;
+            }
+            break;   /* the budget is spent; the rest of running_ waits a step */
+        }
 
         /* KV first, and preempt from the BACK on refusal -- the lowest priority, latest arrival
          * running request, which is the one that would be re-admitted last anyway. */
@@ -1269,8 +1310,10 @@ const RadBatch* Scheduler::step_next() {
 
 const RadBatch* Scheduler::step_next_locked() {
     if (!step_open_ || next_open_ || plan_.e.empty()) return nullptr;
-    /* An admission is a decision about the pool and the queue that the full step makes. */
-    if (!waiting_.empty()) return nullptr;
+    /* An admission is a decision about the pool and the queue that the full step makes.
+     * When capacity is already full (plan_.e.size() >= cfg_.max_seqs), no waiting request
+     * can be admitted on the next step anyway, so device lookahead is safe to proceed. */
+    if (!waiting_.empty() && (int64_t)plan_.e.size() < cfg_.max_seqs) return nullptr;
 
     plan_next_.reset();
     for (const StepEntry& e : plan_.e) {
@@ -1282,6 +1325,15 @@ const RadBatch* Scheduler::step_next_locked() {
          * is. And a grammar that cannot rewind decides, when this step commits, whether the next
          * may speculate; one that can -- and a request with no grammar -- answers as it did. */
         if (!e.produces_token || !r.speculation_fixed) return nullptr;
+
+        const bool surely_terminal = (r.max_tokens > 0) &&
+                                     ((int64_t)r.max_tokens - (int64_t)r.output.size() <= 1) &&
+                                     e.produces_token;
+        if (surely_terminal) {
+            s.draft_next = 0;
+            s.entry_next = -1;
+            continue;
+        }
 
         /* THE FURTHEST CONTEXT THE ROW CAN REACH: every position this step verifies committed,
          * counted from where the host knows the sequence is -- the last commit -- and not from
@@ -1313,6 +1365,7 @@ const RadBatch* Scheduler::step_next_locked() {
         plan_next_.n_tok += want;
         if (d > plan_next_.n_spec) plan_next_.n_spec = d;
     }
+    if (plan_next_.e.empty()) { plan_next_.reset(); return nullptr; }
     plan_next_.phase        = RAD_PHASE_DECODE;
     plan_next_.n_seq_decode = (int64_t)plan_next_.e.size();
     plan_next_.n_tok_decode = plan_next_.n_tok;
@@ -1479,15 +1532,21 @@ int Scheduler::commit(const StepResult& res) {
             /* AND THE CONTEXT BOUNDS IT WHATEVER max_tokens SAYS, including "no limit": a
              * sequence may not grow past the positions this deployment can address. */
             if (ctx_limit_ > 0 && ctx_limit_ - s.seq_len() < room) room = ctx_limit_ - s.seq_len();
+            int32_t emit_buf[RAD_SCHED_MAX_SPEC + 2];
+            int n_emit = 0;
             auto emit = [&](int32_t t) {
                 if (room <= 0) return;
                 --room;
                 if (!s.first_tok_us) s.first_tok_us = mono_us();
                 r.output.push_back(t);
-                if (!server::sink_push(r.sink, t)) overflowed = true;
+                emit_buf[n_emit++] = t;
             };
             for (int32_t j = 0; j < a; ++j) emit(s.draft[j]);
             if (res.token) emit(res.token[i]);
+            if (n_emit > 0) {
+                if (!server::sink_push_span(r.sink, emit_buf, (size_t)n_emit))
+                    overflowed = true;
+            }
             r.n_computed = valid;
             step_decode_tok_ += 1 + a;
 
@@ -1647,7 +1706,11 @@ int Scheduler::serial_begin(int* rounds, SerialRow* out, int max) {
      * Neither answer stops the HISTORY pass. The head's own K and V have to be filled whether or
      * not this particular step drafts -- a sequence three chunks into a long prompt is exactly the
      * case where nothing can draft yet and the history is exactly what will be needed. */
-    const int depth = draft_.next_depth();
+    int n_decode_seqs = 0;
+    for (size_t i = 0; i < plan_.e.size(); ++i) {
+        if (plan_.e[i].produces_token) n_decode_seqs++;
+    }
+    const int depth = draft_.next_depth(n_decode_seqs);
     bool may_draft = depth > 0;
     if (depth > 0 && *rounds > depth) *rounds = depth;
     if (*rounds > RAD_SCHED_MAX_SPEC) *rounds = RAD_SCHED_MAX_SPEC;
@@ -1671,7 +1734,10 @@ int Scheduler::serial_begin(int* rounds, SerialRow* out, int max) {
          * them. A chunk in the middle of a prompt verified nothing and continues nothing. */
         const int64_t vstart = (int64_t)e.ctx_len + e.n_tokens - 1 - e.n_spec;
         const int64_t head_max = vstart + e.n_spec;
-        bool can_draft = may_draft && e.produces_token;
+        const bool surely_terminal = (r.max_tokens > 0) &&
+                                     ((int64_t)r.max_tokens - (int64_t)r.output.size() <= 1) &&
+                                     e.produces_token;
+        bool can_draft = may_draft && e.produces_token && !surely_terminal;
 
         /* THE LOOKAHEAD KV. Round k writes the head's K and V at position head + k - 1, which runs
          * past the committed end, so the blocks have to exist before the round does -- for the
@@ -2106,12 +2172,29 @@ SchedMetrics Scheduler::metrics() const {
 
 void Scheduler::publish(bool idle) {
     const int64_t now = mono_us();
+    const bool demand = observer_demand_.exchange(false, std::memory_order_relaxed);
+    const bool dirty  = pub_dirty_.load(std::memory_order_relaxed);
+    if (!idle && !demand && !dirty && (now - pub_at_us_ < 20000)) {
+        if (!pub_mu_.try_lock()) return;
+        pub_m_.steps          = m_.steps;
+        pub_m_.decode_tokens  = m_.decode_tokens;
+        pub_m_.prefill_tokens = m_.prefill_tokens;
+        pub_m_.finished       = m_.finished;
+        pub_m_.cancelled      = m_.cancelled;
+        pub_m_.failed         = m_.failed;
+        pub_m_.draft_tokens   = m_.draft_tokens;
+        pub_m_.draft_accepted = m_.draft_accepted;
+        pub_m_.step           = step_;
+        pub_mu_.unlock();
+        return;
+    }
     if (idle && now - pub_at_us_ < 20000) return;
     {
         std::lock_guard<std::mutex> lk(mu_);
         scratch_m_ = metrics_locked();
         scratch_reqs_.resize(reqs_.size());
         scratch_reqs_.resize((size_t)requests_locked(scratch_reqs_.data(), (int)scratch_reqs_.size()));
+        pub_dirty_.store(false, std::memory_order_relaxed);
     }
     if (!pub_mu_.try_lock()) return;
     pub_m_ = scratch_m_;
@@ -2121,11 +2204,13 @@ void Scheduler::publish(bool idle) {
 }
 
 SchedMetrics Scheduler::observed_metrics() const {
+    observer_demand_.store(true, std::memory_order_relaxed);
     std::lock_guard<std::mutex> lk(pub_mu_);
     return pub_m_;
 }
 
 int Scheduler::observed_requests(ReqStat* out, int max) const {
+    observer_demand_.store(true, std::memory_order_relaxed);
     std::lock_guard<std::mutex> lk(pub_mu_);
     const int n = std::min(max, (int)pub_reqs_.size());
     std::copy(pub_reqs_.begin(), pub_reqs_.begin() + n, out);

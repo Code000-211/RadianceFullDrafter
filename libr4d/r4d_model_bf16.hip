@@ -844,42 +844,66 @@ constexpr uint32_t kLgVec  = 8;    // bf16 per 128-bit load
 __global__ __launch_bounds__(kThreads) void logits_gemm_kernel(
     const uint16_t* __restrict__ a, const uint16_t* __restrict__ w, float* __restrict__ c,
     uint32_t M, uint32_t K, uint32_t N, uint32_t a_ld, uint32_t c_ld) {
-    __shared__ float lds[kWaves][kLgRows];
-    const uint32_t j = blockIdx.x;
-    if (j >= N) return;
-    const uint16_t* __restrict__ wj = w + (size_t)j * K;
+    __shared__ float lds[kWaves][2][kLgRows];
+    const uint32_t j0 = blockIdx.x * 2;
+    const uint32_t j1 = j0 + 1;
+    if (j0 >= N) return;
+    const uint16_t* __restrict__ wj0 = w + (size_t)j0 * K;
+    const uint16_t* __restrict__ wj1 = (j1 < N) ? (w + (size_t)j1 * K) : nullptr;
 
     for (uint32_t r0 = 0; r0 < M; r0 += kLgRows) {
         const uint32_t nr = (M - r0) < kLgRows ? (M - r0) : kLgRows;
-        float acc[kLgRows];
+        float acc0[kLgRows];
+        float acc1[kLgRows];
 #pragma unroll
-        for (uint32_t i = 0; i < kLgRows; ++i) acc[i] = 0.0f;
+        for (uint32_t i = 0; i < kLgRows; ++i) {
+            acc0[i] = 0.0f;
+            acc1[i] = 0.0f;
+        }
 
         for (uint32_t k = threadIdx.x * kLgVec; k < K; k += kThreads * kLgVec) {
-            uint16_t wv[kLgVec];
-#pragma unroll
-            for (uint32_t p = 0; p < kLgVec; ++p) wv[p] = wj[k + p];
+            uint4 w0_raw = *reinterpret_cast<const uint4*>(wj0 + k);
+            const uint16_t* wv0 = reinterpret_cast<const uint16_t*>(&w0_raw);
+            uint4 w1_raw = (wj1 != nullptr) ? *reinterpret_cast<const uint4*>(wj1 + k) : uint4{0, 0, 0, 0};
+            const uint16_t* wv1 = reinterpret_cast<const uint16_t*>(&w1_raw);
+
             for (uint32_t i = 0; i < nr; ++i) {
                 const uint16_t* __restrict__ ar = a + (size_t)(r0 + i) * a_ld + k;
-                float s = 0.0f;
+                uint4 a_raw = *reinterpret_cast<const uint4*>(ar);
+                const uint16_t* av = reinterpret_cast<const uint16_t*>(&a_raw);
+                float s0 = 0.0f;
+                float s1 = 0.0f;
 #pragma unroll
-                for (uint32_t p = 0; p < kLgVec; ++p) s += bf2f(ar[p]) * bf2f(wv[p]);
-                acc[i] += s;
+                for (uint32_t p = 0; p < kLgVec; ++p) {
+                    const float af = bf2f(av[p]);
+                    s0 += af * bf2f(wv0[p]);
+                    if (wj1) s1 += af * bf2f(wv1[p]);
+                }
+                acc0[i] += s0;
+                acc1[i] += s1;
             }
         }
 
         for (uint32_t i = 0; i < nr; ++i) {
-            float v = acc[i];
-            v = r4d_wave_sum(v);
+            float v0 = r4d_wave_sum(acc0[i]);
+            float v1 = r4d_wave_sum(acc1[i]);
             const uint32_t lane = threadIdx.x & (kWave - 1), wave = threadIdx.x / kWave;
-            if (lane == 0) lds[wave][i] = v;
+            if (lane == 0) {
+                lds[wave][0][i] = v0;
+                lds[wave][1][i] = v1;
+            }
         }
         __syncthreads();
         if (threadIdx.x < nr) {
-            float v = 0.0f;
+            float v0 = 0.0f;
+            float v1 = 0.0f;
 #pragma unroll
-            for (uint32_t q = 0; q < kWaves; ++q) v += lds[q][threadIdx.x];
-            c[(size_t)(r0 + threadIdx.x) * c_ld + j] = v;
+            for (uint32_t q = 0; q < kWaves; ++q) {
+                v0 += lds[q][0][threadIdx.x];
+                v1 += lds[q][1][threadIdx.x];
+            }
+            c[(size_t)(r0 + threadIdx.x) * c_ld + j0] = v0;
+            if (j1 < N) c[(size_t)(r0 + threadIdx.x) * c_ld + j1] = v1;
         }
         __syncthreads();
     }
@@ -897,7 +921,8 @@ extern "C" int r4d_logits_gemm_bf16(long a, long w, long c, int M, int K, int N,
     if (K % (int)kLgVec) return -3;      // a thread owns eight columns; see the kernel
     if (!a_ld) a_ld = K;
     if (!c_ld) c_ld = N;
-    hipLaunchKernelGGL(logits_gemm_kernel, dim3((uint32_t)N), dim3(kThreads), 0,
+    const uint32_t grid_x = ((uint32_t)N + 1) / 2;
+    hipLaunchKernelGGL(logits_gemm_kernel, dim3(grid_x), dim3(kThreads), 0,
                        (hipStream_t)stream, (const uint16_t*)a, (const uint16_t*)w, (float*)c,
                        (uint32_t)M, (uint32_t)K, (uint32_t)N, (uint32_t)a_ld, (uint32_t)c_ld);
     return hipGetLastError() == hipSuccess ? 0 : -4;

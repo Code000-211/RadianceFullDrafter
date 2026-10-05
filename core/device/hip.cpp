@@ -294,6 +294,16 @@ void* d_alloc(int64_t bytes, int kind) {
             e = hipMalloc(&p, (size_t)bytes);
             break;
         case RAD_MEM_HOST_PINNED:
+            /* The mover's staging pool and the O_DIRECT landing zone. Pinned so a transfer is a
+             * DMA the driver does not have to stage through its own bounce buffer (spec §5.4).
+             * hipHostMallocNonCoherent disables CPU cache snooping during GPU DMA transfers over PCIe,
+             * delivering significantly higher PCIe throughput. */
+#ifdef hipHostMallocNonCoherent
+            e = hipHostMalloc(&p, (size_t)bytes, hipHostMallocNonCoherent);
+#else
+            e = hipHostMalloc(&p, (size_t)bytes, hipHostMallocDefault);
+#endif
+            break;
         case RAD_MEM_HOST_MAPPED:
             /* The AQL backend's, which pins host memory through ROCr in pieces the IOMMU can map
              * (aql.cpp, "pinned host memory, in pieces"). */
@@ -349,11 +359,28 @@ void* d_device_ptr(void* p) {
     return nullptr;
 }
 
+int d_host_register(void* p, int64_t bytes, unsigned flags) {
+    if (!p || bytes <= 0) return RAD_E_INVAL;
+    hipError_t e = hipHostRegister(p, (size_t)bytes, hipHostRegisterMapped);
+    if (e != hipSuccess && e != hipErrorHostMemoryAlreadyRegistered) {
+        return hip_fail(e, "hipHostRegister");
+    }
+    return RAD_OK;
+}
+
+int d_host_unregister(void* p) {
+    if (!p) return RAD_E_INVAL;
+    hipError_t e = hipHostUnregister(p);
+    if (e != hipSuccess) return hip_fail(e, "hipHostUnregister");
+    return RAD_OK;
+}
+
 const DeviceBackend g_hip = {
 
     "hip",
     d_count, d_set, d_props, d_enable_peer,
     d_alloc, d_free, d_host_ptr, d_device_ptr,
+    d_host_register, d_host_unregister,
     /* Streams, events, copies and fills: the AQL backend's (aql.cpp), which starts from this
      * table and fills these in. */
     nullptr, nullptr, nullptr,

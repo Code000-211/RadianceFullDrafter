@@ -766,10 +766,14 @@ int h_vram_used(int device, int64_t* out) {
     return RAD_OK;
 }
 
+int h_host_register(void*, int64_t, unsigned) { return RAD_OK; }
+int h_host_unregister(void*) { return RAD_OK; }
+
 const DeviceBackend g_host = {
     "host",
     h_count, h_set, h_props, h_enable_peer,
     h_alloc, h_free, h_host_ptr, h_device_ptr,
+    h_host_register, h_host_unregister,
     h_stream_create, h_stream_destroy, h_stream_sync,
     h_event_create, h_event_destroy, h_event_record, h_event_wait,
     h_event_query, h_event_sync, h_event_elapsed_ms,

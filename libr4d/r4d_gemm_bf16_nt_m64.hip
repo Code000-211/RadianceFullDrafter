@@ -132,22 +132,74 @@ __global__ __launch_bounds__(1024) void r4d_gemm_bf16_nt_m64_kernel(
   // how the waves were scheduled.
   const int slot = (col_local * SK + ksplit) * 256;
   const int nthreads = WV * SK * WAVE32;
+
+  // AT SK == 1 THERE IS NOTHING TO REDUCE: lane already holds the finished value.
+  if (SK == 1) {
+    if (n0 >= N) return;
+    const int n = nt * 16 + (lane & 15);
+    if (n < N) {
+#pragma unroll
+      for (int i = 0; i < MT; i++) {
+        const int mb = (mt0 + i) * 16 + 8 * (lane >> 4);
+#pragma unroll
+        for (int e = 0; e < 8; e++) {
+          const int m = mb + e;
+          if (m < M) C[(size_t)m * N + n] = (__hip_bfloat16)acc[i][e];
+        }
+      }
+    }
+    return;
+  }
+
+  // AT N == 1: compact [split][m] epilog (1.25 KiB at SK=20). Only lanes with
+  // (lane & 15) == 0 store their 8 accum values. Finisher reduces only live M rows.
+  if (N == 1) {
+#pragma unroll
+    for (int i = 0; i < MT; i++) {
+      const int row_base = (mt0 + i) * 16;
+      if (row_base >= M) break;
+      const int live_m = (M - row_base < 16) ? (M - row_base) : 16;
+      __syncthreads();
+      if (col_local == 0 && (lane & 15) == 0) {
+        const int m_base = 8 * (lane >> 4);
+#pragma unroll
+        for (int e = 0; e < 8; e++) {
+          red[ksplit * 16 + m_base + e] = acc[i][e];
+        }
+      }
+      __syncthreads();
+      if (tid < live_m) {
+        float v = 0.f;
+#pragma unroll
+        for (int s = 0; s < SK; s++) {
+          v += red[s * 16 + tid];
+        }
+        C[(size_t)(row_base + tid) * N + 0] = (__hip_bfloat16)v;
+      }
+    }
+    return;
+  }
+
 #pragma unroll
   for (int i = 0; i < MT; i++) {
+    const int row_base = (mt0 + i) * 16;
+    if (row_base >= M) break;
     __syncthreads();
 #pragma unroll
     for (int e = 0; e < 8; e++) red[slot + e * WAVE32 + lane] = acc[i][e];   // conflict-free
     __syncthreads();
     for (int idx = tid; idx < WV * 256; idx += nthreads) {
       const int col = idx >> 8, off = idx & 255;
-      float v = 0.f;
-      for (int s = 0; s < SK; s++) v += red[(col * SK + s) * 256 + off];
       const int l = off & 31;
       const int n = (blockIdx.x * WV + col) * 16 + (l & 15);
-      const int m = (mt0 + i) * 16 + 8 * (l >> 4) + (off >> 5);
-      // The language's own float-to-bf16 conversion, deliberately and not the header's f2bf,
-      // which rounds half away from zero.
-      if (n < N && m < M) C[(size_t)m * N + n] = (__hip_bfloat16)v;
+      const int m = row_base + 8 * (l >> 4) + (off >> 5);
+      if (n < N && m < M) {
+        float v = 0.f;
+        for (int s = 0; s < SK; s++) v += red[(col * SK + s) * 256 + off];
+        // The language's own float-to-bf16 conversion, deliberately and not the header's f2bf,
+        // which rounds half away from zero.
+        C[(size_t)m * N + n] = (__hip_bfloat16)v;
+      }
     }
   }
 }
@@ -162,7 +214,7 @@ void r4d_gemm_bf16_nt_m64(long a, long w, long c, int M, int K, int N, int WV, i
   const int ntiles = (N + 15) / 16, mtiles = (M + 15) / 16;
   if (MB < 1 || MB > 4) throw std::runtime_error("r4d gemm_bf16_nt_m64: MB must be 1..4");
   dim3 grid((ntiles + WV - 1) / WV, (mtiles + MB - 1) / MB), block(WV * SK * WAVE32);
-  size_t smem = (size_t)WV * SK * 256 * sizeof(float);
+  size_t smem = (size_t)WV * SK * (N == 1 ? 16 : 256) * sizeof(float);
   auto Ap = (const unsigned short*)a; auto Wp = (const unsigned short*)w;
   auto Cp = (__hip_bfloat16*)c;
   hipStream_t st = (hipStream_t)stream;

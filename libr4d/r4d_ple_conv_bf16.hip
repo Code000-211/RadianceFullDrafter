@@ -8,10 +8,10 @@
 // libref/ref_ple.cpp is the oracle and docs/OPS.md the contract. THE TAPS ARE `dilation` APART, so
 // at this model's width 4 and dilation 3 they sit 9, 6, 3 and 0 timesteps back and the history a
 // sequence carries is (width-1)*dilation = NINE, not three. Every off-by-one in a convolution cache
-// is a model that generates fluently from a slightly wrong context, so the indexing here mirrors
-// ref's line for line: state slot `i` holds the value at relative position `i - hist`, a read at
-// `src < 0` becomes `cs[slot][c][off + src + hist]`, and `has_init` 0 means that window is ZEROS
-// rather than whatever the slot last held.
+// is a model that generates fluently from a slightly wrong context. State is kept as a position-addressed
+// ring of capacity `state_len`: a token at absolute position P is stored at P mod capacity.
+// A negative tap reads absolute position (A + src) mod capacity where A = ctx_lens, and negative
+// positions (or cold slot A==0) read ZEROS rather than whatever the slot last held.
 //
 // ============================== ONE THREAD A CHANNEL ==============================
 //
@@ -104,11 +104,12 @@ __global__ __launch_bounds__(kPcThreads) void ple_conv_kernel(
 
     const int32_t slot = sidx ? sidx[s] : (int32_t)s;
     if (slot < 0) return;
-    /* A cold slot's window is ZEROS and not what the slot last held: a fresh sequence landing on a
-     * recycled slot would otherwise convolve the previous sequence's tail into its first `hist`
-     * tokens -- fluent output with the wrong prefix. */
-    const bool warm = cs && (!hini || hini[s] != 0);
-    const long long off = nacc ? (long long)nacc[s] - 1 : 0;
+    const int32_t cap = (int32_t)state_len;
+    /* `hini` is the sequence's first input token absolute position (batch->ctx_lens[s]).
+     * Cold slots (A == 0) yield pos = A + src < 0 for any negative tap (src < 0), reading 0.0f
+     * regardless of whatever recycled content the slot previously held. */
+    const int32_t A = (cs && hini) ? hini[s] : 0;
+    const int32_t A_mod = (cs && cap > 0) ? (int32_t)((uint32_t)A % (uint32_t)cap) : 0;
 
     /* This channel's taps, read once for the whole tile. */
     float wt[kPcMaxW];
@@ -118,7 +119,6 @@ __global__ __launch_bounds__(kPcThreads) void ple_conv_kernel(
     const uint16_t* __restrict__ xc = x + (size_t)bos * xld + c;
     const uint16_t* __restrict__ rc = resid ? resid + (size_t)bos * rld + c : nullptr;
     uint16_t* __restrict__ dst = cs ? cs + (size_t)slot * cs_slot + (size_t)c * cs_ch : nullptr;
-    const uint16_t* __restrict__ hc = warm ? dst + off * cs_tok : nullptr;
     uint16_t* __restrict__ yc = y + (size_t)bos * yld + c;
 
     for (int32_t t = t0; t < t1; ++t) {
@@ -127,65 +127,46 @@ __global__ __launch_bounds__(kPcThreads) void ple_conv_kernel(
         for (uint32_t j = 0; j < kPcMaxW; ++j) {
             if (j >= wid) break;
             const int32_t src = t - (int32_t)hist + (int32_t)(j * dil);
-            const float v = src >= 0 ? bf16_to_f32(xc[(size_t)src * xld])
-                                     : (hc ? bf16_to_f32(hc[(src + (int32_t)hist) * cs_tok]) : 0.0f);
+            float v;
+            if (src >= 0) {
+                v = bf16_to_f32(xc[(size_t)src * xld]);
+            } else {
+                const int32_t pos = A + src;
+                if (pos >= 0 && dst) {
+                    /* Since cap >= hist and src in [-hist, -1], A_mod + src is in [-cap, cap-2].
+                     * Modulo via compare/add avoids per-element division. */
+                    int32_t r = A_mod + src;
+                    if (r < 0) r += cap;
+                    v = bf16_to_f32(dst[(size_t)r * cs_tok]);
+                } else {
+                    v = 0.0f;
+                }
+            }
             acc += v * wt[j];
         }
         const float r = rc ? bf16_to_f32(rc[(size_t)t * rld]) : 0.0f;
         yc[(size_t)t * yld] = f32_to_bf16(r + pc_silu(acc));
     }
 
-    /* THE WINDOW THIS STEP LEAVES BEHIND, in the same launch and with no barrier at all.
+    /* THE WINDOW THIS STEP LEAVES BEHIND, as a position-addressed ring.
      *
-     * WHICH BLOCK READ THE STATE decides that this is legal: history is read only where
-     * `t - hist + j*dilation < 0`, so only tokens below `hist` reach back -- and `hist` is 9
-     * against a 32-token tile, so TILE ZERO is the only block that ever touches state[slot][c].
-     * Within it one thread owns a whole channel, so its own reads are ordered before its own
-     * writes by program order and there is nothing to synchronise.
+     * In a ring buffer of capacity `cap = state_len`, each new input token is stored at its
+     * absolute position mod cap. Tile 0 owns the whole channel and stores its inputs strictly
+     * after its own reads. No old history words need to be loaded, shifted, or rewritten,
+     * saving 320 KiB of data-movement state traffic per sequence per call.
      *
-     * Folding it in matters because at decode this op is nothing but launches: its cost is flat
-     * from M=1 to M=8, which is the dispatches and none of the work.
+     * Rejected speculative drafts: drafts beyond the accepted count will naturally be overwritten
+     * by the subsequent step, since reads in subsequent steps address history by absolute position
+     * derived from `ctx_lens` (which advances only by the accepted tokens).
      *
-     * THE LAYOUT IS libref/ref_ple.cpp's, and `num_accepted` picks it. Present, this is a decode
-     * step whose drafts a verify may reject: the history read is shifted down by one and every
-     * input of the step follows it, slot i holding position i + 1 of (window read ++ step), so a
-     * next step that kept k tokens reads at k - 1 and finds the history ending at the k-th.
-     * Absent, every token commits and the last `hist` inputs land at offset zero. The two agree
-     * at one token. Slots past `state_len` are not written; the manager sizes the window
-     * hist + n_spec, which covers a step of 1 + n_spec tokens.
-     *
-     * The values are copied as bf16 BITS -- the same tensor's bytes on both sides, and a round
-     * trip through f32 would be a second definition of the state's precision. The step's rows
-     * come out of `x`, which is read-only here, so reading rows another tile is also reading is
-     * not a hazard. Every history value is loaded before the first store, as in the tail form. */
+     * For prefill chunks exceeding `cap`, writing the last `cap` tokens guarantees that the
+     * required `hist` history tokens are present for future steps. */
     if (!dst || blockIdx.y != 0) return;
-    uint16_t keep[kPcMaxHist];
-    if (nacc) {
-#pragma unroll
-        for (uint32_t i = 0; i + 1 < kPcMaxHist; ++i) {
-            if (i + 1 >= hist) break;
-            keep[i] = hc ? hc[(size_t)(i + 1) * cs_tok] : (uint16_t)0;
-        }
-#pragma unroll
-        for (uint32_t i = 0; i + 1 < kPcMaxHist; ++i) {
-            if (i + 1 >= hist) break;
-            dst[(size_t)i * cs_tok] = keep[i];
-        }
-        for (int32_t t = 0; t < slen && (long long)hist - 1 + t < state_len; ++t)
-            dst[(size_t)(hist - 1 + (uint32_t)t) * cs_tok] = xc[(size_t)t * xld];
-        return;
-    }
-#pragma unroll
-    for (uint32_t i = 0; i < kPcMaxHist; ++i) {
-        if (i >= hist) break;
-        const int32_t src = slen - (int32_t)hist + (int32_t)i;
-        keep[i] = src >= 0 ? xc[(size_t)src * xld]
-                           : (hc ? hc[(src + (int32_t)hist) * cs_tok] : (uint16_t)0);
-    }
-#pragma unroll
-    for (uint32_t i = 0; i < kPcMaxHist; ++i) {
-        if (i >= hist) break;
-        dst[(size_t)i * cs_tok] = keep[i];
+    const int32_t t_start = max(0, slen - cap);
+    int32_t r = (int32_t)((uint32_t)(A + t_start) % (uint32_t)cap);
+    for (int32_t t = t_start; t < slen; ++t) {
+        dst[(size_t)r * cs_tok] = xc[(size_t)t * xld];
+        if (++r == cap) r = 0;
     }
 }
 
@@ -253,8 +234,10 @@ extern "C" int r4d_rad_ple_conv(const RadArgs* a, RadStream s) {
         state_len = r4d_dim(cs, 2);
     }
 
+    const long long M = r4d_geti_or(a, "M", 0);
+    const long long max_q = (M > 0 && M <= T) ? M : T;   /* longest sequence; NOT bounded by state_len */
     const uint32_t cb = (uint32_t)((n + kPcThreads - 1) / kPcThreads);
-    const uint32_t tb = (uint32_t)((T + kPcBT - 1) / kPcBT);
+    const uint32_t tb = (uint32_t)((max_q + kPcBT - 1) / kPcBT);
     hipLaunchKernelGGL(ple_conv_kernel, dim3(cb, tb, (uint32_t)N), dim3(kPcThreads), 0,
                        (hipStream_t)s,
                        (const uint16_t*)r4d_addr(x), (const uint16_t*)r4d_addr(w),

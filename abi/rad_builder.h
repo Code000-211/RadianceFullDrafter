@@ -409,8 +409,12 @@ int rad_buf_concurrent(RadBuilder* b, rad_buf buf);
  * groups the span would cut. */
 int rad_weight_shard_span(RadBuilder* b, rad_weight w, int64_t lo, int64_t hi);
 
+#ifdef __cplusplus
+#define RAD_BUFS(...)  std::initializer_list<rad_buf>{ __VA_ARGS__ }
+#else
 #define RAD_BUFS(...)  ((const rad_buf[]){ __VA_ARGS__ }), \
                        (int)(sizeof((const rad_buf[]){ __VA_ARGS__ }) / sizeof(rad_buf))
+#endif
 
 /* Did the last rad_decl_op resolve? A plugin asks for the fused op first and emits the unfused
  * sequence when it does not, which is what makes fusion a selection rather than a compiler pass

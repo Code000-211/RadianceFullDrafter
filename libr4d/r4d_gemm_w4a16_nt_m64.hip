@@ -261,6 +261,27 @@ __global__ __launch_bounds__(1024) void r4d_gemm_w4a16_nt_m64_kernel(
   // on how the waves were scheduled.
   const int ncols = WV * NPW;
   const int nthreads = WV * SK * WAVE32;
+
+  // AT SK == 1 THERE IS NOTHING TO REDUCE: lane already holds the finished value.
+  if (SK == 1) {
+    if (n0 >= N) return;
+#pragma unroll
+    for (int j = 0; j < NPW; j++) {
+      const int n = (nt0 + j) * 16 + (lane & 15);
+      if (n >= N) continue;
+#pragma unroll
+      for (int i = 0; i < MT; i++) {
+        const int mb = (mt0 + i) * 16 + 8 * (lane >> 4);
+#pragma unroll
+        for (int e = 0; e < 8; e++) {
+          const int m = mb + e;
+          if (m < M) C[(size_t)m * N + n] = (__hip_bfloat16)acc[j][i][e];
+        }
+      }
+    }
+    return;
+  }
+
 #pragma unroll
   for (int i = 0; i < MT; i++) {
     __syncthreads();

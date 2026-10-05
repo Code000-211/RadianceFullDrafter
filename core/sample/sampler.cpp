@@ -510,7 +510,9 @@ bool Sampler::speculation_fixed(uint64_t req_id) const {
 int Sampler::build_step(const std::vector<Request*>& reqs) {
     if (!declared_) return RAD_E_STATE;
 
-    const auto t_build = std::chrono::steady_clock::now();
+    const auto t_build = ((int)log_level() >= (int)Log::Debug)
+                             ? std::chrono::steady_clock::now()
+                             : std::chrono::steady_clock::time_point{};
     const int64_t cap = rows_for(cfg_);
     n_seq_ = 0;
     any_brk_ = false;
@@ -691,7 +693,8 @@ int Sampler::build_step(const std::vector<Request*>& reqs) {
                  * constrained token and would decide the step if it were slow. Reported at Debug,
                  * per 256 masks, mean and worst. */
                 const bool   inst = (int)log_level() >= (int)Log::Debug;
-                const auto   t0   = std::chrono::steady_clock::now();
+                const auto   t0   = inst ? std::chrono::steady_clock::now()
+                                         : std::chrono::steady_clock::time_point{};
                 /* ASK THE GRAMMAR WHETHER IT COMPUTED THE MASK, rather than inferring it from how
                  * long the call took. No duration threshold separates the two: a mask computed
                  * from the plan can finish inside the time a memo hit costs on a large
@@ -851,6 +854,7 @@ int Sampler::run(RadCtx* c, rad_buf logits, rad_buf out_tokens) {
     bool any_mask = false, any_greedy = false, any_chain = false;
     bool any_penalty = false, any_dry = false, any_xtc = false;
     bool any_topp = false, any_minp = false, any_typ = false;
+    bool any_temp = false;
     for (int64_t i = 0; i < n_seq_; ++i) {
         const DeviceSampleParams& p = cur_stage_[i];
         any_mask    |= (p.flags & RAD_SP_MASK)    != 0;
@@ -860,6 +864,7 @@ int Sampler::run(RadCtx* c, rad_buf logits, rad_buf out_tokens) {
         if (p.flags & RAD_SP_GREEDY) any_greedy = true;
         else {
             any_chain = true;
+            any_temp |= (p.temp > 0.0f && p.temp != 1.0f);
             any_topp |= p.top_p < 1.0f;
             any_minp |= p.min_p > 0.0f;
             any_typ  |= p.typical_p < 1.0f;
@@ -902,8 +907,7 @@ int Sampler::run(RadCtx* c, rad_buf logits, rad_buf out_tokens) {
     const RadOperand o_tok = opd_rows(out_tokens, n_seq_);
 
     auto issue = [&](rad_op op, std::initializer_list<RadOperand> ops) -> int {
-        std::vector<RadOperand> v(ops);
-        return rad_issue(c, op, v.data(), (int)v.size(), n_seq_);
+        return rad_issue(c, op, ops.begin(), (int)ops.size(), n_seq_);
     };
 
     /* Penalties act on raw logits, before anything derives a probability from them. DRY takes the
@@ -931,7 +935,7 @@ int Sampler::run(RadCtx* c, rad_buf logits, rad_buf out_tokens) {
 
     if (!any_chain) return RAD_OK;
 
-    RAD_TRY(issue(op_temp_, { o_logits, o_params }));
+    if (any_temp) RAD_TRY(issue(op_temp_, { o_logits, o_params }));
     if (any_mask && !any_greedy)
         RAD_TRY(issue(op_mask_, { o_logits, o_params, o_mask }));
 
@@ -945,8 +949,8 @@ int Sampler::run(RadCtx* c, rad_buf logits, rad_buf out_tokens) {
      * step's candidates, or another op's bytes. */
     if (vocab_parallel()) {
         /* The fifth operand is the pair plane: this rank's candidates with GLOBAL ids, which is
-         * what crosses the wire. cand_idx and cand_val still come back LOCAL and the merge
-         * overwrites both, so nothing downstream ever sees a local id. */
+         * what crosses the wire. cand_idx and cand_val are omitted (pair-only) because the merge
+         * overwrites both, so local stores are dead in TP2. */
         const RadOperand o_p = opd_rows(buf_pairs_, n_seq_);
         const RadOperand o_g = opd_rows(buf_gather_, n_seq_);
         RAD_TRY(issue(op_topk_,      { o_logits, o_params, o_ci, o_cv, o_p }));

@@ -351,7 +351,7 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
     }
 
     /* ---- streams, events, move records ------------------------------------------------------ */
-    RAD_TRY(rad_stream_create(&mover_, /*high_priority=*/0));
+    RAD_TRY(rad_stream_create(&mover_, /*high_priority=*/1));
     /* EVERY EVENT HERE IS LOCAL. They order the mover's queue against this card's compute queue
      * and tell the host WHEN a slot is free; the bytes they order are read by this card's kernels
      * and never by the host through them. A copy out to host memory carries the system scope on

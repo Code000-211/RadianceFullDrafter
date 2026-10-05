@@ -883,7 +883,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                          RAD_BUF_PERSIST);
     m.b_sorted  = decl_b(b, nm.f("moe_sorted"), RAD_I32,     {ER});
     m.b_egu     = decl_b(b, nm.f("moe_egu"),    g.act_dtype, {ER, 2 * m.moecfg.n_ff_exp});
-    m.a_eff.x   = decl_b(b, nm.f("moe_eff"),    g.act_dtype, {ER, m.moecfg.n_ff_exp});
+    if (m.moecfg.expert_bf16)
+        m.a_eff.x = decl_b(b, nm.f("moe_eff"),    g.act_dtype, {ER, m.moecfg.n_ff_exp});
     /* ER ROWS, NOT max_tok: this is an EXPERT plane, one row per (token, slot). Taking
      * declare_qs's default declares it `top_k` times too short, and the gated quantiser then
      * writes that many times past the end of it -- see ActFP8::declare_qs, which is where the
@@ -1268,9 +1269,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             /* NAMED and declared, because the engine reads the proposal straight out of it: a
              * draft round's token comes from row_topk and never through the sampler. */
             /* kDraftTopR COLUMNS, and a draft reads one. The rest are the coarse head's other
-             * candidates, which `logit_rerank` scores before column 0 is taken, and their width
-             * is also what gives the vocab-parallel all-gather a 16-byte row; rad_block_mtp_hc.h's
-             * kDraftTopR says why. */
+             * candidates, which `logit_rerank` scores before column 0 is taken; SD02 gathers and
+             * merges only the top kDraftGatherR candidates (16-byte row for ar_gather_2rank). */
             m.b_mtp_didx = decl_b(b, nm.f("mtp_didx"), RAD_I32, {g.max_logit_rows, kDraftTopR});
             m.b_mtp_dval = decl_b(b, nm.f("mtp_dval"), RAD_F32, {g.max_logit_rows, kDraftTopR});
         }
@@ -1462,9 +1462,23 @@ static void step(RadCtx* c, const RadBatch* batch) {
      * into, because the first thing that touches the stream is a gated-residual read. */
     if (m.op_embed_ar)
         RAD_ISSUE_N(c, m.op_embed_ar, T * g.n_embd, brows(m.a_x.x, T), RAD_NONE);
-    /* The PLE's hash, ahead of every layer: its host gather waits for it, and the layers issued
-     * between the two keep the device busy while the host gathers (rad_block_ple.h). */
-    if (m.ple_layer >= 0) m.ple.ids(c, batch);
+    /* The PLE's token-dependent ops (hash, gather, cast, key/value projections) run on Lane 1
+     * concurrently with enter, rope, and Layer 0 (Block 0 GDN + MoE), hiding PLE gather latency.
+     * ONLY FOR SMALL PASSES: a prefill chunk's PLE GEMMs compete with Block 0 for the CUs instead
+     * of filling idle ones -- measured -6% at 64k prefill, while decode/verify gains. Large passes
+     * run it inline at the PLE layer. T is a recorded shape, so the branch is replay-stable. */
+    static const bool ple_nolane = getenv("RAD_PLE_NOLANE") != nullptr;  /* A/B switch */
+    const bool ple_inline = ple_nolane || T > 128;
+    if (m.ple_layer >= 0 && !ple_inline) {
+        /* JOIN FIRST. Lane 1 is not ordered behind the previous pass's lane 0 by anything else,
+         * and the host runs ahead of the device: without this the prep of THIS pass overwrites
+         * ple_ids / ple_k / ple_v and the n-gram window state while the previous pass's gate on
+         * lane 0 still reads them -- fluent, wrong text and a collapsed draft acceptance. */
+        rad_lane(c, 1);              /* builds lane 1 on first use; lane_join is a no-op before */
+        rad_lane_join(c, 0, 1);
+        m.ple.prep(c, batch);
+        rad_lane(c, 0);
+    }
     m.enter.step(c, T);
 
     if (m.op_rope_cs && T <= qk_fuse_rows(g) && !rope_mixed(batch))
@@ -1472,14 +1486,18 @@ static void step(RadCtx* c, const RadBatch* batch) {
 
     for (int64_t li = 0; li < m.n_run && li < (int64_t)m.layers.size(); ++li) {
         const Layer& l = m.layers[(size_t)li];
-        /* Before the attention connection reads the stream, which is where the reference puts it. */
-        if (li == m.ple_layer) m.ple.step(c, batch);
+        /* Before the attention connection reads the stream: join lane 1 and issue gate, conv, add. */
+        if (li == m.ple_layer) {
+            if (ple_inline) m.ple.prep(c, batch);
+            else            rad_lane_join(c, 1, 0);
+            m.ple.gate_conv_add(c, batch);
+        }
         {
             l.hc_mix.read(c, T, 0, T);
-            /* THE INDEXER RUNS FIRST, because the attention reads its selection. It can: this
-             * block's input is normed and quantised by the caller (`ext_in`), so `w.h` is already
-             * what it will be when the attention runs. */
-            if (l.full) { l.qsa.step(c, l.attn.w.h, batch); l.attn.step(c, batch); }
+            if (l.full) {
+                l.qsa.step(c, l.attn.w.h, batch);
+                l.attn.step(c, batch);
+            }
             else        l.gdn.step(c, batch);
             l.hc_mix.write(c, T, 0, T);
         }
@@ -1492,9 +1510,11 @@ static void step(RadCtx* c, const RadBatch* batch) {
         dbg_resid(c, (int)li, "ffn", g.n_embd, m.b_h, m.a_x.x);
     }
 
-    m.mixer.read(c, T, 0, T);
-
     if (batch->n_out > 0) {
+        if (batch->n_seq == 1 && batch->n_out < T)
+            m.mixer.read(c, T, T - batch->n_out, batch->n_out);
+        else
+            m.mixer.read(c, T, 0, T);
         RAD_ISSUE_N(c, m.op_gather, batch->n_out,
                     brows(m.a_x.x, T), praw(batch->out_ids, RAD_I32, batch->n_out),
                     brows(m.b_hout, batch->n_out));

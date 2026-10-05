@@ -55,6 +55,8 @@
 #include "r4d.h"
 #include "r4d_common.h"
 #include "r4d_fp8_wmma.h"
+#include "r4d_fwht.h"
+#include "r4d_q8.h"
 #include "r4d_plugin.h"
 #include "r4d_emit.h"
 
@@ -218,10 +220,13 @@ __device__ __forceinline__ int32_t sort_place(int32_t e, uint32_t n_local, const
 }
 
 struct SlotSink {
-    int32_t* e;
-    int32_t  base;
-    uint32_t n_local;
-    Protect  prot;
+    int32_t* e       = nullptr;
+    int32_t  base    = 0;
+    uint32_t n_local = 0;
+    Protect  prot{};
+    int32_t* s_h     = nullptr;
+    uint32_t s_0     = 0;
+    uint32_t s_1     = 0;
 };
 
 template <uint32_t MAXOWN>
@@ -271,14 +276,28 @@ __device__ __forceinline__ void router_topk_row(
         key[i] = topk_key(raw[i], e) & (0u - (uint32_t)ok);
     }
 
-    float mx = -INFINITY;
+    /* R4-05: Round 0 of integer top-k finds the row maximum, eliminating the separate float max. */
+    uint32_t P     = 0xFFFFFFFFu;     /* round 0 may take any key */
+    uint32_t mykey = 0u;
+    uint32_t nsel  = 0;
+
+    uint32_t d0 = 0xFFFFFFFFu;
 #pragma unroll
-    for (uint32_t i = 0; i < MAXOWN; ++i) mx = fmaxf(mx, v[i]);
-    mx = fmaxf(mx, r4d_xor_lane<16>(mx));
-    mx = fmaxf(mx, r4d_xor_lane<8>(mx));
-    mx = fmaxf(mx, r4d_xor_lane<4>(mx));
-    mx = fmaxf(mx, r4d_xor_lane<2>(mx));
-    mx = fmaxf(mx, r4d_xor_lane<1>(mx));
+    for (uint32_t i = 0; i < MAXOWN; ++i) {
+        const uint32_t t = P - key[i];
+        d0 = d0 < t ? d0 : t;
+    }
+    const uint32_t best0 = P - wave_min_u32(d0);
+    float mx;
+    if ((best0 & 0xFFFFu) == 0u) {
+        mx = -INFINITY;
+    } else {
+        if (lane == 0) mykey = best0;
+        P = best0 - 1u;
+        nsel = 1;
+        const uint16_t raw_mx = topk_key_raw(best0);
+        mx = bf16_to_f32(raw_mx);
+    }
 
     float sum = 0.0f;
 #pragma unroll
@@ -286,42 +305,20 @@ __device__ __forceinline__ void router_topk_row(
     sum = r4d_wave_sum(sum);
     const float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
 
-    /* ---- THE SELECTION LEAVES IN A REGISTER, NOT THROUGH DEVICE MEMORY AND BACK.
-     *
-     * The reference stores each selected probability as bf16 and, if `norm`, scales the STORED
-     * value -- so that round trip is part of the answer. Done literally it is top_k scalar stores,
-     * top_k dependent loads and top_k more stores on one lane of one wave, and on a decode step
-     * this kernel is one workgroup, so that chain would be its whole cost. Round r parks its
-     * winner on LANE r instead, which needs top_k <= kWave; both launchers refuse more.
-     *
-     * ROUND r TAKES THE LARGEST KEY BELOW ROUND r-1's, rather than zeroing the last winner and
-     * taking the largest one left. Keys are unique -- the low half is ~id -- so the two are the
-     * same sequence, but zeroing is a compare and a select on every entry, each waiting on the
-     * one condition register, top_k times over. "Below" is one subtraction instead: with P the
-     * last winner minus one, P - key is at most P for every key not above P and wraps past P for
-     * every key already taken, so the smallest P - key names the largest key not yet taken. An
-     * absent or NaN entry (key 0) gives P itself, so it is chosen only once nothing real is left,
-     * and that is the `nothing left` exit.
-     *
-     * THE PROBABILITIES ARE WORKED OUT AFTER THE LOOP, each on the lane its winner is parked on,
-     * from the same expression on the same inputs, so the same bits. `wsum` then adds them in
-     * round order, the order the reference adds them in, and the renormalisation reads the bf16
-     * that was produced, not the f32 behind it, as the reference does. */
-    uint32_t P     = 0xFFFFFFFFu;     /* round 0 may take any key */
-    uint32_t mykey = 0u;
-    uint32_t nsel  = 0;
-    for (uint32_t r = 0; r < top_k; ++r) {
-        uint32_t d = 0xFFFFFFFFu;
+    if (nsel > 0) {
+        for (uint32_t r = 1; r < top_k; ++r) {
+            uint32_t d = 0xFFFFFFFFu;
 #pragma unroll
-        for (uint32_t i = 0; i < MAXOWN; ++i) {
-            const uint32_t t = P - key[i];
-            d = d < t ? d : t;
+            for (uint32_t i = 0; i < MAXOWN; ++i) {
+                const uint32_t t = P - key[i];
+                d = d < t ? d : t;
+            }
+            const uint32_t best = P - wave_min_u32(d);
+            if ((best & 0xFFFFu) == 0u) break;    /* fewer live entries than top_k: nothing left */
+            if (lane == r) mykey = best;
+            P = best - 1u;
+            ++nsel;
         }
-        const uint32_t best = P - wave_min_u32(d);
-        if ((best & 0xFFFFu) == 0u) break;    /* fewer live entries than top_k: nothing left */
-        if (lane == r) mykey = best;
-        P = best - 1u;
-        ++nsel;
     }
     const float    p  = __expf(bf16_to_f32(topk_key_raw(mykey)) - mx) * inv;
     const uint16_t pb = f32_to_bf16(p);
@@ -330,9 +327,19 @@ __device__ __forceinline__ void router_topk_row(
         wsum += __builtin_bit_cast(float,
                     __builtin_amdgcn_readlane(__builtin_bit_cast(int, p), (int)r));
     if (lane < nsel) {
-        ids[(size_t)m * top_k + lane] = (int32_t)(~mykey & 0xFFFFu);
-        w[(size_t)m * top_k + lane]   = (norm && wsum > 0.0f)
-                                      ? f32_to_bf16(bf16_to_f32(pb) * (1.0f / wsum)) : pb;
+        const uint32_t s = m * top_k + lane;
+        const bool own = (snk.s_1 == 0) || (s >= snk.s_0 && s < snk.s_1);
+        if (own) {
+            ids[(size_t)s] = (int32_t)(~mykey & 0xFFFFu);
+            w[(size_t)s]   = (norm && wsum > 0.0f)
+                           ? f32_to_bf16(bf16_to_f32(pb) * (1.0f / wsum)) : pb;
+            if (snk.s_h) {
+                const int32_t e = (int32_t)(~mykey & 0xFFFFu) - snk.base;
+                if (e >= 0 && e < (int32_t)snk.n_local) {
+                    atomicAdd(&snk.s_h[sort_place(e, snk.n_local, snk.prot)], 1);
+                }
+            }
+        }
     }
     if (snk.e && lane < top_k) {
         const int32_t e  = (int32_t)(~mykey & 0xFFFFu) - snk.base;
@@ -538,6 +545,45 @@ __global__ __launch_bounds__(NW * kWave) void router_topk_scatter_kernel(
  * deciding anything. `bcnt` is [n_tile, n_expert] in scratch. */
 constexpr uint32_t kScatterTile = 256;
 
+/* R4-01: Prefill router-top-k and histogram fusion for M >= 128 (T > kScatterSmall).
+ * Each CTA processes a histogram tile of 256 slots (the tokens falling into that slot range).
+ * It calculates the Top-K selection for its assigned tokens, writes IDs and weights strictly
+ * according to its ownership mask to prevent write collisions, and immediately increments the
+ * LDS histogram counter for the winning experts. */
+template <uint32_t MAXOWN>
+__global__ __launch_bounds__(kScatterTile) void router_topk_prefill_hist_kernel(
+    const uint16_t* __restrict__ lg, int32_t* __restrict__ ids, uint16_t* __restrict__ w,
+    int32_t* __restrict__ bcnt,
+    uint32_t M, uint32_t n_expert, uint32_t n_local, uint32_t top_k, uint32_t lg_ld, int norm,
+    int32_t base, Protect prot) {
+    extern __shared__ int32_t s_h[];
+    const uint32_t tid = threadIdx.x, b = blockIdx.x;
+    for (uint32_t e = tid; e < n_local; e += blockDim.x) s_h[e] = 0;
+    __syncthreads();
+
+    const uint32_t T = M * top_k;
+    const uint32_t s_0 = b * kScatterTile;
+    if (s_0 >= T) return;
+    const uint32_t s_1 = (s_0 + kScatterTile < T) ? (s_0 + kScatterTile) : T;
+
+    const uint32_t m_start = s_0 / top_k;
+    const uint32_t m_end   = (s_1 - 1) / top_k;
+
+    const uint32_t wave = tid / kWave;
+    const uint32_t lane = tid % kWave;
+    constexpr uint32_t NW = kScatterTile / kWave;
+
+    const SlotSink snk{nullptr, base, n_local, prot, s_h, s_0, s_1};
+
+    for (uint32_t m = m_start + wave; m <= m_end; m += NW) {
+        router_topk_row<MAXOWN>(lg, ids, w, m, n_expert, top_k, lg_ld, norm, lane, snk);
+    }
+    __syncthreads();
+
+    for (uint32_t e = tid; e < n_local; e += blockDim.x)
+        bcnt[(size_t)b * n_local + e] = s_h[e];
+}
+
 __global__ __launch_bounds__(kScatterTile) void scatter_hist_kernel(
     const int32_t* __restrict__ ids, int32_t* __restrict__ bcnt, uint32_t T, uint32_t n_expert,
     int32_t base, Protect prot) {
@@ -562,23 +608,69 @@ __global__ __launch_bounds__(kScatterTile) void scatter_hist_kernel(
 __global__ __launch_bounds__(256) void scatter_scan_kernel(
     int32_t* __restrict__ bcnt, int32_t* __restrict__ off, int32_t* __restrict__ cnt,
     uint32_t n_tile, uint32_t n_expert) {
-    __shared__ int32_t s_cnt[kMaxExpert + 1];
+    __shared__ int32_t s_wt[2][8];
     const uint32_t tid = threadIdx.x;
-    for (uint32_t e = tid; e < n_expert; e += blockDim.x) {
+    const uint32_t wave = tid / kWave;
+    const uint32_t lane = tid % kWave;
+
+    int32_t v1 = 0;
+    if (tid < n_expert) {
         int32_t run = 0;
         for (uint32_t b = 0; b < n_tile; ++b) {
-            const int32_t v = bcnt[(size_t)b * n_expert + e];
-            bcnt[(size_t)b * n_expert + e] = run;
+            const int32_t v = bcnt[(size_t)b * n_expert + tid];
+            bcnt[(size_t)b * n_expert + tid] = run;
             run += v;
         }
-        s_cnt[e] = run;
-        cnt[e]   = run;
+        v1 = run;
+        cnt[tid] = run;
+    }
+
+    int32_t v2 = 0;
+    if (tid + 256 < n_expert) {
+        const uint32_t e2 = tid + 256;
+        int32_t run = 0;
+        for (uint32_t b = 0; b < n_tile; ++b) {
+            const int32_t v = bcnt[(size_t)b * n_expert + e2];
+            bcnt[(size_t)b * n_expert + e2] = run;
+            run += v;
+        }
+        v2 = run;
+        cnt[e2] = run;
+    }
+
+    const int32_t x1 = wave_incl_scan_i32(v1, lane);
+    const int32_t x2 = wave_incl_scan_i32(v2, lane);
+
+    if (lane == kWave - 1) {
+        s_wt[0][wave] = x1;
+        s_wt[1][wave] = x2;
     }
     __syncthreads();
+
+    int32_t below0 = 0, tot0 = 0;
+#pragma unroll
+    for (uint32_t k = 0; k < 8; ++k) {
+        const int32_t c = s_wt[0][k];
+        below0 += (k < wave) ? c : 0;
+        tot0   += c;
+    }
+
+    int32_t below1 = 0, tot1 = 0;
+#pragma unroll
+    for (uint32_t k = 0; k < 8; ++k) {
+        const int32_t c = s_wt[1][k];
+        below1 += (k < wave) ? c : 0;
+        tot1   += c;
+    }
+
+    if (tid < n_expert) {
+        off[tid] = below0 + x1 - v1;
+    }
+    if (tid + 256 < n_expert) {
+        off[tid + 256] = tot0 + below1 + x2 - v2;
+    }
     if (tid == 0) {
-        int32_t run = 0;
-        for (uint32_t e = 0; e < n_expert; ++e) { off[e] = run; run += s_cnt[e]; }
-        off[n_expert] = run;
+        off[n_expert] = tot0 + tot1;
     }
 }
 
@@ -586,29 +678,60 @@ __global__ __launch_bounds__(kScatterTile) void scatter_place_kernel(
     const int32_t* __restrict__ ids, const int32_t* __restrict__ bcnt,
     const int32_t* __restrict__ off, int32_t* __restrict__ sorted,
     uint32_t T, uint32_t n_expert, int32_t base, Protect prot) {
-    __shared__ int32_t s_id[kScatterTile];
+    constexpr uint32_t NW = kScatterTile / kWave;  /* 8 waves */
+    __shared__ uint32_t s_ballot[NW][10];
     const uint32_t tid = threadIdx.x, b = blockIdx.x;
     const uint32_t i = b * kScatterTile + tid;
+    const uint32_t live = (uint32_t)off[n_expert];
+    if (i >= live && i < T) sorted[i] = -1;
     /* THE PLACE IN THE SORT throughout -- the local expert index, with any protected experts moved
      * last: s_id, the range test and the rank scan all work in the indices the offsets and the
      * weight tables are built from. */
     const int32_t  l = (i < T) ? ids[i] - base : -1;
     const int32_t  e = (l >= 0 && l < (int32_t)n_expert) ? sort_place(l, n_expert, prot) : -1;
-    s_id[tid] = e;
-    __syncthreads();
-    if (i >= T || e < 0) return;
-    /* Rank within the tile: how many earlier slots of this tile chose the same expert. A serial
-     * scan of at most 256 LDS words a thread, which is the price of stability. */
-    int32_t rank = 0;
-    for (uint32_t j = 0; j < tid; ++j) rank += (s_id[j] == e);
-    sorted[off[e] + bcnt[(size_t)b * n_expert + e] + rank] = (int32_t)i;
-}
+    const bool valid = (e >= 0);
 
-__global__ void scatter_tail_kernel(const int32_t* __restrict__ off, int32_t* __restrict__ sorted,
-                                    uint32_t T, uint32_t n_expert) {
-    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    const uint32_t live = (uint32_t)off[n_expert];
-    if (i >= live && i < T) sorted[i] = -1;
+    const uint32_t wave = tid / kWave;
+    const uint32_t lane = tid % kWave;
+
+    uint32_t b_planes[9];
+#pragma unroll
+    for (int bit = 0; bit < 9; ++bit) {
+        b_planes[bit] = __builtin_amdgcn_ballot_w32(valid && ((e >> bit) & 1));
+    }
+    const uint32_t bv = __builtin_amdgcn_ballot_w32(valid);
+
+    if (lane < 9) {
+        s_ballot[wave][lane] = b_planes[lane];
+    } else if (lane == 9) {
+        s_ballot[wave][9] = bv;
+    }
+    __syncthreads();
+
+    if (!valid) return;
+
+    int32_t rank = 0;
+#pragma unroll
+    for (uint32_t w = 0; w < 8; ++w) {
+        if (w < wave) {
+            uint32_t m = s_ballot[w][9];
+#pragma unroll
+            for (int bit = 0; bit < 9; ++bit) {
+                m &= ((e >> bit) & 1) ? s_ballot[w][bit] : ~s_ballot[w][bit];
+            }
+            rank += __builtin_popcount(m);
+        }
+    }
+    {
+        uint32_t m = bv & ((1u << lane) - 1u);
+#pragma unroll
+        for (int bit = 0; bit < 9; ++bit) {
+            m &= ((e >> bit) & 1) ? b_planes[bit] : ~b_planes[bit];
+        }
+        rank += __builtin_popcount(m);
+    }
+
+    sorted[off[e] + bcnt[(size_t)b * n_expert + e] + rank] = (int32_t)i;
 }
 
 
@@ -653,6 +776,30 @@ __device__ __forceinline__ uint32_t w4_e4m3(uint32_t nib, const uint32_t (&tab)[
     const uint32_t hi  = __builtin_amdgcn_perm(tab[3], tab[2], m);
     const uint32_t sel = 0x03020100u + ((nib & 0x08080808u) >> 1);
     return __builtin_amdgcn_perm(hi, lo, sel);
+}
+
+/* KM01: w4nl levels are 8 positive magnitudes in tab[0..1] and their exact negatives with
+ * the E4M3 sign bit (0x80) set in tab[2..3]. We unpack the magnitude with one permute out of
+ * tab[1], tab[0], and set the sign bit directly from nibble bit 3 with ((nib & 0x08080808) << 4).
+ * Eliminates 2 permutes, 1 add, and 1 shift per 4 weights (16 permutes per 32 weights). */
+__device__ __forceinline__ uint32_t w4nl_e4m3(uint32_t nib, const uint32_t (&tab)[4]) {
+    const uint32_t m  = nib & 0x07070707u;
+    const uint32_t lo = __builtin_amdgcn_perm(tab[1], tab[0], m);
+    return lo | ((nib & 0x08080808u) << 4);
+}
+
+__device__ __forceinline__ Stage8 w4nl_expand(uint4 p, const uint32_t (&tab)[4]) {
+    const uint32_t d[4] = { p.x, p.y, p.z, p.w };
+    uint32_t o[8];
+#pragma unroll
+    for (uint32_t i = 0; i < 4; ++i) {
+        o[2 * i]     = w4nl_e4m3(d[i] & 0x0F0F0F0Fu, tab);
+        o[2 * i + 1] = w4nl_e4m3((d[i] >> 4) & 0x0F0F0F0Fu, tab);
+    }
+    Stage8 r;
+    r.v = make_uint4(o[0], o[1], o[2], o[3]);
+    r.w = make_uint4(o[4], o[5], o[6], o[7]);
+    return r;
 }
 
 __device__ __forceinline__ Stage8 w4_expand(uint4 p, const uint32_t (&tab)[4]) {
@@ -907,6 +1054,9 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_q_kernel(
         r0 = (ES ? (blockIdx.x / FM) : blockIdx.x) * FM;
         if (r0 >= T) return;
         rN = (r0 + FM < T) ? (r0 + FM) : T;
+        if constexpr (ES) {
+            if (jrun >= (rN - r0)) return;
+        }
     }
     const uint32_t n0 = blockIdx.y * FN;
 
@@ -1176,7 +1326,11 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_q_kernel(
             }
             if (tid < FM) s_as[tid] = pas;
             else if (tid < FM + FN) {
-                if constexpr (kSub > 1) {
+                if constexpr (kSub == 2) {
+                    const v2f sc = r4d_fp8::e4m3_pk<false>((uint32_t)pws);
+                    s_ws[0 * FN + tid - FM] = sc.x * kW4G64Scale;
+                    s_ws[1 * FN + tid - FM] = sc.y * kW4G64Scale;
+                } else if constexpr (kSub > 1) {
                     /* The tile's scale groups in column order, the first in the low byte. */
 #pragma unroll
                     for (uint32_t q = 0; q < kSub; ++q)
@@ -1781,18 +1935,38 @@ extern "C" int r4d_rad_router_topk(const RadArgs* a, RadStream s) {
 static int protect_of(const RadArgs* a, long long n_local, Protect* p) {
     *p = Protect{};
     const char* s = r4d_gets(a, "protect");
-    if (!s) return RAD_OK;
+    if (!s || !*s) return RAD_OK;
+
+    struct ProtectCacheEntry {
+        const char* str = nullptr;
+        long long n_local = 0;
+        Protect prot{};
+        int rc = 0;
+    };
+    static ProtectCacheEntry s_cache[64];
+    static int s_cache_len = 0;
+    for (int i = 0; i < s_cache_len; ++i) {
+        if (s_cache[i].str == s && s_cache[i].n_local == n_local) {
+            *p = s_cache[i].prot;
+            return s_cache[i].rc;
+        }
+    }
+
     long long prev = -1;
-    while (*s) {
+    const char* cur = s;
+    while (*cur) {
         char* end = nullptr;
-        const long long v = std::strtoll(s, &end, 10);
-        if (end == s || v <= prev || v >= n_local || p->n >= kMaxProtect)
+        const long long v = std::strtoll(cur, &end, 10);
+        if (end == cur || v <= prev || v >= n_local || p->n >= kMaxProtect)
             return R4D_NO(RAD_E_SHAPE);
         p->e[p->n++] = (uint16_t)v;
         prev = v;
-        s = end;
-        if (*s == ',') ++s;
-        else if (*s) return R4D_NO(RAD_E_SHAPE);
+        cur = end;
+        if (*cur == ',') ++cur;
+        else if (*cur) return R4D_NO(RAD_E_SHAPE);
+    }
+    if (s_cache_len < 64) {
+        s_cache[s_cache_len++] = { s, n_local, *p, RAD_OK };
     }
     return RAD_OK;
 }
@@ -1841,43 +2015,113 @@ static int rad_router_topk_scatter_body(const RadArgs* a, const R4dSink& sk) {
         !r4d_contig(cnt)) return R4D_NO(RAD_E_STRIDE);
 
     const long long T = M * top_k;
-    if (T > (long long)kScatterSmall) return R4D_NO(RAD_E_SHAPE);
     if (r4d_numel(ids) < T || r4d_numel(w) < T) return R4D_NO(RAD_E_SHAPE);
     if (r4d_numel(sorted) < T) return R4D_NO(RAD_E_SHAPE);
     if (r4d_numel(off) < n_local + 1 || r4d_numel(cnt) < n_local) return R4D_NO(RAD_E_SHAPE);
 
+    if (T <= (long long)kScatterSmall) {
 #define R4D_RTS_L(OWN, NWV)                                                                     \
-    emit_rc = R4D_EMIT(sk, (router_topk_scatter_kernel<OWN, NWV>), dim3(1),                     \
-                       dim3((NWV) * kWave), 0,                                                  \
-                       (const uint16_t*)lg->data, (int32_t*)ids->data,                          \
-                       (uint16_t*)w->data, (int32_t*)sorted->data, (int32_t*)off->data,         \
-                       (int32_t*)cnt->data, (uint32_t)M, (uint32_t)n_expert,                    \
-                       (uint32_t)n_local, (uint32_t)top_k,                                      \
-                       (uint32_t)lg_ld, (int)norm, (int32_t)base, prot)
-    /* The same narrowest-instantiation rule the standalone selection uses, and for the same
-     * reason: MAXOWN is registers a lane.
-     *
-     * ONE WAVE A ROW, as a power of two between the sort's own eight waves and the workgroup's
-     * thirty-two. A wave selects its rows one after another, so at eight waves a 32-row verify
-     * step runs four selections back to back: 8.6 us against 5.4 at thirty-two waves. Fewer rows do
-     * not pay for more waves -- a launch of thirty-two costs about 0.4 us more than one of eight at
-     * four rows. Above 32 rows the waves wrap. */
-    const int nw = M <= 8 ? 8 : M <= 16 ? 16 : 32;
-    if (n_expert <= (long long)(8 * kWave)) {
-        if      (nw == 8)  R4D_RTS_L(8, 8);
-        else if (nw == 16) R4D_RTS_L(8, 16);
-        else               R4D_RTS_L(8, 32);
-    } else {
-        if      (nw == 8)  R4D_RTS_L(16, 8);
-        else if (nw == 16) R4D_RTS_L(16, 16);
-        else               R4D_RTS_L(16, 32);
-    }
+        emit_rc = R4D_EMIT(sk, (router_topk_scatter_kernel<OWN, NWV>), dim3(1),                 \
+                           dim3((NWV) * kWave), 0,                                              \
+                           (const uint16_t*)lg->data, (int32_t*)ids->data,                      \
+                           (uint16_t*)w->data, (int32_t*)sorted->data, (int32_t*)off->data,     \
+                           (int32_t*)cnt->data, (uint32_t)M, (uint32_t)n_expert,                \
+                           (uint32_t)n_local, (uint32_t)top_k,                                  \
+                           (uint32_t)lg_ld, (int)norm, (int32_t)base, prot)
+        /* The same narrowest-instantiation rule the standalone selection uses, and for the same
+         * reason: MAXOWN is registers a lane.
+         *
+         * ONE WAVE A ROW, as a power of two between the sort's own eight waves and the workgroup's
+         * thirty-two. A wave selects its rows one after another, so at eight waves a 32-row verify
+         * step runs four selections back to back: 8.6 us against 5.4 at thirty-two waves. Fewer rows do
+         * not pay for more waves -- a launch of thirty-two costs about 0.4 us more than one of eight at
+         * four rows. Above 32 rows the waves wrap. */
+        const int nw = M <= 8 ? 8 : M <= 16 ? 16 : 32;
+        if (n_expert <= (long long)(8 * kWave)) {
+            if      (nw == 8)  R4D_RTS_L(8, 8);
+            else if (nw == 16) R4D_RTS_L(8, 16);
+            else               R4D_RTS_L(8, 32);
+        } else {
+            if      (nw == 8)  R4D_RTS_L(16, 8);
+            else if (nw == 16) R4D_RTS_L(16, 16);
+            else               R4D_RTS_L(16, 32);
+        }
 #undef R4D_RTS_L
+        if (emit_rc != RAD_OK) return emit_rc;
+        if (!sk.desc) R4D_MOE_CHK();
+        return RAD_OK;
+    }
+
+    /* R4-01: Prefill Router-Top-K and Histogram Fusion (T > kScatterSmall, M >= 128).
+     * Eliminates standalone scatter_hist_kernel across prefill:
+     * Launch 1: Fused router_topk_prefill_hist_kernel calculates Top-K and populates bcnt.
+     * Launch 2: scatter_scan_kernel scans bcnt, building offsets and expert counts.
+     * Launch 3: scatter_place_kernel places slots into sorted order. */
+    const long long n_tile = (T + kScatterTile - 1) / kScatterTile;
+    const int64_t need = n_tile * n_local * (long long)sizeof(int32_t);
+    if (!sk.desc && (!a->scratch || a->scratch_bytes < need)) return R4D_NO(RAD_E_SCRATCH);
+    int32_t* bcnt = (int32_t*)a->scratch;
+
+    const unsigned lds_bytes = (unsigned)(n_local * sizeof(int32_t));
+    if (n_expert <= (long long)(8 * kWave)) {
+        emit_rc = R4D_EMIT(sk, (router_topk_prefill_hist_kernel<8>),
+                           dim3((unsigned)n_tile), dim3(kScatterTile), lds_bytes,
+                           (const uint16_t*)lg->data, (int32_t*)ids->data,
+                           (uint16_t*)w->data, bcnt,
+                           (uint32_t)M, (uint32_t)n_expert, (uint32_t)n_local,
+                           (uint32_t)top_k, (uint32_t)lg_ld, (int)norm,
+                           (int32_t)base, prot);
+    } else {
+        emit_rc = R4D_EMIT(sk, (router_topk_prefill_hist_kernel<16>),
+                           dim3((unsigned)n_tile), dim3(kScatterTile), lds_bytes,
+                           (const uint16_t*)lg->data, (int32_t*)ids->data,
+                           (uint16_t*)w->data, bcnt,
+                           (uint32_t)M, (uint32_t)n_expert, (uint32_t)n_local,
+                           (uint32_t)top_k, (uint32_t)lg_ld, (int)norm,
+                           (int32_t)base, prot);
+    }
+    if (emit_rc != RAD_OK) return emit_rc;
+
+    emit_rc = R4D_EMIT(sk, scatter_scan_kernel, dim3(1), dim3(256), 0,
+                       bcnt, (int32_t*)off->data, (int32_t*)cnt->data,
+                       (uint32_t)n_tile, (uint32_t)n_local);
+    if (emit_rc != RAD_OK) return emit_rc;
+
+    emit_rc = R4D_EMIT(sk, scatter_place_kernel,
+                       dim3((unsigned)n_tile), dim3(kScatterTile), 0,
+                       (const int32_t*)ids->data, bcnt,
+                       (const int32_t*)off->data, (int32_t*)sorted->data,
+                       (uint32_t)T, (uint32_t)n_local, (int32_t)base, prot);
     if (emit_rc != RAD_OK) return emit_rc;
     if (!sk.desc) R4D_MOE_CHK();
     return RAD_OK;
 }
 R4D_ENTRY(r4d_rad_router_topk_scatter, rad_router_topk_scatter_body)
+
+extern "C" int64_t r4d_rad_router_topk_scatter_scratch(const RadArgs* a) {
+    const long long n_expert = r4d_geti_or(a, "n_expert", 0);
+    const long long n_local  = r4d_geti_or(a, "n_local", n_expert);
+    const long long top_k    = r4d_geti_or(a, "top_k", 0);
+    if (n_expert <= 0 || n_local <= 0 || top_k <= 0) return R4D_NO(RAD_E_SHAPE);
+
+    long long M = r4d_geti_or(a, "M", 0);
+    if (M <= 0) {
+        const RadTensor* lg = r4d_opt(a, 0);
+        if (lg && lg->data) {
+            const long long lg_ld = r4d_rows_pitch(lg, n_expert, &M);
+            if (lg_ld < 0 || M <= 0) return R4D_NO(RAD_E_STRIDE);
+        } else {
+            const RadTensor* ids = r4d_opt(a, 1);
+            if (ids && ids->data) M = r4d_numel(ids) / top_k;
+        }
+    }
+    if (M <= 0) return R4D_NO(RAD_E_SHAPE);
+
+    const long long T = M * top_k;
+    if (T <= (long long)kScatterSmall) return 0;
+    const long long n_tile = (T + kScatterTile - 1) / kScatterTile;
+    return n_tile * n_local * (long long)sizeof(int32_t);
+}
 
 /* Scratch for the general scatter: the per-tile histogram plane. The small form needs none, and
  * the hook answers for the shape it is asked about rather than for the worst case, because the
@@ -1956,9 +2200,6 @@ extern "C" int r4d_rad_moe_scatter(const RadArgs* a, RadStream s) {
     hipLaunchKernelGGL(scatter_place_kernel, dim3((unsigned)n_tile), dim3(kScatterTile), 0,
                        (hipStream_t)s, idp, bcnt, op, sp, (uint32_t)T, (uint32_t)n_expert,
                        (int32_t)base, prot);
-    R4D_MOE_CHK();
-    hipLaunchKernelGGL(scatter_tail_kernel, dim3((unsigned)((T + 255) / 256)), dim3(256), 0,
-                       (hipStream_t)s, op, sp, (uint32_t)T, (uint32_t)n_expert);
     R4D_MOE_CHK();
     return RAD_OK;
 }

@@ -733,18 +733,12 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
      * shape each is a single 256-thread workgroup ranking about a kilobyte, so each costs a full
      * dispatch for no arithmetic, once per layer per step, twice over. The sort reads
      * `expert_ids` and nothing else and the selection writes it, so the launch between them buys a
-     * barrier and nothing more.
-     *
-     * BOUNDED BY THE SORT'S SINGLE-WORKGROUP FORM. `moe_scatter` runs one launch at
-     * M*top_k <= 1024 and three above it -- the three exist to keep the sort stable without an
-     * atomic deciding the order -- and only the first shape is fusible. That is the DECODE band by
-     * construction (eight sequences at depth 3 and top_k 10 is 320) and a prefill chunk is past
-     * it, which is also where the pair is amortised over real work and the fusion would buy
-     * nothing. Declared either way, so the graph and the buffer plan do not depend on it. */
-    if (c.top_k > 0 && (int64_t)c.rows * c.top_k <= kMoeSortRows)
+     * barrier and nothing more. */
+    /* R4-01: router_topk_scatter fuses router top-k and histogram generation across both decode
+     * and prefill (M >= 128), eliminating the standalone scatter_hist_kernel launch across all
+     * 48 MoE layers in prefill. topk_scatter_rows therefore covers all c.rows. */
+    if (c.top_k > 0)
         topk_scatter_rows = c.rows;
-    else
-        topk_scatter_rows = kMoeSortRows / c.top_k;
     if (topk_scatter_rows > 0 && !prot_list)
         op_topk_scatter = rw(b, RAD_OP(b, "router_topk_scatter",
                                 RAD_PARAMS(RAD_RANGE("M", 1, topk_scatter_rows),
@@ -1413,17 +1407,12 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) const 
 
     if (!ext_in) nq_h.step(c_, T, r0, rows);
 
-    /* THE SHARED ARM BESIDE THE ROUTED ONE, ON THE SAME QUEUE. It reads the same normed input the
-     * routed arm does and writes nothing the routed arm touches until the gather joins them, so
-     * each of its three stages is independent of the routed stage it is issued behind: its gate
-     * and gate_up beside the routed gate_up, its quantiser beside the routed one, its down beside
-     * the routed down. A recorded pass plays each such pair with the second launch unordered
-     * behind the first (Ctx::haz_mark), so the two run at once, and the next routed stage --
-     * which waits for everything in front of it -- waits for the shorter shared stage too, which
-     * has long finished. That is the overlap a second queue would buy, without the queue's fork and
-     * join: a barrier packet on each side of the arm, and a join on another queue's signal that
-     * the packet processor sees microseconds late. Every buffer the arm writes is out of the
-     * sharing pool (see declare), so issuing it ahead of its declared position moves no byte. */
+    /* THE SHARED ARM ISSUED BEFORE THE ROUTED ONE. It reads the same normed input the routed
+     * arm does and writes nothing the routed arm touches until the gather joins them. Issuing
+     * the shared arm before op_gu allows the routed pipeline op_gu -> gq_exp -> op_dn to execute
+     * strictly back-to-back without interleaving shared-expert weight streaming GEMMs that evict
+     * w.egu and w.eff from L2 cache. Furthermore, shared_up runs concurrently with op_router and
+     * op_topk_scatter (via Ctx::haz_mark unordered marking), finishing well before op_gather needs it. */
 
     /* THE ROUTED ARM. */
     /* THE COUNTS GO STRAIGHT INTO THE CORE'S ROW for this layer when it keeps one, so the

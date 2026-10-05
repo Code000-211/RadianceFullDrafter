@@ -1259,10 +1259,7 @@ extern "C" int r4d_shape_router_topk_scatter(const RadParam* p, int n_p, int ope
     const int64_t M  = pi(p, n_p, "M");
     const int64_t ne = pi(p, n_p, "n_expert");
     const int64_t k  = pi(p, n_p, "top_k");
-    if (ne <= 0 || ne > 256 || k <= 0 || k > ne) return RAD_E_UNSUPPORTED;
-    /* The sort's single-workgroup bound, stated here too so the workbench never draws a shape the
-     * shim will refuse. 1024 is `kScatterSmall`. */
-    if (M * k > 1024) return RAD_E_UNSUPPORTED;
+    if (ne <= 0 || ne > 512 || k <= 0 || k > ne) return RAD_E_UNSUPPORTED;
     /* The sort's three outputs are sized by THIS RANK'S SLICE, not by the router. */
     const int64_t nl = pi(p, n_p, "n_local", ne);
     if (nl <= 0 || nl > ne) return RAD_E_UNSUPPORTED;

@@ -304,7 +304,9 @@ void r4d_gdn_recurrent_update_kernel(const unsigned short* __restrict__ q,
   constexpr int NR = RU_V / VS;         // v rows this workgroup owns
   constexpr int THR = NR * 2;
   static_assert(!(NORM && VS > 1), "the fused row norm needs the whole 128-wide row");
-  __shared__ float wsum[THR / 32];
+  /* AG01: Separate reduction buffers for RMS norm and Amax eliminate 2 reuse barriers per token */
+  __shared__ float wsum_rms[THR / 32];
+  __shared__ float wsum_amax[THR / 32];
   __shared__ float spart[STG ? RU_TMAX * 4 : 1];   // per (token, half): sum q^2, sum k^2
   __shared__ float sscl [STG ? RU_TMAX * 2 : 1];   // per token: the two closed scales
   const int n = blockIdx.x, hv = blockIdx.y;
@@ -341,6 +343,9 @@ void r4d_gdn_recurrent_update_kernel(const unsigned short* __restrict__ q,
    * stay coalesced. The values are the loaded ones, so every product downstream is unchanged. */
   constexpr int ZPT = (RU_CVT * RU_V + THR - 1) / THR;  // gate values a thread stages
   __shared__ float sab[CV ? 2 * RU_CVT : 1];
+  __shared__ float sg [CV ? RU_CVT : 1];
+  __shared__ float sbt[CV ? RU_CVT : 1];
+  __shared__ float seg[CV ? RU_CVT : 1];
   __shared__ unsigned short szg[CV ? RU_CVT * RU_V : 1];
   float ca_b = 0.0f;
   unsigned short czg[ZPT];
@@ -581,6 +586,18 @@ void r4d_gdn_recurrent_update_kernel(const unsigned short* __restrict__ q,
       const int zi = tid + i * THR;
       if (zi < T * RU_V) szg[zi] = czg[i];
     }
+    __builtin_amdgcn_wave_barrier();
+    if (tid < T) {
+      const float ra = sab[tid];
+      const float rb = sab[T + tid];
+      const float alog_t = __expf(a_log_h);
+      const float g  = -alog_t * ru_softplus(ra + dtb, sp_thr);
+      const float bt = 1.0f / (1.0f + __expf(-rb));
+      const float eg = __expf(g);
+      sg[tid]  = g;
+      sbt[tid] = bt;
+      seg[tid] = eg;
+    }
     // Every thread's history is consumed by now -- its taps are in LDS -- so after the barrier
     // this workgroup no longer reads the key head's state and may be counted out.
     __syncthreads();
@@ -589,7 +606,7 @@ void r4d_gdn_recurrent_update_kernel(const unsigned short* __restrict__ q,
                                        __HIP_MEMORY_SCOPE_AGENT);
   }
 
-  const float alog = __expf(a_log_h);
+  const float alog = CV ? 0.0f : __expf(a_log_h);
 
   if (STG) {
     // One lane per (token, half) does exactly the sum a v-row takes for itself on the STG=0 path.
@@ -656,11 +673,18 @@ void r4d_gdn_recurrent_update_kernel(const unsigned short* __restrict__ q,
       for (int j = 0; j < RU_HK; ++j) { qq[j] *= qs; kk[j] *= ks; }
     }
 
-    const float ra  = CV ? sab[t]     : ru_ab<ABF16>(av, (size_t)tok * ab_stride + hv);
-    const float rb  = CV ? sab[T + t] : ru_ab<ABF16>(bv, (size_t)tok * ab_stride + hv);
-    const float g   = -alog * ru_softplus(ra + dtb, sp_thr);
-    const float bt  = 1.0f / (1.0f + __expf(-rb));
-    const float eg  = __expf(g);
+    float g, bt, eg;
+    if constexpr (CV) {
+      g  = sg[t];
+      bt = sbt[t];
+      eg = seg[t];
+    } else {
+      const float ra = ru_ab<ABF16>(av, (size_t)tok * ab_stride + hv);
+      const float rb = ru_ab<ABF16>(bv, (size_t)tok * ab_stride + hv);
+      g  = -alog * ru_softplus(ra + dtb, sp_thr);
+      bt = 1.0f / (1.0f + __expf(-rb));
+      eg = __expf(g);
+    }
 
     float dot = 0.0f;
 #pragma unroll
@@ -720,16 +744,16 @@ void r4d_gdn_recurrent_update_kernel(const unsigned short* __restrict__ q,
       // rest are DPP row_xmask.  Same order, same value.
       sq += r4d_xor_lane<16>(sq); sq += r4d_xor_lane<8>(sq); sq += r4d_xor_lane<4>(sq);
       sq += r4d_xor_lane<2>(sq);  sq += r4d_xor_lane<1>(sq);
-      if ((threadIdx.x & 31) == 0) wsum[threadIdx.x >> 5] = sq;
+      if ((threadIdx.x & 31) == 0) wsum_rms[threadIdx.x >> 5] = sq;
       __syncthreads();
       float tot = 0.0f;
 #pragma unroll
-      for (int i = 0; i < THR / 32; ++i) tot += wsum[i];
+      for (int i = 0; i < THR / 32; ++i) tot += wsum_rms[i];
       const float sc = __frsqrt_rn(tot * (1.0f / RU_V) + neps);
       const unsigned short zr = CV ? szg[t * RU_V + row]
                                    : zg[(size_t)tok * zg_pitch + (size_t)hv * RU_V + row];
       on *= sc * nw[row] * ru_act(bf2f(zr), nact);
-      __syncthreads();                 // wsum is reused by the next token
+      /* AG01: Barrier removed: wsum_amax is a distinct LDS buffer from wsum_rms */
     }
 
     const unsigned short ob = f2bf(on);
@@ -757,24 +781,26 @@ void r4d_gdn_recurrent_update_kernel(const unsigned short* __restrict__ q,
       mv = fmaxf(mv, r4d_xor_lane<16>(mv)); mv = fmaxf(mv, r4d_xor_lane<8>(mv));
       mv = fmaxf(mv, r4d_xor_lane<4>(mv));  mv = fmaxf(mv, r4d_xor_lane<2>(mv));
       mv = fmaxf(mv, r4d_xor_lane<1>(mv));
-      if ((threadIdx.x & 31) == 0) wsum[threadIdx.x >> 5] = mv;
+      if ((threadIdx.x & 31) == 0) wsum_amax[threadIdx.x >> 5] = mv;
       __syncthreads();
       float amax = 0.0f;
 #pragma unroll
-      for (int i = 0; i < THR / 32; ++i) amax = fmaxf(amax, wsum[i]);
+      for (int i = 0; i < THR / 32; ++i) amax = fmaxf(amax, wsum_amax[i]);
       const float qs = amax > 0.0f ? amax * (1.0f / q8_top<NORM == 2>()) : 1.0f;
       if (tid == 0) os[(size_t)tok * os_ld + hv] = qs;
       if (half == 0) {
         unsigned char code;
         if constexpr (NORM == 2) {
-          code = (unsigned char)(int)rintf(fminf(fmaxf(ov * (1.0f / qs), -127.0f), 127.0f));
+          constexpr float kMagic = 12582912.0f;
+          const float cv = fminf(fmaxf(ov * (1.0f / qs), -127.0f), 127.0f);
+          code = (unsigned char)(__float_as_uint(cv + kMagic) & 0xff);
         } else {
           const float cv = fminf(fmaxf(ov * (1.0f / qs), -448.0f), 448.0f);
           code = (unsigned char)(__builtin_amdgcn_cvt_pk_fp8_f32(cv, cv, 0, false) & 0xff);
         }
         oq[(size_t)tok * oq_pitch + (size_t)hv * RU_V + row] = code;
       }
-      __syncthreads();               // wsum is reused by the next token
+      /* AG01: Barrier removed: wsum_rms in next token iteration does not overwrite wsum_amax */
     }
 
     if (!ANC) {

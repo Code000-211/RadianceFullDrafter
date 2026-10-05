@@ -67,6 +67,7 @@ __global__ __launch_bounds__(kMaxN) void qsa_block_key_kernel(
     __shared__ float red[kMaxN / 32];
 
     const int b = blockIdx.x;
+    if (page && page[b] < 0) return;
     const int t = threadIdx.x;
 
     /* The mean, in f32 over the block's rows, rounded to bf16 exactly once. */

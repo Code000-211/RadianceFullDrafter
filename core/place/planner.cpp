@@ -98,6 +98,24 @@ int64_t weight_bytes(const WeightInfo& w) {
 }
 
 
+static inline bool is_ple_device(const Config* cfg) {
+    const char* env = std::getenv("RADIANCE_PLE_BACKEND");
+    if (!env) env = std::getenv("RADIANCE_PLE_STORAGE");
+    if (!env) env = std::getenv("RADIANCE_PLE_MODE");
+    if (env && *env) {
+        if (!std::strcmp(env, "host") || !std::strcmp(env, "cpu") ||
+            !std::strcmp(env, "nvme") || !std::strcmp(env, "mmap")) {
+            return false;
+        }
+        if (!std::strcmp(env, "device") || !std::strcmp(env, "gpu") ||
+            !std::strcmp(env, "shm") || !std::strcmp(env, "zerocopy") || !std::strcmp(env, "zero-copy")) {
+            return true;
+        }
+    }
+    if (cfg && cfg->ple_backend == "host") return false;
+    return true;
+}
+
 /* See planner.h. Planner::resolve_sites, Planner::build_units and Planner::pin_mapped, run over
  * the same program without allocating a Plan -- the budget resolver calls this before a Planner
  * exists. Kept adjacent to the three so a change to any of them has this in the same diff. */
@@ -119,6 +137,22 @@ void weight_footprint(const Program& prog, WeightFootprint* out, TablePlacement 
             if (w == RAD_NULL_HANDLE || w >= device_ok.size()) continue;
             if (!dev) device_ok[w] = 0u;
             if (!host) host_ok[w] = 0u;
+        }
+    }
+
+    std::vector<uint8_t> zero_copy_mapped(prog.weights.size(), 0u);
+    if (is_ple_device(nullptr)) {
+        for (const OpInfo& o : prog.ops) {
+            if (o.op == "embed_lookup_q") {
+                for (rad_weight w : o.weights) {
+                    if (w != RAD_NULL_HANDLE && w < prog.weights.size()) {
+                        if (prog.weights[w].decl.access == RAD_ACCESS_VOCAB ||
+                            prog.weights[w].stored_bytes > (1LL << 30)) {
+                            zero_copy_mapped[w] = 1u;
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -152,7 +186,6 @@ void weight_footprint(const Program& prog, WeightFootprint* out, TablePlacement 
         U& mu = units[u];
         const int64_t a = wi.align > 0 ? wi.align : RAD_ALIGN_UNIT;
         mu.bytes = align_up(mu.bytes, a) + weight_bytes(wi);
-        /* pin_mapped: THE WHOLE UNIT GOES, not the one weight. */
         if (w < device_ok.size() && !device_ok[w]) mu.mapped = true;
         if (w < host_ok.size() && !host_ok[w]) mu.host = false;
         /* The placement flags' tables: model-level, so the unit is this one weight. */

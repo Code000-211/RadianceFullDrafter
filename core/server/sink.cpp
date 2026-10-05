@@ -51,23 +51,25 @@ Sink::~Sink() {
 int64_t Sink::age_ns() const { return now_ns() - t_start_ns_; }
 
 void Sink::notify() {
-    /* Deliberately not holding m_. See the header: this can lose a wake-up, and the consumer's
-     * bounded wait is what pays for that. Taking the lock here would put the scheduler thread
-     * behind whatever an HTTP thread happens to be doing. */
-    cv_.notify_one();
+    {
+        std::unique_lock<std::mutex> lk(m_, std::try_to_lock);
+    }
+    cv_.notify_all();
 }
 
-bool Sink::push(int32_t token, float logprob) {
+bool Sink::push_span(const int32_t* tokens, size_t n, const float* logprobs) {
+    if (n == 0) return true;
     const uint64_t h = head_.load(std::memory_order_relaxed);
     const uint64_t t = tail_.load(std::memory_order_acquire);
-    if (h - t > mask_) {
-        /* The consumer is not draining. Failing loudly beats a stream with a hole in it. */
+    if (h + n - t > ring_.size()) {
         overflow_.store(true, std::memory_order_release);
         fail(RAD_E_FULL);
         return false;
     }
-    ring_[h & mask_] = SinkToken{token, logprob};
-    head_.store(h + 1, std::memory_order_release);
+    for (size_t i = 0; i < n; ++i) {
+        ring_[(h + i) & mask_] = SinkToken{tokens[i], logprobs ? logprobs[i] : 0.0f};
+    }
+    head_.store(h + n, std::memory_order_release);
 
     const int64_t t_now = now_ns() - t_start_ns_;
     if (h == 0) t_first_.store(t_now, std::memory_order_release);
@@ -75,6 +77,10 @@ bool Sink::push(int32_t token, float logprob) {
 
     notify();
     return true;
+}
+
+bool Sink::push(int32_t token, float logprob) {
+    return push_span(&token, 1, &logprob);
 }
 
 void Sink::finish(Finish f) {

@@ -617,11 +617,56 @@ int Vocab::load(VocabBuild b) {
     enc_ = std::make_shared<TokEncoder>();
     RAD_TRY(enc_->build(b_, special_));
 
+    /* Precompute decoded pieces (FF05) */
+    decoded_pieces_.resize(b_.tokens.size());
+    for (size_t i = 0; i < b_.tokens.size(); ++i) {
+        const int32_t b = (i < byte_of_.size()) ? byte_of_[i] : -1;
+        if (b >= 0) {
+            decoded_pieces_[i] = std::string(1, (char)b);
+            continue;
+        }
+        std::string s = b_.tokens[i];
+        const uint8_t t = b_.types[i];
+        if (t == RAD_TT_CONTROL || t == RAD_TT_UNKNOWN || t == RAD_TT_USER_DEFINED) {
+            decoded_pieces_[i] = std::move(s);
+            continue;
+        }
+        for (const VocabStep& st : b_.steps) {
+            if (!step_is_dec(st.kind)) continue;
+            switch (st.kind) {
+                case RAD_DEC_BYTELEVEL: s = byte_decode(s); break;
+                case RAD_DEC_METASPACE:
+                    replace_all(s, st.arg0.empty() ? std::string(k_metaspace) : st.arg0, " ");
+                    break;
+                case RAD_DEC_REPLACE: replace_all(s, st.arg0, st.arg1); break;
+                case RAD_DEC_STRIP: {
+                    const std::string c = st.arg0.empty() ? std::string(" ") : st.arg0;
+                    int32_t start = (int32_t)(st.iarg & 0xFFFFFFFF);
+                    int32_t stop  = (int32_t)(st.iarg >> 32);
+                    while (start-- > 0 && s.size() >= c.size() && s.compare(0, c.size(), c) == 0)
+                        s.erase(0, c.size());
+                    while (stop-- > 0 && s.size() >= c.size() &&
+                           s.compare(s.size() - c.size(), c.size(), c) == 0)
+                        s.erase(s.size() - c.size());
+                    break;
+                }
+                default: break;
+            }
+        }
+        decoded_pieces_[i] = std::move(s);
+    }
+
     ready_ = true;
     RAD_DEBUG("vocab: %zu tokens, %zu merges, %zu special, %zu eog, %zu chain steps, kind %u",
               b_.tokens.size(), b_.merges.size(), special_.size(), eog_.size(), b_.steps.size(),
               b_.kind);
     return RAD_OK;
+}
+
+const std::string& Vocab::decoded_piece(int32_t id) const {
+    static const std::string empty;
+    if (id < 0 || id >= (int32_t)decoded_pieces_.size()) return empty;
+    return decoded_pieces_[(size_t)id];
 }
 
 const std::string& Vocab::text(int32_t id) const {
@@ -1377,53 +1422,7 @@ std::string Tokenizer::piece(int32_t id, bool render_special) const {
     const uint8_t t = v_->type(id);
     if (!render_special && (t == RAD_TT_CONTROL || t == RAD_TT_UNKNOWN)) return {};
 
-    /* A byte token is one byte and no decoder step applies to it -- running ByteLevel over
-     * "<0x0A>" would produce the literal text. */
-    const int32_t b = v_->token_byte(id);
-    if (b >= 0) return std::string(1, (char)b);
-
-    std::string s = v_->text(id);
-    /* A user-defined or control token is stored as the literal text it stands for; only NORMAL
-     * tokens are in the vocab's own encoding and need the decoder chain. */
-    if (t == RAD_TT_CONTROL || t == RAD_TT_UNKNOWN || t == RAD_TT_USER_DEFINED) return s;
-
-    bool any = false;
-    for (const VocabStep& st : v_->steps()) {
-        if (!step_is_dec(st.kind)) continue;
-        any = true;
-        switch (st.kind) {
-            case RAD_DEC_BYTELEVEL: s = byte_decode(s); break;
-            case RAD_DEC_METASPACE:
-                replace_all(s, st.arg0.empty() ? std::string(k_metaspace) : st.arg0, " ");
-                break;
-            case RAD_DEC_REPLACE:   replace_all(s, st.arg0, st.arg1); break;
-            case RAD_DEC_STRIP: {
-                const std::string c = st.arg0.empty() ? std::string(" ") : st.arg0;
-                int32_t start = (int32_t)(st.iarg & 0xFFFFFFFF);
-                int32_t stop  = (int32_t)(st.iarg >> 32);
-                while (start-- > 0 && s.size() >= c.size() && s.compare(0, c.size(), c) == 0)
-                    s.erase(0, c.size());
-                while (stop-- > 0 && s.size() >= c.size() &&
-                       s.compare(s.size() - c.size(), c.size(), c) == 0)
-                    s.erase(s.size() - c.size());
-                break;
-            }
-            case RAD_DEC_FUSE:
-            case RAD_DEC_BYTE_FALLBACK:
-                /* Both are sequence-level: Fuse concatenates adjacent pieces and ByteFallback
-                 * reassembles "<0xNN>" runs. Per-token there is nothing to do, and the
-                 * sequence-level behaviour is what Detokenizer's buffering already is. */
-                break;
-            default:
-                RAD_WARN("tokenizer: decoder step %u is not implemented", st.kind);
-                break;
-        }
-    }
-    /* A vocab with no declared decoder is a vocab whose tokens are already text -- which is
-     * true for unigram and wordpiece and false for byte-level BPE, so the absence is only safe
-     * when it was declared. It is; rad-convert emits the chain it read. */
-    (void)any;
-    return s;
+    return v_->decoded_piece(id);
 }
 
 std::string Tokenizer::decode(const std::vector<int32_t>& ids, bool render_special) const {
@@ -1568,14 +1567,11 @@ std::string utf8_sanitize(std::string_view s) {
 std::string Detokenizer::push(int32_t token) {
     if (!v_ || !v_->ready() || stopped_) return {};
 
-    Tokenizer t;
-    /* Constructing a Tokenizer per push looks wasteful and is not: it holds a shared_ptr and
-     * nothing else, and piece() is a pure function of the vocab. Keeping one as a member would
-     * make Detokenizer non-copyable for no gain. */
-    if (t.init(std::const_pointer_cast<Vocab>(std::const_pointer_cast<const Vocab>(v_))) < 0)
-        return {};
+    const uint8_t t = v_->type(token);
+    const bool render = render_special_ || preserved_.count(token) != 0;
+    if (!render && (t == RAD_TT_CONTROL || t == RAD_TT_UNKNOWN)) return {};
 
-    std::string p = t.piece(token, render_special_ || preserved_.count(token) != 0);
+    std::string p = v_->decoded_piece(token);
 
     /* HuggingFace's decoders strip the leading space that Metaspace's prepend added. Only the
      * first piece of a stream can carry it, which is why this is a member flag and not a
@@ -1590,7 +1586,6 @@ std::string Detokenizer::push(int32_t token) {
         }
     }
 
-    all_ += p;
     pending_ += p;
 
     /* A complete stop string inside pending_ ends the stream. Everything before it is emitted;

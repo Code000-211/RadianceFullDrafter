@@ -905,6 +905,7 @@ static const RadOperandSpec oMoeGemmQMod4[] = {
     { "w_3_scale",     RAD_OPD_WTAB, 0 },
     { "y",             RAD_OPD_OUT,  0 },
 };
+
 static const RadParamSpec pMoeGather[] = {
     P_INT("M"), P_INT("n"), P_INT("top_k"), P_STR("dtype"),
     /* The shared arm's gate, and it is present exactly when `shared` and `shared_gate` are.
@@ -4336,12 +4337,12 @@ static const RadKernelInfo kKernels[] = {
 
 { "router_topk_scatter_bf16", "router_topk_scatter", "moe",
   "the router's top-k and the stable counting sort that follows it, in one launch",
-  "n_expert <= 512, top_k <= min(n_expert, 32), and M*top_k <= 1024 so the sort is the "
-  "single-workgroup form; bf16 logits and weights, i32 everything else",
+  "n_expert <= 512, top_k <= min(n_expert, 32); single-workgroup decode or fused prefill; "
+  "bf16 logits and weights, i32 everything else",
   "bf16 in, bf16 weights + i32 ids, sorted slots, offsets and counts out",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cRouterTopkScatter), NOTUNE,
-  nullptr, nullptr, r4d_rad_router_topk_scatter, nullptr, nullptr, nullptr,
+  nullptr, nullptr, r4d_rad_router_topk_scatter, r4d_rad_router_topk_scatter_scratch, nullptr, nullptr,
   r4d_shape_router_topk_scatter, nullptr, nullptr, r4d_rad_router_topk_scatter_describe },
 
 { "moe_scatter_i32", "moe_scatter", "moe",
