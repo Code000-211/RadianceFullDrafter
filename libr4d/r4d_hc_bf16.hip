@@ -1552,7 +1552,11 @@ constexpr long kDecMinRows  = 8;    // ...and below THIS the per-row kernels sti
  * launch ramp this part charges anything under ~13 us, so deleting its WORK can never buy much.
  * Only deleting the LAUNCH would, and that needs the scales computed by something already running
  * -- which the op's private scratch forbids, since the producer of `h` is hc_write, a different op
- * with a different arena. */
+ * with a different arena.
+ *
+ * THE LOADS GO IN BATCHES OF kPre, then the tail one at a time: at this model's n = 2560 that is
+ * all ten of a thread's loads in flight at once instead of ten dependent trips. The same element
+ * in the same order, so the same scale (hc-read-tp4's PRE form, one batch wide enough for n). */
 __global__ __launch_bounds__(kThreads)
 void hc_norm_scale_kernel(const unsigned short* __restrict__ h, float* __restrict__ scaleout,
                           long rows, long n, long hrow, float eps) {
@@ -1561,8 +1565,17 @@ void hc_norm_scale_kernel(const unsigned short* __restrict__ h, float* __restric
     if (r >= rows) return;
     const int tid = threadIdx.x, lane = tid & (kWave - 1), wave = tid / kWave;
     const unsigned short* hp = h + r * hrow + c * n;
+    constexpr int kPre = 10;
     float acc = 0.0f;
-    for (long i = tid; i < n; i += kThreads) { const float v = bf2f(hp[i]); acc += v * v; }
+    long  i = tid;
+    for (; i + (long)(kPre - 1) * kThreads < n; i += (long)kPre * kThreads) {
+        unsigned short hv[kPre];
+#pragma unroll
+        for (int p = 0; p < kPre; ++p) hv[p] = hp[i + (long)p * kThreads];
+#pragma unroll
+        for (int p = 0; p < kPre; ++p) { const float v = bf2f(hv[p]); acc += v * v; }
+    }
+    for (; i < n; i += kThreads) { const float v = bf2f(hp[i]); acc += v * v; }
     acc = wave_sum(acc);
     if (lane == 0) s_part[wave] = acc;
     __syncthreads();
