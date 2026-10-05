@@ -113,69 +113,60 @@ __global__ __launch_bounds__(kThreads) void embed_lookup_kernel(
     for (uint32_t i = threadIdx.x; i < n_embd; i += kThreads) dst[i] = src[i];
 }
 
-__device__ __forceinline__ float d_fp8e4m3_to_f32(uint8_t b) {
-    uint32_t s = (uint32_t)(b >> 7) << 31;
-    uint32_t e = (uint32_t)(b >> 3) & 0xfu;
-    uint32_t m = (uint32_t)b & 0x7u;
-    uint32_t u;
-    if (e == 0u) {
-        if (m == 0u) {
-            u = s;
-        } else {
-            int sh = 0;
-            while (!(m & 0x8u)) { m <<= 1; ++sh; }
-            m &= 0x7u;
-            u = s | ((uint32_t)(127 - 6 - sh) << 23) | (m << 20);
-        }
-    } else if (e == 0xfu && m == 0x7u) {
-        u = s | 0x7fc00000u;
-    } else {
-        u = s | ((e - 7u + 127u) << 23) | (m << 20);
-    }
-    return __uint_as_float(u);
-}
-
-__device__ __forceinline__ uint16_t d_f32_to_bf16(float f) {
-    uint32_t u = __float_as_uint(f);
-    uint32_t lsb = (u >> 16) & 1;
-    u += 0x7fff + lsb;
-    return (uint16_t)(u >> 16);
-}
-
+// ---------------------------------------------------------------------------- embed_lookup_q
+// ref_embed_lookup_q.  x[m] = bf16(wte[id] * scale), from a table stored as E4M3 codes with ONE
+// scale (Q) or as plain bf16, where an absent scale is one.  This is the n-gram table's gather
+// (arch/common/rad_block_ple.h) wherever --ngram-placement lets a card read the table: in VRAM, or
+// in pinned host memory the card reads in place over the link.
+//
+// A THREAD A QUAD OF ENTRIES, NOT A BLOCK A ROW.  A row of the n-gram table is 160 entries, so a
+// block a row leaves most of its threads idle and the grid is as deep as the chunk's row count.
+// Flattened, consecutive threads take consecutive quads, and a row's 40 threads read its 160
+// contiguous bytes.  V = 1 is the same walk an entry at a time, for a width or a pitch the quad's
+// 4- and 8-byte accesses would misalign.
+//
+// THE VALUE libavx's LOOKUP TABLE HOLDS, to the bit: a code decodes to f32 exactly
+// (v_cvt_pk_f32_fp8, or the software form beside it in r4d_fp8_wmma.h), the product with the
+// scale rounds once in f32, and f32_to_bf16 rounds to nearest even.  An id outside [0, n_vocab)
+// after the offset writes a zero row (the divergence note at the top of this file).
+template <uint32_t V, bool Q>
 __global__ __launch_bounds__(kThreads) void embed_lookup_q_kernel(
-    const int32_t* __restrict__ tok, const uint8_t* __restrict__ wte,
-    const void* __restrict__ sc, uint16_t* __restrict__ x,
-    uint32_t n_embd, int32_t n_vocab, int32_t vocab_off, uint32_t x_ld, uint32_t sc_bf16) {
-    __shared__ uint16_t lut[256];
-    /* The scale is ONE element in whatever dtype the plane holds: the recipe stores it bf16. */
-    const float scale = !sc ? 1.0f
-                      : sc_bf16 ? __uint_as_float((uint32_t)(*(const uint16_t*)sc) << 16)
-                                : *(const float*)sc;
-    if (threadIdx.x < 256) {
-        lut[threadIdx.x] = d_f32_to_bf16(d_fp8e4m3_to_f32((uint8_t)threadIdx.x) * scale);
-    }
-    __syncthreads();
-
-    const uint32_t m = blockIdx.x;
+    const int32_t* __restrict__ tok, const void* __restrict__ wte, const void* __restrict__ sc,
+    uint32_t sc_f32, uint16_t* __restrict__ x, uint32_t M, uint32_t n_embd, int32_t n_vocab,
+    int32_t vocab_off, uint32_t x_ld) {
+    const uint32_t per_row = n_embd / V;
+    const uint64_t g = (uint64_t)blockIdx.x * kThreads + threadIdx.x;
+    if (g >= (uint64_t)M * per_row) return;
+    const uint32_t m = (uint32_t)(g / per_row), j = (uint32_t)(g % per_row) * V;
     const int32_t id = tok[m] - vocab_off;
-    uint16_t* __restrict__ dst = x + (size_t)m * x_ld;
+    uint16_t* __restrict__ dst = x + (size_t)m * x_ld + j;
     if (id < 0 || id >= n_vocab) {
-        for (uint32_t i = threadIdx.x; i < n_embd; i += kThreads) dst[i] = 0;
+        if constexpr (V == 4) *(uint2*)dst = make_uint2(0u, 0u);
+        else                  dst[0] = 0;
         return;
     }
-    const uint8_t* __restrict__ src = wte + (size_t)id * n_embd;
-    const uint32_t n_vec = ((n_embd & 3u) == 0u && (x_ld & 1u) == 0u) ? n_embd / 4 : 0u;
-    for (uint32_t i = threadIdx.x; i < n_vec; i += kThreads) {
-        uint32_t b4 = ((const uint32_t*)src)[i];
-        uint16_t out0 = lut[b4 & 0xff];
-        uint16_t out1 = lut[(b4 >> 8) & 0xff];
-        uint16_t out2 = lut[(b4 >> 16) & 0xff];
-        uint16_t out3 = lut[(b4 >> 24) & 0xff];
-        ((uint32_t*)dst)[i * 2 + 0] = (uint32_t)out0 | ((uint32_t)out1 << 16);
-        ((uint32_t*)dst)[i * 2 + 1] = (uint32_t)out2 | ((uint32_t)out3 << 16);
+    const float s = !sc ? 1.0f : sc_f32 ? *(const float*)sc : bf16_to_f32(*(const uint16_t*)sc);
+    const size_t at = (size_t)id * n_embd + j;
+    float v[V];
+    if constexpr (Q && V == 4) {
+        const uint32_t q = *(const uint32_t*)((const uint8_t*)wte + at);
+        const v2f lo = r4d_fp8::e4m3_pk<false>(q), hi = r4d_fp8::e4m3_pk<true>(q);
+        v[0] = lo.x; v[1] = lo.y; v[2] = hi.x; v[3] = hi.y;
+    } else if constexpr (Q) {
+        v[0] = r4d_fp8::e4m3(((const uint8_t*)wte)[at]);
+    } else if constexpr (V == 4) {
+        const uint2 b = *(const uint2*)((const uint16_t*)wte + at);
+        v[0] = bf16_to_f32((uint16_t)b.x); v[1] = bf16_to_f32((uint16_t)(b.x >> 16));
+        v[2] = bf16_to_f32((uint16_t)b.y); v[3] = bf16_to_f32((uint16_t)(b.y >> 16));
+    } else {
+        v[0] = bf16_to_f32(((const uint16_t*)wte)[at]);
     }
-    for (uint32_t i = n_vec * 4 + threadIdx.x; i < n_embd; i += kThreads) {
-        dst[i] = lut[src[i]];
+    if constexpr (V == 4) {
+        *(uint2*)dst = make_uint2(
+            (uint32_t)f32_to_bf16(v[0] * s) | ((uint32_t)f32_to_bf16(v[1] * s) << 16),
+            (uint32_t)f32_to_bf16(v[2] * s) | ((uint32_t)f32_to_bf16(v[3] * s) << 16));
+    } else {
+        dst[0] = f32_to_bf16(v[0] * s);
     }
 }
 
@@ -601,21 +592,23 @@ extern "C" int r4d_embed_lookup_bf16(long tok, long wte, long x, int M, int n_em
     return embed_lookup_bf16_emit(tok, wte, x, M, n_embd, n_vocab, vocab_off, x_ld, sk);
 }
 
-static int embed_lookup_q_emit(long tok, long wte, long sc, long x, int M, int n_embd, int n_vocab,
-                               int vocab_off, int x_ld, const R4dSink& sk, bool sc_bf16 = true) {
-    if (!tok || !wte || !x) return -1;
-    if (M <= 0 || n_embd <= 0 || n_vocab <= 0 || vocab_off < 0) return -2;
-    if (!x_ld) x_ld = n_embd;
-    return R4D_EMIT(sk, embed_lookup_q_kernel, dim3((uint32_t)M), dim3(kThreads), 0,
-                    (const int32_t*)tok, (const uint8_t*)wte, (const void*)sc,
-                    (uint16_t*)x, (uint32_t)n_embd, (int32_t)n_vocab, (int32_t)vocab_off,
-                    (uint32_t)x_ld, (uint32_t)(sc_bf16 ? 1u : 0u)) == RAD_OK ? 0 : -4;
-}
-
-extern "C" int r4d_embed_lookup_q(long tok, long wte, long sc, long x, int M, int n_embd, int n_vocab,
-                                  int vocab_off, int x_ld, long stream) {
-    R4dSink sk; sk.stream = (RadStream)(uintptr_t)stream;
-    return embed_lookup_q_emit(tok, wte, sc, x, M, n_embd, n_vocab, vocab_off, x_ld, sk);
+/* The quad walk when the width, the pitch and both bases allow its 4- and 8-byte accesses (a bf16
+ * table's quad is 8 bytes), an entry a thread otherwise. */
+static int embed_lookup_q_emit(const int32_t* tok, const void* wte, bool q, const void* sc,
+                               bool sc_f32, uint16_t* x, long long M, int n_embd, int n_vocab,
+                               int vocab_off, long long x_ld, const R4dSink& sk) {
+    const bool quad = n_embd % 4 == 0 && x_ld % 4 == 0 && r4d_aligned(x, 8) &&
+                      r4d_aligned(wte, q ? 4 : 8);
+    const uint64_t threads = (uint64_t)M * (uint64_t)(quad ? n_embd / 4 : n_embd);
+    const dim3 grid((uint32_t)((threads + kThreads - 1) / kThreads));
+#define R4D_ELQ(V, Q)                                                                             \
+    R4D_EMIT(sk, (embed_lookup_q_kernel<V, Q>), grid, dim3(kThreads), 0, tok, wte, sc,          \
+             (uint32_t)(sc_f32 ? 1u : 0u), x, (uint32_t)M, (uint32_t)n_embd, (int32_t)n_vocab,   \
+             (int32_t)vocab_off, (uint32_t)x_ld)
+    const int rc = quad ? (q ? R4D_ELQ(4, true) : R4D_ELQ(4, false))
+                        : (q ? R4D_ELQ(1, true) : R4D_ELQ(1, false));
+#undef R4D_ELQ
+    return rc == RAD_OK ? 0 : -4;
 }
 
 static int gather_rows_bf16_emit(long x, long idx, long y, int M, int n, int src_rows,
@@ -1003,7 +996,10 @@ R4D_ENTRY(r4d_rad_embed_lookup, rad_embed_lookup_body)
 
 /* ------------------------------------------------------------------ embed_lookup_q */
 
-enum { ELQ_TOK = 0, ELQ_WTE, ELQ_SCALE, ELQ_X, ELQ_AHEAD };
+/* Operand 4, `ahead`, is not read. It carries the ids of the prompt after this step for a host
+ * reader that fetches table rows from a file before they are wanted; a card reads its table where
+ * it already is, so there is nothing to fetch. */
+enum { ELQ_TOK = 0, ELQ_WTE, ELQ_SCALE, ELQ_X };
 
 static int rad_embed_lookup_q_body(const RadArgs* a, const R4dSink& sk) {
     const RadTensor* tok = r4d_opt(a, ELQ_TOK);
@@ -1013,9 +1009,10 @@ static int rad_embed_lookup_q_body(const RadArgs* a, const R4dSink& sk) {
     if (!tok || !wte || !x) return R4D_NO(RAD_E_INVAL);
     R4D_NEED(dt_i32(tok));
     R4D_NEED(dt_bf16(x));
-    /* The LUT decodes E4M3 codes only; the checkpoint's own bf16 table stays a host gather. */
-    if (wte->dtype != RAD_F8E4M3) return R4D_NO(RAD_E_DTYPE);
+    const bool q = wte->dtype == RAD_F8E4M3;
+    if (!q && wte->dtype != RAD_BF16) return R4D_NO(RAD_E_DTYPE);
     if (sc && sc->dtype != RAD_BF16 && sc->dtype != RAD_F32) return R4D_NO(RAD_E_DTYPE);
+    if (sc && r4d_numel(sc) < 1) return R4D_NO(RAD_E_SHAPE);
     if (!r4d_contig(tok) || !r4d_contig(wte)) return R4D_NO(RAD_E_STRIDE);
 
     const long long n_embd = r4d_geti_or(a, "n_embd", r4d_dim(wte, (int)wte->rank - 1));
@@ -1029,9 +1026,11 @@ static int rad_embed_lookup_q_body(const RadArgs* a, const R4dSink& sk) {
     if (x_ld < 0) return R4D_NO(RAD_E_STRIDE);
     if (M <= 0 || r4d_numel(tok) < M) return R4D_NO(RAD_E_SHAPE);
 
-    return embed_lookup_q_emit(r4d_addr(tok), r4d_addr(wte), sc ? r4d_addr(sc) : 0, r4d_addr(x),
-                               (int)M, (int)n_embd, (int)n_vocab, (int)voff, (int)x_ld,
-                               sk, !sc || sc->dtype == RAD_BF16) == 0 ? RAD_OK : RAD_E_DEVICE;
+    return embed_lookup_q_emit((const int32_t*)r4d_addr(tok), (const void*)r4d_addr(wte), q,
+                               sc ? (const void*)r4d_addr(sc) : nullptr,
+                               sc && sc->dtype == RAD_F32, (uint16_t*)r4d_addr(x), M,
+                               (int)n_embd, (int)n_vocab, (int)voff, x_ld, sk) == 0
+               ? RAD_OK : RAD_E_DEVICE;
 }
 R4D_ENTRY(r4d_rad_embed_lookup_q, rad_embed_lookup_q_body)
 
