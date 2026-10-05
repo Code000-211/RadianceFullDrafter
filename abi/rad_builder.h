@@ -311,6 +311,39 @@ rad_op rad_decl_op(RadBuilder* b, const char* op,
  *                     RAD_PARAMS(RAD_RANGE("M",1,max_tok), RAD_INT("N",8192), RAD_INT("K",5120)),
  *                     RAD_WEIGHTS(w));
  */
+#ifdef __cplusplus
+} /* extern "C" */
+#include <initializer_list>
+
+inline rad_op rad_decl_op(RadBuilder* b, const char* op,
+                          std::initializer_list<RadParam> params,
+                          std::initializer_list<rad_weight> weights) {
+    return rad_decl_op(b, op,
+                       params.size() ? params.begin() : nullptr, (int)params.size(),
+                       weights.size() ? weights.begin() : nullptr, (int)weights.size());
+}
+inline rad_op rad_decl_op(RadBuilder* b, const char* op,
+                          std::initializer_list<RadParam> params,
+                          const rad_weight* weights, int n_weights) {
+    return rad_decl_op(b, op,
+                       params.size() ? params.begin() : nullptr, (int)params.size(),
+                       weights, n_weights);
+}
+inline rad_op rad_decl_op(RadBuilder* b, const char* op,
+                          const RadParam* params, int n_params,
+                          std::initializer_list<rad_weight> weights) {
+    return rad_decl_op(b, op,
+                       params, n_params,
+                       weights.size() ? weights.begin() : nullptr, (int)weights.size());
+}
+
+#define RAD_PARAMS(...)   std::initializer_list<RadParam>{ __VA_ARGS__ }
+#define RAD_NOPARAMS      ((const RadParam*)0), 0
+#define RAD_WEIGHTS(...)  std::initializer_list<rad_weight>{ __VA_ARGS__ }
+#define RAD_NOWEIGHTS     ((const rad_weight*)0), 0
+#define RAD_OP(b, op, ...) rad_decl_op((b), (op), __VA_ARGS__)
+extern "C" {
+#else
 #define RAD_PARAMS(...)   ((const RadParam[]){ __VA_ARGS__ }), \
                           (int)(sizeof((const RadParam[]){ __VA_ARGS__ }) / sizeof(RadParam))
 #define RAD_NOPARAMS      ((const RadParam*)0), 0
@@ -318,6 +351,7 @@ rad_op rad_decl_op(RadBuilder* b, const char* op,
                           (int)(sizeof((const rad_weight[]){ __VA_ARGS__ }) / sizeof(rad_weight))
 #define RAD_NOWEIGHTS     ((const rad_weight*)0), 0
 #define RAD_OP(b, op, ...) rad_decl_op((b), (op), __VA_ARGS__)
+#endif
 
 /* An op's BUFFER operands, which rad_decl_op does not name -- it names weights, because those are
  * what placement moves. But the buffer planner needs liveness, and liveness is exactly which ops
@@ -331,6 +365,17 @@ rad_op rad_decl_op(RadBuilder* b, const char* op,
  * declaration. */
 int rad_op_reads (RadBuilder* b, rad_op h, const rad_buf* bufs, int n);
 int rad_op_writes(RadBuilder* b, rad_op h, const rad_buf* bufs, int n);
+
+#ifdef __cplusplus
+} /* extern "C" */
+inline int rad_op_reads (RadBuilder* b, rad_op h, std::initializer_list<rad_buf> bufs) {
+    return rad_op_reads(b, h, bufs.size() ? bufs.begin() : nullptr, (int)bufs.size());
+}
+inline int rad_op_writes(RadBuilder* b, rad_op h, std::initializer_list<rad_buf> bufs) {
+    return rad_op_writes(b, h, bufs.size() ? bufs.begin() : nullptr, (int)bufs.size());
+}
+extern "C" {
+#endif
 
 /* A BUFFER THE ARCHITECTURE TOUCHES FROM THE SECOND LANE, which is the one case where the op
  * range a buffer's declarations imply is NOT a bound on when its bytes are in use.

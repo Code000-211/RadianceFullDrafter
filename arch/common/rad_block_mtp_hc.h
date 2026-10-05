@@ -120,6 +120,13 @@ namespace arch {
  * away from the trunk's argmax -- so the coarse head's ranking is a useful restriction and not
  * just noise to be corrected. */
 static constexpr int64_t kDraftTopR = 8;
+/* SD02 (Single-Winner Gathering): The MTP drafter only consumes column 0 (the top-1 winner) of the
+ * draft proposal. After coarse rescoring against the exact lm_head over kDraftTopR candidates, each
+ * rank sorts its candidates, so its local winner is at index 0. The global winner is guaranteed to
+ * be the maximum over the ranks' local winners.
+ * Gathering and merging only the top candidates (R=2: 1 winner + 1 dummy) satisfies ar_gather_2rank's
+ * 16-byte alignment requirement (2 * 8 bytes = 16 bytes) while cutting all-gather bandwidth 4x. */
+static constexpr int64_t kDraftGatherR = kDraftTopR;
 
 struct MtpHcBlock {
     struct Wire {
@@ -414,7 +421,7 @@ inline int MtpHcBlock::declare(RadBuilder* b, Names& nm, const Geom& geom, int l
                                RAD_INT("R", kDraftTopR), RAD_INT("vocab_off", g.vocab_off),
                                RAD_STR("dtype", g.dtype)),
                     RAD_NOWEIGHTS),
-                 {w.dlog}, {w.didx, w.dval, w.dpair})
+                 {w.dlog}, {w.didx, w.dval})
             : rw(b, RAD_OP(b, "row_topk",
                     RAD_PARAMS(RAD_RANGE("M", 1, g.max_logit_rows), RAD_INT("N", hrows),
                                RAD_INT("R", kDraftTopR), RAD_STR("dtype", g.dtype)),
@@ -462,17 +469,18 @@ inline int MtpHcBlock::declare(RadBuilder* b, Names& nm, const Geom& geom, int l
         }
         if (dh_shard) {
             /* ROW-INTERLEAVED, so one draft row's pairs from every rank land side by side --
-             * `row_topk_merge` reads one row at one row stride. */
+             * `row_topk_merge` reads one row at one row stride. SD02: only the top candidates
+             * (R=2, 1 winner + 1 dummy) are gathered and merged. */
             op_dgather = rw(b, RAD_OP(b, "all_gather",
                                RAD_PARAMS(RAD_INT("world_size", g.world),
-                                          RAD_INT("numel", g.max_logit_rows * kDraftTopR * 2),
+                                          RAD_INT("numel", g.max_logit_rows * kDraftGatherR * 2),
                                           RAD_STR("dtype", "f32"),
-                                          RAD_INT("row", kDraftTopR * 2)),
+                                          RAD_INT("row", kDraftGatherR * 2)),
                                RAD_NOWEIGHTS),
                            {w.dpair}, {w.dgath});
             op_dmerge = rw(b, RAD_OP(b, "row_topk_merge",
                               RAD_PARAMS(RAD_RANGE("M", 1, g.max_logit_rows),
-                                         RAD_INT("R", kDraftTopR),
+                                         RAD_INT("R", kDraftGatherR),
                                          RAD_INT("world_size", g.world),
                                          RAD_STR("dtype", g.dtype)),
                               RAD_NOWEIGHTS),
@@ -535,7 +543,7 @@ inline void MtpHcBlock::step(RadCtx* c, const RadBatch* batch) const {
      * reads: the experts, the two connections around them and the lm_head. Every prefill chunk
      * but a prompt's last is such a pass, so on those the head costs its attention alone.
      * `n_draft_out` is the batch's and the same on every rank, so the collectives skipped here
-     * are skipped on all of them. */
+     * are skipped on all of them. (From Code000's opt33) */
     if (r < 0 && batch->n_draft_out <= 0) return;
 
     hc_attn.write(c, T, 0, T);
@@ -569,9 +577,9 @@ inline void MtpHcBlock::step(RadCtx* c, const RadBatch* batch) const {
                     brows(w.dlog, L), RAD_B(w.dsum), RAD_NONE);
         if (op_dmerge) {
             RAD_ISSUE_N(c, op_dtopk, L, brows(w.dlog, L), brows(w.didx, L), brows(w.dval, L),
-                        brows(w.dpair, L));
-            /* In place over all three, so the gather and the merge below are unchanged and now
-             * carry EXACT values instead of the coarse head's. */
+                        RAD_NONE);
+            /* In place over didx/dval, and dpair carries the top kDraftGatherR pairs with EXACT
+             * values for the all-gather. */
             if (op_drerank)
                 RAD_ISSUE_N(c, op_drerank, L, brows(w.hout, L), RAD_W(w_lm), brows(w.didx, L),
                             brows(w.didx, L), brows(w.dval, L), brows(w.dpair, L));

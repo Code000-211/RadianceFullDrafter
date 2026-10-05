@@ -92,6 +92,7 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
 
     /* What is left after the terms nobody gets to spend. */
     int64_t fixed = b.already_held + b.headroom + b.arena + b.staging + b.queues;
+    if (cfg.checkpoint_slots > 0) fixed += cfg.checkpoint_slots * 58 * kMiB;
     if (!want_w)  fixed += cfg.vram_weights_mib * kMiB;   /* a stated pool is fixed too */
     if (!want_kv) fixed += cfg.vram_kv_mib * kMiB;
     b.claimable = b.capacity - fixed;

@@ -291,8 +291,12 @@ typedef struct RadOperand {
     ((RadOperand){ RAD_OPK_RAW, (dt), 0, (void*)(ptr), 0, (r), (c) })
 #define RAD_NONE            ((RadOperand){ RAD_OPK_NONE,   RAD_DT_INVALID, 0, 0, 0, 0, 0 })
 
+#ifdef __cplusplus
+#define RAD_OPD(...)  std::initializer_list<RadOperand>{ __VA_ARGS__ }
+#else
 #define RAD_OPD(...)  ((const RadOperand[]){ __VA_ARGS__ }), \
                       (int)(sizeof((const RadOperand[]){ __VA_ARGS__ }) / sizeof(RadOperand))
+#endif
 
 /* ================================================================== issue */
 /* The core resolves each weight handle to a pointer, waits on the mover's event if the weight is
@@ -309,6 +313,15 @@ typedef struct RadOperand {
 #define RAD_N_BATCH ((int64_t)-1)
 
 int rad_issue(RadCtx* c, rad_op op, const RadOperand* opd, int n_opd, int64_t n);
+
+#ifdef __cplusplus
+} /* extern "C" */
+#include <initializer_list>
+inline int rad_issue(RadCtx* c, rad_op op, std::initializer_list<RadOperand> opd, int64_t n) {
+    return rad_issue(c, op, opd.size() ? opd.begin() : nullptr, (int)opd.size(), n);
+}
+extern "C" {
+#endif
 
 /* THE SECOND LANE, for overlapping a collective -- or an arm no shard divides -- with compute.
  * `rad_lane` selects which stream subsequent issues launch on (0 or 1); `rad_lane_join(c, from,

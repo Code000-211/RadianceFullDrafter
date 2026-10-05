@@ -71,7 +71,7 @@ static inline int lds_cap_of() {
         if (hipGetDevice(&dev) != hipSuccess) return 0;
         hipDeviceProp_t pr{};
         if (hipGetDeviceProperties(&pr, dev) != hipSuccess) return 0;
-        const size_t stat = 4096;                      /* hist + suf + wsum + the scalars */
+        const size_t stat = 3072;                      /* hist + wsum + the scalars */
         if (pr.sharedMemPerBlock <= stat) return 0;
         const size_t room = (pr.sharedMemPerBlock - stat) / sizeof(uint32_t);
         return (int)(room < (size_t)kLdsCap ? room : (size_t)kLdsCap);
@@ -100,23 +100,38 @@ __device__ __forceinline__ uint32_t keyof(float v, int page) {
  * of what it does. A wave's 32 values scan in five DPP steps -- row_shr or row_shl within each row
  * of sixteen, then one readlane across the two rows (r4d_common.h) -- and only the waves' totals
  * need LDS at all. The sums are of integers, so either form gives the same answer. */
-/* suf[b] = the sum of hist[i] over i >= b, for all kBins bins: each wave's 32 bins by a suffix
- * scan in registers, then the totals of the waves above it. Two barriers. The caller has a barrier
- * between the histogram and this, and `wt` holds kBins / 32 words nothing else is using. */
+/* radix_step selects the digit without materialising the suffix plane in LDS.
+ * Each wave suffix-scans its own 32 bins in registers, then publishes its total in wt.
+ * Thread t computes its complete suffix sum s and after = s - hist[t].
+ * When want > 0 and s >= want && after < want, that unique bin publishes the digit and new need.
+ * If s < want (or want == 0), thread 0 publishes the fallback.
+ * One barrier publishes the wave sums; one barrier publishes sh_T and sh_need. */
 template <int NT>
-__device__ __forceinline__ void bin_suffix(const uint32_t* hist, uint32_t* suf, uint32_t* wt) {
+__device__ __forceinline__ void radix_step(const uint32_t* hist, uint32_t* wt,
+                                           uint32_t shift, uint32_t fixed, uint32_t want,
+                                           uint32_t* sh_T, uint32_t* sh_need) {
     static_assert(NT >= kBins && kBins % kWave == 0, "the bins are whole waves of the workgroup");
     const int t = (int)threadIdx.x, lane = t & (kWave - 1), wave = t >> 5;
-    uint32_t x = 0;
+    uint32_t h = 0, x = 0;
     if (t < kBins) {
-        x = r4d_wave_suffix_u32(hist[t], lane);
+        h = hist[t];
+        x = r4d_wave_suffix_u32(h, lane);
         if (lane == 0) wt[wave] = x;
     }
     __syncthreads();
     if (t < kBins) {
         uint32_t above = 0;
         for (int w = wave + 1; w < kBins / kWave; ++w) above += wt[w];
-        suf[t] = x + above;
+        const uint32_t s = x + above;
+        const uint32_t after = s - h;
+        if (want > 0 && s >= want && after < want) {
+            *sh_T = fixed | ((uint32_t)t << shift);
+            *sh_need = want - after;
+        }
+        if (t == 0 && (s < want || want == 0)) {
+            *sh_T = fixed;
+            *sh_need = want - s;
+        }
     }
     __syncthreads();
 }
@@ -147,10 +162,10 @@ __global__ __launch_bounds__(kThreads) void qsa_select_kernel(
     const int32_t* __restrict__ nc, const int32_t* __restrict__ pos,
     const int32_t* __restrict__ cu,
     int32_t* __restrict__ sel, int32_t* __restrict__ nsel, int32_t* __restrict__ seqused,
-    int nb, int topk, int ratio, int nseq, int s_ld, int t_ld, int o_ld, int cap) {
+    int nb, int topk, int ratio, int nseq, int s_ld, int t_ld, int o_ld, int cap,
+    int m_offset) {
 
     __shared__ uint32_t hist[kBins];
-    __shared__ uint32_t suf[kBins];
     __shared__ uint32_t wsum[kWaves];
     __shared__ uint32_t sh_T, sh_need, sh_out;
     __shared__ int      sh_seq;
@@ -162,8 +177,9 @@ __global__ __launch_bounds__(kThreads) void qsa_select_kernel(
 
     if (t == 0) sh_seq = 0;
     __syncthreads();
+    const int gm = m + m_offset;
     for (int i = t; i < nseq; i += kThreads)
-        if (m >= cu[i] && m < cu[i + 1]) sh_seq = i;
+        if (gm >= cu[i] && gm < cu[i + 1]) sh_seq = i;
     __syncthreads();
     const int seq = sh_seq;
     const int p   = pos ? pos[m] : 0;
@@ -215,17 +231,7 @@ __global__ __launch_bounds__(kThreads) void qsa_select_kernel(
              * walk stops at, with `run` its `suf[t+1]`. The fallback covers the case where the
              * walk reaches the bottom without ever arriving: fewer live keys than `want`, which
              * happens whenever enough of the table is padding. */
-            bin_suffix<kThreads>(hist, suf, wsum);
-            if (t == 0) { sh_T = fixed; sh_need = want - suf[0]; }
-            __syncthreads();
-            {
-                const uint32_t after = (t + 1 < kBins) ? suf[t + 1] : 0u;
-                if (suf[t] >= want && after < want) {
-                    sh_T    = fixed | ((uint32_t)t << shift);
-                    sh_need = want - after;
-                }
-            }
-            __syncthreads();
+            radix_step<kThreads>(hist, wsum, (uint32_t)shift, fixed, want, &sh_T, &sh_need);
             fixed = sh_T;
             want  = sh_need;
         }
@@ -248,21 +254,20 @@ __global__ __launch_bounds__(kThreads) void qsa_select_kernel(
         const bool eq = k != 0u && n > topk && k == T;
 
         /* Two scans in one pass: the high entries take their slots from the running output
-         * count, the tie entries from the count of ties already taken. */
+         * count, the tie entries from the count of ties already taken.
+         * AG05: Both counts are packed into a single uint32 (hi in low 16 bits, eq in high 16 bits),
+         * reducing 4 CTA barriers down to 2 and halving wave scan dispatches with zero cross-lane carry. */
         const unsigned long long mh = __ballot(hi), me = __ballot(eq);
         const uint32_t rh = (uint32_t)__popcll(mh & ((1ull << lane) - 1ull));
         const uint32_t re = (uint32_t)__popcll(me & ((1ull << lane) - 1ull));
-        if (lane == 0) wsum[wave] = (uint32_t)__popcll(mh);
+        if (lane == 0) wsum[wave] = (uint32_t)__popcll(mh) | ((uint32_t)__popcll(me) << 16);
         __syncthreads();
-        uint32_t before_h, tot_h;
-        counts_before<kWaves>(wsum, lane, wave, &before_h, &tot_h);
-        const uint32_t base_h = sh_out + before_h;
-        __syncthreads();
-        if (lane == 0) wsum[wave] = (uint32_t)__popcll(me);
-        __syncthreads();
-        uint32_t before_e, tot_e;
-        counts_before<kWaves>(wsum, lane, wave, &before_e, &tot_e);
-        const uint32_t base_e = taken_eq + before_e;
+        uint32_t before_pk, tot_pk;
+        counts_before<kWaves>(wsum, lane, wave, &before_pk, &tot_pk);
+        const uint32_t base_h = sh_out + (before_pk & 0xffffu);
+        const uint32_t base_e = taken_eq + (before_pk >> 16);
+        const uint32_t tot_h  = tot_pk & 0xffffu;
+        const uint32_t tot_e  = tot_pk >> 16;
 
         if (hi) {
             const uint32_t slot = base_h + rh;
@@ -393,7 +398,7 @@ static_assert(kSamp + kBins <= kWideBins, "the sample and its histogram share th
  * single-workgroup kernel's four eight-bit digits over a list. Fewer than `want` live keys leave
  * the threshold at 0, which every live key exceeds. */
 __device__ __forceinline__ void lds_kth(const uint32_t* keys, int cnt, uint32_t want,
-                                        uint32_t* hist, uint32_t* suf, uint32_t* wsum,
+                                        uint32_t* hist, uint32_t* wsum,
                                         uint32_t* sh_T, uint32_t* sh_need, uint32_t* T,
                                         uint32_t* need) {
     const int t = (int)threadIdx.x;
@@ -407,17 +412,7 @@ __device__ __forceinline__ void lds_kth(const uint32_t* keys, int cnt, uint32_t 
             if (k != 0u && (k & mask) == (fixed & mask)) atomicAdd(&hist[(k >> shift) & 255u], 1u);
         }
         __syncthreads();
-        bin_suffix<kThreads>(hist, suf, wsum);
-        if (t == 0) { *sh_T = fixed; *sh_need = want - suf[0]; }
-        __syncthreads();
-        {
-            const uint32_t after = (t + 1 < kBins) ? suf[t + 1] : 0u;
-            if (suf[t] >= want && after < want) {
-                *sh_T    = fixed | ((uint32_t)t << shift);
-                *sh_need = want - after;
-            }
-        }
-        __syncthreads();
+        radix_step<kThreads>(hist, wsum, (uint32_t)shift, fixed, want, sh_T, sh_need);
         fixed = *sh_T;
         want  = *sh_need;
     }
@@ -430,13 +425,13 @@ __global__ __launch_bounds__(kThreads) void qsa_select_wide_kernel(
     const int32_t* __restrict__ nc, const int32_t* __restrict__ pos,
     const int32_t* __restrict__ cu,
     int32_t* __restrict__ sel, int32_t* __restrict__ nsel, int32_t* __restrict__ seqused,
-    int nb, int topk, int ratio, int nseq, int s_ld, int t_ld, int o_ld) {
+    int nb, int topk, int ratio, int nseq, int s_ld, int t_ld, int o_ld,
+    int m_offset) {
 
     /* The first digit's 4096 bins; after it, bins [0, kBins) are the later digits' histogram and
      * the rest hold the collected keys. */
     __shared__ uint32_t wide[kWideBins];
-    __shared__ uint32_t suf[kBins];
-    __shared__ uint32_t wsum[kWaves], wsum2[kWaves];
+    __shared__ uint32_t wsum[kWaves];
     __shared__ uint32_t sh_T, sh_need, sh_out, sh_cnt, sh_bin;
     __shared__ int      sh_seq;
     uint32_t* const hist = wide;
@@ -454,8 +449,9 @@ __global__ __launch_bounds__(kThreads) void qsa_select_wide_kernel(
 
     if (t == 0) sh_seq = 0;
     __syncthreads();
+    const int gm = m + m_offset;
     for (int i = t; i < nseq; i += kThreads)
-        if (m >= cu[i] && m < cu[i + 1]) sh_seq = i;
+        if (gm >= cu[i] && gm < cu[i + 1]) sh_seq = i;
     __syncthreads();
     const int seq = sh_seq;
     const int p   = pos ? pos[m] : 0;
@@ -481,7 +477,7 @@ __global__ __launch_bounds__(kThreads) void qsa_select_wide_kernel(
         uint32_t m = (uint32_t)(((uint64_t)topk * 2u * kSamp + (uint64_t)n - 1u) / (uint64_t)n) + 8u;
         if (m > (uint32_t)kSamp) m = (uint32_t)kSamp;
         uint32_t lo, lo_need;
-        lds_kth(samp, kSamp, m, wide + kSamp, suf, wsum, &sh_T, &sh_need, &lo, &lo_need);
+        lds_kth(samp, kSamp, m, wide + kSamp, wsum, &sh_T, &sh_need, &lo, &lo_need);
 
         /* ---- one pass: every key at or above the bound, with its block, in block order. */
         uint32_t* const lkey = wide + kBins;
@@ -528,7 +524,7 @@ __global__ __launch_bounds__(kThreads) void qsa_select_wide_kernel(
 
         /* ---- the table from the list, when the list holds the answer. */
         if (cnt >= (uint32_t)topk && cnt <= (uint32_t)kSampCap) {
-            lds_kth(lkey, (int)cnt, (uint32_t)topk, hist, suf, wsum, &sh_T, &sh_need, &T, &need);
+            lds_kth(lkey, (int)cnt, (uint32_t)topk, hist, wsum, &sh_T, &sh_need, &T, &need);
             uint32_t hbase = 0, ebase = 0;
             for (uint32_t i0 = 0; i0 < cnt; i0 += kThreads) {
                 const uint32_t i = i0 + (uint32_t)t;
@@ -536,22 +532,18 @@ __global__ __launch_bounds__(kThreads) void qsa_select_wide_kernel(
                 const bool hi = i < cnt && k > T;
                 const bool eq = i < cnt && k == T;
                 const unsigned long long mh = __ballot(hi), me = __ballot(eq);
-                if (lane == 0) {
-                    wsum[wave]  = (uint32_t)__popcll(mh);
-                    wsum2[wave] = (uint32_t)__popcll(me);
-                }
+                if (lane == 0) wsum[wave] = (uint32_t)__popcll(mh) | ((uint32_t)__popcll(me) << 16);
                 __syncthreads();
-                uint32_t before_h, tot_h, before_e, tot_e;
-                counts_before<kWaves>(wsum,  lane, wave, &before_h, &tot_h);
-                counts_before<kWaves>(wsum2, lane, wave, &before_e, &tot_e);
-                const uint32_t hp = hbase + before_h +
+                uint32_t before_pk, tot_pk;
+                counts_before<kWaves>(wsum, lane, wave, &before_pk, &tot_pk);
+                const uint32_t hp = hbase + (before_pk & 0xffffu) +
                                     (uint32_t)__popcll(mh & ((1ull << lane) - 1ull));
-                const uint32_t ep = ebase + before_e +
+                const uint32_t ep = ebase + (before_pk >> 16) +
                                     (uint32_t)__popcll(me & ((1ull << lane) - 1ull));
                 if (hi) ou[hp] = tb[lblk[i]];
                 if (eq && ep < need) ou[(uint32_t)topk - need + ep] = tb[lblk[i]];
-                hbase += tot_h;
-                ebase += tot_e;
+                hbase += (tot_pk & 0xffffu);
+                ebase += (tot_pk >> 16);
                 __syncthreads();
             }
             sampled = true;
@@ -614,25 +606,21 @@ __global__ __launch_bounds__(kThreads) void qsa_select_wide_kernel(
                     const bool abv = k != 0u && (k >> kWideShift) > B;
                     const bool inb = k != 0u && (k >> kWideShift) == B;
                     const unsigned long long ma = __ballot(abv), mi = __ballot(inb);
-                    if (lane == 0) {
-                        wsum[wave]  = (uint32_t)__popcll(ma);
-                        wsum2[wave] = (uint32_t)__popcll(mi);
-                    }
+                    if (lane == 0) wsum[wave] = (uint32_t)__popcll(ma) | ((uint32_t)__popcll(mi) << 16);
                     __syncthreads();
-                    uint32_t before_a, tot_a, before_i, tot_i;
-                    counts_before<kWaves>(wsum,  lane, wave, &before_a, &tot_a);
-                    counts_before<kWaves>(wsum2, lane, wave, &before_i, &tot_i);
+                    uint32_t before_pk, tot_pk;
+                    counts_before<kWaves>(wsum, lane, wave, &before_pk, &tot_pk);
                     if (abv)
-                        mabv[n_abv + before_a + (uint32_t)__popcll(ma & ((1ull << lane) - 1ull))] =
+                        mabv[n_abv + (before_pk & 0xffffu) + (uint32_t)__popcll(ma & ((1ull << lane) - 1ull))] =
                             (uint32_t)b;
                     if (inb) {
-                        const uint32_t j = n_in + before_i +
+                        const uint32_t j = n_in + (before_pk >> 16) +
                                            (uint32_t)__popcll(mi & ((1ull << lane) - 1ull));
                         mkey[j] = k;
                         mblk[j] = (uint32_t)b;
                     }
-                    n_abv += tot_a;
-                    n_in  += tot_i;
+                    n_abv += (tot_pk & 0xffffu);
+                    n_in  += (tot_pk >> 16);
                     __syncthreads();
                 }
                 if (t == 0) sh_cnt = n_in;
@@ -662,17 +650,7 @@ __global__ __launch_bounds__(kThreads) void qsa_select_wide_kernel(
                     if (k != 0u && (k & hm) == (fixed & hm)) atomicAdd(&hist[(k >> shift) & dm], 1u);
                 }
                 __syncthreads();
-                bin_suffix<kThreads>(hist, suf, wsum);
-                if (t == 0) { sh_T = fixed; sh_need = want - suf[0]; }
-                __syncthreads();
-                {
-                    const uint32_t after = (t + 1 < kBins) ? suf[t + 1] : 0u;
-                    if (suf[t] >= want && after < want) {
-                        sh_T    = fixed | ((uint32_t)t << shift);
-                        sh_need = want - after;
-                    }
-                }
-                __syncthreads();
+                radix_step<kThreads>(hist, wsum, (uint32_t)shift, fixed, want, &sh_T, &sh_need);
                 fixed = sh_T;
                 want  = sh_need;
             }
@@ -692,17 +670,13 @@ __global__ __launch_bounds__(kThreads) void qsa_select_wide_kernel(
                     const bool hi = i < nin && k > T;
                     const bool eq = i < nin && k == T;
                     const unsigned long long mh = __ballot(hi), me = __ballot(eq);
-                    if (lane == 0) {
-                        wsum[wave]  = (uint32_t)__popcll(mh);
-                        wsum2[wave] = (uint32_t)__popcll(me);
-                    }
+                    if (lane == 0) wsum[wave] = (uint32_t)__popcll(mh) | ((uint32_t)__popcll(me) << 16);
                     __syncthreads();
-                    uint32_t before_h, tot_h, before_e, tot_e;
-                    counts_before<kWaves>(wsum,  lane, wave, &before_h, &tot_h);
-                    counts_before<kWaves>(wsum2, lane, wave, &before_e, &tot_e);
-                    const uint32_t hp = hbase + before_h +
+                    uint32_t before_pk, tot_pk;
+                    counts_before<kWaves>(wsum, lane, wave, &before_pk, &tot_pk);
+                    const uint32_t hp = hbase + (before_pk & 0xffffu) +
                                         (uint32_t)__popcll(mh & ((1ull << lane) - 1ull));
-                    const uint32_t ep = ebase + before_e +
+                    const uint32_t ep = ebase + (before_pk >> 16) +
                                         (uint32_t)__popcll(me & ((1ull << lane) - 1ull));
                     if (i < nin) {
                         const uint32_t b = mblk[i];
@@ -710,8 +684,8 @@ __global__ __launch_bounds__(kThreads) void qsa_select_wide_kernel(
                         if (eq && ep < need) ou[(uint32_t)topk - need + ep] = tb[b];
                         mkey[i] = hp;
                     }
-                    hbase += tot_h;
-                    ebase += tot_e;
+                    hbase += (tot_pk & 0xffffu);
+                    ebase += (tot_pk >> 16);
                     __syncthreads();
                 }
                 for (uint32_t j = (uint32_t)t; j < n_abv; j += kThreads) {
@@ -740,17 +714,14 @@ __global__ __launch_bounds__(kThreads) void qsa_select_wide_kernel(
         const unsigned long long mh = __ballot(hi), me = __ballot(eq);
         const uint32_t rh = (uint32_t)__popcll(mh & ((1ull << lane) - 1ull));
         const uint32_t re = (uint32_t)__popcll(me & ((1ull << lane) - 1ull));
-        if (lane == 0) wsum[wave] = (uint32_t)__popcll(mh);
+        if (lane == 0) wsum[wave] = (uint32_t)__popcll(mh) | ((uint32_t)__popcll(me) << 16);
         __syncthreads();
-        uint32_t before_h, tot_h;
-        counts_before<kWaves>(wsum, lane, wave, &before_h, &tot_h);
-        const uint32_t base_h = sh_out + before_h;
-        __syncthreads();
-        if (lane == 0) wsum[wave] = (uint32_t)__popcll(me);
-        __syncthreads();
-        uint32_t before_e, tot_e;
-        counts_before<kWaves>(wsum, lane, wave, &before_e, &tot_e);
-        const uint32_t base_e = taken_eq + before_e;
+        uint32_t before_pk, tot_pk;
+        counts_before<kWaves>(wsum, lane, wave, &before_pk, &tot_pk);
+        const uint32_t base_h = sh_out + (before_pk & 0xffffu);
+        const uint32_t base_e = taken_eq + (before_pk >> 16);
+        const uint32_t tot_h  = tot_pk & 0xffffu;
+        const uint32_t tot_e  = tot_pk >> 16;
 
         if (hi) {
             const uint32_t slot = base_h + rh;
@@ -853,7 +824,7 @@ static inline int par_chunks(long long nb) {
  * undefined, and the whole point of widening is that some threads have nothing to do here. */
 template <int NT>
 __device__ __forceinline__ void radix_thresh(const uint32_t* __restrict__ key, int n,
-                                             uint32_t want, uint32_t* hist, uint32_t* suf,
+                                             uint32_t want, uint32_t* hist,
                                              uint32_t* wt, uint32_t* sh_T, uint32_t* sh_need) {
     const int t = (int)threadIdx.x;
     uint32_t fixed = 0;
@@ -867,17 +838,7 @@ __device__ __forceinline__ void radix_thresh(const uint32_t* __restrict__ key, i
                 atomicAdd(&hist[(k >> shift) & 255u], 1u);
         }
         __syncthreads();
-        bin_suffix<NT>(hist, suf, wt);
-        if (t == 0) { *sh_T = fixed; *sh_need = want - suf[0]; }
-        __syncthreads();
-        if (t < kBins) {
-            const uint32_t after = (t + 1 < kBins) ? suf[t + 1] : 0u;
-            if (suf[t] >= want && after < want) {
-                *sh_T    = fixed | ((uint32_t)t << shift);
-                *sh_need = want - after;
-            }
-        }
-        __syncthreads();
+        radix_step<NT>(hist, wt, (uint32_t)shift, fixed, want, sh_T, sh_need);
         fixed = *sh_T;
         want  = *sh_need;
     }
@@ -967,10 +928,11 @@ __global__ __launch_bounds__(kLocalThreads) void qsa_local_kernel(
     const int32_t* __restrict__ nc, const int32_t* __restrict__ pos,
     const int32_t* __restrict__ cu,
     uint32_t* __restrict__ ck, int32_t* __restrict__ ci, int32_t* __restrict__ cc,
-    int nb, int topk, int ratio, int nseq, int s_ld, int t_ld, int chunk) {
+    int nb, int topk, int ratio, int nseq, int s_ld, int t_ld, int chunk,
+    int m_offset) {
 
     constexpr int LT = kLocalThreads;
-    __shared__ uint32_t hist[kBins], suf[kBins], wsum[LT / kWave];
+    __shared__ uint32_t hist[kBins], wsum[LT / kWave];
     __shared__ uint32_t sh_T, sh_need, sh_hi, sh_ord;
     __shared__ int      sh_seq;
     extern __shared__ uint32_t sh_key[];
@@ -980,8 +942,9 @@ __global__ __launch_bounds__(kLocalThreads) void qsa_local_kernel(
 
     if (t == 0) { sh_seq = 0; cc[(size_t)m * kParWMax + c] = 0; }
     __syncthreads();
+    const int gm = m + m_offset;
     for (int i = t; i < nseq; i += LT)
-        if (m >= cu[i] && m < cu[i + 1]) sh_seq = i;
+        if (gm >= cu[i] && gm < cu[i + 1]) sh_seq = i;
     __syncthreads();
     const int seq = sh_seq;
     const int p   = pos ? pos[m] : 0;
@@ -1001,7 +964,7 @@ __global__ __launch_bounds__(kLocalThreads) void qsa_local_kernel(
 
     ParEmit e{ wsum, &sh_hi, &sh_ord, 0u, 0u, 0u, cn <= topk };
     if (!e.all) {
-        radix_thresh<LT>(sh_key, cn, (uint32_t)topk, hist, suf, wsum, &sh_T, &sh_need);
+        radix_thresh<LT>(sh_key, cn, (uint32_t)topk, hist, wsum, &sh_T, &sh_need);
         e.T = sh_T; e.need = sh_need;
     }
     if (t == 0) { sh_hi = 0; sh_ord = 0; }
@@ -1040,10 +1003,11 @@ __global__ __launch_bounds__(kMergeThreads) void qsa_merge_kernel(
     const int32_t* __restrict__ nc, const int32_t* __restrict__ pos,
     const int32_t* __restrict__ cu,
     int32_t* __restrict__ sel, int32_t* __restrict__ nsel, int32_t* __restrict__ seqused,
-    int nb, int topk, int ratio, int nseq, int t_ld, int o_ld, int nchunk) {
+    int nb, int topk, int ratio, int nseq, int t_ld, int o_ld, int nchunk,
+    int m_offset) {
 
     constexpr int NT = kMergeThreads;
-    __shared__ uint32_t hist[kBins], suf[kBins], wsum[NT / kWave];
+    __shared__ uint32_t hist[kBins], wsum[NT / kWave];
     __shared__ uint32_t sh_T, sh_need, sh_hi, sh_ord, sh_tot;
     __shared__ int      sh_seq, sh_off[kParWMax + 1];
     extern __shared__ uint32_t sh_key[];
@@ -1053,8 +1017,9 @@ __global__ __launch_bounds__(kMergeThreads) void qsa_merge_kernel(
 
     if (t == 0) sh_seq = 0;
     __syncthreads();
+    const int gm = m + m_offset;
     for (int i = t; i < nseq; i += NT)
-        if (m >= cu[i] && m < cu[i + 1]) sh_seq = i;
+        if (gm >= cu[i] && gm < cu[i + 1]) sh_seq = i;
     __syncthreads();
     const int seq = sh_seq;
     const int p   = pos ? pos[m] : 0;
@@ -1081,7 +1046,7 @@ __global__ __launch_bounds__(kMergeThreads) void qsa_merge_kernel(
 
     ParEmit e{ wsum, &sh_hi, &sh_ord, 0u, 0u, 0u, tot <= topk };
     if (!e.all) {
-        radix_thresh<NT>(sh_key, tot, (uint32_t)topk, hist, suf, wsum, &sh_T, &sh_need);
+        radix_thresh<NT>(sh_key, tot, (uint32_t)topk, hist, wsum, &sh_T, &sh_need);
         e.T = sh_T; e.need = sh_need;
     }
     if (t == 0) { sh_hi = 0; sh_ord = 0; }
@@ -1147,7 +1112,8 @@ static inline int64_t par_scratch_bytes(long long topk) {
 static int r4d_qsa_select_bf16_emit(long score, long bt, long nc, long pos, long cu, long sel,
                                    long nsel, long seqused, int M, int nb, int topk, int ratio,
                                    int nseq, int s_ld, int t_ld, int o_ld,
-                                   void* scratch, long long scratch_bytes, const R4dSink& sk) {
+                                   void* scratch, long long scratch_bytes, const R4dSink& sk,
+                                   int m_offset = 0) {
     int emit_rc = RAD_OK;
     if (!score || !bt || !nc || !cu || !sel || !nsel) return -1;
     if (M <= 0 || nb <= 0 || topk <= 0 || ratio <= 0 || nseq <= 0) return -2;
@@ -1172,13 +1138,13 @@ static int r4d_qsa_select_bf16_emit(long score, long bt, long nc, long pos, long
         emit_rc = R4D_EMIT(sk, qsa_local_kernel, dim3((unsigned)nchunk, (unsigned)M), dim3(kLocalThreads),
                            (size_t)chunk * sizeof(uint32_t), (const float*)score, (const int32_t*)bt,
                            (const int32_t*)nc, (const int32_t*)pos, (const int32_t*)cu,
-                           ck, ci, cc, nb, topk, ratio, nseq, s_ld, t_ld, chunk);
+                           ck, ci, cc, nb, topk, ratio, nseq, s_ld, t_ld, chunk, m_offset);
         emit_rc = R4D_EMIT(sk, qsa_merge_kernel, dim3((unsigned)M), dim3(kMergeThreads),
                            (size_t)nchunk * topk * sizeof(uint32_t), (const uint32_t*)ck, (const int32_t*)ci,
                            (const int32_t*)cc, (const int32_t*)bt, (const int32_t*)nc,
                            (const int32_t*)pos, (const int32_t*)cu,
                            (int32_t*)sel, (int32_t*)nsel, (int32_t*)seqused,
-                           nb, topk, ratio, nseq, t_ld, o_ld, nchunk);
+                           nb, topk, ratio, nseq, t_ld, o_ld, nchunk, m_offset);
         return emit_rc == RAD_OK && (sk.desc || hipGetLastError() == hipSuccess) ? 0 : -4;
     }
 
@@ -1188,7 +1154,7 @@ static int r4d_qsa_select_bf16_emit(long score, long bt, long nc, long pos, long
                            (const float*)score, (const int32_t*)bt, (const int32_t*)nc,
                            (const int32_t*)pos, (const int32_t*)cu, (int32_t*)sel,
                            (int32_t*)nsel, (int32_t*)seqused, nb, topk, ratio, nseq, s_ld, t_ld,
-                           o_ld);
+                           o_ld, m_offset);
         return emit_rc == RAD_OK && (sk.desc || hipGetLastError() == hipSuccess) ? 0 : -4;
     }
 
@@ -1199,7 +1165,7 @@ static int r4d_qsa_select_bf16_emit(long score, long bt, long nc, long pos, long
                        (size_t)cap * sizeof(uint32_t), (const float*)score, (const int32_t*)bt,
                        (const int32_t*)nc, (const int32_t*)pos, (const int32_t*)cu,
                        (int32_t*)sel, (int32_t*)nsel,
-                       (int32_t*)seqused, nb, topk, ratio, nseq, s_ld, t_ld, o_ld, cap);
+                       (int32_t*)seqused, nb, topk, ratio, nseq, s_ld, t_ld, o_ld, cap, m_offset);
     return emit_rc == RAD_OK && (sk.desc || hipGetLastError() == hipSuccess) ? 0 : -4;
 }
 
@@ -1260,13 +1226,17 @@ static int r4d_rad_qsa_select_body(const RadArgs* a, const R4dSink& sk) {
     if (r4d_numel(ns) < M) return R4D_NO(RAD_E_SHAPE);
     if (r4d_numel(po) < M || r4d_numel(su) < M) return R4D_NO(RAD_E_SHAPE);
     const long long sp = r4d_row_pitch(sc), tp = r4d_row_pitch(bt), op = r4d_row_pitch(se);
-    if (sp < 0 || tp < 0 || op < 0) return R4D_NO(RAD_E_STRIDE);
+    long long m_offset = r4d_geti_or(a, "m_offset", 0);
+    const long long tp_part = r4d_geti_or(a, "tp_partition", 0);
+    if (tp_part && a->world_size == 2 && a->rank == 1) {
+        m_offset = M;
+    }
     /* Scratch is OPTIONAL here and the launcher says so: the split path takes it when it is
      * there and big enough, and the single-workgroup kernel runs when it is not. */
     const int e = r4d_qsa_select_bf16_emit(r4d_addr(sc), r4d_addr(bt), r4d_addr(nc), r4d_addr(po),
                                       r4d_addr(cu), r4d_addr(se), r4d_addr(ns), r4d_addr(su),
                                       (int)M, (int)nb, (int)topk, (int)ratio, (int)nseq,
-                                      (int)sp, (int)tp, (int)op, a->scratch, a->scratch_bytes, sk);
+                                      (int)sp, (int)tp, (int)op, a->scratch, a->scratch_bytes, sk, (int)m_offset);
     return e == 0 ? RAD_OK : RAD_E_SHAPE;
 }
 

@@ -85,7 +85,8 @@ __global__ __launch_bounds__(kThreads) void qsa_score_kernel(
     const __hip_bfloat16* __restrict__ q, const __hip_bfloat16* __restrict__ bk,
     const int32_t* __restrict__ bt, const int32_t* __restrict__ cu,
     const int32_t* __restrict__ nc, float* __restrict__ out,
-    int n, int heads, int nb, int nseq, int q_ld, int bk_ld, int bt_ld, int out_ld) {
+    int n, int heads, int nb, int nseq, int q_ld, int bk_ld, int bt_ld, int out_ld,
+    int m_offset) {
 
     __shared__ int sh_seq;
     const int lane = threadIdx.x & (kWave - 1), wave = threadIdx.x >> 5;
@@ -105,14 +106,16 @@ __global__ __launch_bounds__(kThreads) void qsa_score_kernel(
          * however the threads are scheduled -- which matters because this tree compares generated
          * text across builds byte for byte. A query past the batch matches nothing and ends the
          * tile. */
+        const int gm = m + m_offset;
         if (threadIdx.x == 0) sh_seq = -1;
         __syncthreads();
         for (int i = (int)threadIdx.x; i < nseq; i += kThreads)
-            if (m >= cu[i] && m < cu[i + 1]) sh_seq = i;
+            if (gm >= cu[i] && gm < cu[i + 1]) sh_seq = i;
         __syncthreads();
         const int seq = sh_seq;
         if (seq < 0) return;
-        const int mend = cu[seq + 1] < m0 + kQT ? cu[seq + 1] : m0 + kQT;
+        const int cu_end_local = cu[seq + 1] - m_offset;
+        const int mend = cu_end_local < m0 + kQT ? cu_end_local : m0 + kQT;
         const int nq   = mend - m;
 
         const int nbs = nc[seq] < nb ? nc[seq] : nb;
@@ -319,7 +322,8 @@ __global__ __launch_bounds__(kMxWaves * kWave) void qsa_score_mx_kernel(
     const unsigned short* __restrict__ q, const unsigned short* __restrict__ bk,
     const int32_t* __restrict__ bt, const int32_t* __restrict__ cu,
     const int32_t* __restrict__ nc, float* __restrict__ out,
-    int M, int nb, int nseq, int tpw, int q_ld, int bk_ld, int bt_ld, int out_ld, int vec) {
+    int M, int nb, int nseq, int tpw, int q_ld, int bk_ld, int bt_ld, int out_ld, int vec,
+    int m_offset) {
 
     const int lane = threadIdx.x & (kWave - 1), wave = threadIdx.x >> 5;
     const int half = lane >> 4, col = lane & 15;
@@ -344,14 +348,16 @@ __global__ __launch_bounds__(kMxWaves * kWave) void qsa_score_mx_kernel(
     const int row = m0 + col;
     for (int m = m0; m < mlim; ) {
         /* The sequence of query `m`: exactly one entry of `cu` brackets it. */
+        const int gm = m + m_offset;
         int seq = -1;
         for (int i0 = 0; i0 < nseq; i0 += kWave) {
             const int i = i0 + lane;
-            const unsigned long long hit = __ballot(i < nseq && m >= cu[i] && m < cu[i + 1]);
+            const unsigned long long hit = __ballot(i < nseq && gm >= cu[i] && gm < cu[i + 1]);
             if (hit) { seq = i0 + __ffsll((long long)hit) - 1; break; }
         }
         if (seq < 0) return;                /* past the batch: so is every later row */
-        const int mend = cu[seq + 1] < mlim ? cu[seq + 1] : mlim;
+        const int cu_end_local = cu[seq + 1] - m_offset;
+        const int mend = cu_end_local < mlim ? cu_end_local : mlim;
         const bool live = row >= m && row < mend;
         const int nbs  = nc[seq] < nb ? nc[seq] : nb;
         const int bend = wb0 + tpw * 16 < nbs ? wb0 + tpw * 16 : nbs;
@@ -420,7 +426,8 @@ extern "C" void r4d_qsa_score_pin_form(int form) { g_qsa_form = form; }
 //   out  [M][nb]         f32, `out_ld` elements a row (0 = nb)
 static int r4d_qsa_score_bf16_emit(long q, long bk, long bt, long cu, long nc, long out,
                                   int M, int n, int heads, int nb, int nseq,
-                                  int q_ld, int bk_ld, int bt_ld, int out_ld, const R4dSink& sk) {
+                                  int q_ld, int bk_ld, int bt_ld, int out_ld, const R4dSink& sk,
+                                  int m_offset = 0) {
     int emit_rc = RAD_OK;
     if (!q || !bk || !bt || !cu || !nc || !out) return -1;
     if (M <= 0 || n <= 0 || heads <= 0 || nb <= 0 || nseq <= 0) return -2;
@@ -453,7 +460,7 @@ static int r4d_qsa_score_bf16_emit(long q, long bk, long bt, long cu, long nc, l
         emit_rc = R4D_EMIT(sk, (qsa_score_mx_kernel<H>), dim3(gx, (unsigned)qt), dim3(kMxWaves * kWave), \
                            0, (const unsigned short*)q, (const unsigned short*)bk,                \
                            (const int32_t*)bt, (const int32_t*)cu, (const int32_t*)nc,            \
-                           (float*)out, M, nb, nseq, (int)tpw, q_ld, bk_ld, bt_ld, out_ld, vec)
+                           (float*)out, M, nb, nseq, (int)tpw, q_ld, bk_ld, bt_ld, out_ld, vec, m_offset)
         switch (heads) {
             case 1: RAD_QSA_MX(1); break;
             case 2: RAD_QSA_MX(2); break;
@@ -478,7 +485,7 @@ static int r4d_qsa_score_bf16_emit(long q, long bk, long bt, long cu, long nc, l
     emit_rc = R4D_EMIT(sk, (qsa_score_kernel<V, H>), dim3(nbg, nmg), dim3(kThreads), 0,              \
                        (const __hip_bfloat16*)q, (const __hip_bfloat16*)bk, (const int32_t*)bt, \
                        (const int32_t*)cu, (const int32_t*)nc,                                  \
-                       (float*)out, n, heads, nb, nseq, q_ld, bk_ld, bt_ld, out_ld)
+                       (float*)out, n, heads, nb, nseq, q_ld, bk_ld, bt_ld, out_ld, m_offset)
 #define RAD_QSA_HEADS(V)                                        \
     switch (heads) {                                            \
         case 1: RAD_QSA_GO(V, 1); break;                        \
@@ -553,10 +560,15 @@ static int r4d_rad_qsa_score_body(const RadArgs* a, const R4dSink& sk) {
     const long long qp = r4d_row_pitch(q), kp = r4d_row_pitch(bk);
     const long long tp = r4d_row_pitch(bt), op = r4d_row_pitch(o);
     if (qp < 0 || kp < 0 || tp < 0 || op < 0) return R4D_NO(RAD_E_STRIDE);
+    long long m_offset = r4d_geti_or(a, "m_offset", 0);
+    const long long tp_part = r4d_geti_or(a, "tp_partition", 0);
+    if (tp_part && a->world_size == 2 && a->rank == 1) {
+        m_offset = M;
+    }
     const int e = r4d_qsa_score_bf16_emit(r4d_addr(q), r4d_addr(bk), r4d_addr(bt), r4d_addr(cu),
                                      r4d_addr(nc), r4d_addr(o),
                                      (int)M, (int)n, (int)heads, (int)nb, (int)nseq,
-                                     (int)qp, (int)kp, (int)tp, (int)op, sk);
+                                     (int)qp, (int)kp, (int)tp, (int)op, sk, (int)m_offset);
     return e == 0 ? RAD_OK : RAD_E_SHAPE;
 }
 

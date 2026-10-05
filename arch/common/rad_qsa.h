@@ -120,6 +120,8 @@ struct QsaIndexer {
         rad_buf sel   = 0;   /* [max_tok, topk + 1]   i32 */
         rad_buf nsel  = 0;   /* [max_tok]             i32 */
         rad_buf sequ  = 0;   /* [max_tok]             i32 */
+        rad_buf sel_shard  = 0;   /* [max_tok / 2, topk + 1] i32 */
+        rad_buf sequ_shard = 0;   /* [max_tok / 2]           i32 */
         /* THE MODEL'S cos/sin PLANE, [rope_table_rows, rot], or 0 if it builds none. It is the
          * attention block's -- `rope_table` fills it once a step for every layer -- and the
          * indexer's own rotation is at the same `rot`, `theta` and `scale`, so the rows are
@@ -142,6 +144,8 @@ struct QsaIndexer {
      * under it, so above it the rows this op would read were never written. */
     int64_t     qprep_rows = 0;
     rad_op      op_work = 0, op_bkey = 0, op_tail = 0, op_score = 0, op_select = 0;
+    rad_op      op_score_shard = 0, op_select_shard = 0;
+    rad_op      op_gather_sel = 0, op_gather_sequ = 0;
 
     bool on() const { return op_rope != 0; }
 
@@ -311,6 +315,35 @@ inline int QsaIndexer::declare(RadBuilder* b, Names& nm, const Geom& geom, int l
                                  RAD_INT("ratio", c.ratio), RAD_INT("seqs", g.max_seqs)),
                       RAD_NOWEIGHTS),
                   {w.score, w.nc}, {w.sel, w.nsel, w.sequ});
+
+    if (g.world == 2 && w.sel_shard && w.sequ_shard) {
+        op_score_shard = rw(b, RAD_OP(b, "qsa_score",
+                                RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok / 2), RAD_INT("n", c.head_dim),
+                                           RAD_INT("heads", c.heads), RAD_INT("blocks", c.max_blocks),
+                                           RAD_INT("seqs", g.max_seqs), RAD_STR("dtype", g.dtype),
+                                           RAD_INT("tp_partition", 1)),
+                                RAD_NOWEIGHTS),
+                            {w.q, w.nc}, {w.score});
+        op_select_shard = rw(b, RAD_OP(b, "qsa_select",
+                                 RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok / 2),
+                                            RAD_INT("blocks", c.max_blocks), RAD_INT("topk", c.topk),
+                                            RAD_INT("ratio", c.ratio), RAD_INT("seqs", g.max_seqs),
+                                            RAD_INT("tp_partition", 1)),
+                                 RAD_NOWEIGHTS),
+                             {w.score, w.nc}, {w.sel_shard, w.nsel, w.sequ_shard});
+        op_gather_sel = rw(b, RAD_OP(b, "all_gather",
+                               RAD_PARAMS(RAD_INT("world_size", 2),
+                                          RAD_RANGE("numel", c.topk + 1, (g.max_tok / 2) * (c.topk + 1)),
+                                          RAD_STR("dtype", "i32")),
+                               RAD_NOWEIGHTS),
+                           {w.sel_shard}, {w.sel});
+        op_gather_sequ = rw(b, RAD_OP(b, "all_gather",
+                                RAD_PARAMS(RAD_INT("world_size", 2),
+                                           RAD_RANGE("numel", 1, g.max_tok / 2),
+                                           RAD_STR("dtype", "i32")),
+                                RAD_NOWEIGHTS),
+                            {w.sequ_shard}, {w.sequ});
+    }
     return RAD_OK;
 }
 
@@ -413,17 +446,39 @@ inline void QsaIndexer::step(RadCtx* c_, const ActFP8& in, const RadBatch* batch
     if (live > c.max_blocks) live = c.max_blocks;
     if (live < 1) live = 1;
 
-    RAD_ISSUE_N(c_, op_score, T,
-                brows(w.q, T), kv_cache(kv_bk, layer),
-                praw2(bkb->block_table, RAD_I32, S, bkb->block_table_pitch),
-                praw(batch->cu_seqlens, RAD_I32, S + 1), brows(w.nc, S),
-                bcol_at(w.score, 0, c.max_blocks, 0, live, T));
-    RAD_ISSUE_N(c_, op_select, T,
-                bcol_at(w.score, 0, c.max_blocks, 0, live, T),
-                praw2(atb->block_table, RAD_I32, S, atb->block_table_pitch),
-                brows(w.nc, S), praw(batch->positions, RAD_I32, T),
-                praw(batch->cu_seqlens, RAD_I32, S + 1),
-                brows(w.sel, T), brows(w.nsel, T), brows(w.sequ, T));
+    const bool do_part = (g.world == 2) && (T >= 8) && (T % 8 == 0) &&
+                         op_score_shard && op_select_shard && op_gather_sel && op_gather_sequ;
+    if (do_part) {
+        const int64_t Th = T / 2;
+        const int rank = rad_rank(c_);
+        const int64_t m_off = (rank == 1) ? Th : 0;
+        RAD_ISSUE_N(c_, op_score_shard, Th,
+                    brow_slice(w.q, m_off, Th, qw), kv_cache(kv_bk, layer),
+                    praw2(bkb->block_table, RAD_I32, S, bkb->block_table_pitch),
+                    praw(batch->cu_seqlens, RAD_I32, S + 1), brows(w.nc, S),
+                    bcol_at(w.score, m_off, c.max_blocks, 0, live, Th));
+        RAD_ISSUE_N(c_, op_select_shard, Th,
+                    bcol_at(w.score, m_off, c.max_blocks, 0, live, Th),
+                    praw2(atb->block_table, RAD_I32, S, atb->block_table_pitch),
+                    brows(w.nc, S),
+                    praw((const int32_t*)batch->positions + m_off, RAD_I32, Th),
+                    praw(batch->cu_seqlens, RAD_I32, S + 1),
+                    brows(w.sel_shard, Th), brows(w.nsel, Th), brows(w.sequ_shard, Th));
+        RAD_ISSUE_N(c_, op_gather_sel, Th * (c.topk + 1), brows(w.sel_shard, Th), brows(w.sel, T));
+        RAD_ISSUE_N(c_, op_gather_sequ, Th, brows(w.sequ_shard, Th), brows(w.sequ, T));
+    } else {
+        RAD_ISSUE_N(c_, op_score, T,
+                    brows(w.q, T), kv_cache(kv_bk, layer),
+                    praw2(bkb->block_table, RAD_I32, S, bkb->block_table_pitch),
+                    praw(batch->cu_seqlens, RAD_I32, S + 1), brows(w.nc, S),
+                    bcol_at(w.score, 0, c.max_blocks, 0, live, T));
+        RAD_ISSUE_N(c_, op_select, T,
+                    bcol_at(w.score, 0, c.max_blocks, 0, live, T),
+                    praw2(atb->block_table, RAD_I32, S, atb->block_table_pitch),
+                    brows(w.nc, S), praw(batch->positions, RAD_I32, T),
+                    praw(batch->cu_seqlens, RAD_I32, S + 1),
+                    brows(w.sel, T), brows(w.nsel, T), brows(w.sequ, T));
+    }
 
     /* RADIANCE_DEBUG_QSA: the only window into a selection. Nothing else in the tree reports one,
      * and the numbers it prints are what tell a divergence from the dense path apart from QSA

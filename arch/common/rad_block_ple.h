@@ -20,19 +20,16 @@
  *
  * ============================== THE TABLE DECIDES THE SHAPE OF ALL OF THIS ======================
  *
- * 51.2 GB cannot be staged onto a card, so `embed_lookup_q` reads it where --ngram-placement put
- * it: the HOST gather over the container's own mmap or a locked copy in RAM (libavx/avx_ngram.cpp
- * carries that argument in full), or a device kernel reading a pinned copy over the link -- or the
- * card's own copy, on a card that holds it. Either way its result reaches the card through the
- * host arena, 5 KB a token at decode. Three consequences reach this file:
+ * 51.2 GB cannot be on the card and cannot be staged onto it, so `embed_lookup_q` runs on the HOST
+ * over the container's own mmap and its result crosses the link once -- 5 KB a token at decode.
+ * libavx/avx_ngram.cpp carries that argument in full. Three consequences reach this file:
  *
  *   THE TABLE IS A WEIGHT OPERAND, because the planner puts an op on the host only when every
- *   weight operand of it is Site::Host, and decides that from the table's placement. A gather
- *   whose source were an activation could never be placed there.
+ *   weight operand of it is Site::Host. A gather whose source were an activation could never be
+ *   placed there.
  *
- *   ITS BUFFERS ARE HOST DOMAIN. `ids` and `e` are read and written by the host gather when it
- *   runs, so they live in the host arena, which a device gather reads and writes over the link
- *   just as well; everything downstream of `e` is ordinary device work.
+ *   ITS BUFFERS ARE HOST DOMAIN. `ids` and `e` are read and written by a host kernel, so they live
+ *   in the host arena; everything downstream of `e` is ordinary device work.
  *
  *   IT IS 128 CHECKPOINT TENSORS. RadNameMap holds eight sources, so the map is declared in pieces
  *   by map_concat_shards() and the order IS the concatenation -- a permuted table is a model that
@@ -123,6 +120,9 @@ struct PleLayer {
                  const Wire& wire, const Src& src);
     /* The hash, issued at the TOP of the step; the rest, at the layer. See step(). */
     void ids(RadCtx* c_, const RadBatch* batch) const;
+    void prep(RadCtx* c_, const RadBatch* batch) const;
+    void prep_after_ids(RadCtx* c_, const RadBatch* batch) const;
+    void gate_conv_add(RadCtx* c_, const RadBatch* batch) const;
     void step(RadCtx* c_, const RadBatch* batch) const;
 };
 
@@ -305,22 +305,31 @@ inline int PleLayer::declare(RadBuilder* b, Names& nm, const Geom& geom, const C
 
     /* ---- buffers ---------------------------------------------------------------------------- */
     /* HOST DOMAIN for the two the gather touches. `ids` is written by ngram_ids and read by the
-     * gather; `e` is written by the gather and read by one device copy onto the card
+     * host gather; `e` is written by the host gather and read by one device copy onto the card
      * (`ple_emb_dev`, below). The host arena is mapped, so the device side of that hand-off is a
-     * link read (core/runtime/ctx.cpp) -- 5 KB a token at decode. Where a device kernel gathers
-     * (--ngram-placement ram or vram, with libr4d loaded) it reads `ids` and writes `e` over the
-     * link too, which costs a round trip of those 5 KB and leaves no host op in the step: the
-     * domain is declared here, before the placement that would say who gathers is decided.
+     * link read (core/runtime/ctx.cpp) -- 5 KB a token at decode.
      *
      * `ids` IS PERSIST because it is written at the top of the step and read at this layer: the
      * buffer plan computes liveness in DECLARED order, where the two ops are neighbours, and a
      * transient would lend its bytes to anything issued in between. */
     {
+        const char* ple_env = std::getenv("RADIANCE_PLE_BACKEND");
+        if (!ple_env) ple_env = std::getenv("RADIANCE_PLE_STORAGE");
+        if (!ple_env) ple_env = std::getenv("RADIANCE_PLE_MODE");
+        bool ple_on_device = true;
+        if (ple_env && *ple_env) {
+            if (!std::strcmp(ple_env, "host") || !std::strcmp(ple_env, "cpu") ||
+                !std::strcmp(ple_env, "nvme") || !std::strcmp(ple_env, "mmap")) {
+                ple_on_device = false;
+            }
+        }
+
         /* TWICE THE STEP'S ROWS: the step's own ids, then the ids of the prompt that follows it
          * (RadBatch::n_ahead), which the gather hands to its reader to fetch while the step runs. */
         RadBufDecl d{};
         d.dtype = RAD_I32; d.rank = 2; d.shape[0] = 2 * g.max_tok; d.shape[1] = c.heads;
-        d.kind = RAD_BUF_PERSIST; d.domain = RAD_DOMAIN_HOST;
+        d.kind = RAD_BUF_PERSIST;
+        d.domain = ple_on_device ? RAD_DOMAIN_DEVICE : RAD_DOMAIN_HOST;
         b_ids = rad_decl_buffer(b, nm.f("ple_ids"), &d);
 
         /* [max_tok, embed_dim] AND NOT [max_tok * heads, head_dim], because ONE declared shape has
@@ -337,16 +346,11 @@ inline int PleLayer::declare(RadBuilder* b, Names& nm, const Geom& geom, const C
         RadBufDecl e{};
         e.dtype = g.act_dtype; e.rank = 2;
         e.shape[0] = g.max_tok; e.shape[1] = c.embed_dim;
-        e.kind = RAD_BUF_TRANSIENT; e.domain = RAD_DOMAIN_HOST;
+        e.kind = RAD_BUF_TRANSIENT;
+        e.domain = ple_on_device ? RAD_DOMAIN_DEVICE : RAD_DOMAIN_HOST;
         b_emb = rad_decl_buffer(b, nm.f("ple_emb"), &e);
     }
-    /* AND ITS COPY ON THE CARD, which is what the two projections read. `e` in the mapped host
-     * arena is a link read, and a GEMM does not read its A operand once: the tiled kernel reads
-     * each row band once a column block, 80 times for the key projection, every one of them a PCIe
-     * round trip or a hit on the copy that round trip left in the card's cache. At a 2048-token
-     * chunk the two projections take about 3.0 and 0.9 ms reading the host arena against 1.4 and
-     * 0.3 ms reading VRAM. One pass of the link into VRAM is 10.5 MB at a chunk and 5 KB a token
-     * at decode. */
+    /* AND ITS COPY ON THE CARD, which is what the two projections read. */
     b_embd = decl_b(b, nm.f("ple_emb_dev"), g.act_dtype, {g.max_tok, c.embed_dim});
     b_k   = decl_b(b, nm.f("ple_k"),   g.act_dtype, {g.max_tok, HN});
     b_v   = decl_b(b, nm.f("ple_v"),   g.act_dtype, {g.max_tok, g.n_embd});
@@ -355,6 +359,12 @@ inline int PleLayer::declare(RadBuilder* b, Names& nm, const Geom& geom, const C
     b_out = decl_b(b, nm.f("ple_out"), g.act_dtype, {g.max_tok, HN});
     if (!b_ids || !b_emb || !b_embd || !b_k || !b_v || !b_gv || !b_gvn || !b_out)
         return RAD_E_INVAL;
+
+    rad_buf_concurrent(b, b_ids);
+    rad_buf_concurrent(b, b_emb);
+    rad_buf_concurrent(b, b_embd);
+    rad_buf_concurrent(b, b_k);
+    rad_buf_concurrent(b, b_v);
 
     /* NO DERIVED BUFFER FOR THE STATE SLOTS, and that is worth saying because the obvious reading
      * of the core says otherwise. `conv_state_index` exists, computes exactly the cursor these two
@@ -491,14 +501,14 @@ inline void PleLayer::ids(RadCtx* c_, const RadBatch* batch) const {
                     A > 0 ? brow_slice(b_ids, T, A, c.heads) : RAD_NONE);
 }
 
-inline void PleLayer::step(RadCtx* c_, const RadBatch* batch) const {
+inline void PleLayer::prep(RadCtx* c_, const RadBatch* batch) const {
+    ids(c_, batch);
+    prep_after_ids(c_, batch);
+}
+
+inline void PleLayer::prep_after_ids(RadCtx* c_, const RadBatch* batch) const {
     const int64_t T = batch->n_tok;
     const int64_t S = batch->n_seq;
-    const int64_t HD = c.head_dim();
-
-    const RadKVGroupBatch* cv = kv_batch(batch, kv_conv);
-    const int32_t* cv_idx = cv ? cv->state_index : nullptr;
-
     int64_t D = 0, DT = 0;
     batch_split(batch, &D, &DT);
     const int64_t P = S - D;
@@ -513,27 +523,40 @@ inline void PleLayer::step(RadCtx* c_, const RadBatch* batch) const {
                 brows(b_ids, T), RAD_W(w_table), table_bf16 ? RAD_NONE : RAD_W(w_scale),
                 brows(b_emb, T),
                 A > 0 ? brow_slice(b_ids, T, A, c.heads) : RAD_NONE);
-    (void)HD;
 
     RAD_ISSUE_N(c_, op_embd,  T, brows(b_emb, T), brows(b_embd, T));
     RAD_ISSUE_N(c_, op_key,   T, brows(b_embd, T), RAD_W(w_key),   brows(b_k, T));
     RAD_ISSUE_N(c_, op_value, T, brows(b_embd, T), RAD_W(w_value), brows(b_v, T));
+}
+
+inline void PleLayer::gate_conv_add(RadCtx* c_, const RadBatch* batch) const {
+    const int64_t T = batch->n_tok;
+    const int64_t S = batch->n_seq;
+
+    const RadKVGroupBatch* cv = kv_batch(batch, kv_conv);
+    const int32_t* cv_idx = cv ? cv->state_index : nullptr;
+
+    int64_t D = 0, DT = 0;
+    batch_split(batch, &D, &DT);
+    const int64_t P = S - D;
 
     RAD_ISSUE_N(c_, op_gate, T,
                 brows(b_k, T), brows(w.h, T), brows(b_v, T),
                 RAD_W(w_nk), RAD_W(w_nq), RAD_W(w_nc),
                 brows(b_gv, T), brows(b_gvn, T));
 
+    const int32_t qd = batch->phase == RAD_PHASE_MIXED ? batch->max_q_len_decode : batch->max_q_len;
     if (D > 0)
-        RAD_ISSUE_N(c_, op_conv, DT,
+        RAD_ISSUE_N(c_, op_conv, qd > 0 ? qd : DT,
                     brows(b_gvn, DT), RAD_W(w_conv), kv_cache(kv_conv, layer_),
                     praw(batch->cu_seqlens, RAD_I32, D + 1), brows(b_gv, DT),
                     praw(cv_idx, RAD_I32, D),
                     praw(batch->ctx_lens, RAD_I32, D),
                     praw(batch->num_accepted, RAD_I32, D),
                     brows(b_out, DT));
+    const int32_t qp = batch->max_q_len_prefill > 0 ? batch->max_q_len_prefill : batch->max_q_len;
     if (P > 0)
-        RAD_ISSUE_N(c_, op_conv, T,
+        RAD_ISSUE_N(c_, op_conv, qp > 0 ? qp : T,
                     brows(b_gvn, T), RAD_W(w_conv), kv_cache(kv_conv, layer_),
                     praw(batch->cu_seqlens + D, RAD_I32, P + 1), brows(b_gv, T),
                     praw(cv_idx ? cv_idx + D : nullptr, RAD_I32, P),
@@ -545,6 +568,11 @@ inline void PleLayer::step(RadCtx* c_, const RadBatch* batch) const {
      * that way -- and the declared band is 1..max_tok. Passing the element count instead lands
      * outside every band of the op's own bucket table and the run phase refuses the step. */
     RAD_ISSUE_N(c_, op_add, T, brows(w.h, T), brows(b_out, T), brows(w.h, T));
+}
+
+inline void PleLayer::step(RadCtx* c_, const RadBatch* batch) const {
+    prep_after_ids(c_, batch);
+    gate_conv_add(c_, batch);
 }
 
 }  /* namespace arch */

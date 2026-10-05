@@ -830,6 +830,14 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                               { g.max_tok, m.qsacfg.topk + 1 });
         m.qsaw.nsel  = decl_b(b, nm.f("qsa_nsel"),  RAD_I32, { g.max_tok });
         m.qsaw.sequ  = decl_b(b, nm.f("qsa_sequ"),  RAD_I32, { g.max_tok });
+        if (g.world == 2) {
+            m.qsaw.sel_shard  = decl_b(b, nm.f("qsa_sel_shard"),  RAD_I32,
+                                       { g.max_tok / 2, m.qsacfg.topk + 1 });
+            m.qsaw.sequ_shard = decl_b(b, nm.f("qsa_sequ_shard"), RAD_I32,
+                                       { g.max_tok / 2 });
+            if (!m.qsaw.sel_shard || !m.qsaw.sequ_shard)
+                return RAD_E_INVAL;
+        }
         if (!m.qsaw.qk || !m.qsaw.q || !m.qsaw.stage || !m.qsaw.page ||
             !m.qsaw.bpos || !m.qsaw.nc || !m.qsaw.score || !m.qsaw.sel || !m.qsaw.nsel ||
             !m.qsaw.sequ)

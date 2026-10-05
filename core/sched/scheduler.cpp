@@ -238,6 +238,11 @@ int Scheduler::set_draft(uint64_t id, const int32_t* tokens, int n) {
     }
 
     int cap = draft_.next_depth();
+    if (s.req->max_tokens > 0) {
+        const int64_t rem = (int64_t)s.req->max_tokens - (int64_t)s.req->output.size();
+        const int64_t max_d = rem > 1 ? rem - 1 : 0;
+        if (n > max_d) n = (int)max_d;
+    }
     if (n > cap) n = cap;
     if (n > RAD_SCHED_MAX_SPEC) n = RAD_SCHED_MAX_SPEC;
     for (int i = 0; i < n; ++i) s.draft[i] = tokens[i];

@@ -1175,11 +1175,13 @@ static const RadOperandSpec oQsaTailStore[] = {
 };
 
 static const RadParamSpec pQsaSelect[] = {
-    { "M",      RAD_P_INT, RAD_REQUIRED },
-    { "blocks", RAD_P_INT, RAD_REQUIRED },
-    { "topk",   RAD_P_INT, RAD_REQUIRED },
-    { "ratio",  RAD_P_INT, RAD_REQUIRED },
-    { "seqs",   RAD_P_INT, RAD_REQUIRED },
+    { "M",            RAD_P_INT, RAD_REQUIRED },
+    { "blocks",       RAD_P_INT, RAD_REQUIRED },
+    { "topk",         RAD_P_INT, RAD_REQUIRED },
+    { "ratio",        RAD_P_INT, RAD_REQUIRED },
+    { "seqs",         RAD_P_INT, RAD_REQUIRED },
+    { "tp_partition", RAD_P_INT, RAD_OPTIONAL },
+    { "m_offset",     RAD_P_INT, RAD_OPTIONAL },
 };
 static const RadOperandSpec oQsaSelect[] = {
     { "score",   RAD_OPD_IN,  0 },
@@ -1202,12 +1204,14 @@ static const RadOperandSpec oQsaSelect[] = {
 };
 
 static const RadParamSpec pQsaScore[] = {
-    { "M",      RAD_P_INT, RAD_REQUIRED },
-    { "n",      RAD_P_INT, RAD_REQUIRED },
-    { "heads",  RAD_P_INT, RAD_REQUIRED },
-    { "blocks", RAD_P_INT, RAD_REQUIRED },
-    { "seqs",   RAD_P_INT, RAD_REQUIRED },
-    { "dtype",  RAD_P_STR, RAD_REQUIRED },
+    { "M",            RAD_P_INT, RAD_REQUIRED },
+    { "n",            RAD_P_INT, RAD_REQUIRED },
+    { "heads",        RAD_P_INT, RAD_REQUIRED },
+    { "blocks",       RAD_P_INT, RAD_REQUIRED },
+    { "seqs",         RAD_P_INT, RAD_REQUIRED },
+    { "dtype",        RAD_P_STR, RAD_REQUIRED },
+    { "tp_partition", RAD_P_INT, RAD_OPTIONAL },
+    { "m_offset",     RAD_P_INT, RAD_OPTIONAL },
 };
 static const RadOperandSpec oQsaScore[] = {
     { "q",     RAD_OPD_IN,  0 },
@@ -2414,17 +2418,17 @@ static const RadConstraint cGdnGatedRmsNorm[] = {
  * declare `bf16`/`fp32` and core/sample/sampler.cpp declares `f32`. r4d_ar_dtype_code already
  * accepts either, so a constraint that took only one would refuse the sampler by a synonym. */
 static const RadConstraint cArGather2[] = {
-    C_EQ("world_size", 2), C_IN("dtype", "bf16 fp16 f16 fp32 f32"),
+    C_EQ("world_size", 2), C_IN("dtype", "bf16 fp16 f16 fp32 f32 i32 u32"),
     C_P2P,
 };
 /* The same gather at a width whose handshake is the wide family's tree and not one peer flag. The
  * dtype set is cArGather2's verbatim for the same reason -- the two callers' synonyms. */
 static const RadConstraint cArGather4[] = {
-    C_EQ("world_size", 4), C_IN("dtype", "bf16 fp16 f16 fp32 f32"),
+    C_EQ("world_size", 4), C_IN("dtype", "bf16 fp16 f16 fp32 f32 i32 u32"),
     C_P2P,
 };
 static const RadConstraint cArGather8[] = {
-    C_EQ("world_size", 8), C_IN("dtype", "bf16 fp16 f16 fp32 f32"),
+    C_EQ("world_size", 8), C_IN("dtype", "bf16 fp16 f16 fp32 f32 i32 u32"),
     C_P2P,
 };
 
@@ -2433,7 +2437,7 @@ static const RadConstraint cArExact[] = {
     C_P2P,
 };
 static const RadConstraint cArGather3[] = {
-    C_EQ("world_size", 3), C_IN("dtype", "bf16 fp16 f16 fp32 f32"),
+    C_EQ("world_size", 3), C_IN("dtype", "bf16 fp16 f16 fp32 f32 i32 u32"),
     C_P2P,
 };
 static const RadConstraint cArExact3[] = {

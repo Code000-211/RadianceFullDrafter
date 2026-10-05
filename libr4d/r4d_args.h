@@ -223,6 +223,7 @@ static inline int r4d_ar_dtype_code(const char* s) {
     if (!std::strcmp(s, "bf16")) return 0;
     if (!std::strcmp(s, "fp16") || !std::strcmp(s, "f16")) return 1;
     if (!std::strcmp(s, "fp32") || !std::strcmp(s, "f32")) return 2;
+    if (!std::strcmp(s, "i32") || !std::strcmp(s, "u32")) return 2;
     return -1;
 }
 
