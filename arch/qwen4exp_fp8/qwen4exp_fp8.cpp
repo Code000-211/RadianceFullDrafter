@@ -1262,9 +1262,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                   {g.max_logit_rows, vocab_head_rows(g)});
             if (vocab_head_sharded(g)) {
                 m.b_mtp_dpair = decl_b(b, nm.f("mtp_dpair"), RAD_F32,
-                                       {g.max_logit_rows, kDraftTopR, 2});
+                                       {g.max_logit_rows, kDraftGatherR, 2});
                 m.b_mtp_dgath = decl_b(b, nm.f("mtp_dgath"), RAD_F32,
-                                       {g.max_logit_rows, (int64_t)g.world * kDraftTopR, 2});
+                                       {g.max_logit_rows, (int64_t)g.world * kDraftGatherR, 2});
             }
             /* NAMED and declared, because the engine reads the proposal straight out of it: a
              * draft round's token comes from row_topk and never through the sampler. */
