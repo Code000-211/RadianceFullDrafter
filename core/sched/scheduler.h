@@ -74,10 +74,10 @@ struct SchedReq {
     int suggest_depth(int default_depth, bool adaptive) const {
         if (!adaptive || default_depth < 4) return default_depth;
         /* Only expand to depth 4 if this specific sequence has demonstrated
-         * a sustained 100% acceptance streak of at least 4 steps and ema_accept >= 2.75f.
+         * a sustained 100% acceptance streak of at least 6 steps and ema_accept >= 2.85f.
          * This strictly guards code and file_edit from premature depth 4 promotion,
          * while allowing math/json bursts to reach depth 4. */
-        if (accepted_streak >= 4 && ema_accept >= 2.75f) {
+        if (accepted_streak >= 6 && ema_accept >= 2.85f) {
             return 4;
         }
         return 3;
