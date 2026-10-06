@@ -74,8 +74,9 @@ struct SchedReq {
     int suggest_depth(int default_depth, bool adaptive) const {
         if (!adaptive) return default_depth;
         /* Safe Floor is strictly default_depth (3) so code & reasoning never regress.
-         * Burst to depth 4 only on high-acceptance streaks (math, json, repetitive syntax). */
-        if (accepted_streak >= 5 && ema_accept >= 2.8f) {
+         * Burst to depth 4 only on high-acceptance streaks (math, json, repetitive syntax).
+         * Requiring streak >= 8 and ema >= 2.92 protects code from premature depth 4 promotion. */
+        if (accepted_streak >= 8 && ema_accept >= 2.92f) {
             return std::min(default_depth + 1, 4);
         }
         return default_depth;
