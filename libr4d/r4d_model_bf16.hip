@@ -53,22 +53,25 @@
 namespace {
 
 struct PleVramCache {
-    const void* current_wte = nullptr;
-    int32_t*    tags = nullptr;
-    uint8_t*    heat = nullptr;
-    uint8_t*    data = nullptr;
-    uint32_t    num_sets = 0;
+    int32_t* tags     = nullptr;
+    uint8_t* heat     = nullptr;
+    uint8_t* data     = nullptr;
+    uint32_t num_sets = 0;
 };
 
 static std::mutex g_ple_mu;
 static PleVramCache g_ple_caches[8];
 
-static PleVramCache get_ple_vram_cache(int dev_id, const void* wte, int n_embd) {
+static PleVramCache get_ple_vram_cache(int dev_id, int n_embd) {
     if (dev_id < 0 || dev_id >= 8 || n_embd != 160) {
         return PleVramCache{};
     }
-    std::lock_guard<std::mutex> lk(g_ple_mu);
     PleVramCache& c = g_ple_caches[dev_id];
+    if (c.tags) {
+        return c; // Fast lock-free path
+    }
+    std::lock_guard<std::mutex> lk(g_ple_mu);
+    if (c.tags) return c;
 
     const char* sets_env = std::getenv("RADIANCE_PLE_VRAM_CACHE_SETS");
     uint32_t num_sets = sets_env ? (uint32_t)std::strtoul(sets_env, nullptr, 0) : 65536u;
@@ -82,38 +85,30 @@ static PleVramCache get_ple_vram_cache(int dev_id, const void* wte, int n_embd) 
     const size_t heat_bytes = (size_t)total_entries * sizeof(uint8_t);
     const size_t data_bytes = (size_t)total_entries * 160u;
 
-    if (!c.tags) {
-        (void)hipSetDevice(dev_id);
-        if (hipMalloc((void**)&c.tags, tag_bytes) != hipSuccess) {
-            c.tags = nullptr;
-            return PleVramCache{};
-        }
-        if (hipMalloc((void**)&c.heat, heat_bytes) != hipSuccess) {
-            (void)hipFree(c.tags);
-            c.tags = nullptr;
-            return PleVramCache{};
-        }
-        if (hipMalloc((void**)&c.data, data_bytes) != hipSuccess) {
-            (void)hipFree(c.tags);
-            (void)hipFree(c.heat);
-            c.tags = nullptr;
-            c.heat = nullptr;
-            return PleVramCache{};
-        }
-        (void)hipMemset(c.tags, 0xFF, tag_bytes);
-        (void)hipMemset(c.heat, 0, heat_bytes);
-        c.num_sets = num_sets;
-        c.current_wte = wte;
-        fprintf(stderr, "I[ple] device %d: allocated 4-Way Set-Associative RLFU L1 VRAM N-Gram Cache: "
-                        "%u sets x 4 ways = %u entries (%.2f MiB VRAM: %zu KiB tags, %zu KiB heat, %.1f MiB data)\n",
-                dev_id, num_sets, total_entries, (tag_bytes + heat_bytes + data_bytes) / (1024.0 * 1024.0),
-                tag_bytes / 1024, heat_bytes / 1024, data_bytes / (1024.0 * 1024.0));
-    } else if (c.current_wte != wte) {
-        (void)hipSetDevice(dev_id);
-        (void)hipMemset(c.tags, 0xFF, tag_bytes);
-        (void)hipMemset(c.heat, 0, heat_bytes);
-        c.current_wte = wte;
+    (void)hipSetDevice(dev_id);
+    if (hipMalloc((void**)&c.tags, tag_bytes) != hipSuccess) {
+        c.tags = nullptr;
+        return PleVramCache{};
     }
+    if (hipMalloc((void**)&c.heat, heat_bytes) != hipSuccess) {
+        (void)hipFree(c.tags);
+        c.tags = nullptr;
+        return PleVramCache{};
+    }
+    if (hipMalloc((void**)&c.data, data_bytes) != hipSuccess) {
+        (void)hipFree(c.tags);
+        (void)hipFree(c.heat);
+        c.tags = nullptr;
+        c.heat = nullptr;
+        return PleVramCache{};
+    }
+    (void)hipMemset(c.tags, 0xFF, tag_bytes);
+    (void)hipMemset(c.heat, 0, heat_bytes);
+    c.num_sets = num_sets;
+    fprintf(stderr, "I[ple] device %d: allocated 4-Way Set-Associative RLFU L1 VRAM N-Gram Cache: "
+                    "%u sets x 4 ways = %u entries (%.2f MiB VRAM: %zu KiB tags, %zu KiB heat, %.1f MiB data)\n",
+            dev_id, num_sets, total_entries, (tag_bytes + heat_bytes + data_bytes) / (1024.0 * 1024.0),
+            tag_bytes / 1024, heat_bytes / 1024, data_bytes / (1024.0 * 1024.0));
     return c;
 }
 
@@ -195,13 +190,110 @@ __global__ __launch_bounds__(kThreads) void embed_lookup_kernel(
 // (v_cvt_pk_f32_fp8, or the software form beside it in r4d_fp8_wmma.h), the product with the
 // scale rounds once in f32, and f32_to_bf16 rounds to nearest even.  An id outside [0, n_vocab)
 // after the offset writes a zero row (the divergence note at the top of this file).
+// ---------------------------------------------------------------------------- ple_embed_lookup_q_kernel
+// Specialized 1-workgroup-per-row kernel for PLE N-Gram table (n_embd = 160, FP8 E4M3, V = 4).
+// 64 threads per workgroup: threads 0..39 handle the 40 columns (160 bytes) of row m = blockIdx.x.
+// Exactly one workgroup per row guarantees ZERO straddling across workgroup boundaries,
+// and __syncthreads() guarantees that all 40 columns are fully committed to VRAM cache
+// before cache_tags is published!
+__global__ __launch_bounds__(64) void ple_embed_lookup_q_kernel(
+    const int32_t* __restrict__ tok, const void* __restrict__ wte, const void* __restrict__ sc,
+    uint32_t sc_f32, uint16_t* __restrict__ x, uint32_t M, int32_t n_vocab,
+    int32_t vocab_off, uint32_t x_ld,
+    int32_t* __restrict__ cache_tags, uint8_t* __restrict__ cache_heat,
+    uint8_t* __restrict__ cache_data, uint32_t num_sets) {
+    const uint32_t m = blockIdx.x;
+    if (m >= M) return;
+    const uint32_t tid = threadIdx.x;
+    if (tid >= 40u) return;
+
+    const uint32_t j = tid * 4u;
+    const int32_t id = tok[m] - vocab_off;
+    uint16_t* __restrict__ dst = x + (size_t)m * x_ld + j;
+
+    if (id < 0 || id >= n_vocab) {
+        *(uint2*)dst = make_uint2(0u, 0u);
+        return;
+    }
+
+    const float s = !sc ? 1.0f : sc_f32 ? *(const float*)sc : bf16_to_f32(*(const uint16_t*)sc);
+    const size_t at = (size_t)id * 160u + j;
+    uint32_t q = 0;
+    uint32_t slot = 0;
+    bool is_hit = false;
+
+    if (cache_tags && cache_heat && cache_data && num_sets > 0) {
+        const uint32_t set = ((uint32_t)id * 2654435761u) & (num_sets - 1);
+        const uint32_t base = set * 4u;
+        const int4 tags = *(const int4*)(cache_tags + base);
+
+        int way = -1;
+        if      (tags.x == id) way = 0;
+        else if (tags.y == id) way = 1;
+        else if (tags.z == id) way = 2;
+        else if (tags.w == id) way = 3;
+
+        if (way >= 0) {
+            // 4-WAY L1 VRAM HIT!
+            slot = base + (uint32_t)way;
+            is_hit = true;
+            const size_t c_at = (size_t)slot * 160u + j;
+            q = *(const uint32_t*)(cache_data + c_at);
+        } else {
+            // 4-WAY L1 VRAM MISS: Fallback to L2 Host RAM / /dev/shm
+            q = *(const uint32_t*)((const uint8_t*)wte + at);
+
+            // Find victim way among 4 ways
+            int victim_way = 0;
+            if      (tags.x < 0) { victim_way = 0; }
+            else if (tags.y < 0) { victim_way = 1; }
+            else if (tags.z < 0) { victim_way = 2; }
+            else if (tags.w < 0) { victim_way = 3; }
+            else {
+                const uint32_t h4 = *(const uint32_t*)(cache_heat + base);
+                const uint32_t h0 = h4 & 0xFFu;
+                const uint32_t h1 = (h4 >> 8) & 0xFFu;
+                const uint32_t h2 = (h4 >> 16) & 0xFFu;
+                const uint32_t h3 = (h4 >> 24) & 0xFFu;
+                uint32_t min_h = h0;
+                if (h1 < min_h) { min_h = h1; victim_way = 1; }
+                if (h2 < min_h) { min_h = h2; victim_way = 2; }
+                if (h3 < min_h) { min_h = h3; victim_way = 3; }
+            }
+
+            slot = base + (uint32_t)victim_way;
+            is_hit = false;
+            const size_t c_at = (size_t)slot * 160u + j;
+            *(uint32_t*)(cache_data + c_at) = q;
+        }
+    } else {
+        q = *(const uint32_t*)((const uint8_t*)wte + at);
+    }
+
+    const v2f lo = r4d_fp8::e4m3_pk<false>(q), hi = r4d_fp8::e4m3_pk<true>(q);
+    *(uint2*)dst = make_uint2(
+        (uint32_t)f32_to_bf16(lo.x * s) | ((uint32_t)f32_to_bf16(lo.y * s) << 16),
+        (uint32_t)f32_to_bf16(hi.x * s) | ((uint32_t)f32_to_bf16(hi.y * s) << 16));
+
+    if (cache_tags && cache_heat && num_sets > 0) {
+        __syncthreads();
+        if (tid == 0) {
+            if (is_hit) {
+                const uint8_t h = cache_heat[slot];
+                if (h < 255) cache_heat[slot] = h + 1;
+            } else {
+                cache_tags[slot] = id;
+                cache_heat[slot] = 4;
+            }
+        }
+    }
+}
+
 template <uint32_t V, bool Q>
 __global__ __launch_bounds__(kThreads) void embed_lookup_q_kernel(
     const int32_t* __restrict__ tok, const void* __restrict__ wte, const void* __restrict__ sc,
     uint32_t sc_f32, uint16_t* __restrict__ x, uint32_t M, uint32_t n_embd, int32_t n_vocab,
-    int32_t vocab_off, uint32_t x_ld,
-    int32_t* __restrict__ cache_tags, uint8_t* __restrict__ cache_heat,
-    uint8_t* __restrict__ cache_data, uint32_t num_sets) {
+    int32_t vocab_off, uint32_t x_ld) {
     const uint32_t per_row = n_embd / V;
     const uint64_t g = (uint64_t)blockIdx.x * kThreads + threadIdx.x;
     if (g >= (uint64_t)M * per_row) return;
@@ -216,59 +308,8 @@ __global__ __launch_bounds__(kThreads) void embed_lookup_q_kernel(
     const float s = !sc ? 1.0f : sc_f32 ? *(const float*)sc : bf16_to_f32(*(const uint16_t*)sc);
     const size_t at = (size_t)id * n_embd + j;
     float v[V];
-    uint32_t slot = 0;
-    bool is_hit = false;
-
     if constexpr (Q && V == 4) {
-        uint32_t q;
-        if (cache_tags && cache_heat && cache_data && num_sets > 0) {
-            const uint32_t set = ((uint32_t)id * 2654435761u) & (num_sets - 1);
-            const uint32_t base = set * 4u;
-            const int4 tags = *(const int4*)(cache_tags + base);
-
-            int way = -1;
-            if      (tags.x == id) way = 0;
-            else if (tags.y == id) way = 1;
-            else if (tags.z == id) way = 2;
-            else if (tags.w == id) way = 3;
-
-            if (way >= 0) {
-                // 4-WAY L1 VRAM HIT!
-                slot = base + (uint32_t)way;
-                is_hit = true;
-                const size_t c_at = (size_t)slot * n_embd + j;
-                q = *(const uint32_t*)(cache_data + c_at);
-            } else {
-                // 4-WAY L1 VRAM MISS: Fallback to L2 Host RAM / /dev/shm over PCIe link
-                q = *(const uint32_t*)((const uint8_t*)wte + at);
-
-                // Find RLFU victim among the 4 ways in this set
-                const uint32_t h4 = *(const uint32_t*)(cache_heat + base);
-                const uint32_t h0 = h4 & 0xFFu;
-                const uint32_t h1 = (h4 >> 8) & 0xFFu;
-                const uint32_t h2 = (h4 >> 16) & 0xFFu;
-                const uint32_t h3 = (h4 >> 24) & 0xFFu;
-
-                uint32_t min_h = h0;
-                int victim_way = 0;
-                if (tags.x < 0) { victim_way = 0; }
-                else if (tags.y < 0) { victim_way = 1; }
-                else if (tags.z < 0) { victim_way = 2; }
-                else if (tags.w < 0) { victim_way = 3; }
-                else {
-                    if (h1 < min_h) { min_h = h1; victim_way = 1; }
-                    if (h2 < min_h) { min_h = h2; victim_way = 2; }
-                    if (h3 < min_h) { min_h = h3; victim_way = 3; }
-                }
-
-                slot = base + (uint32_t)victim_way;
-                is_hit = false;
-                const size_t c_at = (size_t)slot * n_embd + j;
-                *(uint32_t*)(cache_data + c_at) = q;
-            }
-        } else {
-            q = *(const uint32_t*)((const uint8_t*)wte + at);
-        }
+        const uint32_t q = *(const uint32_t*)((const uint8_t*)wte + at);
         const v2f lo = r4d_fp8::e4m3_pk<false>(q), hi = r4d_fp8::e4m3_pk<true>(q);
         v[0] = lo.x; v[1] = lo.y; v[2] = hi.x; v[3] = hi.y;
     } else if constexpr (Q) {
@@ -286,17 +327,6 @@ __global__ __launch_bounds__(kThreads) void embed_lookup_q_kernel(
             (uint32_t)f32_to_bf16(v[2] * s) | ((uint32_t)f32_to_bf16(v[3] * s) << 16));
     } else {
         dst[0] = f32_to_bf16(v[0] * s);
-    }
-    if constexpr (Q && V == 4) {
-        if (cache_tags && cache_heat && j == 0 && num_sets > 0) {
-            if (is_hit) {
-                const uint8_t h = cache_heat[slot];
-                if (h < 255) cache_heat[slot] = h + 1;
-            } else {
-                cache_tags[slot] = id;
-                cache_heat[slot] = 4;
-            }
-        }
     }
 }
 
@@ -729,22 +759,30 @@ static int embed_lookup_q_emit(const int32_t* tok, const void* wte, bool q, cons
                                int vocab_off, long long x_ld, const R4dSink& sk) {
     const bool quad = n_embd % 4 == 0 && x_ld % 4 == 0 && r4d_aligned(x, 8) &&
                       r4d_aligned(wte, q ? 4 : 8);
+
+    if (q && quad && n_embd == 160) {
+        int dev = 0;
+        hipPointerAttribute_t attr;
+        if (hipPointerGetAttributes(&attr, (const void*)x) == hipSuccess) {
+            dev = attr.device;
+        } else {
+            (void)hipGetDevice(&dev);
+        }
+        const PleVramCache cache = get_ple_vram_cache(dev, n_embd);
+        const int rc = R4D_EMIT(sk, ple_embed_lookup_q_kernel, dim3((uint32_t)M), dim3(64), 0,
+                                tok, wte, sc, (uint32_t)(sc_f32 ? 1u : 0u), x,
+                                (uint32_t)M, (int32_t)n_vocab, (int32_t)vocab_off,
+                                (uint32_t)x_ld, cache.tags, cache.heat, cache.data, cache.num_sets);
+        return rc == RAD_OK ? 0 : -4;
+    }
+
     const uint64_t threads = (uint64_t)M * (uint64_t)(quad ? n_embd / 4 : n_embd);
     const dim3 grid((uint32_t)((threads + kThreads - 1) / kThreads));
-
-    int dev = 0;
-    (void)hipGetDevice(&dev);
-    const PleVramCache cache = (q && quad && n_embd == 160) ? get_ple_vram_cache(dev, wte, n_embd) : PleVramCache{};
-
-    int32_t* cache_tags = cache.tags;
-    uint8_t* cache_heat = cache.heat;
-    uint8_t* cache_data = cache.data;
-    uint32_t num_sets   = cache.num_sets;
 
 #define R4D_ELQ(V, Q)                                                                             \
     R4D_EMIT(sk, (embed_lookup_q_kernel<V, Q>), grid, dim3(kThreads), 0, tok, wte, sc,          \
              (uint32_t)(sc_f32 ? 1u : 0u), x, (uint32_t)M, (uint32_t)n_embd, (int32_t)n_vocab,   \
-             (int32_t)vocab_off, (uint32_t)x_ld, cache_tags, cache_heat, cache_data, num_sets)
+             (int32_t)vocab_off, (uint32_t)x_ld)
     const int rc = quad ? (q ? R4D_ELQ(4, true) : R4D_ELQ(4, false))
                         : (q ? R4D_ELQ(1, true) : R4D_ELQ(1, false));
 #undef R4D_ELQ
