@@ -14,6 +14,8 @@ int DraftController::configure(const Params& p) {
     tot_drafted_ = tot_accepted_ = 0;
     for (int j = 0; j < RAD_SCHED_MAX_SPEC; ++j) { reach_[j] = 0; hit_[j] = 0; }
     seen_ = 0;
+    ema_acceptance_ = 1.0f;
+    consecutive_zero_ = 0;
     return RAD_OK;
 }
 
@@ -24,6 +26,15 @@ void DraftController::observe(int drafted, int accepted) {
     if (accepted > drafted) accepted = drafted;
     tot_drafted_  += drafted;
     tot_accepted_ += accepted;
+
+    /* Adaptive controller: update EMA acceptance rate and zero streak */
+    const float acc_ratio = (float)accepted / (float)drafted;
+    ema_acceptance_ = 0.85f * ema_acceptance_ + 0.15f * acc_ratio;
+    if (accepted == 0) {
+        ++consecutive_zero_;
+    } else {
+        consecutive_zero_ = 0;
+    }
 
     /* Position j was EVALUATED only if every position before it was accepted, so this verify
      * produces exactly: 0..accepted-1 evaluated and accepted, and -- when the prefix was not the
