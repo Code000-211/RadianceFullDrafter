@@ -215,11 +215,6 @@ int Engine::declare_sampler(int rank, RadBuilder* b, int64_t logits_width, bool 
 void Engine::tiering_dispatch(Rank& r, int step, int n_seq) {
     if (!r.heat.enabled()) return;
 
-    if (n_seq > 1) {
-        /* High concurrency: scale moves dynamically with active request count to quickly warm diverse domains */
-        r.heat.set_burst_moves(std::min(32, 4 * n_seq));
-    }
-
     r.mover.begin_dispatch(step, &r.heat);
 
     const int n_layer = r.ctx.n_route_layers();

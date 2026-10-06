@@ -221,20 +221,12 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
                 one = target_one;
             }
         }
-        if (3 * one < b.experts + b.unusable) {
+        if (3 * one < b.experts) {
             b.stage    = 3 * one;
             /* Fund staging buffers entirely from unclaimed slack to maximize expert cache for concurrency */
-            const int64_t from_unusable = std::min(b.unusable, b.stage);
-            b.unusable -= from_unusable;
-            const int64_t from_exp = b.stage - from_unusable;
-            b.experts -= from_exp;
             b.weights  = b.statics + b.experts;
-        } else if (2 * one < b.experts + b.unusable) {
+        } else if (2 * one < b.experts) {
             b.stage    = 2 * one;
-            const int64_t from_unusable = std::min(b.unusable, b.stage);
-            b.unusable -= from_unusable;
-            const int64_t from_exp = b.stage - from_unusable;
-            b.experts -= from_exp;
             b.weights  = b.statics + b.experts;
         }
     }
