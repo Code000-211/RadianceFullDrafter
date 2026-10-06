@@ -43,8 +43,8 @@ public:
     int  next_depth(int active_seqs = 1) const {
         if (p_.max_depth <= 0) return 0;
 
-        /* Concurrency: preserve baseline depth 3 */
-        if (active_seqs >= 4) return std::min(p_.max_depth, 3);
+        /* Concurrency: strictly clamp to 3 for any multi-sequence batch (active_seqs > 1) */
+        if (active_seqs > 1) return std::min(p_.max_depth, 3);
 
         /* Single stream: expand to 4 on proven hot streaks */
         if (p_.max_depth >= 4 && ema_accept_len_ >= 2.6f) {

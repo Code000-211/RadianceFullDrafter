@@ -895,7 +895,7 @@ const RadBatch* Scheduler::step() {
                            (req.n_computed + 1 < tgt);
         if (!is_pf) n_running_dec++;
     }
-    const int depth = draft_.next_depth(n_running_dec);
+    const int depth = draft_.next_depth((int)running_.size());
 
     /* C1: Reserve token budget for running decode requests so that a long prefill chunk
      * doesn't exhaust the token budget and starve active decoders in concurrent workloads. */
@@ -1711,7 +1711,7 @@ int Scheduler::serial_begin(int* rounds, SerialRow* out, int max) {
     for (size_t i = 0; i < plan_.e.size(); ++i) {
         if (plan_.e[i].produces_token) n_decode_seqs++;
     }
-    const int depth = draft_.next_depth(n_decode_seqs);
+    const int depth = draft_.next_depth(std::max(n_decode_seqs, (int)running_.size()));
     bool may_draft = depth > 0;
     if (depth > 0 && *rounds > depth) *rounds = depth;
     if (*rounds > RAD_SCHED_MAX_SPEC) *rounds = RAD_SCHED_MAX_SPEC;
