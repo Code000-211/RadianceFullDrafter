@@ -720,6 +720,7 @@ struct Config {
      * paying for it again in VRAM, and then running at one token a step -- a small fraction of
      * the throughput the same container gives at its declared depth. */
     int     n_spec = -1;                /* --num-speculative-tokens; -1 = auto, 0 = off */
+    bool    adaptive_spec = false;     /* --adaptive-spec: enable dynamic speculative depth controller */
 
     /* ---------------- KL DIVERGENCE AGAINST A REFERENCE (core/kld.h) ----------------
      *

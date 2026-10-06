@@ -106,6 +106,7 @@ static const Flag g_flags[] = {
     { "--num-speculative-tokens", "N",  "speculative window; 0 disables. Default `auto`: the drafter's\n"
     "                                    own operating point, which the plugin states. A container\n"
     "                                    with no draft head is unaffected -- auto resolves to 0." },
+    { "--adaptive-spec",      nullptr,  "enable dynamic speculative depth adaptation with baseline floor 3" },
     { "--draft-model",        "PATH",   "NOT IMPLEMENTED -- merge the drafter at convert time" },
 
     { "--host",               "ADDR",   "listen address" },
@@ -468,6 +469,9 @@ int config_parse(int argc, char** argv, Config* c) {
                         "off), not '%s'", v);
                 return RAD_E_INVAL;
             }
+        }
+        else if (S("--adaptive-spec")) {
+            c->adaptive_spec = true;
         }
         else if (S("--draft-model")) {
             /* REFUSED, NOT QUIETLY IGNORED. Accepting this flag and then serving the container's

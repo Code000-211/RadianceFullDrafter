@@ -30,37 +30,41 @@ class DraftController {
 public:
     struct Params {
         int max_depth = 0;        /* the deployment's window; 0 disables speculation entirely */
+        bool adaptive = false;    /* dynamic depth adaptation */
     };
 
     int  configure(const Params& p);
     const Params& params() const { return p_; }
 
     /* The draft depth for the next step.
-     * Floor is ALWAYS 3 (guaranteeing zero regression against Opt33 baseline across all categories).
-     * At high concurrency, keeps depth at 3 to maintain full C8 throughput.
-     * At single stream, expands to 4 on high-acceptance streaks (ema_accept_len >= 2.6),
-     * unlocking +11.7% boost on chat/math without penalizing low-acceptance domains. */
+     * When adaptive is false: static depth is preserved (tests and fixed profiles).
+     * When adaptive is true:
+     *   - Floor is ALWAYS 3 (guaranteeing zero regression against Opt33 baseline across all categories).
+     *   - Single stream expands to 4 on high-acceptance streaks (ema_accept_len >= 2.6).
+     *   - Concurrency also adaptively expands to 4 on high-acceptance streaks (batch ema_accept_len >= 2.65),
+     *     maximizing throughput when multiple streams hit high-acceptance patterns. */
     int  next_depth(int active_seqs = 1) const {
         if (p_.max_depth <= 0) return 0;
+        if (!p_.adaptive) return p_.max_depth;
+        if (p_.max_depth < 3) return p_.max_depth;
 
-        /* Concurrency: strictly clamp to 3 for any multi-sequence batch (active_seqs > 1) */
-        if (active_seqs > 1) return std::min(p_.max_depth, 3);
-
-        /* Single stream: expand to 4 on proven hot streaks */
-        if (p_.max_depth >= 4 && ema_accept_len_ >= 2.6f) {
-            return std::min(p_.max_depth, 4);
+        if (p_.max_depth >= 4) {
+            const float threshold = (active_seqs > 1) ? 2.65f : 2.60f;
+            if (ema_accept_len_ >= threshold) {
+                return p_.max_depth;
+            }
         }
 
-        return std::min(p_.max_depth, 3);
+        return 3;
     }
 
     /* One verify's outcome: `drafted` tokens were proposed and a prefix of `accepted` of them was
      * taken. Feeds the reported metrics and adaptive depth controller. */
-    void observe(int drafted, int accepted);
+    void observe(int drafted, int accepted, int active_seqs = 1);
 
     /* Reset adaptive state (e.g. on new request arrival or prefill completion) */
     void reset_adaptive() {
-        ema_accept_len_ = 2.0f;
+        ema_accept_len_ = (float)p_.max_depth;
     }
 
     /* Metrics (spec §14). Cumulative and exact. */

@@ -90,6 +90,8 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
 
     DraftController::Params dp;
     dp.max_depth = cfg.n_spec;
+    const char* env_adapt = std::getenv("RADIANCE_ADAPTIVE_SPEC");
+    dp.adaptive = cfg.adaptive_spec || (env_adapt && strcmp(env_adapt, "0") != 0);
     RAD_TRY(draft_.configure(dp));
 
     RAD_TRY(builder_.init(prog, cfg, geo_, kvgeom_, ranks));
@@ -1552,7 +1554,11 @@ int Scheduler::commit(const StepResult& res) {
             step_decode_tok_ += 1 + a;
 
             if (e.n_spec > 0) {
-                draft_.observe(e.n_spec, a);
+                int n_spec_seqs = 0;
+                for (int si = 0; si < res.n_seq; ++si) {
+                    if (plan_.e[(size_t)si].n_spec > 0) n_spec_seqs++;
+                }
+                draft_.observe(e.n_spec, a, n_spec_seqs);
                 m_.draft_tokens += e.n_spec;
                 m_.draft_accepted += a;
                 server::sink_drafts(r.sink, e.n_spec, a);
