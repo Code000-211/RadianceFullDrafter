@@ -1103,34 +1103,31 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_q_kernel(
     if constexpr (AL) {
         e = tail ? 0u : e_al;          /* the map already named it; a tail block owns no expert */
     } else if constexpr (ES) {
-        __shared__ int32_t  s_run[FM];
-        __shared__ uint32_t s_wc[NTHR / kWave];
-        uint32_t nrun = 0;
-        for (uint32_t c = 0; c < n_expert && nrun <= jrun; c += NTHR) {
-            const uint32_t ce = c + NTHR < n_expert ? c + NTHR : n_expert;
-            if ((uint32_t)off[ce] <= r0) continue;          /* every expert here ends before it */
-            if ((uint32_t)off[c] >= rN) break;              /* and every one from here after it */
-            const uint32_t x = c + tid;
-            bool p = false;
-            if (x < ce) {
-                const uint32_t a = (uint32_t)off[x], b = (uint32_t)off[x + 1];
-                p = a < b && a < rN && b > r0;
+        __shared__ uint32_t s_es_e;
+        __shared__ uint32_t s_es_nrun;
+        if (wave == 0) {
+            uint32_t e_lane = 0;
+            const uint32_t r = r0 + lane;
+            const bool valid = (lane < FM) && (r < rN) && (r < live);
+            if (valid) {
+                uint32_t lo = 0, hi = n_expert;
+                while (lo + 1 < hi) {
+                    const uint32_t mid = (lo + hi) >> 1;
+                    if ((uint32_t)off[mid] <= r) lo = mid; else hi = mid;
+                }
+                e_lane = lo;
             }
-            const unsigned long long mk = __ballot(p);
-            if (lane == 0) s_wc[wave] = (uint32_t)__popcll(mk);
-            __syncthreads();
-            uint32_t before = nrun, tot = 0;
-            for (uint32_t w = 0; w < NTHR / kWave; ++w) {
-                if (w < wave) before += s_wc[w];
-                tot += s_wc[w];
-            }
-            const uint32_t pos = before + (uint32_t)__popcll(mk & ((1ull << lane) - 1ull));
-            if (p && pos < FM) s_run[pos] = (int32_t)x;
-            __syncthreads();
-            nrun += tot;
+            const uint32_t prev_e = __shfl_up(e_lane, 1, kWave);
+            const bool is_new_run = valid && (lane == 0 || e_lane != prev_e);
+            const unsigned long long mk = __ballot(is_new_run);
+            const uint32_t nrun = (uint32_t)__popcll(mk);
+            const uint32_t pos = (uint32_t)__popcll(mk & ((1ull << lane) - 1ull));
+            if (is_new_run && pos == jrun) s_es_e = e_lane;
+            if (lane == 0) s_es_nrun = nrun;
         }
-        if (jrun >= nrun) return;       /* the tile has fewer runs than this block's index */
-        e = (uint32_t)s_run[jrun];
+        __syncthreads();
+        if (jrun >= s_es_nrun) return;
+        e = s_es_e;
     } else {
         uint32_t lo = 0, hi = n_expert;
         while (lo + 1 < hi) {
@@ -1600,34 +1597,31 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_bf16_kernel(
     if constexpr (AL) {
         e = e_al;
     } else if constexpr (ES) {
-        __shared__ int32_t  s_run[FM];
-        __shared__ uint32_t s_wc[NTHR / kWave];
-        uint32_t nrun = 0;
-        for (uint32_t c = 0; c < n_expert && nrun <= jrun; c += NTHR) {
-            const uint32_t ce = c + NTHR < n_expert ? c + NTHR : n_expert;
-            if ((uint32_t)off[ce] <= r0) continue;          /* every expert here ends before it */
-            if ((uint32_t)off[c] >= rN) break;              /* and every one from here after it */
-            const uint32_t x = c + tid;
-            bool p = false;
-            if (x < ce) {
-                const uint32_t a = (uint32_t)off[x], b = (uint32_t)off[x + 1];
-                p = a < b && a < rN && b > r0;
+        __shared__ uint32_t s_es_e;
+        __shared__ uint32_t s_es_nrun;
+        if (wave == 0) {
+            uint32_t e_lane = 0;
+            const uint32_t r = r0 + lane;
+            const bool valid = (lane < FM) && (r < rN) && (r < live);
+            if (valid) {
+                uint32_t lo = 0, hi = n_expert;
+                while (lo + 1 < hi) {
+                    const uint32_t mid = (lo + hi) >> 1;
+                    if ((uint32_t)off[mid] <= r) lo = mid; else hi = mid;
+                }
+                e_lane = lo;
             }
-            const unsigned long long mk = __ballot(p);
-            if (lane == 0) s_wc[wave] = (uint32_t)__popcll(mk);
-            __syncthreads();
-            uint32_t before = nrun, tot = 0;
-            for (uint32_t w = 0; w < NTHR / kWave; ++w) {
-                if (w < wave) before += s_wc[w];
-                tot += s_wc[w];
-            }
-            const uint32_t pos = before + (uint32_t)__popcll(mk & ((1ull << lane) - 1ull));
-            if (p && pos < FM) s_run[pos] = (int32_t)x;
-            __syncthreads();
-            nrun += tot;
+            const uint32_t prev_e = __shfl_up(e_lane, 1, kWave);
+            const bool is_new_run = valid && (lane == 0 || e_lane != prev_e);
+            const unsigned long long mk = __ballot(is_new_run);
+            const uint32_t nrun = (uint32_t)__popcll(mk);
+            const uint32_t pos = (uint32_t)__popcll(mk & ((1ull << lane) - 1ull));
+            if (is_new_run && pos == jrun) s_es_e = e_lane;
+            if (lane == 0) s_es_nrun = nrun;
         }
-        if (jrun >= nrun) return;       /* the tile has fewer runs than this block's index */
-        e = (uint32_t)s_run[jrun];
+        __syncthreads();
+        if (jrun >= s_es_nrun) return;
+        e = s_es_e;
     } else {
         uint32_t lo = 0, hi = n_expert;
         while (lo + 1 < hi) {
@@ -2817,8 +2811,9 @@ static int moe_gemm_bf16_body(const RadArgs* a, const R4dSink& sk) {
     const int form = g_moe_prefill_form;
     if ((form == 0 && r4d_moe_decode_band(T, n_expert)) || form == 2) {
         const unsigned tiles = (unsigned)((T + 15) / 16);
+        const unsigned gx = (tiles == 0) ? 0u : (unsigned)T;
         emit_rc = R4D_EMIT(sk, (moe_gemm_bf16_kernel<1, 4, 1, 4, true>),
-                           dim3(tiles * 16u, ny), dim3(4 * kWave), 0,
+                           dim3(gx, ny), dim3(4 * kWave), 0,
                            (const uint16_t*)A->data, tab, w_s0,
                            (const int32_t*)sorted->data, (const int32_t*)off->data,
                            (uint16_t*)Y->data, (uint32_t)T, (uint32_t)N, (uint32_t)K,
