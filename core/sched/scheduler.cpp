@@ -838,7 +838,6 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget) {
     server::sink_admitted(r.sink);
     s.sched_tokens = (int32_t)want;
     s.pending_ckpt = ckpt;
-    if (running_.empty()) draft_.reset_adaptive();
     ++m_.admitted;
     return RAD_OK;
 }
@@ -1609,7 +1608,6 @@ int Scheduler::commit(const StepResult& res) {
      * serial_end() has cleared since. Every pass that named them was issued before this step's
      * readback, which waited for the compute stream. */
     sweep_deferred();
-    if (running_.empty()) draft_.reset_adaptive();
     return RAD_OK;
 }
 

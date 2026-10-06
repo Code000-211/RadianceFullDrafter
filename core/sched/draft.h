@@ -37,9 +37,7 @@ public:
 
     /* The draft depth for the next step.
      * Keeps depth at p_.max_depth across concurrency levels to maximize draft throughput.
-     * Setting RADIANCE_DYNAMIC_SPEC=1 optionally restores concurrency-based depth throttling.
-     * Adaptive Speculation: throttles depth to 1 when consecutive verify rejections occur and EMA
-     * acceptance drops below threshold, recovering immediately on the next accepted token. */
+     * Setting RADIANCE_DYNAMIC_SPEC=1 optionally restores concurrency-based depth throttling. */
     int  next_depth(int active_seqs = 1) const {
         if (p_.max_depth <= 0) return 0;
         static const bool dynamic_spec = (std::getenv("RADIANCE_DYNAMIC_SPEC") != nullptr);
@@ -48,26 +46,12 @@ public:
             if (active_seqs >= 5) return std::min(p_.max_depth, 1);
             if (active_seqs >= 3) return std::min(p_.max_depth, 2);
         }
-
-        static const bool disable_adaptive = (std::getenv("RADIANCE_DISABLE_ADAPTIVE_SPEC") != nullptr);
-        if (__builtin_expect(!disable_adaptive, 1)) {
-            if (consecutive_zero_ >= 2 && ema_acceptance_ < 0.35f) {
-                return std::min(p_.max_depth, 1);
-            }
-        }
-
         return p_.max_depth;
     }
 
     /* One verify's outcome: `drafted` tokens were proposed and a prefix of `accepted` of them was
-     * taken. Feeds the reported metrics and adaptive depth controller. */
+     * taken. Feeds the reported metrics and nothing else. */
     void observe(int drafted, int accepted);
-
-    /* Reset adaptive state (e.g. on new request arrival or prefill completion) */
-    void reset_adaptive() {
-        ema_acceptance_ = 1.0f;
-        consecutive_zero_ = 0;
-    }
 
     /* Metrics (spec §14). Cumulative and exact. */
     int64_t drafted()  const { return tot_drafted_; }
@@ -75,8 +59,6 @@ public:
     float   acceptance() const {
         return tot_drafted_ ? (float)((double)tot_accepted_ / (double)tot_drafted_) : 0.0f;
     }
-    float   ema_acceptance() const { return ema_acceptance_; }
-    int     consecutive_zero() const { return consecutive_zero_; }
 
     /* PER-POSITION ACCEPTANCE, and it is a diagnostic rather than a policy input.
      *
@@ -105,10 +87,6 @@ private:
     int64_t reach_[RAD_SCHED_MAX_SPEC] = {};
     int64_t hit_  [RAD_SCHED_MAX_SPEC] = {};
     int     seen_ = 0;
-
-    /* Adaptive speculation state */
-    float   ema_acceptance_ = 1.0f;
-    int     consecutive_zero_ = 0;
 };
 
 }  /* namespace rad */
