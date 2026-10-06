@@ -72,7 +72,7 @@ __device__ __forceinline__ void wht6_block_rows(int c0, int c1, int ce, int n_gr
 }
 
 template <bool GATHER, int CG>
-__global__ void r4d_ar_hc_write_wht6_kernel(
+__device__ __forceinline__ void r4d_ar_hc_write_wht6_impl(
     unsigned short* __restrict__ y, char* peer_scratch, const char* my_scratch, char* loc_pack,
     unsigned int* peer_flags, unsigned int* my_flags, unsigned int* seq_ctrs,
     const unsigned short* __restrict__ inj, unsigned short* __restrict__ h, int n, int hc,
@@ -150,6 +150,30 @@ __global__ void r4d_ar_hc_write_wht6_kernel(
     wht6_reduce_chunk<CG>(st, c, n_groups, lane, lig, gw, w.m_pay, w.m_sc, w.l_pay, w.l_sc);
 }
 
+template <int CG>
+__global__ __attribute__((amdgpu_num_vgpr(64))) void r4d_ar_hc_write_wht6_kernel(
+    unsigned short* __restrict__ y, char* peer_scratch, const char* my_scratch, char* loc_pack,
+    unsigned int* peer_flags, unsigned int* my_flags, unsigned int* seq_ctrs,
+    const unsigned short* __restrict__ inj, unsigned short* __restrict__ h, int n, int hc,
+    long irow, long hrow, int n_groups, int n_chunks, long slot_stride_bytes,
+    long scale_off_bytes, int drain, int acq, unsigned int nbw, R4dArGather G, int rows_max) {
+  r4d_ar_hc_write_wht6_impl<false, CG>(y, peer_scratch, my_scratch, loc_pack, peer_flags, my_flags,
+                                       seq_ctrs, inj, h, n, hc, irow, hrow, n_groups, n_chunks,
+                                       slot_stride_bytes, scale_off_bytes, drain, acq, nbw, G, rows_max);
+}
+
+template <int CG>
+__global__ void r4d_ar_gather_hc_write_wht6_kernel(
+    unsigned short* __restrict__ y, char* peer_scratch, const char* my_scratch, char* loc_pack,
+    unsigned int* peer_flags, unsigned int* my_flags, unsigned int* seq_ctrs,
+    const unsigned short* __restrict__ inj, unsigned short* __restrict__ h, int n, int hc,
+    long irow, long hrow, int n_groups, int n_chunks, long slot_stride_bytes,
+    long scale_off_bytes, int drain, int acq, unsigned int nbw, R4dArGather G, int rows_max) {
+  r4d_ar_hc_write_wht6_impl<true, CG>(y, peer_scratch, my_scratch, loc_pack, peer_flags, my_flags,
+                                      seq_ctrs, inj, h, n, hc, irow, hrow, n_groups, n_chunks,
+                                      slot_stride_bytes, scale_off_bytes, drain, acq, nbw, G, rows_max);
+}
+
 int r4d_ar_hc_write_wht6(long peer_scratch, long my_scratch, long peer_flags, long my_flags,
                          long seq_ctrs, long loc_pack, long slot_stride_bytes,
                          long scale_off_bytes, long y, long inj, long h, long M, long n, long hc,
@@ -193,13 +217,18 @@ int r4d_ar_hc_write_wht6(long peer_scratch, long my_scratch, long peer_flags, lo
     G.ye_ld = ye_ld; G.ew_ld = ew_ld; G.sh_ld = sh_ld; G.sg_ld = sg_ld;
     G.top_k = (int)top_k; G.T = (int)(M * top_k); G.sig = (int)sig;
   }
-#define LF(GA, CG) r4d_ar_hc_write_wht6_kernel<GA, CG><<<nb, nt, lds, st>>>( \
-    (unsigned short*)y, (char*)peer_scratch, (const char*)my_scratch, (char*)loc_pack, \
-    (unsigned*)peer_flags, (unsigned*)my_flags, (unsigned*)seq_ctrs, (const unsigned short*)inj, \
-    (unsigned short*)h, (int)n, (int)hc, irow, hrow, n_groups, n_chunks, slot_stride_bytes, \
-    scale_off_bytes, (int)drain, (int)acq, (unsigned)R4D_AR_MAX_BLOCKS, G, rows_max)
-  if (gather) LF(true, kWht6FusedCG);
-  else LF(false, kWht6FusedCG);
-#undef LF
+  if (gather) {
+    r4d_ar_gather_hc_write_wht6_kernel<kWht6FusedCG><<<nb, nt, lds, st>>>(
+        (unsigned short*)y, (char*)peer_scratch, (const char*)my_scratch, (char*)loc_pack,
+        (unsigned*)peer_flags, (unsigned*)my_flags, (unsigned*)seq_ctrs, (const unsigned short*)inj,
+        (unsigned short*)h, (int)n, (int)hc, irow, hrow, n_groups, n_chunks, slot_stride_bytes,
+        scale_off_bytes, (int)drain, (int)acq, (unsigned)R4D_AR_MAX_BLOCKS, G, rows_max);
+  } else {
+    r4d_ar_hc_write_wht6_kernel<kWht6FusedCG><<<nb, nt, lds, st>>>(
+        (unsigned short*)y, (char*)peer_scratch, (const char*)my_scratch, (char*)loc_pack,
+        (unsigned*)peer_flags, (unsigned*)my_flags, (unsigned*)seq_ctrs, (const unsigned short*)inj,
+        (unsigned short*)h, (int)n, (int)hc, irow, hrow, n_groups, n_chunks, slot_stride_bytes,
+        scale_off_bytes, (int)drain, (int)acq, (unsigned)R4D_AR_MAX_BLOCKS, G, rows_max);
+  }
   return (int)hipGetLastError();
 }
