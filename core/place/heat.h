@@ -60,12 +60,12 @@ struct HeatParams {
      * 0.98 is a half-life of a few dozen dispatches: long enough to survive a paragraph, short
      * enough to follow a change of subject. Nearby values are not distinguishable from each other
      * above the run-to-run spread, which is what the offline replay predicts. */
-    float decay = 0.98f;
+    float decay = 0.985f;
 
     /* Promote only when the candidate beats the victim by this ratio. Without it the two ends of
      * the ranking trade places on noise and the engine spends the whole link on churn that
      * changes nothing. */
-    float hysteresis = 1.25f;
+    float hysteresis = 1.15f;
 
     /* ...and the additive half of the same guard, in units of one activation. It is what stops a
      * swap when the victim's heat is ZERO, where any ratio test passes trivially -- and right
@@ -82,7 +82,7 @@ struct HeatParams {
      * The exchange rate behind the value: the two link directions share one budget, so
      * a demotion costs about what a promotion does, and a swap therefore has to repay about 1.4
      * future hits rather than the 0.74 a half-price demotion would imply. */
-    float min_gain = 1.5f;
+    float min_gain = 0.75f;
 
     /* A BOUNDED MOVE BUDGET PER LAYER DISPATCH. The apparent risk is that a high budget makes the
      * mover compete with the tier it is trying to shrink -- a promotion and a streamed miss are
@@ -99,7 +99,7 @@ struct HeatParams {
      * a dispatch that whole experts do: residency would converge half as fast, and a fresh server
      * would run about 2% slower for its first minute. Per class, the two together move about as
      * many whole experts as one class of whole experts does. */
-    int moves_per_dispatch = 8;
+    int moves_per_dispatch = 16;
 
     /* Dispatches to watch before moving anything, and it is 0 because THE GUARD ALREADY DOES THIS
      * JOB. min_gain means a promotion needs `hot >= cold*hysteresis + 1.5`, and against a
