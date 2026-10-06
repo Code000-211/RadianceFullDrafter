@@ -77,7 +77,7 @@ struct SchedReq {
          * a sustained 100% acceptance streak of at least 6 steps and ema_accept >= 2.85f.
          * This strictly guards code and file_edit from premature depth 4 promotion,
          * while allowing math/json bursts to reach depth 4. */
-        if (accepted_streak >= 5 && ema_accept >= 2.75f) {
+        if (accepted_streak >= 6 && ema_accept >= 2.85f) {
             return 4;
         }
         return 3;

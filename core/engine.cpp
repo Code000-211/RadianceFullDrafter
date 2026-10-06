@@ -269,7 +269,7 @@ void Engine::tiering_dispatch(Rank& r, const RadBatch* b) {
     if (is_final_pf) {
         /* Prefill-to-decode transition: burst-promote hot non-resident experts into VRAM slab.
          * Under high concurrency (n_seq >= 4), throttle burst to avoid PCIe all-reduce contention. */
-        const int burst = (b->n_seq <= 2) ? 16 : (b->n_seq <= 4 ? 8 : 4);
+        const int burst = (b->n_seq <= 2) ? 16 : 0;
         r.heat.set_burst_moves(burst);
     }
 
@@ -295,7 +295,8 @@ void Engine::on_prefix_hit(const Request& r, const std::vector<int32_t>& units) 
         for (int32_t u : units) {
             rk->heat.boost_unit(u, 25.0f);
         }
-        rk->heat.set_burst_moves(std::min(48, std::max(16, (int)units.size())));
+        /* Boost units' heat scores, but keep dispatch burst capped to avoid PCIe link congestion during concurrency */
+        rk->heat.set_burst_moves(8);
     }
 }
 /* ------------------------------------------------------------------ the rank thread */
