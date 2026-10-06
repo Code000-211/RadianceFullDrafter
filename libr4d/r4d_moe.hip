@@ -2481,7 +2481,7 @@ constexpr long long kPrefillCols = 128;
  * a decode step stays on the decode form with room; a server with a few dozen concurrent
  * sequences crosses onto the prefill form exactly where that form is the faster one. */
 static inline bool r4d_moe_decode_band(long long T, long long n_expert) {
-    return T <= 64;
+    return 2 * T <= 3 * n_expert;
 }
 /* THE MAP'S UPPER BOUND, stated once because the scratch hook and the launcher must agree about
  * it exactly: a hook that answers for a different shape than the launch uses is how a kernel ends
