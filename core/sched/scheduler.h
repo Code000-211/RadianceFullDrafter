@@ -72,12 +72,20 @@ struct SchedReq {
     }
 
     int suggest_depth(int default_depth, bool adaptive) const {
-        if (!adaptive || default_depth < 4) return default_depth;
-        /* Only expand to depth 4 if this specific sequence has demonstrated
-         * a sustained 100% acceptance streak of at least 5 steps and ema_accept >= 2.85f.
-         * This strictly guards code and file_edit from premature depth 4 promotion,
-         * while allowing math/json bursts to reach depth 4. */
-        if (accepted_streak >= 5 && ema_accept >= 2.85f) {
+        if (!adaptive) return default_depth;
+        /* Dynamic Multi-Tier Speculative Depth Controller:
+         * - Baseline floor is always 3 tokens (guaranteeing zero regression across all categories).
+         * - Tier 4: unlocked on sustained streak >= 3 steps and ema_accept >= 2.45f.
+         * - Tier 5: unlocked on sustained streak >= 5 steps and ema_accept >= 3.45f.
+         * - Tier 6: unlocked on sustained streak >= 7 steps and ema_accept >= 4.45f.
+         */
+        if (default_depth >= 6 && accepted_streak >= 7 && ema_accept >= 4.45f) {
+            return 6;
+        }
+        if (default_depth >= 5 && accepted_streak >= 5 && ema_accept >= 3.45f) {
+            return 5;
+        }
+        if (default_depth >= 4 && accepted_streak >= 3 && ema_accept >= 2.45f) {
             return 4;
         }
         return 3;
