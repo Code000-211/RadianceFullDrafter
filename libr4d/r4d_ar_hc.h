@@ -102,24 +102,13 @@ __device__ __forceinline__ void r4d_ar_hc_write_word(const unsigned short* __res
   float v[8];
 #pragma unroll
   for (int j = 0; j < 8; ++j) v[j] = bf2f(yv[j]);
-
-  int4 hv[8];
-  float g[8];
+  for (int c = 0; c < hc; ++c) {
+    const float g = bf2f(inj[(long)row * irow + c]);
+    int4* hp = reinterpret_cast<int4*>(h + (long)row * hrow + (long)c * n + i0);
+    int4 hv = *hp;
+    unsigned short* he = reinterpret_cast<unsigned short*>(&hv);
 #pragma unroll
-  for (int c = 0; c < 8; ++c) {
-    if (c < hc) {
-      g[c] = bf2f(inj[(long)row * irow + c]);
-      hv[c] = *reinterpret_cast<const int4*>(h + (long)row * hrow + (long)c * n + i0);
-    }
-  }
-
-#pragma unroll
-  for (int c = 0; c < 8; ++c) {
-    if (c >= hc) break;
-    unsigned short* he = reinterpret_cast<unsigned short*>(&hv[c]);
-#pragma unroll
-    for (int j = 0; j < 8; ++j) he[j] = f2bf(bf2f(he[j]) + g[c] * v[j]);
-    *reinterpret_cast<int4*>(h + (long)row * hrow + (long)c * n + i0) = hv[c];
+    for (int j = 0; j < 8; ++j) he[j] = f2bf(bf2f(he[j]) + g * v[j]);
+    *hp = hv;
   }
 }
-
