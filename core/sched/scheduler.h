@@ -80,6 +80,11 @@ struct SchedReq {
          * across 256 experts (400 slots). Keep C8 strictly at default_depth (3)
          * to preserve maximum cache locality and peak throughput. */
         if (multi_seq) {
+            /* In concurrency: default floor is 3. Only promote individual sequence to depth 4
+             * if it has proven sustained streak >= 5 and ema >= 2.85f */
+            if (accepted_streak >= 5 && ema_accept >= 2.85f) {
+                return std::min(max_cap, 4);
+            }
             return std::min(default_depth, 3);
         } else {
             /* Single-stream: burst to 4 on steady streak >= 3 and ema >= 2.5f (code/json/math/file_edit),
