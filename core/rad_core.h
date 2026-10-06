@@ -619,6 +619,7 @@ struct Config {
     int64_t vram_weights_mib = 0;
     int64_t vram_kv_mib = 0;
     int64_t gpu_headroom_mib = 96;     /* --gpu-headroom, left unclaimed on every card */
+    int64_t prefill_stage_mib = 0;     /* --prefill-stage-mib, buffer size for each prefill staging buffer */
     /* --kv-cache-dtype bf16|fp8. fp8 is an E4M3 cache with per-(sequence, head) descales, and it
      * halves what a token of context costs -- which at a production context is most of the KV
      * pool. It is a real quantisation and the model computes a slightly different function with

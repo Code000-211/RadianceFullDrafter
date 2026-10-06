@@ -99,7 +99,7 @@ extern "C" int r4d_attn_prefill_h256_gqa6_bf16kv(const R4DArgs* a, hipStream_t s
 // 23%.  The crossover is around 192 rows, and above 288 the vectorised form wins by 1.2-20%; the
 // cut is set at four rows per CU.
 #ifndef D_VECMIN
-#define D_VECMIN 256
+#define D_VECMIN 144
 #endif
 
 // Split law: AS MANY WORKGROUPS AS FIT UNDER 128.  `splits * kv_heads * num_seqs` is the whole

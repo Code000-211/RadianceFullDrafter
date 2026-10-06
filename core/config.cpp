@@ -44,6 +44,7 @@ static const Flag g_flags[] = {
     { "--max-model-len",      "N",      "context bound; 0 takes the model's training context" },
 
     { "--gpu-headroom-mib",   "N",      "VRAM left unclaimed on every card (default 96)" },
+    { "--prefill-stage-mib",  "N",      "prefill staging buffer size in MiB per buffer (default 280)" },
     /* THE FLAG THAT DECIDES WHETHER MULTI-TURN WORKS, which is more than the split it names.
      * The KV side is not just concurrency: prefix caching holds a finished sequence's blocks
      * so the next turn can reuse them, so when the pool cannot hold the LIVE SESSIONS the
@@ -384,6 +385,8 @@ int config_parse(int argc, char** argv, Config* c) {
          * parse to the same field. */
         else if (S("--gpu-headroom-mib") || S("--gpu-headroom"))
                                                { if (!(v = need(i))) return RAD_E_INVAL; c->gpu_headroom_mib = atoll(v); }
+        else if (S("--prefill-stage-mib") || S("--prefill-stage"))
+                                               { if (!(v = need(i))) return RAD_E_INVAL; c->prefill_stage_mib = atoll(v); }
         else if (S("--kv-cache-dtype")) {
             if (!(v = need(i))) return RAD_E_INVAL;
             if (std::strcmp(v, "bf16") && std::strcmp(v, "fp8")) {

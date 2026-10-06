@@ -92,7 +92,7 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
 
     /* What is left after the terms nobody gets to spend. */
     int64_t fixed = b.already_held + b.headroom + b.arena + b.staging + b.queues;
-    if (cfg.checkpoint_slots > 0) fixed += cfg.checkpoint_slots * 58 * kMiB;
+    if (cfg.checkpoint_slots > 0 && want_kv) fixed += cfg.checkpoint_slots * 58 * kMiB;
     if (!want_w)  fixed += cfg.vram_weights_mib * kMiB;   /* a stated pool is fixed too */
     if (!want_kv) fixed += cfg.vram_kv_mib * kMiB;
     b.claimable = b.capacity - fixed;
@@ -213,8 +213,14 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
     if (want_w && layer_max > 0 && b.expert_ceiling > b.experts && cfg.placement != "all_vram" &&
         cfg.placement != "layer_offload") {
         const double f = (double)(b.expert_ceiling - b.experts) / (double)b.expert_ceiling;
-        const int64_t one = ((int64_t)std::ceil(f * (double)layer_max) + RAD_ALIGN_UNIT - 1) /
+        int64_t one = ((int64_t)std::ceil(f * (double)layer_max) + RAD_ALIGN_UNIT - 1) /
                             RAD_ALIGN_UNIT * RAD_ALIGN_UNIT;
+        const int64_t target_one = cfg.prefill_stage_mib > 0
+            ? cfg.prefill_stage_mib * kMiB
+            : (int64_t)280 * kMiB;
+        if (target_one > one && 2 * target_one < b.experts) {
+            one = target_one;
+        }
         if (2 * one < b.experts) {
             b.stage    = 2 * one;
             b.experts -= b.stage;
