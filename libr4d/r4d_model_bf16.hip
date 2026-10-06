@@ -83,7 +83,7 @@ static PleVramCache get_ple_vram_cache(int dev_id, int n_embd) {
     const uint32_t total_entries = num_sets * 4u;
     const size_t tag_bytes  = (size_t)total_entries * sizeof(int32_t);
     const size_t heat_bytes = (size_t)total_entries * sizeof(uint8_t);
-    const size_t data_bytes = (size_t)total_entries * 160u;
+    const size_t data_bytes = (size_t)total_entries * 320u; // 160 elements x 2 bytes (BF16)
 
     (void)hipSetDevice(dev_id);
     if (hipMalloc((void**)&c.tags, tag_bytes) != hipSuccess) {
@@ -106,7 +106,7 @@ static PleVramCache get_ple_vram_cache(int dev_id, int n_embd) {
     (void)hipMemset(c.heat, 0, heat_bytes);
     c.num_sets = num_sets;
     fprintf(stderr, "I[ple] device %d: allocated 4-Way Set-Associative RLFU L1 VRAM N-Gram Cache: "
-                    "%u sets x 4 ways = %u entries (%.2f MiB VRAM: %zu KiB tags, %zu KiB heat, %.1f MiB data)\n",
+                    "%u sets x 4 ways = %u entries (%.2f MiB VRAM: %zu KiB tags, %zu KiB heat, %.1f MiB data [dequantized BF16])\n",
             dev_id, num_sets, total_entries, (tag_bytes + heat_bytes + data_bytes) / (1024.0 * 1024.0),
             tag_bytes / 1024, heat_bytes / 1024, data_bytes / (1024.0 * 1024.0));
     return c;
@@ -191,12 +191,12 @@ __global__ __launch_bounds__(kThreads) void embed_lookup_kernel(
 // scale rounds once in f32, and f32_to_bf16 rounds to nearest even.  An id outside [0, n_vocab)
 // after the offset writes a zero row (the divergence note at the top of this file).
 // ---------------------------------------------------------------------------- ple_embed_lookup_q_kernel
-// Specialized 1-workgroup-per-row kernel for PLE N-Gram table (n_embd = 160, FP8 E4M3, V = 4).
-// 64 threads per workgroup: threads 0..39 handle the 40 columns (160 bytes) of row m = blockIdx.x.
-// Exactly one workgroup per row guarantees ZERO straddling across workgroup boundaries,
-// and __syncthreads() guarantees that all 40 columns are fully committed to VRAM cache
-// before cache_tags is published!
-__global__ __launch_bounds__(64) void ple_embed_lookup_q_kernel(
+// Specialized 1-wave-per-row kernel for PLE N-Gram table (n_embd = 160, FP8 E4M3).
+// Exactly 32 threads (1 wavefront) per row: threads 0..19 process 8 elements each (uint2 FP8 -> uint4 BF16).
+// Lane 0 evaluates the 4-way L1 cache tags once and broadcasts the result via __shfl,
+// eliminating 19 redundant memory loads of tags and branches!
+// All 20 threads reside in wave 0, guaranteeing zero cross-wave races and zero straddling.
+__global__ __launch_bounds__(32) void ple_embed_lookup_q_kernel(
     const int32_t* __restrict__ tok, const void* __restrict__ wte, const void* __restrict__ sc,
     uint32_t sc_f32, uint16_t* __restrict__ x, uint32_t M, int32_t n_vocab,
     int32_t vocab_off, uint32_t x_ld,
@@ -204,80 +204,107 @@ __global__ __launch_bounds__(64) void ple_embed_lookup_q_kernel(
     uint8_t* __restrict__ cache_data, uint32_t num_sets) {
     const uint32_t m = blockIdx.x;
     if (m >= M) return;
-    const uint32_t tid = threadIdx.x;
-    if (tid >= 40u) return;
+    const uint32_t lane = threadIdx.x;
 
-    const uint32_t j = tid * 4u;
     const int32_t id = tok[m] - vocab_off;
-    uint16_t* __restrict__ dst = x + (size_t)m * x_ld + j;
-
     if (id < 0 || id >= n_vocab) {
-        *(uint2*)dst = make_uint2(0u, 0u);
+        if (lane < 20u) {
+            uint16_t* __restrict__ dst = x + (size_t)m * x_ld + lane * 8u;
+            *(uint4*)dst = make_uint4(0u, 0u, 0u, 0u);
+        }
         return;
     }
 
-    const float s = !sc ? 1.0f : sc_f32 ? *(const float*)sc : bf16_to_f32(*(const uint16_t*)sc);
-    const size_t at = (size_t)id * 160u + j;
-    uint32_t q = 0;
     uint32_t slot = 0;
-    bool is_hit = false;
+    uint32_t is_hit = 0;
 
     if (cache_tags && cache_heat && cache_data && num_sets > 0) {
-        const uint32_t set = ((uint32_t)id * 2654435761u) & (num_sets - 1);
-        const uint32_t base = set * 4u;
-        const int4 tags = *(const int4*)(cache_tags + base);
+        if (lane == 0) {
+            const uint32_t set = ((uint32_t)id * 2654435761u) & (num_sets - 1);
+            const uint32_t base = set * 4u;
+            const int4 tags = *(const int4*)(cache_tags + base);
 
-        int way = -1;
-        if      (tags.x == id) way = 0;
-        else if (tags.y == id) way = 1;
-        else if (tags.z == id) way = 2;
-        else if (tags.w == id) way = 3;
+            int way = -1;
+            if      (tags.x == id) way = 0;
+            else if (tags.y == id) way = 1;
+            else if (tags.z == id) way = 2;
+            else if (tags.w == id) way = 3;
 
-        if (way >= 0) {
-            // 4-WAY L1 VRAM HIT!
-            slot = base + (uint32_t)way;
-            is_hit = true;
-            const size_t c_at = (size_t)slot * 160u + j;
-            q = *(const uint32_t*)(cache_data + c_at);
-        } else {
-            // 4-WAY L1 VRAM MISS: Fallback to L2 Host RAM / /dev/shm
-            q = *(const uint32_t*)((const uint8_t*)wte + at);
-
-            // Find victim way among 4 ways
-            int victim_way = 0;
-            if      (tags.x < 0) { victim_way = 0; }
-            else if (tags.y < 0) { victim_way = 1; }
-            else if (tags.z < 0) { victim_way = 2; }
-            else if (tags.w < 0) { victim_way = 3; }
-            else {
-                const uint32_t h4 = *(const uint32_t*)(cache_heat + base);
-                const uint32_t h0 = h4 & 0xFFu;
-                const uint32_t h1 = (h4 >> 8) & 0xFFu;
-                const uint32_t h2 = (h4 >> 16) & 0xFFu;
-                const uint32_t h3 = (h4 >> 24) & 0xFFu;
-                uint32_t min_h = h0;
-                if (h1 < min_h) { min_h = h1; victim_way = 1; }
-                if (h2 < min_h) { min_h = h2; victim_way = 2; }
-                if (h3 < min_h) { min_h = h3; victim_way = 3; }
+            if (way >= 0) {
+                slot = base + (uint32_t)way;
+                is_hit = 1;
+            } else {
+                int victim_way = 0;
+                if      (tags.x < 0) { victim_way = 0; }
+                else if (tags.y < 0) { victim_way = 1; }
+                else if (tags.z < 0) { victim_way = 2; }
+                else if (tags.w < 0) { victim_way = 3; }
+                else {
+                    const uint32_t h4 = *(const uint32_t*)(cache_heat + base);
+                    const uint32_t h0 = h4 & 0xFFu;
+                    const uint32_t h1 = (h4 >> 8) & 0xFFu;
+                    const uint32_t h2 = (h4 >> 16) & 0xFFu;
+                    const uint32_t h3 = (h4 >> 24) & 0xFFu;
+                    uint32_t min_h = h0;
+                    if (h1 < min_h) { min_h = h1; victim_way = 1; }
+                    if (h2 < min_h) { min_h = h2; victim_way = 2; }
+                    if (h3 < min_h) { min_h = h3; victim_way = 3; }
+                }
+                slot = base + (uint32_t)victim_way;
+                is_hit = 0;
             }
-
-            slot = base + (uint32_t)victim_way;
-            is_hit = false;
-            const size_t c_at = (size_t)slot * 160u + j;
-            *(uint32_t*)(cache_data + c_at) = q;
         }
-    } else {
-        q = *(const uint32_t*)((const uint8_t*)wte + at);
+        slot = __shfl(slot, 0, 32);
+        is_hit = __shfl(is_hit, 0, 32);
     }
 
-    const v2f lo = r4d_fp8::e4m3_pk<false>(q), hi = r4d_fp8::e4m3_pk<true>(q);
-    *(uint2*)dst = make_uint2(
-        (uint32_t)f32_to_bf16(lo.x * s) | ((uint32_t)f32_to_bf16(lo.y * s) << 16),
-        (uint32_t)f32_to_bf16(hi.x * s) | ((uint32_t)f32_to_bf16(hi.y * s) << 16));
+    if (lane < 20u) {
+        const uint32_t j = lane * 8u;
+        uint16_t* __restrict__ dst = x + (size_t)m * x_ld + j;
+
+        if (cache_tags && cache_heat && cache_data && num_sets > 0) {
+            const size_t c_at = (size_t)slot * 320u + (size_t)lane * 16u;
+            if (is_hit) {
+                // 4-WAY L1 VRAM HIT: Direct 128-bit vector load! Zero dequant arithmetic!
+                *(uint4*)dst = *(const uint4*)(cache_data + c_at);
+            } else {
+                // 4-WAY L1 VRAM MISS: Load FP8 from L2 Host RAM, dequantize, store to dst and L1 cache
+                const size_t at = (size_t)id * 160u + j;
+                const uint2 q2 = *(const uint2*)((const uint8_t*)wte + at);
+                const float s = !sc ? 1.0f : sc_f32 ? *(const float*)sc : bf16_to_f32(*(const uint16_t*)sc);
+                const uint32_t q0 = q2.x, q1 = q2.y;
+                const v2f lo0 = r4d_fp8::e4m3_pk<false>(q0), hi0 = r4d_fp8::e4m3_pk<true>(q0);
+                const v2f lo1 = r4d_fp8::e4m3_pk<false>(q1), hi1 = r4d_fp8::e4m3_pk<true>(q1);
+
+                const uint4 bf16_quad = make_uint4(
+                    (uint32_t)f32_to_bf16(lo0.x * s) | ((uint32_t)f32_to_bf16(lo0.y * s) << 16),
+                    (uint32_t)f32_to_bf16(hi0.x * s) | ((uint32_t)f32_to_bf16(hi0.y * s) << 16),
+                    (uint32_t)f32_to_bf16(lo1.x * s) | ((uint32_t)f32_to_bf16(lo1.y * s) << 16),
+                    (uint32_t)f32_to_bf16(hi1.x * s) | ((uint32_t)f32_to_bf16(hi1.y * s) << 16));
+                *(uint4*)dst = bf16_quad;
+                *(uint4*)(cache_data + c_at) = bf16_quad;
+            }
+        } else {
+            const size_t at = (size_t)id * 160u + j;
+            const uint2 q2 = *(const uint2*)((const uint8_t*)wte + at);
+            const float s = !sc ? 1.0f : sc_f32 ? *(const float*)sc : bf16_to_f32(*(const uint16_t*)sc);
+            const uint32_t q0 = q2.x, q1 = q2.y;
+            const v2f lo0 = r4d_fp8::e4m3_pk<false>(q0), hi0 = r4d_fp8::e4m3_pk<true>(q0);
+            const v2f lo1 = r4d_fp8::e4m3_pk<false>(q1), hi1 = r4d_fp8::e4m3_pk<true>(q1);
+
+            *(uint4*)dst = make_uint4(
+                (uint32_t)f32_to_bf16(lo0.x * s) | ((uint32_t)f32_to_bf16(lo0.y * s) << 16),
+                (uint32_t)f32_to_bf16(hi0.x * s) | ((uint32_t)f32_to_bf16(hi0.y * s) << 16),
+                (uint32_t)f32_to_bf16(lo1.x * s) | ((uint32_t)f32_to_bf16(lo1.y * s) << 16),
+                (uint32_t)f32_to_bf16(hi1.x * s) | ((uint32_t)f32_to_bf16(hi1.y * s) << 16));
+        }
+    }
 
     if (cache_tags && cache_heat && num_sets > 0) {
-        __syncthreads();
-        if (tid == 0) {
+        if (!is_hit) {
+            __threadfence();
+        }
+        if (lane == 0) {
             if (is_hit) {
                 const uint8_t h = cache_heat[slot];
                 if (h < 255) cache_heat[slot] = h + 1;
@@ -769,7 +796,7 @@ static int embed_lookup_q_emit(const int32_t* tok, const void* wte, bool q, cons
             (void)hipGetDevice(&dev);
         }
         const PleVramCache cache = get_ple_vram_cache(dev, n_embd);
-        const int rc = R4D_EMIT(sk, ple_embed_lookup_q_kernel, dim3((uint32_t)M), dim3(64), 0,
+        const int rc = R4D_EMIT(sk, ple_embed_lookup_q_kernel, dim3((uint32_t)M), dim3(32), 0,
                                 tok, wte, sc, (uint32_t)(sc_f32 ? 1u : 0u), x,
                                 (uint32_t)M, (int32_t)n_vocab, (int32_t)vocab_off,
                                 (uint32_t)x_ld, cache.tags, cache.heat, cache.data, cache.num_sets);

@@ -59,32 +59,36 @@ struct SchedReq {
     int32_t  n_draft = 0;
     int32_t  conv_cursor = 0;
     int32_t  accepted_streak = 0;
-    float    ema_accept = 2.0f;
+    float    ema_accept = 2.4f;
 
     void observe_draft(int drafted, int accepted) {
         if (drafted <= 0) return;
-        if (accepted >= drafted && accepted >= 3) {
+        if (accepted >= 3) {
             ++accepted_streak;
+        } else if (accepted == 2) {
+            accepted_streak = std::max(0, accepted_streak - 1);
         } else {
             accepted_streak = 0;
         }
-        ema_accept = 0.8f * ema_accept + 0.2f * (float)accepted;
+        ema_accept = 0.75f * ema_accept + 0.25f * (float)accepted;
     }
 
-    int suggest_depth(int default_depth, bool adaptive, bool multi_seq = false) const {
+    int suggest_depth(int default_depth, bool adaptive, bool multi_seq = false, int max_cap = 5) const {
         if (!adaptive) return default_depth;
         /* Safe Floor is strictly default_depth (3) so code & reasoning never regress.
-         * In multi-sequence concurrency (C8), promoting sequences to depth 4 upon steady streaks
-         * dramatically expands aggregate tokens per forward step. */
+         * In multi-sequence concurrency (C8), bursting to depth 4 floods L2 cache
+         * across 256 experts (400 slots). Keep C8 strictly at default_depth (3)
+         * to preserve maximum cache locality and peak throughput. */
         if (multi_seq) {
-            /* In multi-sequence concurrency (C8), bursting to depth 4 floods L2 cache
-             * across 256 experts (400 slots). Keep C8 strictly at default_depth (3)
-             * to preserve maximum cache locality and peak throughput. */
-            return default_depth;
+            return std::min(default_depth, 3);
         } else {
-            /* Single-stream: require streak >= 5 and ema >= 2.8f to burst to depth 4 on math/json/syntax */
-            if (accepted_streak >= 5 && ema_accept >= 2.8f) {
-                return std::min(default_depth + 1, 4);
+            /* Single-stream: burst to 4 on steady streak >= 3 and ema >= 2.5f (code/json/math/file_edit),
+             * and burst to 5 on strong streak >= 6 and ema >= 3.2f */
+            if (accepted_streak >= 6 && ema_accept >= 3.2f) {
+                return std::min(max_cap, 5);
+            }
+            if (accepted_streak >= 3 && ema_accept >= 2.5f) {
+                return std::min(max_cap, 4);
             }
         }
         return default_depth;
@@ -139,7 +143,7 @@ struct SchedReq {
         draft_lo     = 0;
         draft_hi     = 0;
         accepted_streak = 0;
-        ema_accept   = 2.0f;
+        ema_accept   = 2.4f;
     }
 
     int32_t  sched_tokens = 0;   /* tokens given to this request in the current step */

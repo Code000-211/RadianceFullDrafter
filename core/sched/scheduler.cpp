@@ -244,7 +244,7 @@ int Scheduler::set_draft(uint64_t id, const int32_t* tokens, int n) {
     }
 
     int cap = draft_.next_depth((int)running_.size());
-    cap = s.suggest_depth(cap, draft_.params().adaptive);
+    cap = s.suggest_depth(cap, draft_.params().adaptive, running_.size() > 1, draft_.params().max_depth);
     if (s.req->max_tokens > 0) {
         const int64_t rem = (int64_t)s.req->max_tokens - (int64_t)s.req->output.size();
         const int64_t max_d = rem > 1 ? rem - 1 : 0;
@@ -903,7 +903,7 @@ const RadBatch* Scheduler::step() {
     }
     int depth = draft_.next_depth((int)running_.size());
     if (running_.size() == 1 && (size_t)running_[0] < reqs_.size() && reqs_[(size_t)running_[0]]) {
-        depth = reqs_[(size_t)running_[0]]->suggest_depth(depth, draft_.params().adaptive);
+        depth = reqs_[(size_t)running_[0]]->suggest_depth(depth, draft_.params().adaptive, false, draft_.params().max_depth);
     }
 
     /* C1: Reserve token budget for running decode requests so that a long prefill chunk
@@ -953,7 +953,7 @@ const RadBatch* Scheduler::step() {
             if (!r.may_speculate) s.n_draft = 0;
             else if (s.n_draft == 0) s.n_draft = (int32_t)draft_ngram(s, depth);
             const bool multi_seq = running_.size() > 1;
-            const int32_t seq_depth = (int32_t)s.suggest_depth(depth, draft_.params().adaptive, multi_seq);
+            const int32_t seq_depth = (int32_t)s.suggest_depth(depth, draft_.params().adaptive, multi_seq, draft_.params().max_depth);
             if (s.n_draft > seq_depth) s.n_draft = seq_depth;
             /* NO VERIFIED POSITION AT OR PAST THE CONTEXT. The step computes positions n_computed
              * .. n_computed + n_draft, and nothing past ctx_limit_ - 1 has a rotary row or a
@@ -1729,7 +1729,7 @@ int Scheduler::serial_begin(int* rounds, SerialRow* out, int max) {
     }
     int depth = draft_.next_depth(std::max(n_decode_seqs, (int)running_.size()));
     if (n_decode_seqs == 1 && running_.size() == 1 && (size_t)running_[0] < reqs_.size() && reqs_[(size_t)running_[0]]) {
-        depth = reqs_[(size_t)running_[0]]->suggest_depth(depth, draft_.params().adaptive);
+        depth = reqs_[(size_t)running_[0]]->suggest_depth(depth, draft_.params().adaptive, false, draft_.params().max_depth);
     }
     bool may_draft = depth > 0;
     if (depth > 0 && *rounds > depth) *rounds = depth;

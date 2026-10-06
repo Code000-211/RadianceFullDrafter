@@ -54,9 +54,9 @@ public:
          * - Depth 3 is the rock-solid optimal sweet spot for C8 (479.5 - 532.4 t/s). */
         if (active_seqs > 1) return std::min(p_.max_depth, 3);
 
-        /* Single stream: return max_depth (e.g. 4) as ceiling; SchedReq::suggest_depth
-         * gates depth 4 on per-sequence proven streak with safe floor 3. */
-        return p_.max_depth;
+        /* Single stream: safe baseline floor is 3. SchedReq::suggest_depth dynamically
+         * promotes depth to 4 or 5 upon proven high-acceptance streaks. */
+        return std::min(p_.max_depth, 3);
     }
 
     /* One verify's outcome: `drafted` tokens were proposed and a prefix of `accepted` of them was
