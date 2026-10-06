@@ -107,12 +107,15 @@ bool PrefillStager::will_issue(int32_t li) const {
 }
 
 int PrefillStager::start(int32_t li) {
-    started_[(size_t)li] = 1;
     const int b = li % n_bufs_;
-    if (holds_[b] >= 0) return RAD_OK;       /* the layer before still holds it */
+    if (holds_[b] >= 0) return RAD_OK;       /* the buffer still holds a previous layer: stage when buffer is released */
+    started_[(size_t)li] = 1;
     const int rc = mover_->stage_units(layers_[(size_t)li].units, buf_[b], cap_,
                                        free_rec_[b] ? free_[b] : nullptr, done_[b], &staged_[b]);
-    if (rc < 0) return rc;
+    if (rc < 0) {
+        started_[(size_t)li] = 0;
+        return rc;
+    }
     if (!staged_[b].empty()) { holds_[b] = li; read_[b] = false; wrapped_[b] = false; }
     return RAD_OK;
 }
