@@ -72,20 +72,15 @@ struct SchedReq {
     }
 
     int suggest_depth(int default_depth, bool adaptive) const {
-        if (!adaptive) return default_depth;
-        /* Step down to depth 2 if acceptance is low (< 1.80f) to avoid wasting compute
-         * and PCIe bandwidth on speculative rounds that will be rejected (e.g. reasoning/prose). */
-        if (ema_accept < 1.80f && default_depth >= 2) {
-            return 2;
-        }
+        if (!adaptive || default_depth < 4) return default_depth;
         /* Only expand to depth 4 if this specific sequence has demonstrated
-         * a sustained 100% acceptance streak of at least 5 steps and ema_accept >= 2.80f.
+         * a sustained 100% acceptance streak of at least 6 steps and ema_accept >= 2.85f.
          * This strictly guards code and file_edit from premature depth 4 promotion,
          * while allowing math/json bursts to reach depth 4. */
-        if (default_depth >= 4 && accepted_streak >= 5 && ema_accept >= 2.80f) {
+        if (accepted_streak >= 6 && ema_accept >= 2.85f) {
             return 4;
         }
-        return std::min(default_depth, 3);
+        return 3;
     }
 
     /* HOW MUCH OF A SERIAL DRAFTER`S OWN ATTENTION HISTORY IS VALID: positions [0, draft_filled)
