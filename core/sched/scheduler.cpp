@@ -244,7 +244,7 @@ int Scheduler::set_draft(uint64_t id, const int32_t* tokens, int n) {
     }
 
     int cap = draft_.next_depth((int)running_.size());
-    if (running_.size() == 1) cap = s.suggest_depth(cap, draft_.params().adaptive);
+    cap = s.suggest_depth(cap, draft_.params().adaptive);
     if (s.req->max_tokens > 0) {
         const int64_t rem = (int64_t)s.req->max_tokens - (int64_t)s.req->output.size();
         const int64_t max_d = rem > 1 ? rem - 1 : 0;
@@ -952,7 +952,8 @@ const RadBatch* Scheduler::step() {
              * none. Request::may_speculate says why a request can be ineligible. */
             if (!r.may_speculate) s.n_draft = 0;
             else if (s.n_draft == 0) s.n_draft = (int32_t)draft_ngram(s, depth);
-            if (s.n_draft > depth) s.n_draft = depth;
+            const int32_t seq_depth = (int32_t)s.suggest_depth(depth, draft_.params().adaptive);
+            if (s.n_draft > seq_depth) s.n_draft = seq_depth;
             /* NO VERIFIED POSITION AT OR PAST THE CONTEXT. The step computes positions n_computed
              * .. n_computed + n_draft, and nothing past ctx_limit_ - 1 has a rotary row or a
              * block-table column. commit() finishes a sequence before its length reaches the

@@ -48,12 +48,16 @@ public:
         if (!p_.adaptive) return p_.max_depth;
         if (p_.max_depth < 3) return p_.max_depth;
 
-        /* Concurrency: strictly maintain optimal baseline depth 3.
-         * Empirical proof on Dual R9700 (gfx1201):
-         * - Depth 2: 407.5 t/s (-14.2% regression from lost accepted tokens)
-         * - Depth 4: 448.6 t/s (-5.5% regression from extra draft round + 40-row verify)
-         * - Depth 3: 474.9 t/s (Optimal peak matching baseline) */
-        if (active_seqs > 1) return std::min(p_.max_depth, 3);
+        /* Concurrency: adaptive depth with safe floor 3.
+         * Baseline optimal is depth 3 (474.9 t/s).
+         * Dynamically expand to 4 only when batch acceptance EMA is high (>= 2.75f),
+         * capturing massive parallel throughput bursts on high-acceptance streams. */
+        if (active_seqs > 1) {
+            if (p_.max_depth >= 4 && ema_accept_len_ >= 2.75f) {
+                return 4;
+            }
+            return std::min(p_.max_depth, 3);
+        }
 
         /* Single stream: return max_depth (e.g. 4) as ceiling; SchedReq::suggest_depth
          * gates depth 4 on per-sequence proven streak with safe floor 3. */
