@@ -232,54 +232,6 @@ void r4d_gemm_bf16_nt_m64(long a, long w, long c, int M, int K, int N, int WV, i
 
 int r4d_gemm_bf16_nt_m64_max_m(void) { return R4D_GEMM64_MAX_M; }
 
-#include "clav_pleproj_co.h"
-
-struct ClavPleProj {
-    hipModule_t mod = nullptr;
-    hipFunction_t fn[5] = {nullptr};
-    bool init = false;
-
-    void ensure_init(int dev) {
-        if (init) return;
-        (void)hipSetDevice(dev);
-        if (hipModuleLoadData(&mod, kClavPleprojCO) == hipSuccess) {
-            for (int t = 1; t <= 4; ++t) {
-                char name[128];
-                snprintf(name, sizeof(name), "_ZN12_GLOBAL__N_115ple_proj_kernelILi%dELi2EEEvPKtS2_S2_PtS3_iiii", t);
-                (void)hipModuleGetFunction(&fn[t], mod, name);
-            }
-            init = true;
-        }
-    }
-};
-
-static ClavPleProj s_clav_proj[8];
-
-static bool try_clav_pleproj(const GemmOps& g, RadStream s) {
-    if (g.M < 1 || g.M > 4 || g.K != 2560 || (g.N % 64) != 0) return false;
-    int dev = 0;
-    (void)hipGetDevice(&dev);
-    if (dev < 0 || dev >= 8) return false;
-    s_clav_proj[dev].ensure_init(dev);
-    if (!s_clav_proj[dev].init || !s_clav_proj[dev].fn[g.M]) return false;
-
-    void* d_act = (void*)r4d_addr(g.a);
-    void* d_w = (void*)r4d_addr(g.b);
-    void* d_y = (void*)r4d_addr(g.y);
-    void* null_ptr = nullptr;
-    int t_arg = (int)g.M;
-    int k_arg = (int)g.K;
-    int n1_arg = (int)g.N;
-    int n2_arg = 0;
-    void* args[] = { &d_act, &d_w, &null_ptr, &d_y, &null_ptr, &t_arg, &k_arg, &n1_arg, &n2_arg };
-
-    dim3 grid((g.N + 63) / 64, 1, 1);
-    dim3 block(256, 1, 1);
-    hipError_t err = hipModuleLaunchKernel(s_clav_proj[dev].fn[g.M], grid.x, grid.y, grid.z,
-                                           block.x, block.y, block.z, 0, (hipStream_t)s, args, nullptr);
-    return (err == hipSuccess);
-}
-
 // ============================================================== the plugin ABI entry points
 //
 // The operand reader and the split law are in r4d_gemm_args.h. See libr4d/r4d_args.h for why there
@@ -289,11 +241,6 @@ extern "C" int r4d_rad_gemm_bf16_m64(const RadArgs* a, RadStream s) {
     int rc = gemm_ops(a, &g, 0);
     if (rc != RAD_OK) return rc;
     if (g.M > r4d_gemm_bf16_nt_m64_max_m()) return R4D_NO(RAD_E_SHAPE);
-
-    if (try_clav_pleproj(g, s)) {
-        return RAD_OK;
-    }
-
     Cfg c;
     rc = cfg_for(a, g.K, g.M, 16, BR_FLAT, &c, (g.N + 15) / 16);  /* "K divisible by SK*16" */
     if (rc != RAD_OK) return rc;
@@ -303,5 +250,4 @@ extern "C" int r4d_rad_gemm_bf16_m64(const RadArgs* a, RadStream s) {
                              (long)(uintptr_t)s));
     return RAD_OK;
 }
-
 
