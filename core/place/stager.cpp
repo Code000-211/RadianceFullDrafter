@@ -55,28 +55,12 @@ int PrefillStager::init(const Program& prog, const Plan& plan, Mover* mover, cha
     }
 
     mover_ = mover;
-    int req_bufs = 3;
+    int req_bufs = (bytes >= 220ll * 1024 * 1024) ? 3 : 2;
     if (const char* env = std::getenv("RADIANCE_PREFILL_BUFFERS")) {
         const int v = std::atoi(env);
         if (v >= 2 && v <= kMaxBufs) req_bufs = v;
     }
-    int64_t max_layer_bytes = 0;
-    for (const auto& L : layers_) {
-        int64_t lb = 0;
-        for (int32_t u : L.units) {
-            if ((size_t)u < plan.units.size()) {
-                const auto& mu = plan.units[(size_t)u];
-                if (mu.tier == Tier::HostPinned && mu.slab_slot < 0)
-                    lb += (mu.bytes + RAD_ALIGN_UNIT - 1) / RAD_ALIGN_UNIT * RAD_ALIGN_UNIT;
-            }
-        }
-        max_layer_bytes = std::max(max_layer_bytes, lb);
-    }
-    if (req_bufs > 2 && max_layer_bytes > 0 && bytes < (int64_t)req_bufs * max_layer_bytes) {
-        n_bufs_ = 2;
-    } else {
-        n_bufs_ = req_bufs;
-    }
+    n_bufs_ = req_bufs;
     cap_ = bytes / n_bufs_ / RAD_ALIGN_UNIT * RAD_ALIGN_UNIT;
     for (int b = 0; b < n_bufs_; ++b) {
         buf_[b] = region + b * cap_;
