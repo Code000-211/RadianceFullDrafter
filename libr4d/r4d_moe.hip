@@ -2537,8 +2537,9 @@ static int moe_gemm_launch(const RadArgs* a, const R4dSink& sk, int ncls = 2) {
         /* THE DECODE GRID IS (tile, run) WIDE -- see the kernel's ES note. One tile of rows is all
          * a decode step has, so without this the whole layer runs on N/64 workgroups. */
         const unsigned tiles = (unsigned)((T + 15) / 16);
+        const unsigned gx = (tiles == 0) ? 0u : (unsigned)T;
         emit_rc = R4D_EMIT(sk, (moe_gemm_q_kernel<1, 4, 1, 4, W4, true>),
-                           dim3(tiles * 16u, ny), dim3(4 * kWave), 0,
+                           dim3(gx, ny), dim3(4 * kWave), 0,
                            (const uint8_t*)Aq->data, (const float*)As->data, ce, co, c2, c3,
                            (const int32_t*)sorted->data, (const int32_t*)off->data,
                            (uint16_t*)Y->data, nullptr,
