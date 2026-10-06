@@ -43,7 +43,10 @@ public:
     int  next_depth(int active_seqs = 1) const {
         if (p_.max_depth <= 0) return 0;
 
-        /* Concurrency: strictly clamp to 3 for any multi-sequence batch (active_seqs > 1) */
+        /* High concurrency (C8): clamp to 2 so 8*(1+2) = 24 rows <= 25 (exact wire, no CU saturation) */
+        if (active_seqs >= 4) return std::min(p_.max_depth, 2);
+
+        /* Medium concurrency: clamp to baseline 3 */
         if (active_seqs > 1) return std::min(p_.max_depth, 3);
 
         /* Single stream: expand to 4 on proven hot streaks */
