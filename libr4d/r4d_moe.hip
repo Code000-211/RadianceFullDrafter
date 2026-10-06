@@ -1397,12 +1397,6 @@ __device__ __forceinline__ void moe_gemm_q_body(
                  * The fp8 form is written out separately rather than folded into a common
                  * expression because a * (b * c) and (a * b) * c differ in the last bit, and that
                  * kernel's output is byte-checked. */
-                float as[WM][8];
-#pragma unroll
-                for (uint32_t i = 0; i < WM; ++i)
-#pragma unroll
-                    for (uint32_t t = 0; t < 8; ++t)
-                        as[i][t] = s_as[(wgm * WM + i) * 16 + acc_row(lane, t)];
                 if constexpr (kSub > 1) {
                     float wq[kSub][WN];
 #pragma unroll
@@ -1419,7 +1413,8 @@ __device__ __forceinline__ void moe_gemm_q_body(
                                 float v = raw[i][j][t] * wq[0][j];
 #pragma unroll
                                 for (uint32_t q = 1; q < kSub; ++q) v += rx[q - 1][i][j][t] * wq[q][j];
-                                out[i][j][t] += v * as[i][t];
+                                const float as_val = s_as[(wgm * WM + i) * 16 + acc_row(lane, t)];
+                                out[i][j][t] += v * as_val;
                             }
                 } else if constexpr (W4) {
                     float wsj[WN];
@@ -1432,7 +1427,8 @@ __device__ __forceinline__ void moe_gemm_q_body(
                         for (uint32_t j = 0; j < WN; ++j)
 #pragma unroll
                             for (uint32_t t = 0; t < 8; ++t) {
-                                out[i][j][t] += raw[i][j][t] * as[i][t] * wsj[j];
+                                const float as_val = s_as[(wgm * WM + i) * 16 + acc_row(lane, t)];
+                                out[i][j][t] += raw[i][j][t] * as_val * wsj[j];
                                 raw[i][j][t] = 0.0f;
                             }
                 } else {
@@ -1440,14 +1436,11 @@ __device__ __forceinline__ void moe_gemm_q_body(
 #pragma unroll
                     for (uint32_t i = 0; i < WM; ++i)
 #pragma unroll
-                        for (uint32_t t = 0; t < 8; ++t) as[i][t] *= ws;
-#pragma unroll
-                    for (uint32_t i = 0; i < WM; ++i)
-#pragma unroll
                         for (uint32_t j = 0; j < WN; ++j)
 #pragma unroll
                             for (uint32_t t = 0; t < 8; ++t) {
-                                out[i][j][t] += raw[i][j][t] * as[i][t];
+                                const float as_val = s_as[(wgm * WM + i) * 16 + acc_row(lane, t)] * ws;
+                                out[i][j][t] += raw[i][j][t] * as_val;
                                 raw[i][j][t] = 0.0f;
                             }
                 }

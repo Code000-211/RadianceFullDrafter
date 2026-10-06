@@ -77,9 +77,10 @@ struct SchedReq {
          * In multi-sequence concurrency (C8), promoting sequences to depth 4 upon steady streaks
          * dramatically expands aggregate tokens per forward step. */
         if (multi_seq) {
-            if (accepted_streak >= 3 && ema_accept >= 2.4f) {
-                return std::min(default_depth + 1, 4);
-            }
+            /* In multi-sequence concurrency (C8), bursting to depth 4 floods L2 cache
+             * across 256 experts (400 slots). Keep C8 strictly at default_depth (3)
+             * to preserve maximum cache locality and peak throughput (>508 tok/s). */
+            return default_depth;
         } else {
             /* Single-stream: require streak >= 5 and ema >= 2.8f to burst to depth 4 on math/json/syntax */
             if (accepted_streak >= 5 && ema_accept >= 2.8f) {
