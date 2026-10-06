@@ -79,11 +79,7 @@ int PrefillStager::init(const Program& prog, const Plan& plan, Mover* mover, cha
 }
 
 bool PrefillStager::begin_pass(const RadBatch* b) {
-    has_wrapped_ = false;
-    for (int b_idx = 0; b_idx < n_bufs_; ++b_idx) {
-        if (wrapped_[b_idx] && holds_[b_idx] >= 0) has_wrapped_ = true;
-    }
-    armed_ = enabled() && b && ((full_ && b->n_tok >= min_rows_) || has_wrapped_);
+    armed_ = full_ && enabled() && b && b->n_tok >= min_rows_;
     if (!armed_) return false;
     std::fill(started_.begin(), started_.end(), (uint8_t)0);
     first_op_ = true;
@@ -93,7 +89,7 @@ bool PrefillStager::begin_pass(const RadBatch* b) {
     is_chunked_prefill_ = is_prefill && b->n_out == 0;
     is_final_prefill_   = is_prefill && b->n_out > 0;
 
-    /* Preserve any wrap-around pre-staged buffers from the previous chunk/pass */
+    /* Preserve any wrap-around pre-staged buffers from the previous prefill chunk */
     for (int b_idx = 0; b_idx < n_bufs_; ++b_idx) {
         if (wrapped_[b_idx] && holds_[b_idx] >= 0 && (size_t)holds_[b_idx] < started_.size()) {
             started_[(size_t)holds_[b_idx]] = 1;
@@ -177,10 +173,6 @@ int PrefillStager::before_op(rad_op h, RadStream s, bool* resync) {
                     }
                 }
             }
-        } else if (has_wrapped_) {
-            /* Decode drain pass: we have wrap-around pre-staged buffers from the prefill pass!
-             * Resync residency table so kernels immediately point to the VRAM staged addresses. */
-            *resync = true;
         }
     }
 
@@ -222,18 +214,16 @@ int PrefillStager::after_op(rad_op h, RadStream s) {
         read_[b] = true;
         if (layers_.size() > 2) {
             release(b);
-            if (is_chunked_prefill_ || is_final_prefill_) {
-                const int32_t next = li + n_bufs_;
-                if ((size_t)next < layers_.size() && !started_[(size_t)next] && will_issue(next)) {
-                    RAD_TRY(start(next));
-                } else if ((size_t)next >= layers_.size()) {
-                    /* CHUNK-TO-CHUNK or PREFILL-TO-DECODE PREFETCH:
-                     * As the final layers of this chunk (e.g. layers 45, 46, 47) complete, wrap around
-                     * and pre-stage Layer 0, Layer 1, Layer 2 for the upcoming chunk / decode step! */
-                    const int32_t wrap_layer = next - (int32_t)layers_.size();
-                    if (wrap_layer >= 0 && wrap_layer < n_bufs_) {
-                        RAD_TRY(start_wrap(wrap_layer, b));
-                    }
+            const int32_t next = li + n_bufs_;
+            if ((size_t)next < layers_.size() && !started_[(size_t)next] && will_issue(next)) {
+                RAD_TRY(start(next));
+            } else if (is_chunked_prefill_ && (size_t)next >= layers_.size()) {
+                /* CHUNK-TO-CHUNK PREFETCH:
+                 * As the final layers of this chunk (e.g. layers 45, 46, 47) complete, wrap around
+                 * and pre-stage Layer 0, Layer 1, Layer 2 for the upcoming chunk! */
+                const int32_t wrap_layer = next - (int32_t)layers_.size();
+                if (wrap_layer >= 0 && wrap_layer < n_bufs_) {
+                    RAD_TRY(start_wrap(wrap_layer, b));
                 }
             }
         }
@@ -249,7 +239,7 @@ int PrefillStager::end_pass(RadStream s) {
     for (int b = 0; b < n_bufs_; ++b) {
         if (holds_[b] >= 0) {
             /* If this buffer holds a wrap-around layer (Layer 0, 1, or 2) pre-staged for
-             * the next chunk or first decode step, keep it warm in VRAM! */
+             * the next prefill chunk, keep it warm in VRAM! */
             if (wrapped_[b]) {
                 continue;
             }

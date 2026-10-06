@@ -267,8 +267,10 @@ void Engine::tiering_dispatch(Rank& r, const RadBatch* b) {
     const bool is_final_pf = ((b->phase == RAD_PHASE_PREFILL || b->phase == RAD_PHASE_MIXED) &&
                               b->n_out > 0 && b->n_tok >= 512);
     if (is_final_pf) {
-        /* Prefill-to-decode transition for substantive prompts: burst-promote hot non-resident experts into VRAM slab */
-        r.heat.set_burst_moves(16);
+        /* Prefill-to-decode transition: burst-promote hot non-resident experts into VRAM slab.
+         * Under high concurrency (n_seq >= 4), throttle burst to avoid PCIe all-reduce contention. */
+        const int burst = (b->n_seq <= 2) ? 16 : (b->n_seq <= 4 ? 8 : 4);
+        r.heat.set_burst_moves(burst);
     }
 
     std::vector<Swap> swaps;
