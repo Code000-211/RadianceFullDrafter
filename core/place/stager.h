@@ -70,6 +70,8 @@ public:
     void set_full_arena(bool full) { full_ = full; }
 
     bool    enabled() const { return !layers_.empty(); }
+    static constexpr int kMaxBufs = 4;
+    int     n_bufs() const { return n_bufs_; }
     int64_t buffer_bytes() const { return cap_; }
     size_t  n_layers() const { return layers_.size(); }
 
@@ -89,23 +91,23 @@ private:
     std::vector<int32_t> last_of_;     /* by op: the layer whose last op it is, or -1 */
 
     Mover*   mover_ = nullptr;
-    char*    buf_[2] = { nullptr, nullptr };
+    int      n_bufs_ = 2;
+    char*    buf_[kMaxBufs] = { nullptr };
     int64_t  cap_ = 0;
     int64_t  min_rows_ = 0;
-    RadEvent done_[2] = { nullptr, nullptr };   /* behind a buffer's copies, on the mover stream */
-    RadEvent free_[2] = { nullptr, nullptr };   /* behind a buffer's last reader */
-    bool     free_rec_[2] = { false, false };
-    std::vector<int32_t> staged_[2];
-    int32_t  holds_[2] = { -1, -1 };             /* the layer a buffer holds, or -1 */
-    /* The holder's last op has been issued at least once, and `free_` is recorded behind it. A
-     * step longer than the MoE block's pass of rows issues a layer's ops once per pass, so the
-     * last op can run again: the copies are released at the NEXT layer's first op, which is past
-     * every pass, while each run of the last op moves `free_` behind itself. */
-    bool     read_[2] = { false, false };
+    RadEvent done_[kMaxBufs] = { nullptr };   /* behind a buffer's copies, on the mover stream */
+    RadEvent free_[kMaxBufs] = { nullptr };   /* behind a buffer's last reader */
+    bool     free_rec_[kMaxBufs] = { false };
+    std::vector<int32_t> staged_[kMaxBufs];
+    int32_t  holds_[kMaxBufs] = { -1, -1, -1, -1 }; /* the layer a buffer holds, or -1 */
+    bool     read_[kMaxBufs] = { false };
+    bool     wrapped_[kMaxBufs] = { false };
 
     bool     full_ = false;
     bool     armed_ = false;
     bool     first_op_ = false;                  /* the pass has issued nothing yet */
+    bool     is_chunked_prefill_ = false;
+    bool     is_final_prefill_ = false;
     std::vector<uint8_t> started_;               /* by layer: staged (or tried) this pass */
     int32_t  pass_kind_ = 0;
     int32_t  last_issued_ = -1;
@@ -113,6 +115,7 @@ private:
 
     bool will_issue(int32_t li) const;
     int  start(int32_t li);
+    int  start_wrap(int32_t wrap_layer, int b);
     int  finish(int32_t b, RadStream s);
     void release(int32_t b);
 };

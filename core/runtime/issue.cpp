@@ -514,7 +514,7 @@ int Ctx::issue(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
     const int sb = stager_->before_op(h, cur_stream(), &resync);
     if (sb < 0)
         return abort_step_msg(h, sb, "the weight stager could not stage this op's weights");
-    if (resync) sync_residency();
+    if (resync || (residency_ && !residency_->changes().empty())) sync_residency();
     const int rc = issue_body(h, opd, n_opd, n);
     if (rc < 0) return rc;
     const int sa = stager_->after_op(h, cur_stream());

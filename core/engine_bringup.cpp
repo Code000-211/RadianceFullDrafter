@@ -3206,11 +3206,11 @@ int Engine::start() {
                                    (char*)r->ctx.arena_base() + r->program.arena_stage_off,
                                    r->program.arena_stage_bytes, top_level + 1));
             if (r->stager.enabled() && r->index == 0)
-                RAD_INFO("prefill staging: two %s buffers at the top of the arena; a step of "
+                RAD_INFO("prefill staging: %d %s buffers at the top of the arena; a step of "
                          "more than %lld tokens copies the next of %zu routed layers' pooled "
                          "experts onto the card while the one before it runs",
-                         humanb(r->stager.buffer_bytes()).c_str(), (long long)top_level,
-                         r->stager.n_layers());
+                         r->stager.n_bufs(), humanb(r->stager.buffer_bytes()).c_str(),
+                         (long long)top_level, r->stager.n_layers());
         }
         /* THE FILE STAGER, wherever the plan put a routed expert on the file tier -- static plan
          * or dynamic, since a file-tier unit has no other address. */

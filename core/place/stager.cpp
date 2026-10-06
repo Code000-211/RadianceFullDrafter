@@ -6,7 +6,8 @@
 namespace rad {
 
 PrefillStager::~PrefillStager() {
-    for (int b = 0; b < 2; ++b) {
+    for (int b = 0; b < kMaxBufs; ++b) {
+        if (!staged_[b].empty() && mover_) mover_->unstage_units(staged_[b]);
         if (done_[b]) rad_event_destroy(done_[b]);
         if (free_[b]) rad_event_destroy(free_[b]);
     }
@@ -54,16 +55,37 @@ int PrefillStager::init(const Program& prog, const Plan& plan, Mover* mover, cha
     }
 
     mover_ = mover;
-    cap_ = bytes / 2 / RAD_ALIGN_UNIT * RAD_ALIGN_UNIT;
-    buf_[0] = region;
-    buf_[1] = region + cap_;
-    min_rows_ = min_rows;
-    for (int b = 0; b < 2; ++b) {
+    int req_bufs = 3;
+    if (const char* env = std::getenv("RADIANCE_PREFILL_BUFFERS")) {
+        const int v = std::atoi(env);
+        if (v >= 2 && v <= kMaxBufs) req_bufs = v;
+    }
+    int64_t max_layer_bytes = 0;
+    for (const auto& L : layers_) {
+        int64_t lb = 0;
+        for (int32_t u : L.units) {
+            if ((size_t)u < plan.units.size()) lb += plan.units[(size_t)u].bytes;
+        }
+        max_layer_bytes = std::max(max_layer_bytes, lb);
+    }
+    if (req_bufs > 2 && max_layer_bytes > 0 && bytes < (int64_t)req_bufs * max_layer_bytes) {
+        n_bufs_ = 2;
+    } else {
+        n_bufs_ = req_bufs;
+    }
+    cap_ = bytes / n_bufs_ / RAD_ALIGN_UNIT * RAD_ALIGN_UNIT;
+    for (int b = 0; b < n_bufs_; ++b) {
+        buf_[b] = region + b * cap_;
         if (rad_event_create_local(&done_[b]) < 0 || rad_event_create_local(&free_[b]) < 0) {
             layers_.clear();
             return RAD_E_DEVICE;
         }
+        holds_[b] = -1;
+        read_[b] = false;
+        wrapped_[b] = false;
+        free_rec_[b] = false;
     }
+    min_rows_ = min_rows;
     started_.assign(layers_.size(), 0);
     return RAD_OK;
 }
@@ -72,10 +94,21 @@ bool PrefillStager::begin_pass(const RadBatch* b) {
     armed_ = full_ && enabled() && b && b->n_tok >= min_rows_;
     if (!armed_) return false;
     std::fill(started_.begin(), started_.end(), (uint8_t)0);
-    holds_[0] = holds_[1] = -1;
     first_op_ = true;
     pass_kind_ = b->draft_pass;
     last_issued_ = -1;
+    is_chunked_prefill_ = (b->phase == RAD_PHASE_PREFILL && b->n_out == 0);
+    is_final_prefill_   = (b->phase == RAD_PHASE_PREFILL && b->n_out > 0);
+
+    /* Preserve any wrap-around pre-staged buffers from the previous chunk/pass */
+    for (int b_idx = 0; b_idx < n_bufs_; ++b_idx) {
+        if (wrapped_[b_idx] && holds_[b_idx] >= 0 && (size_t)holds_[b_idx] < started_.size()) {
+            started_[(size_t)holds_[b_idx]] = 1;
+            wrapped_[b_idx] = false;
+        } else if (!wrapped_[b_idx]) {
+            holds_[b_idx] = -1;
+        }
+    }
     return true;
 }
 
@@ -86,12 +119,25 @@ bool PrefillStager::will_issue(int32_t li) const {
 
 int PrefillStager::start(int32_t li) {
     started_[(size_t)li] = 1;
-    const int b = li & 1;
-    if (holds_[b] >= 0) return RAD_OK;       /* the layer before still holds it: stream this one */
+    const int b = li % n_bufs_;
+    if (holds_[b] >= 0) return RAD_OK;       /* the layer before still holds it */
     const int rc = mover_->stage_units(layers_[(size_t)li].units, buf_[b], cap_,
                                        free_rec_[b] ? free_[b] : nullptr, done_[b], &staged_[b]);
     if (rc < 0) return rc;
-    if (!staged_[b].empty()) { holds_[b] = li; read_[b] = false; }
+    if (!staged_[b].empty()) { holds_[b] = li; read_[b] = false; wrapped_[b] = false; }
+    return RAD_OK;
+}
+
+int PrefillStager::start_wrap(int32_t wrap_layer, int b) {
+    if ((size_t)wrap_layer >= layers_.size()) return RAD_OK;
+    const int rc = mover_->stage_units(layers_[(size_t)wrap_layer].units, buf_[b], cap_,
+                                       free_rec_[b] ? free_[b] : nullptr, done_[b], &staged_[b]);
+    if (rc < 0) return rc;
+    if (!staged_[b].empty()) {
+        holds_[b] = wrap_layer;
+        read_[b] = false;
+        wrapped_[b] = true;
+    }
     return RAD_OK;
 }
 
@@ -102,6 +148,7 @@ void PrefillStager::release(int32_t b) {
     staged_[b].clear();
     holds_[b] = -1;
     read_[b] = false;
+    wrapped_[b] = false;
 }
 
 int PrefillStager::finish(int32_t b, RadStream s) {
@@ -115,25 +162,18 @@ int PrefillStager::before_op(rad_op h, RadStream s, bool* resync) {
     *resync = false;
     if ((int32_t)h > last_issued_) last_issued_ = (int32_t)h;
 
-    /* THE PASS'S FIRST ROUTED LAYER, staged at its first op of any kind, so the copy runs behind
-     * whatever the pass issues before the layer. */
+    /* THE PASS'S FIRST ROUTED LAYERS, staged at its first op of any kind.
+     * With n_bufs_ staging buffers, pre-launch all initial buffers into the mover stream! */
     if (first_op_) {
         first_op_ = false;
         const auto it = std::lower_bound(layers_.begin(), layers_.end(), (int32_t)h,
                                          [](const Layer& L, int32_t op) { return L.first_op < op; });
         if (it != layers_.end()) {
             const int32_t li = (int32_t)(it - layers_.begin());
-            if (!started_[(size_t)li] && will_issue(li)) {
-                RAD_TRY(start(li));
-                *resync = true;
-            }
-            /* Deep pipelining for multi-layer models (48 layers):
-             * Queue layer li + 1 into buffer 1 immediately at pass start so both mover buffers
-             * are actively transferring ahead of compute. */
-            if (layers_.size() > 2) {
-                const int32_t li1 = li + 1;
-                if ((size_t)li1 < layers_.size() && !started_[(size_t)li1] && will_issue(li1)) {
-                    RAD_TRY(start(li1));
+            for (int k = 0; k < n_bufs_; ++k) {
+                const int32_t lik = li + k;
+                if ((size_t)lik < layers_.size() && !started_[(size_t)lik] && will_issue(lik)) {
+                    RAD_TRY(start(lik));
                     *resync = true;
                 }
             }
@@ -143,46 +183,45 @@ int PrefillStager::before_op(rad_op h, RadStream s, bool* resync) {
     if ((size_t)h >= first_of_.size()) return RAD_OK;
     const int32_t li = first_of_[(size_t)h];
     if (li < 0) return RAD_OK;
-    /* This layer's copies were published a layer ago: the one wait that orders its ops behind
-     * them. */
-    for (int b = 0; b < 2; ++b)
-        if (holds_[b] == li) RAD_TRY(rad_event_wait(s, done_[b]));
-    /* The layer before is done with its buffer: every pass of rows issued its last op, the last
-     * of them recorded `free_`, and a layer's ops do not interleave with the next one's. Released
-     * here and not at that op, whose next run would read copies already overwritten. */
-    for (int b = 0; b < 2; ++b)
-        if (holds_[b] >= 0 && holds_[b] != li && read_[b]) release(b);
-    /* And the next layer's copies go out now, behind it. */
-    const int32_t next = li + 1;
-    if ((size_t)next < layers_.size() && !started_[(size_t)next] && will_issue(next)) {
-        RAD_TRY(start(next));
+    const int b = li % n_bufs_;
+    /* This layer's copies were published ahead: wait for mover stream transfer to complete */
+    if (holds_[b] == li) RAD_TRY(rad_event_wait(s, done_[b]));
+
+    /* Safety check: ensure layer li + n_bufs_ - 1 is launched */
+    const int32_t ahead = li + n_bufs_ - 1;
+    if ((size_t)ahead < layers_.size() && !started_[(size_t)ahead] && will_issue(ahead)) {
+        RAD_TRY(start(ahead));
         *resync = true;
     }
     return RAD_OK;
 }
 
-/* THE LAYER'S LAST OP: `free_` goes behind it, so the copies two layers on can start as early as
- * they could before -- and goes behind it again if the block issues the op for another pass of
- * rows, which is why the copies themselves are not released until the next layer starts. */
+/* THE LAYER'S LAST OP: `free_` goes behind it, so the copies n_bufs_ layers on can start as early
+ * as they could before -- and goes behind it again if the block issues the op for another pass of
+ * rows. */
 int PrefillStager::after_op(rad_op h, RadStream s) {
     if ((size_t)h >= last_of_.size()) return RAD_OK;
     const int32_t li = last_of_[(size_t)h];
     if (li < 0) return RAD_OK;
-    for (int b = 0; b < 2; ++b)
-        if (holds_[b] == li) {
-            RAD_TRY(rad_event_record(free_[b], s));
-            free_rec_[b] = true;
-            read_[b] = true;
-            /* In multi-layer prefill, as soon as this layer finishes, release buffer b and
-             * immediately launch layer li + 2 into buffer b behind free_[b]! */
-            if (layers_.size() > 2) {
-                release(b);
-                const int32_t next = li + 2;
-                if ((size_t)next < layers_.size() && !started_[(size_t)next] && will_issue(next)) {
-                    RAD_TRY(start(next));
-                }
+    const int b = li % n_bufs_;
+    if (holds_[b] == li) {
+        RAD_TRY(rad_event_record(free_[b], s));
+        free_rec_[b] = true;
+        read_[b] = true;
+        release(b);
+        const int32_t next = li + n_bufs_;
+        if ((size_t)next < layers_.size() && !started_[(size_t)next] && will_issue(next)) {
+            RAD_TRY(start(next));
+        } else if ((size_t)next >= layers_.size() && (is_chunked_prefill_ || is_final_prefill_)) {
+            /* CHUNK-TO-CHUNK or PREFILL-TO-DECODE PREFETCH:
+             * As the final layers of this chunk (e.g. layers 45, 46, 47) complete, wrap around
+             * and pre-stage Layer 0, Layer 1, Layer 2 for the upcoming chunk / decode step! */
+            const int32_t wrap_layer = next - (int32_t)layers_.size();
+            if (wrap_layer >= 0 && wrap_layer < n_bufs_) {
+                RAD_TRY(start_wrap(wrap_layer, b));
             }
         }
+    }
     return RAD_OK;
 }
 
@@ -191,11 +230,17 @@ int PrefillStager::end_pass(RadStream s) {
     armed_ = false;
     pass_last_[pass_kind_] = last_issued_;
     int rc = RAD_OK;
-    for (int b = 0; b < 2; ++b)
+    for (int b = 0; b < n_bufs_; ++b) {
         if (holds_[b] >= 0) {
+            /* If this buffer holds a wrap-around layer (Layer 0, 1, or 2) pre-staged for
+             * the next chunk or first decode step, keep it warm in VRAM! */
+            if (wrapped_[b]) {
+                continue;
+            }
             const int r = finish(b, s);
             if (r < 0 && rc >= 0) rc = r;
         }
+    }
     return rc;
 }
 

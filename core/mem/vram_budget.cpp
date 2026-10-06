@@ -221,7 +221,11 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
                 one = target_one;
             }
         }
-        if (2 * one < b.experts) {
+        if (3 * one < b.experts) {
+            b.stage    = 3 * one;
+            b.experts -= b.stage;
+            b.weights  = b.statics + b.experts;
+        } else if (2 * one < b.experts) {
             b.stage    = 2 * one;
             b.experts -= b.stage;
             b.weights  = b.statics + b.experts;
