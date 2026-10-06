@@ -59,38 +59,28 @@ struct SchedReq {
     int32_t  n_draft = 0;
     int32_t  conv_cursor = 0;
     int32_t  accepted_streak = 0;
-    int32_t  rejected_streak = 0;
     float    ema_accept = 2.0f;
 
     void observe_draft(int drafted, int accepted) {
         if (drafted <= 0) return;
-        if (accepted >= drafted && accepted >= 2) {
+        if (accepted >= drafted && accepted >= 3) {
             ++accepted_streak;
-            rejected_streak = 0;
-        } else if (accepted == 0) {
-            ++rejected_streak;
-            accepted_streak = 0;
         } else {
             accepted_streak = 0;
-            rejected_streak = 0;
         }
         ema_accept = 0.8f * ema_accept + 0.2f * (float)accepted;
     }
 
     int suggest_depth(int default_depth, bool adaptive) const {
-        if (!adaptive) return default_depth;
-        /* AdaSD Dynamic Pruning (arXiv:2512.11280):
-         * When consecutive rejections occur or EMA acceptance drops below 1.0,
-         * draft uncertainty is high. Drop depth to 1 to avoid streaming unneeded
-         * expert weights and computing zero-padded WMMA tiles during MoE verification! */
-        if (rejected_streak >= 2 || ema_accept < 0.9f) {
-            return 1;
+        if (!adaptive || default_depth < 4) return default_depth;
+        /* Only expand to depth 4 if this specific sequence has demonstrated
+         * a sustained 100% acceptance streak of at least 6 steps and ema_accept >= 2.85f.
+         * This strictly guards code and file_edit from premature depth 4 promotion,
+         * while allowing math/json bursts to reach depth 4. */
+        if (accepted_streak >= 6 && ema_accept >= 2.85f) {
+            return 4;
         }
-        /* When acceptance is steady and high (math, json, repetitive syntax), burst to depth 4 */
-        if (accepted_streak >= 5 && ema_accept >= 2.8f) {
-            return std::min(default_depth + 1, 4);
-        }
-        return default_depth;
+        return 3;
     }
 
     /* HOW MUCH OF A SERIAL DRAFTER`S OWN ATTENTION HISTORY IS VALID: positions [0, draft_filled)
