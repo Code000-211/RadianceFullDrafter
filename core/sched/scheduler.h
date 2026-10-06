@@ -72,15 +72,13 @@ struct SchedReq {
     }
 
     int suggest_depth(int default_depth, bool adaptive) const {
-        if (!adaptive || default_depth < 4) return default_depth;
-        /* Only expand to depth 4 if this specific sequence has demonstrated
-         * a sustained 100% acceptance streak of at least 6 steps and ema_accept >= 2.85f.
-         * This strictly guards code and file_edit from premature depth 4 promotion,
-         * while allowing math/json bursts to reach depth 4. */
-        if (accepted_streak >= 6 && ema_accept >= 2.85f) {
-            return 4;
+        if (!adaptive) return default_depth;
+        /* Safe Floor is strictly default_depth (3) so code & reasoning never regress.
+         * Burst to depth 4 only on high-acceptance streaks (math, json, repetitive syntax). */
+        if (accepted_streak >= 5 && ema_accept >= 2.8f) {
+            return std::min(default_depth + 1, 4);
         }
-        return 3;
+        return default_depth;
     }
 
     /* HOW MUCH OF A SERIAL DRAFTER`S OWN ATTENTION HISTORY IS VALID: positions [0, draft_filled)
