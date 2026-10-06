@@ -1282,9 +1282,8 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_q_kernel(
          * scale with the tile, one K block ahead, and the fold reads them from LDS. The same
          * values reach the same multiplies: bit-identical. */
         Stage8 apre[kAP];
-        uint4  bpre4[kBP];      /* W4: packed nibbles, expanded at store time as before */
+        std::conditional_t<W4 != 0, uint4, Stage8> bpre[kBP];
         uint32_t spre[W4 == 4 ? kBP : 1];   /* W4 4: the same 32 elements' sign bits */
-        Stage8 bpre8[kBP];      /* otherwise: the fp8 bytes themselves */
         float    pas = 0.0f;    /* thread tid < FM: its row's activation scale */
         /* thread FM + c: column c's weight scale (w4), or the block's (fp8); at W4 3 its four */
         std::conditional_t<W4 == 3, uint32_t, uint16_t> pws = 0;
@@ -1322,11 +1321,11 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_q_kernel(
                  * sign plane follows its K/2 bytes of nibbles, a bit an element. */
                 if constexpr (W4) {
                     const uint8_t* wr = Wp + (size_t)(wn0 + r) * w_ld;
-                    bpre4[p] = w4_load(wr + ((cc + sk) >> 1), ok);
+                    bpre[p] = w4_load(wr + ((cc + sk) >> 1), ok);
                     if constexpr (W4 == 4)
                         spre[p] = ok ? *(const uint32_t*)(wr + (K >> 1) + ((cc + sk) >> 3)) : 0u;
                 } else
-                    bpre8[p] = stage8_load(Wp + (size_t)(wn0 + r) * w_ld + cc + sk, ok);
+                    bpre[p] = stage8_load(Wp + (size_t)(wn0 + r) * w_ld + cc + sk, ok);
             }
         };
         /* `s_tok` is settled by the barrier above the run loop and no run rewrites it, so priming
@@ -1346,11 +1345,11 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_q_kernel(
                 const uint32_t r = sn + p * kRPP;
                 if (r >= FN) continue;
                 if constexpr (W4 == 4)
-                    stage8_store<kFK>(s_b, r, sk, w5_expand(bpre4[p], spre[p], tab.v));
+                    stage8_store<kFK>(s_b, r, sk, w5_expand(bpre[p], spre[p], tab.v));
                 else if constexpr (W4)
-                    stage8_store<kFK>(s_b, r, sk, w4_expand(bpre4[p], tab.v));
+                    stage8_store<kFK>(s_b, r, sk, w4_expand(bpre[p], tab.v));
                 else
-                    stage8_store<kFK>(s_b, r, sk, bpre8[p]);
+                    stage8_store<kFK>(s_b, r, sk, bpre[p]);
             }
             if (tid < FM) s_as[tid] = pas;
             else if (tid < FM + FN) {
