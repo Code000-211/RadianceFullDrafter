@@ -1003,7 +1003,7 @@ static_assert(sizeof(MoeTab) == 16, "the code table is four words");
  * scales are one sixteen- or thirty-two-bit load. */
 template <uint32_t MT, uint32_t NTL, uint32_t WGM, uint32_t WGN, int W4 = 0,
           bool ES = false, bool AL = false, bool SK = false>
-__global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_q_kernel(
+__device__ __forceinline__ void moe_gemm_q_body(
     const uint8_t* __restrict__ Aq, const float* __restrict__ As,
     const MoeCls c_even, const MoeCls c_odd, const MoeCls c_2, const MoeCls c_3,
     const int32_t* __restrict__ sorted, const int32_t* __restrict__ off,
@@ -1474,6 +1474,34 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_q_kernel(
         ++run;
         if (ES) break;                     /* one run a block, and it is done */
     }
+}
+
+template <uint32_t MT, uint32_t NTL, uint32_t WGM, uint32_t WGN, int W4 = 0,
+          bool ES = false, bool AL = false, bool SK = false>
+__global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_q_kernel(
+    const uint8_t* __restrict__ Aq, const float* __restrict__ As,
+    const MoeCls c_even, const MoeCls c_odd, const MoeCls c_2, const MoeCls c_3,
+    const int32_t* __restrict__ sorted, const int32_t* __restrict__ off,
+    uint16_t* __restrict__ Y, const uint32_t* __restrict__ map,
+    uint32_t T, uint32_t N, uint32_t n_expert, uint32_t top_k,
+    uint32_t a_ld, uint32_t as_ld, uint32_t y_ld, uint32_t mode, const MoeTab tab) {
+    moe_gemm_q_body<MT, NTL, WGM, WGN, W4, ES, AL, SK>(
+        Aq, As, c_even, c_odd, c_2, c_3, sorted, off, Y, map, T, N, n_expert, top_k,
+        a_ld, as_ld, y_ld, mode, tab);
+}
+
+template <int W4 = 0>
+__attribute__((amdgpu_num_vgpr(128)))
+__global__ __launch_bounds__(4 * kWave) void moe_gemm_q_decode_kernel(
+    const uint8_t* __restrict__ Aq, const float* __restrict__ As,
+    const MoeCls c_even, const MoeCls c_odd, const MoeCls c_2, const MoeCls c_3,
+    const int32_t* __restrict__ sorted, const int32_t* __restrict__ off,
+    uint16_t* __restrict__ Y, const uint32_t* __restrict__ map,
+    uint32_t T, uint32_t N, uint32_t n_expert, uint32_t top_k,
+    uint32_t a_ld, uint32_t as_ld, uint32_t y_ld, uint32_t mode, const MoeTab tab) {
+    moe_gemm_q_body<1, 4, 1, 4, W4, true, false, false>(
+        Aq, As, c_even, c_odd, c_2, c_3, sorted, off, Y, map, T, N, n_expert, top_k,
+        a_ld, as_ld, y_ld, mode, tab);
 }
 /* The whole argument list against the descriptor (see MoeTab): every instantiation takes the same
  * parameters, so the decode form stands for all of them. */
@@ -2635,7 +2663,7 @@ static int moe_gemm_launch(const RadArgs* a, const R4dSink& sk, int ncls = 2) {
          * a decode step has, so without this the whole layer runs on N/64 workgroups. */
         const unsigned tiles = (unsigned)((T + 15) / 16);
         const unsigned gx = (tiles <= 1) ? (unsigned)T : (tiles * 16u);
-        emit_rc = R4D_EMIT(sk, (moe_gemm_q_kernel<1, 4, 1, 4, W4, true>),
+        emit_rc = R4D_EMIT(sk, (moe_gemm_q_decode_kernel<W4>),
                            dim3(gx, ny), dim3(4 * kWave), 0,
                            (const uint8_t*)Aq->data, (const float*)As->data, ce, co, c2, c3,
                            (const int32_t*)sorted->data, (const int32_t*)off->data,
