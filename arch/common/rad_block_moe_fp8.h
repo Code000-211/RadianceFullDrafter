@@ -1444,6 +1444,14 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) const 
                     brow_slice(w.hr.q, r0, rows, g.n_embd),
                     brow_slice(w.hr.s, r0, rows, g.n_embd / RAD_FP8_BLOCK));
 
+    /* In Layer 0 before the first MoE grouped GEMM, join lane 1 so any asynchronous H2D transfers
+     * queued during prefix-hit detection are guaranteed to be in VRAM before moe_gemm_q executes.
+     * All preceding ops in Layer 0 (Embedding, RoPE, HyperConn, GDN Layer 0, Router GEMM & Top-K)
+     * executed concurrently on lane 0 without stalling! */
+    if (layer == 0 && r0 == 0) {
+        rad_lane_join(c_, 1, 0);
+    }
+
     /* The two grouped GEMMs, and the weight tables: the FIRST handle of each run and its length.
      * The runs are contiguous by construction -- see declare -- so `w_gu[q] + i` is expert
      * 2 * i + q, and each parity is its own pair of table operands; at four classes expert

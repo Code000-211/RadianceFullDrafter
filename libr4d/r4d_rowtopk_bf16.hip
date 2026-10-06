@@ -446,9 +446,29 @@ __global__ __launch_bounds__(R4D_TOPK_WAVE * R4D_RERANK_WPB) void r4d_logit_rera
        * sum and the order is fixed by the lane count alone. */
       const unsigned char* const wr = W + (size_t)loc * w_ld;
       const unsigned short* const sr = (const unsigned short*)(wr + K);
-      for (long k = lane; k < K; k += R4D_TOPK_WAVE) {
-        const float c = I8 ? (float)(int8_t)wr[k] : r4d_fp8::e4m3((uint32_t)wr[k]);
-        acc = fmaf(c * r4d_fp8::bscale(sr[k / 128]), tk_bf2f(xr[k]), acc);
+      const int n_blocks = (int)(K / 128);
+      for (int b = 0; b < n_blocks; ++b) {
+        const float s = r4d_fp8::bscale(sr[b]);
+        const long col = (long)b * 128 + lane * 4;
+        const uint32_t w4 = *(const uint32_t*)(wr + col);
+        const uint2 x4 = *(const uint2*)(xr + col);
+        const float x0 = tk_bf2f((unsigned short)x4.x);
+        const float x1 = __uint_as_float(x4.x & 0xFFFF0000u);
+        const float x2 = tk_bf2f((unsigned short)x4.y);
+        const float x3 = __uint_as_float(x4.y & 0xFFFF0000u);
+        float dot;
+        if (I8) {
+          const int8_t c0 = (int8_t)(w4 & 0xFFu);
+          const int8_t c1 = (int8_t)((w4 >> 8) & 0xFFu);
+          const int8_t c2 = (int8_t)((w4 >> 16) & 0xFFu);
+          const int8_t c3 = (int8_t)(w4 >> 24);
+          dot = (float)c0 * x0 + (float)c1 * x1 + (float)c2 * x2 + (float)c3 * x3;
+        } else {
+          const v2f w_lo = r4d_fp8::e4m3_pk<false>(w4);
+          const v2f w_hi = r4d_fp8::e4m3_pk<true>(w4);
+          dot = w_lo.x * x0 + w_lo.y * x1 + w_hi.x * x2 + w_hi.y * x3;
+        }
+        acc = fmaf(dot, s, acc);
       }
       acc = r4d_wave_sum(acc);
     }
