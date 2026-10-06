@@ -58,6 +58,28 @@ struct SchedReq {
     int32_t  draft[RAD_SCHED_MAX_SPEC] = {};
     int32_t  n_draft = 0;
     int32_t  conv_cursor = 0;
+    int32_t  accepted_streak = 0;
+    float    ema_accept = 2.0f;
+
+    void observe_draft(int drafted, int accepted) {
+        if (drafted <= 0) return;
+        if (accepted >= drafted && accepted >= 3) {
+            ++accepted_streak;
+        } else {
+            accepted_streak = 0;
+        }
+        ema_accept = 0.8f * ema_accept + 0.2f * (float)accepted;
+    }
+
+    int suggest_depth(int default_depth, bool adaptive) const {
+        if (!adaptive || default_depth < 4) return default_depth;
+        /* Only expand to depth 4 if this specific sequence has demonstrated
+         * a sustained 100% acceptance streak of at least 2 steps (or ema_accept >= 2.65). */
+        if (accepted_streak >= 2 || ema_accept >= 2.65f) {
+            return 4;
+        }
+        return 3;
+    }
 
     /* HOW MUCH OF A SERIAL DRAFTER`S OWN ATTENTION HISTORY IS VALID: positions [0, draft_filled)
      * of the head`s layer hold K and V computed from the tokens the sequence actually has. The
@@ -107,6 +129,8 @@ struct SchedReq {
         draft_filled = 0;
         draft_lo     = 0;
         draft_hi     = 0;
+        accepted_streak = 0;
+        ema_accept   = 2.0f;
     }
 
     int32_t  sched_tokens = 0;   /* tokens given to this request in the current step */

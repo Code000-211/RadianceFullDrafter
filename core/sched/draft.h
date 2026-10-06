@@ -55,14 +55,9 @@ public:
          * - Depth 3: 474.9 t/s (Optimal peak matching baseline) */
         if (active_seqs > 1) return std::min(p_.max_depth, 3);
 
-        /* Single stream (active_seqs == 1):
-         * Floor is strictly 3. Expands to 4 on hot streaks (ema >= 2.40),
-         * unlocking full acceleration on chat/math/json while keeping code/file_edit safe. */
-        if (p_.max_depth >= 4 && ema_accept_len_ >= 2.40f) {
-            return std::min(p_.max_depth, 4);
-        }
-
-        return 3;
+        /* Single stream: return max_depth (e.g. 4) as ceiling; SchedReq::suggest_depth
+         * gates depth 4 on per-sequence proven streak with safe floor 3. */
+        return p_.max_depth;
     }
 
     /* One verify's outcome: `drafted` tokens were proposed and a prefix of `accepted` of them was
@@ -71,7 +66,7 @@ public:
 
     /* Reset adaptive state (e.g. on new request arrival or prefill completion) */
     void reset_adaptive() {
-        ema_accept_len_ = 2.50f;
+        ema_accept_len_ = 2.0f;
     }
 
     /* Metrics (spec §14). Cumulative and exact. */

@@ -173,6 +173,9 @@ int Scheduler::add_locked(std::unique_ptr<Request> r) {
     s.card = -1;
     s.running = false;
     s.drafter_reset();
+    if (running_.empty()) {
+        draft_.reset_adaptive();
+    }
     s.sched_tokens = 0;
     s.entry = -1;
     s.entry_next = -1;
@@ -241,6 +244,7 @@ int Scheduler::set_draft(uint64_t id, const int32_t* tokens, int n) {
     }
 
     int cap = draft_.next_depth((int)running_.size());
+    if (running_.size() == 1) cap = s.suggest_depth(cap, draft_.params().adaptive);
     if (s.req->max_tokens > 0) {
         const int64_t rem = (int64_t)s.req->max_tokens - (int64_t)s.req->output.size();
         const int64_t max_d = rem > 1 ? rem - 1 : 0;
@@ -897,7 +901,10 @@ const RadBatch* Scheduler::step() {
                            (req.n_computed + 1 < tgt);
         if (!is_pf) n_running_dec++;
     }
-    const int depth = draft_.next_depth((int)running_.size());
+    int depth = draft_.next_depth((int)running_.size());
+    if (running_.size() == 1 && (size_t)running_[0] < reqs_.size() && reqs_[(size_t)running_[0]]) {
+        depth = reqs_[(size_t)running_[0]]->suggest_depth(depth, draft_.params().adaptive);
+    }
 
     /* C1: Reserve token budget for running decode requests so that a long prefill chunk
      * doesn't exhaust the token budget and starve active decoders in concurrent workloads. */
@@ -1559,6 +1566,7 @@ int Scheduler::commit(const StepResult& res) {
                     if (plan_.e[(size_t)si].n_spec > 0) n_spec_seqs++;
                 }
                 draft_.observe(e.n_spec, a, n_spec_seqs);
+                s.observe_draft(e.n_spec, a);
                 m_.draft_tokens += e.n_spec;
                 m_.draft_accepted += a;
                 server::sink_drafts(r.sink, e.n_spec, a);
@@ -1717,7 +1725,10 @@ int Scheduler::serial_begin(int* rounds, SerialRow* out, int max) {
     for (size_t i = 0; i < plan_.e.size(); ++i) {
         if (plan_.e[i].produces_token) n_decode_seqs++;
     }
-    const int depth = draft_.next_depth(std::max(n_decode_seqs, (int)running_.size()));
+    int depth = draft_.next_depth(std::max(n_decode_seqs, (int)running_.size()));
+    if (n_decode_seqs == 1 && running_.size() == 1 && (size_t)running_[0] < reqs_.size() && reqs_[(size_t)running_[0]]) {
+        depth = reqs_[(size_t)running_[0]]->suggest_depth(depth, draft_.params().adaptive);
+    }
     bool may_draft = depth > 0;
     if (depth > 0 && *rounds > depth) *rounds = depth;
     if (*rounds > RAD_SCHED_MAX_SPEC) *rounds = RAD_SCHED_MAX_SPEC;

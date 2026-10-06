@@ -127,6 +127,16 @@ int PrefillStager::before_op(rad_op h, RadStream s, bool* resync) {
                 RAD_TRY(start(li));
                 *resync = true;
             }
+            /* Deep pipelining for multi-layer models (48 layers):
+             * Queue layer li + 1 into buffer 1 immediately at pass start so both mover buffers
+             * are actively transferring ahead of compute. */
+            if (layers_.size() > 2) {
+                const int32_t li1 = li + 1;
+                if ((size_t)li1 < layers_.size() && !started_[(size_t)li1] && will_issue(li1)) {
+                    RAD_TRY(start(li1));
+                    *resync = true;
+                }
+            }
         }
     }
 
@@ -163,6 +173,15 @@ int PrefillStager::after_op(rad_op h, RadStream s) {
             RAD_TRY(rad_event_record(free_[b], s));
             free_rec_[b] = true;
             read_[b] = true;
+            /* In multi-layer prefill, as soon as this layer finishes, release buffer b and
+             * immediately launch layer li + 2 into buffer b behind free_[b]! */
+            if (layers_.size() > 2) {
+                release(b);
+                const int32_t next = li + 2;
+                if ((size_t)next < layers_.size() && !started_[(size_t)next] && will_issue(next)) {
+                    RAD_TRY(start(next));
+                }
+            }
         }
     return RAD_OK;
 }
