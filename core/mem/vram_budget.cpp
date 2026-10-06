@@ -215,11 +215,11 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
         const double f = (double)(b.expert_ceiling - b.experts) / (double)b.expert_ceiling;
         int64_t one = ((int64_t)std::ceil(f * (double)layer_max) + RAD_ALIGN_UNIT - 1) /
                             RAD_ALIGN_UNIT * RAD_ALIGN_UNIT;
-        const int64_t target_one = cfg.prefill_stage_mib > 0
-            ? cfg.prefill_stage_mib * kMiB
-            : (int64_t)140 * kMiB;
-        if (target_one > one && 2 * target_one < b.experts) {
-            one = target_one;
+        if (cfg.prefill_stage_mib > 0) {
+            const int64_t target_one = cfg.prefill_stage_mib * kMiB;
+            if (target_one > one && 2 * target_one < b.experts) {
+                one = target_one;
+            }
         }
         if (2 * one < b.experts) {
             b.stage    = 2 * one;
