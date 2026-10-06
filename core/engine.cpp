@@ -264,10 +264,11 @@ void Engine::tiering_dispatch(Rank& r, const RadBatch* b) {
         ++r.heat_credited;
     }
 
-    const bool is_final_pf = ((b->phase == RAD_PHASE_PREFILL || b->phase == RAD_PHASE_MIXED) && b->n_out > 0);
+    const bool is_final_pf = ((b->phase == RAD_PHASE_PREFILL || b->phase == RAD_PHASE_MIXED) &&
+                              b->n_out > 0 && b->n_tok >= 512);
     if (is_final_pf) {
-        /* Prefill-to-decode transition: burst-promote hot non-resident experts into VRAM slab */
-        r.heat.set_burst_moves(32);
+        /* Prefill-to-decode transition for substantive prompts: burst-promote hot non-resident experts into VRAM slab */
+        r.heat.set_burst_moves(16);
     }
 
     std::vector<Swap> swaps;
