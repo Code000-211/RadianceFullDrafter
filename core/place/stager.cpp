@@ -92,6 +92,7 @@ int PrefillStager::start(int32_t li) {
                                        free_rec_[b] ? free_[b] : nullptr, done_[b], &staged_[b]);
     if (rc < 0) return rc;
     if (!staged_[b].empty()) { holds_[b] = li; read_[b] = false; }
+    needs_resync_ = true;
     return RAD_OK;
 }
 
@@ -102,6 +103,7 @@ void PrefillStager::release(int32_t b) {
     staged_[b].clear();
     holds_[b] = -1;
     read_[b] = false;
+    needs_resync_ = true;
 }
 
 int PrefillStager::finish(int32_t b, RadStream s) {
@@ -112,7 +114,6 @@ int PrefillStager::finish(int32_t b, RadStream s) {
 }
 
 int PrefillStager::before_op(rad_op h, RadStream s, bool* resync) {
-    *resync = false;
     if ((int32_t)h > last_issued_) last_issued_ = (int32_t)h;
 
     /* THE PASS'S FIRST ROUTED LAYER, staged at its first op of any kind, so the copy runs behind
@@ -125,7 +126,6 @@ int PrefillStager::before_op(rad_op h, RadStream s, bool* resync) {
             const int32_t li = (int32_t)(it - layers_.begin());
             if (!started_[(size_t)li] && will_issue(li)) {
                 RAD_TRY(start(li));
-                *resync = true;
             }
             /* Deep pipelining for multi-layer models (48 layers):
              * Queue layer li + 1 into buffer 1 immediately at pass start so both mover buffers
@@ -134,15 +134,22 @@ int PrefillStager::before_op(rad_op h, RadStream s, bool* resync) {
                 const int32_t li1 = li + 1;
                 if ((size_t)li1 < layers_.size() && !started_[(size_t)li1] && will_issue(li1)) {
                     RAD_TRY(start(li1));
-                    *resync = true;
                 }
             }
         }
     }
 
-    if ((size_t)h >= first_of_.size()) return RAD_OK;
+    if ((size_t)h >= first_of_.size()) {
+        *resync = needs_resync_;
+        needs_resync_ = false;
+        return RAD_OK;
+    }
     const int32_t li = first_of_[(size_t)h];
-    if (li < 0) return RAD_OK;
+    if (li < 0) {
+        *resync = needs_resync_;
+        needs_resync_ = false;
+        return RAD_OK;
+    }
     /* This layer's copies were published a layer ago: the one wait that orders its ops behind
      * them. */
     for (int b = 0; b < 2; ++b)
@@ -156,8 +163,9 @@ int PrefillStager::before_op(rad_op h, RadStream s, bool* resync) {
     const int32_t next = li + 1;
     if ((size_t)next < layers_.size() && !started_[(size_t)next] && will_issue(next)) {
         RAD_TRY(start(next));
-        *resync = true;
     }
+    *resync = needs_resync_;
+    needs_resync_ = false;
     return RAD_OK;
 }
 
