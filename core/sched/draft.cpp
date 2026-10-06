@@ -14,8 +14,7 @@ int DraftController::configure(const Params& p) {
     tot_drafted_ = tot_accepted_ = 0;
     for (int j = 0; j < RAD_SCHED_MAX_SPEC; ++j) { reach_[j] = 0; hit_[j] = 0; }
     seen_ = 0;
-    last_drafted_ = 0;
-    last_accepted_ = 1;
+    ema_accept_len_ = 2.0f;
     return RAD_OK;
 }
 
@@ -26,8 +25,9 @@ void DraftController::observe(int drafted, int accepted) {
     if (accepted > drafted) accepted = drafted;
     tot_drafted_  += drafted;
     tot_accepted_ += accepted;
-    last_drafted_  = drafted;
-    last_accepted_ = accepted;
+
+    /* SGLang alpha = 0.2 EMA on accepted length */
+    ema_accept_len_ = 0.8f * ema_accept_len_ + 0.2f * (float)accepted;
 
     /* Position j was EVALUATED only if every position before it was accepted, so this verify
      * produces exactly: 0..accepted-1 evaluated and accepted, and -- when the prefix was not the

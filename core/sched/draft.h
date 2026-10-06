@@ -36,28 +36,32 @@ public:
     const Params& params() const { return p_; }
 
     /* The draft depth for the next step.
-     * Keeps depth at p_.max_depth across concurrency levels to maximize draft throughput.
-     * Setting RADIANCE_DYNAMIC_SPEC=1 optionally restores concurrency-based depth throttling.
-     * Setting RADIANCE_ADAPTIVE_SPEC=1 enables zero-overhead single-step depth adaptation:
-     * Drops depth from 3 to 2 on a complete verify miss (saving Round 3 MTP pass),
-     * and recovers immediately to full depth 3 on the first accepted token. */
+     * Incorporates SGLang-style per-batch-size tiered tracking and hysteresis:
+     * - At high concurrency (active_seqs >= 8): clamps depth to 1 to avoid GPU compute saturation.
+     * - At medium concurrency (active_seqs >= 4): clamps depth to 2.
+     * - At single stream (active_seqs <= 2):
+     *   - Uses EMA of accepted token count per round (ema_accept_len_).
+     *   - High-acceptance mode (ema_accept_len_ >= 2.4): scales UP to 4 speculative tokens!
+     *   - Moderate mode (1.2 <= ema_accept_len_ < 2.4): runs at 3 speculative tokens.
+     *   - Low-acceptance mode (ema_accept_len_ < 1.2): drops to 2 speculative tokens.
+     * Setting RADIANCE_STATIC_SPEC=1 forces static p_.max_depth. */
     int  next_depth(int active_seqs = 1) const {
         if (p_.max_depth <= 0) return 0;
-        static const bool dynamic_spec = (std::getenv("RADIANCE_DYNAMIC_SPEC") != nullptr);
-        if (__builtin_expect(dynamic_spec, 0)) {
-            if (active_seqs >= 8) return 0;
-            if (active_seqs >= 5) return std::min(p_.max_depth, 1);
-            if (active_seqs >= 3) return std::min(p_.max_depth, 2);
-        }
+        static const bool static_spec = (std::getenv("RADIANCE_STATIC_SPEC") != nullptr);
+        if (__builtin_expect(static_spec, 0)) return p_.max_depth;
 
-        static const bool adaptive = (std::getenv("RADIANCE_ADAPTIVE_SPEC") != nullptr);
-        if (__builtin_expect(adaptive, 0)) {
-            if (last_accepted_ == 0 && last_drafted_ > 0) {
-                return std::min(p_.max_depth, 2);
-            }
-        }
+        /* Concurrency gating (SGLang per-BS slot) */
+        if (active_seqs >= 8) return std::min(p_.max_depth, 1);
+        if (active_seqs >= 4) return std::min(p_.max_depth, 2);
 
-        return p_.max_depth;
+        /* Single-stream C1 adaptive tiering */
+        if (p_.max_depth >= 4 && ema_accept_len_ >= 2.4f) {
+            return std::min(p_.max_depth, 4);
+        }
+        if (ema_accept_len_ < 1.2f && p_.max_depth >= 3) {
+            return 2;
+        }
+        return std::min(p_.max_depth, 3);
     }
 
     /* One verify's outcome: `drafted` tokens were proposed and a prefix of `accepted` of them was
@@ -66,8 +70,7 @@ public:
 
     /* Reset adaptive state (e.g. on new request arrival or prefill completion) */
     void reset_adaptive() {
-        last_drafted_ = 0;
-        last_accepted_ = 1;
+        ema_accept_len_ = 2.0f;
     }
 
     /* Metrics (spec §14). Cumulative and exact. */
@@ -76,6 +79,7 @@ public:
     float   acceptance() const {
         return tot_drafted_ ? (float)((double)tot_accepted_ / (double)tot_drafted_) : 0.0f;
     }
+    float   ema_accept_len() const { return ema_accept_len_; }
 
     /* PER-POSITION ACCEPTANCE, and it is a diagnostic rather than a policy input.
      *
@@ -104,8 +108,7 @@ private:
     int64_t reach_[RAD_SCHED_MAX_SPEC] = {};
     int64_t hit_  [RAD_SCHED_MAX_SPEC] = {};
     int     seen_ = 0;
-    int     last_drafted_ = 0;
-    int     last_accepted_ = 1;
+    float   ema_accept_len_ = 2.0f;
 };
 
 }  /* namespace rad */
