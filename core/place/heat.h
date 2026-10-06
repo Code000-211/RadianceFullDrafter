@@ -211,7 +211,7 @@ public:
         heat_[(size_t)p] += amount;
         end_invalidate(unit);
     }
-    void set_burst_moves(int n) { burst_moves_ = n; }
+    void set_burst_moves(int n) { burst_moves_ = std::max(burst_moves_, n); }
     std::vector<int32_t> active_units(float min_heat = 0.5f, size_t max_units = 512) const;
 
     float heat(int32_t unit) const { return heat_[(size_t)pos_[(size_t)unit]]; }

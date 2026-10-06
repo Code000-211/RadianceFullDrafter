@@ -85,8 +85,8 @@ bool PrefillStager::begin_pass(const RadBatch* b) {
     first_op_ = true;
     pass_kind_ = b->draft_pass;
     last_issued_ = -1;
-    is_chunked_prefill_ = (b->phase == RAD_PHASE_PREFILL && b->n_out == 0);
-    is_final_prefill_   = (b->phase == RAD_PHASE_PREFILL && b->n_out > 0);
+    is_chunked_prefill_ = ((b->phase == RAD_PHASE_PREFILL || b->phase == RAD_PHASE_MIXED) && b->n_out == 0);
+    is_final_prefill_   = ((b->phase == RAD_PHASE_PREFILL || b->phase == RAD_PHASE_MIXED) && b->n_out > 0);
 
     /* Preserve any wrap-around pre-staged buffers from the previous chunk/pass */
     for (int b_idx = 0; b_idx < n_bufs_; ++b_idx) {

@@ -358,7 +358,7 @@ private:
     /* One dispatch of the tiering seam: retire what landed, credit last step's routing and issue
      * what the heat engine proposes. A member because Rank is private, and a no-op on a static
      * plan. See the long note at the definition for why a step is the unit. */
-    void tiering_dispatch(Rank& r, int step);
+    void tiering_dispatch(Rank& r, int step, int n_seq = 1);
     void rank_loop(int rank);
 };
 

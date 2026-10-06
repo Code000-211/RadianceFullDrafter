@@ -212,8 +212,13 @@ int Engine::declare_sampler(int rank, RadBuilder* b, int64_t logits_width, bool 
  * report overwrites them, so a step in which some layer did not route -- a drafter pass, or a
  * bisect running fewer layers -- would otherwise credit the stale plane again and again.
  */
-void Engine::tiering_dispatch(Rank& r, int step) {
+void Engine::tiering_dispatch(Rank& r, int step, int n_seq) {
     if (!r.heat.enabled()) return;
+
+    if (n_seq > 1) {
+        /* High concurrency: scale moves dynamically with active request count to quickly warm diverse domains */
+        r.heat.set_burst_moves(std::min(32, 4 * n_seq));
+    }
 
     r.mover.begin_dispatch(step, &r.heat);
 
@@ -285,7 +290,7 @@ void Engine::on_prefix_hit(const Request& r, const std::vector<int32_t>& units) 
         for (int32_t u : units) {
             rk->heat.boost_unit(u, 25.0f);
         }
-        rk->heat.set_burst_moves(16);
+        rk->heat.set_burst_moves(std::min(48, std::max(16, (int)units.size())));
     }
 }
 /* ------------------------------------------------------------------ the rank thread */
@@ -341,7 +346,7 @@ void Engine::rank_loop(int index) {
                 }
             }
             /* Behind the pass, once a step: see tiering_dispatch. */
-            if (s >= 0 && b->draft_pass == 0 && what != kIssueModel) tiering_dispatch(r, b->step);
+            if (s >= 0 && b->draft_pass == 0 && what != kIssueModel) tiering_dispatch(r, b->step, b->n_seq);
 
         }
         barrier_->arrive_and_wait();                    /* joined; the scheduler may read */
