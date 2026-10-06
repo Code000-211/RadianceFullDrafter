@@ -61,19 +61,24 @@ __device__ __forceinline__ float pg_narrow(float v) {
  * not where to spend accuracy on an instruction. */
 __device__ __forceinline__ float pg_sigmoid(float x) { return 1.0f / (1.0f + expf(-x)); }
 
-/* A workgroup-wide sum through LDS, called four times. The trailing barrier is what lets the same
- * array serve the next reduction without a second allocation. */
+/* A workgroup-wide sum through LDS, called four times.
+ * Each wave reduces in registers/DPP (r4d_wave_sum) with 0 barriers, writes 8 wave sums to LDS,
+ * wave 0 folds the 8 sums with r4d_xor_sum<8>, and broadcasts via lds[0].
+ * Reduces barriers from 9 down to 2! */
 __device__ __forceinline__ float pg_reduce(float v, float* lds) {
     const uint32_t t = threadIdx.x;
-    lds[t] = v;
+    const uint32_t wave = t / 32;
+    const uint32_t lane = t % 32;
+    v = r4d_wave_sum(v);
+    if (lane == 0) lds[wave] = v;
     __syncthreads();
-    for (uint32_t w = kPgThreads / 2; w > 0; w >>= 1) {
-        if (t < w) lds[t] += lds[t + w];
-        __syncthreads();
+    if (wave == 0) {
+        float s = (lane < (kPgThreads / 32)) ? lds[lane] : 0.0f;
+        s = r4d_xor_sum<8>(s);
+        if (lane == 0) lds[0] = s;
     }
-    const float r = lds[0];
     __syncthreads();
-    return r;
+    return lds[0];
 }
 
 __global__ __launch_bounds__(kPgThreads) void ple_gate_kernel(
