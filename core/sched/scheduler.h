@@ -79,7 +79,7 @@ struct SchedReq {
         if (multi_seq) {
             /* In multi-sequence concurrency (C8), bursting to depth 4 floods L2 cache
              * across 256 experts (400 slots). Keep C8 strictly at default_depth (3)
-             * to preserve maximum cache locality and peak throughput (>508 tok/s). */
+             * to preserve maximum cache locality and peak throughput. */
             return default_depth;
         } else {
             /* Single-stream: require streak >= 5 and ema >= 2.8f to burst to depth 4 on math/json/syntax */
