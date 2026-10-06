@@ -103,6 +103,7 @@ struct VramBudget {
      * arena (core/place/stager.h). Zero when every expert is resident or the placement cannot move
      * any. */
     int64_t stage = 0;
+    int     stage_bufs = 0;
     int64_t weights = 0;              /* statics + experts: what vram_weights is set to */
     bool    derived_weights = false, derived_kv = false;
     std::string report;       /* the block the engine prints at startup */
