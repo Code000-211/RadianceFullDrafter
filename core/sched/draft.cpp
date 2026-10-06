@@ -14,7 +14,7 @@ int DraftController::configure(const Params& p) {
     tot_drafted_ = tot_accepted_ = 0;
     for (int j = 0; j < RAD_SCHED_MAX_SPEC; ++j) { reach_[j] = 0; hit_[j] = 0; }
     seen_ = 0;
-    ema_accept_len_ = 2.0f;
+    ema_accept_len_ = 2.50f;
     return RAD_OK;
 }
 

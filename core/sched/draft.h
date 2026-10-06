@@ -56,9 +56,9 @@ public:
         if (active_seqs > 1) return std::min(p_.max_depth, 3);
 
         /* Single stream (active_seqs == 1):
-         * Floor is strictly 3. Expands to 4 only on proven hot streaks (ema >= 2.60),
-         * boosting math/json/chat while protecting code/file_edit from blind depth-4 penalties. */
-        if (p_.max_depth >= 4 && ema_accept_len_ >= 2.60f) {
+         * Floor is strictly 3. Expands to 4 on hot streaks (ema >= 2.40),
+         * unlocking full acceleration on chat/math/json while keeping code/file_edit safe. */
+        if (p_.max_depth >= 4 && ema_accept_len_ >= 2.40f) {
             return std::min(p_.max_depth, 4);
         }
 
@@ -71,7 +71,7 @@ public:
 
     /* Reset adaptive state (e.g. on new request arrival or prefill completion) */
     void reset_adaptive() {
-        ema_accept_len_ = 2.0f;
+        ema_accept_len_ = 2.50f;
     }
 
     /* Metrics (spec §14). Cumulative and exact. */
