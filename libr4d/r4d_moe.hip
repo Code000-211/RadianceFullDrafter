@@ -2660,12 +2660,10 @@ static int moe_gemm_launch(const RadArgs* a, const R4dSink& sk, int ncls = 2) {
         const bool wide_n = (N / parts) % kPrefillCols == 0;
         const unsigned nyw = (unsigned)(N / kPrefillCols);
         if (map) {
-            if (!a_sorted) {
-                emit_rc = R4D_EMIT(sk, moe_blockmap_kernel, dim3(1), dim3(256), 0,
-                                   (const int32_t*)off->data, (uint32_t)n_expert, (uint32_t)T,
-                                   (uint32_t)kPrefillRows, (uint32_t)cap, map);
-                if (emit_rc != RAD_OK) return emit_rc;
-            }
+            emit_rc = R4D_EMIT(sk, moe_blockmap_kernel, dim3(1), dim3(256), 0,
+                               (const int32_t*)off->data, (uint32_t)n_expert, (uint32_t)T,
+                               (uint32_t)kPrefillRows, (uint32_t)cap, map);
+            if (emit_rc != RAD_OK) return emit_rc;
             if (wide_n)
                 emit_rc = R4D_EMIT(sk, (moe_gemm_q_kernel<kPrefillRows / 16, kPrefillCols / 16, 2, 4, W4, false, true, true>),
                                    dim3((unsigned)cap, nyw), dim3(8 * kWave), 0,
@@ -2836,12 +2834,10 @@ static int moe_gemm_bf16_body(const RadArgs* a, const R4dSink& sk) {
         const unsigned nyw = (unsigned)(N / kPrefillCols);
         const unsigned gx = map ? (unsigned)cap : (unsigned)((T + kPrefillRows - 1) / kPrefillRows);
         if (map) {
-            if (!a_sorted) {
-                emit_rc = R4D_EMIT(sk, moe_blockmap_kernel, dim3(1), dim3(256), 0,
-                                   (const int32_t*)off->data, (uint32_t)n_expert, (uint32_t)T,
-                                   (uint32_t)kPrefillRows, (uint32_t)cap, map);
-                if (emit_rc != RAD_OK) return emit_rc;
-            }
+            emit_rc = R4D_EMIT(sk, moe_blockmap_kernel, dim3(1), dim3(256), 0,
+                               (const int32_t*)off->data, (uint32_t)n_expert, (uint32_t)T,
+                               (uint32_t)kPrefillRows, (uint32_t)cap, map);
+            if (emit_rc != RAD_OK) return emit_rc;
         }
 #define R4D_MOE16(AL_, NTL_, WGN_, NYG_)                                                         \
         R4D_EMIT(sk, (moe_gemm_bf16_kernel<kPrefillRows / 16, NTL_, 2, WGN_, false, AL_, true>),   \
