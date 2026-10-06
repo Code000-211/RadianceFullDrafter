@@ -410,6 +410,8 @@ void r4d_gemm_w4a8_prefill(long a, long ascale, long wq, long ws, long c, int M,
     case 31: PF(2, 8, 4, 2, 2 | 128 | 256, 1); break;     // b128 A + both
     case 32: PF(2, 8, 4, 2, 8 | 128 | 256 | 1, 4); break; // + grid swizzle 4
     case 33: PF(2, 8, 4, 2, 8 | 128 | 256 | 1, 8); break; // + grid swizzle 8
+    case 34: PF(2, 8, 4, 2, 2 | 128 | 256 | 1, 4); break; // b128 A + VOPD + swizzle 4
+    case 35: PF(2, 8, 4, 2, 2 | 128 | 256 | 1, 8); break; // b128 A + VOPD + swizzle 8
     default: PF(2, 8, 4, 2, 2, 1); break;                 // b128 A + VOPD fold
   }
 #undef PF

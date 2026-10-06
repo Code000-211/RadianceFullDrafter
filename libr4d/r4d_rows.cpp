@@ -2994,10 +2994,10 @@ static const RadTunable tGemmTiled[] = {
 
 /* The prefill kernel's arms, on the same terms. Ablations (20-23, 25, 26) are excluded for the
  * same reason. */
-static const int64_t kPrefillArms[] = { 0, 2, 3, 5, 6, 8, 9, 10, 13, 14, 27, 28, 29, 30 };
+static const int64_t kPrefillArms[] = { 0, 2, 3, 5, 6, 8, 9, 10, 13, 14, 27, 28, 29, 30, 31, 32, 33, 34, 35 };
 static const RadTunable tGemmPrefill[] = {
-  { "tile", kPrefillArms, NELEM(kPrefillArms), 0,
-    "compiled tile arm; 0 is BM 128 x BN 256, libr4d's own default" },
+  { "tile", kPrefillArms, NELEM(kPrefillArms), 34,
+    "compiled tile arm; 34 is BM 128 x BN 256 with VOPD, ASCVEC, STFAST and Swizzle 4" },
 };
 
 /* ------------------------------------------------------------------------ split-KV attention
@@ -5095,6 +5095,7 @@ static void tile_bmbn(int arm, int prefill, R4dTileCfg* out) {
         { 0, 128, 256 }, { 2, 128, 256 }, { 3, 128, 256 }, { 5, 128, 256 }, { 6, 128, 256 },
         { 8,  64, 256 }, { 9,  96, 256 }, { 10, 128, 128 }, { 13, 64, 256 }, { 14, 256, 128 },
         { 27, 128, 256 }, { 28, 128, 256 }, { 29, 128, 256 }, { 30, 128, 256 },
+        { 31, 128, 256 }, { 32, 128, 256 }, { 33, 128, 256 }, { 34, 128, 256 }, { 35, 128, 256 },
     };
     const Arm* t = prefill ? pf : tiled;
     const int  n = prefill ? NELEM(pf) : NELEM(tiled);
