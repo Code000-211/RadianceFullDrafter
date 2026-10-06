@@ -1491,7 +1491,7 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_q_kernel(
 }
 
 template <int W4 = 0>
-__attribute__((amdgpu_num_vgpr(128)))
+__attribute__((amdgpu_num_vgpr(84)))
 __global__ __launch_bounds__(4 * kWave) void moe_gemm_q_decode_kernel(
     const uint8_t* __restrict__ Aq, const float* __restrict__ As,
     const MoeCls c_even, const MoeCls c_odd, const MoeCls c_2, const MoeCls c_3,

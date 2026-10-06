@@ -71,13 +71,20 @@ struct SchedReq {
         ema_accept = 0.8f * ema_accept + 0.2f * (float)accepted;
     }
 
-    int suggest_depth(int default_depth, bool adaptive) const {
+    int suggest_depth(int default_depth, bool adaptive, bool multi_seq = false) const {
         if (!adaptive) return default_depth;
         /* Safe Floor is strictly default_depth (3) so code & reasoning never regress.
-         * Burst to depth 4 only on high-acceptance streaks (math, json, repetitive syntax).
-         * Requiring streak >= 8 and ema >= 2.92 protects code from premature depth 4 promotion. */
-        if (accepted_streak >= 8 && ema_accept >= 2.92f) {
-            return std::min(default_depth + 1, 4);
+         * In multi-sequence concurrency (C8), promoting sequences to depth 4 upon steady streaks
+         * dramatically expands aggregate tokens per forward step. */
+        if (multi_seq) {
+            if (accepted_streak >= 3 && ema_accept >= 2.4f) {
+                return std::min(default_depth + 1, 4);
+            }
+        } else {
+            /* Single-stream: require streak >= 5 and ema >= 2.8f to burst to depth 4 on math/json/syntax */
+            if (accepted_streak >= 5 && ema_accept >= 2.8f) {
+                return std::min(default_depth + 1, 4);
+            }
         }
         return default_depth;
     }

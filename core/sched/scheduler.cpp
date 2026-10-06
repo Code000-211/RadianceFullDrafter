@@ -952,7 +952,8 @@ const RadBatch* Scheduler::step() {
              * none. Request::may_speculate says why a request can be ineligible. */
             if (!r.may_speculate) s.n_draft = 0;
             else if (s.n_draft == 0) s.n_draft = (int32_t)draft_ngram(s, depth);
-            const int32_t seq_depth = (int32_t)s.suggest_depth(depth, draft_.params().adaptive);
+            const bool multi_seq = running_.size() > 1;
+            const int32_t seq_depth = (int32_t)s.suggest_depth(depth, draft_.params().adaptive, multi_seq);
             if (s.n_draft > seq_depth) s.n_draft = seq_depth;
             /* NO VERIFIED POSITION AT OR PAST THE CONTEXT. The step computes positions n_computed
              * .. n_computed + n_draft, and nothing past ctx_limit_ - 1 has a rotary row or a

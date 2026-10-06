@@ -221,8 +221,9 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
                 one = target_one;
             }
         }
-        if (2 * one < b.experts) {
-            b.stage    = 2 * one;
+        const int n_stage_bufs = (3 * one < b.experts) ? 3 : 2;
+        if (n_stage_bufs * one < b.experts) {
+            b.stage    = n_stage_bufs * one;
             b.experts -= b.stage;
             b.weights  = b.statics + b.experts;
         }
@@ -346,7 +347,7 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
                   "ceiling\n", humanb(b.unusable).c_str()).c_str()
             : "",
         b.stage > 0
-            ? fmt("    prefill staging  %10s   out of the experts: two buffers of one layer's "
+            ? fmt("    prefill staging  %10s   out of the experts: buffers of one layer's "
                   "non-resident experts,\n"
                   "                                  at the arena's top and lent back to the "
                   "slab while steps are small\n", humanb(b.stage).c_str()).c_str()
