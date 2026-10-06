@@ -64,7 +64,11 @@ int PrefillStager::init(const Program& prog, const Plan& plan, Mover* mover, cha
     for (const auto& L : layers_) {
         int64_t lb = 0;
         for (int32_t u : L.units) {
-            if ((size_t)u < plan.units.size()) lb += plan.units[(size_t)u].bytes;
+            if ((size_t)u < plan.units.size()) {
+                const auto& mu = plan.units[(size_t)u];
+                if (mu.tier == Tier::HostPinned && mu.slab_slot < 0)
+                    lb += (mu.bytes + RAD_ALIGN_UNIT - 1) / RAD_ALIGN_UNIT * RAD_ALIGN_UNIT;
+            }
         }
         max_layer_bytes = std::max(max_layer_bytes, lb);
     }
