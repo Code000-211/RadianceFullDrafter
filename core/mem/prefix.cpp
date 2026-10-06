@@ -280,6 +280,12 @@ CacheHit PrefixCache::lookup(const std::vector<int32_t>& tokens,
      * idle and be demoted from under the request using it. */
     if (tiers_ && matched > 0) tiers_->note_hits(hs.data(), matched, rad_mono_ns());
     hit.n_attn_tokens = (int32_t)(matched * block_size_);
+    if (matched > 0) {
+        auto it = map_.find(hs[(size_t)(matched - 1)]);
+        if (it != map_.end() && !it->second.hot_units.empty()) {
+            hit.prefetch_units = it->second.hot_units;
+        }
+    }
     stats_.block_hits += matched;
     stats_.block_misses += n_full - matched;
 
@@ -312,7 +318,8 @@ int PrefixCache::insert(uint64_t session,
                         const std::vector<int32_t>& tokens,
                         const std::vector<MMContentKey>& mm,
                         const std::vector<std::vector<int32_t>>& blocks,
-                        int64_t n_tokens) {
+                        int64_t n_tokens,
+                        const std::vector<int32_t>& hot_units) {
     if (!enabled_) return RAD_OK;
     if (blocks.size() != groups_.size()) return RAD_E_INVAL;
     if (n_tokens > (int64_t)tokens.size()) return RAD_E_INVAL;
@@ -374,6 +381,13 @@ int PrefixCache::insert(uint64_t session,
         e.lru = std::prev(lru_.end());
         e.in_lru = true;
         map_.emplace(h, std::move(e));
+    }
+
+    if (!hot_units.empty() && !hs.empty()) {
+        auto it = map_.find(hs.back());
+        if (it != map_.end()) {
+            it->second.hot_units = hot_units;
+        }
     }
 
     /* THE TIERS LEARN THE CHAIN HERE AND NOWHERE ELSE. insert() is the one call that knows a chain

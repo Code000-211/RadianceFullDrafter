@@ -339,7 +339,8 @@ void Scheduler::close_request(SchedReq& s, ReqState st, const char* reason, bool
             pub_blocks_[i] = kv_->block_table(s.req->id, cg[i]);
         }
         if (ok) {
-            const int rc = pc_->insert(*s.req, pub_blocks_, s.req->n_computed);
+            const std::vector<int32_t> hot = pc_->current_hot_units();
+            const int rc = pc_->insert(*s.req, pub_blocks_, s.req->n_computed, hot);
             if (rc < 0)
                 RAD_DEBUG("prefix cache: request %llu not published: %s",
                           (unsigned long long)s.req->id, rad_strerror(rc));

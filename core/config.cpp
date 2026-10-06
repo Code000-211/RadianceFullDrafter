@@ -436,6 +436,8 @@ int config_parse(int argc, char** argv, Config* c) {
         else if (S("--checkpoint-interval"))   { if (!(v = need(i))) return RAD_E_INVAL; c->checkpoint_interval = atoll(v); }
         else if (S("--checkpoint-slots"))      { if (!(v = need(i))) return RAD_E_INVAL; c->checkpoint_slots = atoll(v); }
         else if (S("--no-prefix-cache"))       c->prefix_cache = false;
+        else if (S("--prefix-aware-prefetch"))    c->prefix_aware_prefetch = true;
+        else if (S("--no-prefix-aware-prefetch")) c->prefix_aware_prefetch = false;
         else if (S("--checkpoint-policy")) {
             if (!(v = need(i))) return RAD_E_INVAL;
             /* Named here rather than accepted blind: a policy name this build does not know would

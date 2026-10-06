@@ -666,6 +666,7 @@ struct Config {
      * so raising this trades addressable context rather than VRAM (spec 7.3, 19.1). */
     int64_t checkpoint_slots = 8;
     bool    prefix_cache = true;
+    bool    prefix_aware_prefetch = true;  /* --prefix-aware-prefetch / --no-prefix-aware-prefetch */
     /* geometric-backoff | tip-only | keep-all. §19.1 records the default as a GUESS until there is
      * a workload to measure, and core/mem/prefix.h ships the two ends of the trade beside it for
      * exactly that measurement -- which needs a way to select them. */

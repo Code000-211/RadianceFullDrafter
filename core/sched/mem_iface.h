@@ -152,8 +152,16 @@ struct IPrefixCache {
      * conversation is seconds a message. `blocks[i]` is the block table of cached_groups()[i], and
      * `n_tokens` how many of them are backed. Takes a KV reference on every newly indexed block,
      * so it must be called BEFORE the sequence's own blocks are released. */
+    virtual std::vector<int32_t> current_hot_units() const { return {}; }
     virtual int insert(const Request& r, const std::vector<std::vector<int32_t>>& blocks,
-                       int64_t n_tokens) = 0;
+                       int64_t n_tokens) {
+        return insert(r, blocks, n_tokens, {});
+    }
+    virtual int insert(const Request& r, const std::vector<std::vector<int32_t>>& blocks,
+                       int64_t n_tokens, const std::vector<int32_t>& hot_units) {
+        (void)hot_units;
+        return insert(r, blocks, n_tokens);
+    }
 
     /* Release the least recently used entries, and with them their KV references. The cache holds
      * blocks no live sequence needs, so this is what the scheduler tries BEFORE preempting a
@@ -324,10 +332,22 @@ struct PCBinding final : IPrefixCache {
     mutable std::vector<int32_t> blk_;
     explicit PCBinding(PC* p) : m(p) {}
 
+    /* Installed by the engine for prefix-aware expert prefetching; empty otherwise. */
+    std::function<std::vector<int32_t>()> hot_units_fn;
+    std::function<void(const Request&, const std::vector<int32_t>&)> on_prefix_hit;
+
+    std::vector<int32_t> current_hot_units() const override {
+        return hot_units_fn ? hot_units_fn() : std::vector<int32_t>{};
+    }
+
     CacheHit lookup(const Request& r,
                     std::vector<std::vector<int32_t>>* out) const override {
         media_keys(r, &mm_);
-        return m->lookup(r.prompt, mm_, out);
+        CacheHit h = m->lookup(r.prompt, mm_, out);
+        if (h.n_attn_tokens > 0 && !h.prefetch_units.empty() && on_prefix_hit) {
+            on_prefix_hit(r, h.prefetch_units);
+        }
+        return h;
     }
 
     /* Installed by the engine when the idle tiers are on; empty otherwise. */
@@ -343,6 +363,10 @@ struct PCBinding final : IPrefixCache {
      * prompt would stop hitting at the first assistant token and re-prefill everything after it. */
     int insert(const Request& r, const std::vector<std::vector<int32_t>>& blocks,
                int64_t n_tokens) override {
+        return insert(r, blocks, n_tokens, {});
+    }
+    int insert(const Request& r, const std::vector<std::vector<int32_t>>& blocks,
+               int64_t n_tokens, const std::vector<int32_t>& hot_units) override {
         std::vector<int32_t> toks;
         toks.reserve(r.prompt.size() + r.output.size());
         toks.insert(toks.end(), r.prompt.begin(), r.prompt.end());
@@ -351,7 +375,7 @@ struct PCBinding final : IPrefixCache {
         /* r.id is the session, and it is the SAME id reserve_checkpoint keys its snapshots by --
          * so the tiers' session view and the checkpoint index are talking about one thing. */
         media_keys(r, &mm_);
-        return m->insert(r.id, toks, mm_, blocks, n_tokens);
+        return m->insert(r.id, toks, mm_, blocks, n_tokens, hot_units);
     }
     int64_t evict(int64_t n) override { return m->evict_lru(n); }
     int64_t reset() override {

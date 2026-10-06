@@ -108,6 +108,7 @@ struct CacheHit {
     int32_t n_attn_tokens   = 0;   /* attention KV reused directly, always a whole block multiple */
     int32_t n_linear_tokens = 0;   /* linear state reused; <= n_attn_tokens, a checkpoint multiple */
     int32_t checkpoint_slot = -1;  /* the snapshot holding that state, -1 if none */
+    std::vector<int32_t> prefetch_units; /* prefix-aware prefetch: experts needed by this prefix */
 };
 
 /* ------------------------------------------------------------------ retention policy */
@@ -192,7 +193,8 @@ public:
                const std::vector<int32_t>& tokens,
                const std::vector<MMContentKey>& mm,
                const std::vector<std::vector<int32_t>>& blocks,
-               int64_t n_tokens);
+               int64_t n_tokens,
+               const std::vector<int32_t>& hot_units = {});
 
     /* Drop the least recently used entries, releasing their KV references. Returns how many were
      * dropped. Blocks a live sequence still holds stay allocated -- releasing the cache's
@@ -349,6 +351,7 @@ private:
         bool in_lru = false;
         bool drop_wait = false;         /* in drop_wait_: clean, but a sequence still reads it */
         std::list<BlockHash>::iterator lru;
+        std::vector<int32_t> hot_units; /* prefix-aware prefetch: experts needed by this prefix */
     };
     struct Ckpt {
         uint64_t  session = 0;

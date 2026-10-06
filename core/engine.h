@@ -318,6 +318,7 @@ private:
     void loan_tick(bool idle);
     bool     lending_ = false;
     uint64_t loan_last_ns_ = 0;
+    void on_prefix_hit(const Request& r, const std::vector<int32_t>& units);
     /* THE ACTIVATION ARENA'S LOAN (Engine::arena_step). `arena_rows_[k]` is the largest step Ctx
      * level k serves -- level 0 is the full plan -- and empty when the arena lends nothing. The
      * floor is the largest step seen lately: the loan grows past what it allows only once no step

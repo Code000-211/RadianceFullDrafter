@@ -204,6 +204,16 @@ public:
     int step(std::vector<Swap>* out);
     void abandon(const Swap& s);
 
+    void boost_unit(int32_t unit, float amount) {
+        if (!enabled_ || unit < 0 || (size_t)unit >= pos_.size()) return;
+        const int32_t p = pos_[(size_t)unit];
+        if (p < 0 || (size_t)p >= heat_.size()) return;
+        heat_[(size_t)p] += amount;
+        end_invalidate(unit);
+    }
+    void set_burst_moves(int n) { burst_moves_ = n; }
+    std::vector<int32_t> active_units(float min_heat = 0.5f, size_t max_units = 512) const;
+
     float heat(int32_t unit) const { return heat_[(size_t)pos_[(size_t)unit]]; }
     /* How many units of THIS unit's layer are resident. The tiebreak every residency decision
      * needs: a global ranking with no layer term leaves some layers holding far more than others,
@@ -225,6 +235,7 @@ private:
     HeatParams params_;
     bool       enabled_ = false;
     int32_t    n_layer_ = 0;
+    int        burst_moves_ = 0;
     HeatStats  stats_;
 
     /* THE HEAT, BY POSITION RATHER THAN BY UNIT. Each layer owns one run of positions, and the

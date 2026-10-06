@@ -414,7 +414,8 @@ int HeatEngine::step(std::vector<Swap>* out) {
     if (!out) return RAD_E_INVAL;
     out->clear();
     if (!enabled_) return RAD_OK;
-    const int k = params_.moves_per_dispatch;
+    const int k = burst_moves_ > 0 ? burst_moves_ : params_.moves_per_dispatch;
+    burst_moves_ = 0;
     if (k <= 0) return RAD_OK;
 
     /* THE BEST PAIR FROM THE LAYERS' ENDS FIRST. If it fails the guard every pair does -- the
@@ -622,6 +623,27 @@ std::string HeatEngine::report() const {
         s += "\n";
     }
     return s;
+}
+
+std::vector<int32_t> HeatEngine::active_units(float min_heat, size_t max_units) const {
+    std::vector<std::pair<float, int32_t>> cands;
+    if (!enabled_) return {};
+    for (size_t u = 0; u < movable_.size(); ++u) {
+        if (!movable_[u]) continue;
+        const int32_t p = pos_[u];
+        if (p >= 0 && (size_t)p < heat_.size() && heat_[(size_t)p] >= min_heat) {
+            cands.emplace_back(heat_[(size_t)p], (int32_t)u);
+        }
+    }
+    if (cands.size() > max_units) {
+        std::partial_sort(cands.begin(), cands.begin() + max_units, cands.end(),
+                          [](const auto& a, const auto& b) { return a.first > b.first; });
+        cands.resize(max_units);
+    }
+    std::vector<int32_t> res;
+    res.reserve(cands.size());
+    for (const auto& c : cands) res.push_back(c.second);
+    return res;
 }
 
 }  /* namespace rad */

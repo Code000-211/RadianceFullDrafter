@@ -277,6 +277,17 @@ void Engine::tiering_dispatch(Rank& r, int step) {
      * boundary the arbiter happens to be moving reorder the engine's own decisions. */
     (void)r.mover.balance(&r.heat);
 }
+
+void Engine::on_prefix_hit(const Request& r, const std::vector<int32_t>& units) {
+    if (!cfg_.prefix_aware_prefetch || units.empty()) return;
+    for (auto& rk : ranks_) {
+        if (!rk->heat.enabled()) continue;
+        for (int32_t u : units) {
+            rk->heat.boost_unit(u, 25.0f);
+        }
+        rk->heat.set_burst_moves(16);
+    }
+}
 /* ------------------------------------------------------------------ the rank thread */
 void Engine::rank_loop(int index) {
     Rank& r = *ranks_[(size_t)index];
@@ -1440,6 +1451,15 @@ int Engine::serve() {
 
     kv_iface_ = std::make_unique<KVBinding<KVManager>>(&ranks_[0]->kv);
     pc_iface_ = std::make_unique<PCBinding<PrefixCache>>(&ranks_[0]->prefix);
+    {
+        auto* pcb = static_cast<PCBinding<PrefixCache>*>(pc_iface_.get());
+        pcb->hot_units_fn = [this]() {
+            return ranks_.empty() ? std::vector<int32_t>{} : ranks_[0]->heat.active_units(0.5f);
+        };
+        pcb->on_prefix_hit = [this](const Request& r, const std::vector<int32_t>& units) {
+            on_prefix_hit(r, units);
+        };
+    }
     /* THE RESTORE PATH, installed only when the tiers are on. The scheduler calls this before the
      * admission lookup and must not know what a tier is; the engine does, so the knowledge lives
      * here as a callable rather than as an include in core/sched.
