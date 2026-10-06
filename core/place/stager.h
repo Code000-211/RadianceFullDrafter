@@ -106,7 +106,6 @@ private:
     bool     full_ = false;
     bool     armed_ = false;
     bool     first_op_ = false;                  /* the pass has issued nothing yet */
-    bool     needs_resync_ = false;              /* whether weights tables must be synced on next op */
     std::vector<uint8_t> started_;               /* by layer: staged (or tried) this pass */
     int32_t  pass_kind_ = 0;
     int32_t  last_issued_ = -1;

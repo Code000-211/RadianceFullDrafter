@@ -72,20 +72,12 @@ struct SchedReq {
     }
 
     int suggest_depth(int default_depth, bool adaptive) const {
-        if (!adaptive) return default_depth;
-        /* Balanced Multi-Tier Speculative Depth Controller:
-         * - Depth 3 is the rock-solid floor (zero regression).
-         * - Depth 4 requires accepted_streak >= 4 and ema_accept >= 2.75f (proven to give code +4.7%, chat +12.5%, reasoning +5.2%).
-         * - Depth 5 requires accepted_streak >= 7 and ema_accept >= 3.75f (pure math/json bursts).
-         * - Depth 6 requires accepted_streak >= 10 and ema_accept >= 4.75f.
-         */
-        if (default_depth >= 6 && accepted_streak >= 10 && ema_accept >= 4.75f) {
-            return 6;
-        }
-        if (default_depth >= 5 && accepted_streak >= 7 && ema_accept >= 3.75f) {
-            return 5;
-        }
-        if (default_depth >= 4 && accepted_streak >= 4 && ema_accept >= 2.75f) {
+        if (!adaptive || default_depth < 4) return default_depth;
+        /* Only expand to depth 4 if this specific sequence has demonstrated
+         * a sustained 100% acceptance streak of at least 4 steps and ema_accept >= 2.75f.
+         * This strictly guards code and file_edit from premature depth 4 promotion,
+         * while allowing math/json bursts to reach depth 4. */
+        if (accepted_streak >= 4 && ema_accept >= 2.75f) {
             return 4;
         }
         return 3;
