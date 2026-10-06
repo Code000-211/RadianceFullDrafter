@@ -79,14 +79,19 @@ int PrefillStager::init(const Program& prog, const Plan& plan, Mover* mover, cha
 }
 
 bool PrefillStager::begin_pass(const RadBatch* b) {
-    armed_ = full_ && enabled() && b && b->n_tok >= min_rows_;
+    has_wrapped_ = false;
+    for (int b_idx = 0; b_idx < n_bufs_; ++b_idx) {
+        if (wrapped_[b_idx] && holds_[b_idx] >= 0) has_wrapped_ = true;
+    }
+    armed_ = enabled() && b && ((full_ && b->n_tok >= min_rows_) || has_wrapped_);
     if (!armed_) return false;
     std::fill(started_.begin(), started_.end(), (uint8_t)0);
     first_op_ = true;
     pass_kind_ = b->draft_pass;
     last_issued_ = -1;
-    is_chunked_prefill_ = ((b->phase == RAD_PHASE_PREFILL || b->phase == RAD_PHASE_MIXED) && b->n_out == 0);
-    is_final_prefill_   = ((b->phase == RAD_PHASE_PREFILL || b->phase == RAD_PHASE_MIXED) && b->n_out > 0);
+    const bool is_prefill = (b->n_tok >= min_rows_) || (b->phase == RAD_PHASE_PREFILL) || (b->phase == RAD_PHASE_MIXED);
+    is_chunked_prefill_ = is_prefill && b->n_out == 0;
+    is_final_prefill_   = is_prefill && b->n_out > 0;
 
     /* Preserve any wrap-around pre-staged buffers from the previous chunk/pass */
     for (int b_idx = 0; b_idx < n_bufs_; ++b_idx) {
@@ -154,17 +159,28 @@ int PrefillStager::before_op(rad_op h, RadStream s, bool* resync) {
      * With n_bufs_ staging buffers, pre-launch all initial buffers into the mover stream! */
     if (first_op_) {
         first_op_ = false;
-        const auto it = std::lower_bound(layers_.begin(), layers_.end(), (int32_t)h,
-                                         [](const Layer& L, int32_t op) { return L.first_op < op; });
-        if (it != layers_.end()) {
-            const int32_t li = (int32_t)(it - layers_.begin());
-            for (int k = 0; k < n_bufs_; ++k) {
-                const int32_t lik = li + k;
-                if ((size_t)lik < layers_.size() && !started_[(size_t)lik] && will_issue(lik)) {
-                    RAD_TRY(start(lik));
+        if (is_chunked_prefill_ || is_final_prefill_) {
+            const auto it = std::lower_bound(layers_.begin(), layers_.end(), (int32_t)h,
+                                             [](const Layer& L, int32_t op) { return L.first_op < op; });
+            if (it != layers_.end()) {
+                const int32_t li = (int32_t)(it - layers_.begin());
+                if (!started_[(size_t)li] && will_issue(li)) {
+                    RAD_TRY(start(li));
                     *resync = true;
                 }
+                if (layers_.size() > 2) {
+                    for (int k = 1; k < n_bufs_; ++k) {
+                        const int32_t lik = li + k;
+                        if ((size_t)lik < layers_.size() && !started_[(size_t)lik] && will_issue(lik)) {
+                            RAD_TRY(start(lik));
+                        }
+                    }
+                }
             }
+        } else if (has_wrapped_) {
+            /* Decode drain pass: we have wrap-around pre-staged buffers from the prefill pass!
+             * Resync residency table so kernels immediately point to the VRAM staged addresses. */
+            *resync = true;
         }
     }
 
@@ -175,11 +191,19 @@ int PrefillStager::before_op(rad_op h, RadStream s, bool* resync) {
     /* This layer's copies were published ahead: wait for mover stream transfer to complete */
     if (holds_[b] == li) RAD_TRY(rad_event_wait(s, done_[b]));
 
-    /* Safety check: ensure layer li + n_bufs_ - 1 is launched */
-    const int32_t ahead = li + n_bufs_ - 1;
-    if ((size_t)ahead < layers_.size() && !started_[(size_t)ahead] && will_issue(ahead)) {
-        RAD_TRY(start(ahead));
-        *resync = true;
+    /* The layer before is done with its buffer: released here for small models */
+    if (layers_.size() <= 2) {
+        for (int b_idx = 0; b_idx < n_bufs_; ++b_idx)
+            if (holds_[b_idx] >= 0 && holds_[b_idx] != li && read_[b_idx]) release(b_idx);
+    }
+
+    /* Safety check: ensure layer ahead is launched during prefill */
+    if (is_chunked_prefill_ || is_final_prefill_) {
+        const int32_t ahead = li + (layers_.size() > 2 ? n_bufs_ - 1 : 1);
+        if ((size_t)ahead < layers_.size() && !started_[(size_t)ahead] && will_issue(ahead)) {
+            RAD_TRY(start(ahead));
+            *resync = true;
+        }
     }
     return RAD_OK;
 }
@@ -196,17 +220,21 @@ int PrefillStager::after_op(rad_op h, RadStream s) {
         RAD_TRY(rad_event_record(free_[b], s));
         free_rec_[b] = true;
         read_[b] = true;
-        release(b);
-        const int32_t next = li + n_bufs_;
-        if ((size_t)next < layers_.size() && !started_[(size_t)next] && will_issue(next)) {
-            RAD_TRY(start(next));
-        } else if ((size_t)next >= layers_.size() && (is_chunked_prefill_ || is_final_prefill_)) {
-            /* CHUNK-TO-CHUNK or PREFILL-TO-DECODE PREFETCH:
-             * As the final layers of this chunk (e.g. layers 45, 46, 47) complete, wrap around
-             * and pre-stage Layer 0, Layer 1, Layer 2 for the upcoming chunk / decode step! */
-            const int32_t wrap_layer = next - (int32_t)layers_.size();
-            if (wrap_layer >= 0 && wrap_layer < n_bufs_) {
-                RAD_TRY(start_wrap(wrap_layer, b));
+        if (layers_.size() > 2) {
+            release(b);
+            if (is_chunked_prefill_ || is_final_prefill_) {
+                const int32_t next = li + n_bufs_;
+                if ((size_t)next < layers_.size() && !started_[(size_t)next] && will_issue(next)) {
+                    RAD_TRY(start(next));
+                } else if ((size_t)next >= layers_.size()) {
+                    /* CHUNK-TO-CHUNK or PREFILL-TO-DECODE PREFETCH:
+                     * As the final layers of this chunk (e.g. layers 45, 46, 47) complete, wrap around
+                     * and pre-stage Layer 0, Layer 1, Layer 2 for the upcoming chunk / decode step! */
+                    const int32_t wrap_layer = next - (int32_t)layers_.size();
+                    if (wrap_layer >= 0 && wrap_layer < n_bufs_) {
+                        RAD_TRY(start_wrap(wrap_layer, b));
+                    }
+                }
             }
         }
     }

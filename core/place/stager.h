@@ -108,6 +108,7 @@ private:
     bool     first_op_ = false;                  /* the pass has issued nothing yet */
     bool     is_chunked_prefill_ = false;
     bool     is_final_prefill_ = false;
+    bool     has_wrapped_ = false;
     std::vector<uint8_t> started_;               /* by layer: staged (or tried) this pass */
     int32_t  pass_kind_ = 0;
     int32_t  last_issued_ = -1;
