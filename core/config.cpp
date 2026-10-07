@@ -6,6 +6,7 @@
  * (spec §6).
  */
 #include "rad_core.h"
+#include "runtime/rad_ridgefill_wrapper.h"
 #include "sample/host_ref.h"
 #include "server/oai.h"
 
@@ -188,6 +189,9 @@ static const Flag g_flags[] = {
     { "--max-source-pixels",  "N",      "the largest image or video frame the decoder accepts, before any resize\n"
     "                                    (default 67108864). The media flags above default to what the container\n"
     "                                    states, and do nothing for a model that takes no media" },
+
+    { "--ridgefill",          "MODE",   "RidgeFill cold prefill acceleration: off|speed|quality|plumb (default off)" },
+    { "--ridgefill-projector", "DIR",   "path to RidgeFill projector folder (default <model dir>/projector)" },
 
     { "--kld-record",         "DIR",    "instead of serving, run --kld-corpus through prefill and write this\n"
     "                                    model's log-probabilities at every scored position to DIR: the\n"
@@ -442,6 +446,12 @@ int config_parse(int argc, char** argv, Config* c) {
         else if (S("--no-prefix-cache"))       c->prefix_cache = false;
         else if (S("--prefix-aware-prefetch"))    c->prefix_aware_prefetch = true;
         else if (S("--no-prefix-aware-prefetch")) c->prefix_aware_prefetch = false;
+        else if (S("--ced-prefetch"))             c->ced_prefetch = true;
+        else if (S("--no-ced-prefetch"))          c->ced_prefetch = false;
+        else if (S("--ced-lookahead"))            { if (!(v = need(i))) return RAD_E_INVAL; c->ced_lookahead = atoi(v); }
+        else if (S("--ced-threshold"))            { if (!(v = need(i))) return RAD_E_INVAL; c->ced_threshold = (float)atof(v); }
+        else if (S("--ced-topk"))                 { if (!(v = need(i))) return RAD_E_INVAL; c->ced_top_k = atoi(v); }
+        else if (S("--ced-reuse-ridgefill"))      c->ced_reuse_ridgefill = true;
         else if (S("--checkpoint-policy")) {
             if (!(v = need(i))) return RAD_E_INVAL;
             /* Named here rather than accepted blind: a policy name this build does not know would
@@ -668,6 +678,13 @@ int config_parse(int argc, char** argv, Config* c) {
              : S("--video-max-frames") ? c->video_max_frames
                                        : c->video_max_frame_tokens) = (int32_t)n;
         }
+        else if (S("--ridgefill")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if (std::string(v) != "off" && std::string(v) != "speed" && std::string(v) != "quality" && std::string(v) != "plumb") {
+                RAD_ERR("--ridgefill must be off, speed, quality, or plumb (got '%s')", v); return RAD_E_INVAL; }
+            c->ridgefill = v;
+        }
+        else if (S("--ridgefill-projector"))   { if (!(v = need(i))) return RAD_E_INVAL; c->ridgefill_projector = v; }
         else if (S("--kld-record"))            { if (!(v = need(i))) return RAD_E_INVAL; c->kld_record = v; }
         else if (S("--kld-ref"))               { if (!(v = need(i))) return RAD_E_INVAL; c->kld_ref = v; }
         else if (S("--kld-corpus"))            { if (!(v = need(i))) return RAD_E_INVAL; c->kld_corpus = v; }
@@ -789,6 +806,12 @@ int config_parse(int argc, char** argv, Config* c) {
         RAD_ERR("--video-min-pixels is above --video-max-pixels"); return RAD_E_INVAL; }
     if (c->video_min_frames && c->video_max_frames && *c->video_min_frames > *c->video_max_frames) {
         RAD_ERR("--video-min-frames is above --video-max-frames"); return RAD_E_INVAL; }
+
+    /* Normalise and export RidgeFill flags to environment for plugin compatibility */
+    {
+        auto rf_cfg = rad::ridgefill::InteropConfig::from_env_and_flags(c->ridgefill, c->ridgefill_projector);
+        rf_cfg.apply_to_env();
+    }
 
     return RAD_OK;
 }

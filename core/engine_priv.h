@@ -24,6 +24,7 @@
 #include "place/planner.h"
 #include "place/mover.h"
 #include "place/stager.h"
+#include "place/prefetch.h"
 #include "runtime/ctx.h"
 #include "sample/sampler.h"
 #include "sched/advance.h"
@@ -82,6 +83,7 @@ struct Engine::Rank {
      * every pass. With both stagers in use the chain hands each the passes it armed for. */
     FileStager  fstager;
     StagerChain stagers;
+    CedPrefetcher prefetcher;
     Ctx       ctx;
     Sampler   sampler;          /* one per rank: each samples its own vocab shard (spec §9) */
     rad_buf   tok_buf = 0;      /* where the chain writes the sampled ids */

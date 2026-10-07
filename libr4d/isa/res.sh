@@ -7,8 +7,8 @@
 # SPILL IS THE LOUD COLUMN, and SCRATCH after it: spilled registers are a memory round trip the
 # source does not show, and scratch without spills is a private array the compiler could not keep
 # in registers. WAVES is the other one: on gfx1201 a SIMD has 1536 VGPRs in wave32 allocated in
-# groups of 8, so 256 VGPRs is 6 waves and 128 is 12 -- and LDS can cut it further, which this
-# column does NOT model.
+# groups of 24, so 256 VGPRs is 5 waves, 240 is 6 waves, and 128 is 10 waves (allocating 144) --
+# and LDS can cut it further, which this column does NOT model.
 #
 # The metadata is msgpack printed as YAML and its keys are ALPHABETICAL, so .vgpr_count comes after
 # .symbol and .sgpr_count before it. Emitting a row at .symbol prints the previous kernel's VGPR
@@ -33,7 +33,7 @@ awk -v OFS='\t' '
   /^ *\.vgpr_spill_count:/           { vs  = $2 }
   /^ *\.max_flat_workgroup_size:/    { wg  = $2 }
   /^ *\.name:/                       { nm  = $2 }
-  /^ *\.wavefront_size:/ { if (nm != "") { g = int((v + 7) / 8) * 8; w = (g > 0) ? int(1536 / g) : 16
+  /^ *\.wavefront_size:/ { if (nm != "") { g = int((v + 23) / 24) * 24; w = (g > 0) ? int(1536 / g) : 16
                                            if (w > 16) w = 16
                                            print v, s, lds, sc, vs + ss, w, wg, nm; nm = "" } }
 ' "$D"/*.md | sort -k5,5nr -k4,4nr -k1,1nr

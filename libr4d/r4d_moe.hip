@@ -94,6 +94,7 @@ using r4d_fp8::Stage8;
 using r4d_fp8::stage8_load;
 using r4d_fp8::stage8_store;
 using r4d_fp8::lds_pitch;
+using r4d_fp8::r4d_f8_ntu4;
 
 #define R4D_MOE_CHK() do { hipError_t e_ = hipGetLastError();                       \
                            if (e_ != hipSuccess) return -100 - (int)e_; } while (0)
@@ -836,8 +837,15 @@ __device__ __forceinline__ Stage8 w5_expand(uint4 p, uint32_t sg, const uint32_t
  * lane's zeros expand to entry 0, which is E4M3 zero under -8..7 and 1.125 under w4nl; either way
  * the column contributes nothing, because the staging gives a column this block does not own a
  * weight scale of zero. */
+template <bool NT = false>
 __device__ __forceinline__ uint4 w4_load(const uint8_t* __restrict__ src, bool live) {
-    return live ? *(const uint4*)src : make_uint4(0, 0, 0, 0);
+    if (!live) return make_uint4(0, 0, 0, 0);
+    if constexpr (NT) {
+        return __builtin_bit_cast(uint4,
+                   __builtin_nontemporal_load((const r4d_f8_ntu4*)src));
+    } else {
+        return *(const uint4*)src;
+    }
 }
 
 /* ================================================================== moe_gemm_q
@@ -1560,7 +1568,7 @@ static_assert(MoeQArgs::count <= RAD_MAX_KPARAMS,
  *   - NOTHING TO FOLD: the WMMA accumulates into the output tile across every pass of K.
  */
 constexpr uint32_t kBK16 = 64;            // bf16 K elements staged per pass
-constexpr uint32_t kP16  = kBK16 + 8;     // the LDS row pitch, in elements
+constexpr uint32_t kP16  = kBK16 + 12;    // the LDS row pitch, in elements (76 elements = 38 dwords, gcd(38, 32)=2)
 
 typedef __bf16 mb_v8bf __attribute__((ext_vector_type(8)));
 typedef float  mb_v8f  __attribute__((ext_vector_type(8)));
@@ -1773,13 +1781,17 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_bf16_kernel(
             for (uint32_t p = 0; p < kAC; ++p) {
                 const uint32_t c = tid + p * NTHR;
                 if (c >= FM * kCPR) continue;
-                *(uint4*)(s_a + (c / kCPR) * kP16 + (c % kCPR) * 8) = apre[p];
+                const uint32_t r = c / kCPR, kk = (c % kCPR) * 8;
+                *(uint2*)(s_a + r * kP16 + kk)     = make_uint2(apre[p].x, apre[p].y);
+                *(uint2*)(s_a + r * kP16 + kk + 4) = make_uint2(apre[p].z, apre[p].w);
             }
 #pragma unroll
             for (uint32_t p = 0; p < kBC; ++p) {
                 const uint32_t c = tid + p * NTHR;
                 if (c >= FN * kCPR) continue;
-                *(uint4*)(s_b + (c / kCPR) * kP16 + (c % kCPR) * 8) = bpre[p];
+                const uint32_t r = c / kCPR, kk = (c % kCPR) * 8;
+                *(uint2*)(s_b + r * kP16 + kk)     = make_uint2(bpre[p].x, bpre[p].y);
+                *(uint2*)(s_b + r * kP16 + kk + 4) = make_uint2(bpre[p].z, bpre[p].w);
             }
             if (k0 + kBK16 < K) issue(k0 + kBK16);
             __syncthreads();

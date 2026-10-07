@@ -668,6 +668,11 @@ struct Config {
     int64_t checkpoint_slots = 8;
     bool    prefix_cache = true;
     bool    prefix_aware_prefetch = true;  /* --prefix-aware-prefetch / --no-prefix-aware-prefetch */
+    bool    ced_prefetch = true;           /* --ced-prefetch / --no-ced-prefetch */
+    int     ced_lookahead = 4;             /* --ced-lookahead ΔL (default 4 layers ahead) */
+    float   ced_threshold = 0.15f;         /* --ced-threshold probability threshold tau */
+    int     ced_top_k = 2;                 /* --ced-topk candidates per lookahead */
+    bool    ced_reuse_ridgefill = false;   /* --ced-reuse-ridgefill */
     /* geometric-backoff | tip-only | keep-all. §19.1 records the default as a GUESS until there is
      * a workload to measure, and core/mem/prefix.h ships the two ends of the trade beside it for
      * exactly that measurement -- which needs a way to select them. */
@@ -721,6 +726,10 @@ struct Config {
      * the throughput the same container gives at its declared depth. */
     int     n_spec = -1;                /* --num-speculative-tokens; -1 = auto, 0 = off */
     bool    adaptive_spec = false;     /* --adaptive-spec: enable dynamic speculative depth controller */
+
+    /* RidgeFill cold prefill projector acceleration */
+    std::string ridgefill;              /* --ridgefill off|speed|quality|plumb */
+    std::string ridgefill_projector;    /* --ridgefill-projector DIR */
 
     /* ---------------- KL DIVERGENCE AGAINST A REFERENCE (core/kld.h) ----------------
      *

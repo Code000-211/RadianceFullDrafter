@@ -252,6 +252,9 @@ void r4d_gdn_kkt_solve_kernel(const unsigned short* __restrict__ k,
       *(uint2*)(&s.TMP[blk * 16 + lo][8 * hi + 4]) = f2bf4(X[4], X[5], X[6], X[7]);
       // fragT reads A column-wise below, so the merge result only needs the row-major copy
       __builtin_amdgcn_wave_barrier();
+#if defined(__AMDGCN__)
+      asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
+#endif
       // M10 = -D1 . X    (left D1 row-major, in place in A; right X transposed, in TMP)
       v8f Y = (v8f){0, 0, 0, 0, 0, 0, 0, 0};
       Y = mma(frag(&s.A[0][0], AP, r0 + 16, r0 + 16, lane),

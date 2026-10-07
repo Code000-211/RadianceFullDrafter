@@ -59,39 +59,56 @@ struct SchedReq {
     int32_t  n_draft = 0;
     int32_t  conv_cursor = 0;
     int32_t  accepted_streak = 0;
-    float    ema_accept = 2.4f;
+    int32_t  rejected_streak = 0;
+    int32_t  last_accepted = 3;
+    float    ema_accept = 2.8f;
 
     void observe_draft(int drafted, int accepted) {
         if (drafted <= 0) return;
-        if (accepted >= 3) {
+        last_accepted = accepted;
+        if (accepted >= 3 || (accepted == drafted && accepted >= 2)) {
             ++accepted_streak;
+            rejected_streak = 0;
         } else if (accepted == 2) {
-            accepted_streak = std::max(0, accepted_streak - 1);
+            accepted_streak = std::min(accepted_streak, 1);
+            rejected_streak = 0;
+        } else if (accepted == 1) {
+            accepted_streak = 0;
+            rejected_streak = 0;
         } else {
             accepted_streak = 0;
+            ++rejected_streak;
         }
-        ema_accept = 0.75f * ema_accept + 0.25f * (float)accepted;
+        ema_accept = 0.70f * ema_accept + 0.30f * (float)accepted;
     }
 
     int suggest_depth(int default_depth, bool adaptive, bool multi_seq = false, int max_cap = 5) const {
         if (!adaptive) return default_depth;
-        /* Safe Floor is strictly default_depth (3) so code & reasoning never regress.
-         * In multi-sequence concurrency (C8), bursting to depth 4 floods L2 cache
-         * across 256 experts (400 slots). Keep C8 strictly at default_depth (3)
-         * to preserve maximum cache locality and peak throughput. */
+        /* In multi-sequence concurrency (C8), strictly lock depth to 3.
+         * Depth 3 yields peak concurrency throughput (534.8 tok/s in arm14_spec3_warm)
+         * without falling into the depth-2 under-speculation trap. */
         if (multi_seq) {
             return std::min(default_depth, 3);
         } else {
-            /* Single-stream: burst to 4 on steady streak >= 3 and ema >= 2.5f (code/json/math/file_edit),
-             * and burst to 5 on strong streak >= 6 and ema >= 3.2f */
-            if (accepted_streak >= 6 && ema_accept >= 3.2f) {
+            /* Single-stream (batch=1):
+             * Dynamically promote to depth 4 and 5 on fluent acceptance:
+             * - Promote to depth 5 when:
+             *     (accepted_streak >= 2 && ema_accept >= 2.40f && last_accepted >= 3) ||
+             *     (accepted_streak >= 3 && ema_accept >= 2.30f && last_accepted >= 2)
+             * - Promote to depth 4 when:
+             *     (accepted_streak >= 1 && ema_accept >= 1.85f && last_accepted >= 2) ||
+             *     (accepted_streak >= 2 && ema_accept >= 1.70f)
+             * - Floor is strictly default_depth (3) to prevent regression on creative prose & summarization. */
+            if ((accepted_streak >= 2 && ema_accept >= 2.40f && last_accepted >= 3) ||
+                (accepted_streak >= 3 && ema_accept >= 2.30f && last_accepted >= 2)) {
                 return std::min(max_cap, 5);
             }
-            if (accepted_streak >= 3 && ema_accept >= 2.5f) {
+            if ((accepted_streak >= 1 && ema_accept >= 1.85f && last_accepted >= 2) ||
+                (accepted_streak >= 2 && ema_accept >= 1.70f)) {
                 return std::min(max_cap, 4);
             }
+            return std::min(default_depth, 3);
         }
-        return default_depth;
     }
 
     /* HOW MUCH OF A SERIAL DRAFTER`S OWN ATTENTION HISTORY IS VALID: positions [0, draft_filled)
@@ -136,14 +153,16 @@ struct SchedReq {
      * greedy prompt yields a different completion per request, reproducible request-for-request
      * across processes, and only ever with speculation on. */
     void drafter_reset() {
-        n_draft      = 0;
-        draft_next   = 0;
-        conv_cursor  = 0;
-        draft_filled = 0;
-        draft_lo     = 0;
-        draft_hi     = 0;
+        n_draft         = 0;
+        draft_next      = 0;
+        conv_cursor     = 0;
+        draft_filled    = 0;
+        draft_lo        = 0;
+        draft_hi        = 0;
         accepted_streak = 0;
-        ema_accept   = 2.4f;
+        rejected_streak = 0;
+        last_accepted   = 3;
+        ema_accept      = 2.8f;
     }
 
     int32_t  sched_tokens = 0;   /* tokens given to this request in the current step */
@@ -480,6 +499,8 @@ public:
     void                 publish(bool idle);
     SchedMetrics         observed_metrics() const;
     int                  observed_requests(ReqStat* out, int max) const;
+    size_t               num_waiting() const { std::lock_guard<std::mutex> lk(mu_); return waiting_.size(); }
+    size_t               num_running() const { std::lock_guard<std::mutex> lk(mu_); return running_.size(); }
 
     /* Visible for tests: the chunk the scheduler would give a request at `n_computed` under a
      * token budget, and the checkpoint position it will land on (-1 for none). */

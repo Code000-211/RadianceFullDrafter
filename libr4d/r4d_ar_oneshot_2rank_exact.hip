@@ -44,6 +44,9 @@ __device__ __forceinline__ void store_sys_rel(unsigned int* p, unsigned int v) {
 __device__ __forceinline__ unsigned int load_sys_acq(const unsigned int* p) {
   return __hip_atomic_load(p, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
 }
+__device__ __forceinline__ void r4d_ar_acquire(int acq) {
+  if (acq) __threadfence_system();
+}
 __device__ __forceinline__ float rd_to_f(const float& x) { return x; }
 __device__ __forceinline__ float rd_to_f(const __half& x) { return __half2float(x); }
 __device__ __forceinline__ float rd_to_f(const __hip_bfloat16& x) { return (float)x; }
@@ -114,7 +117,7 @@ __global__ void r4d_ar_oneshot_2rank_exact_kernel(
     }
   }
   __syncthreads();
-  if (acq) __threadfence_system();
+  r4d_ar_acquire(acq);
   // reduce chunk (vectorized, 4x-unrolled): out = local input + peer input (staged in local scratch)
   {
     int k = start + tid;
@@ -163,8 +166,7 @@ __global__ void r4d_ar_hc_write_kernel(
     }
     for (; k < end; k += nt) ps[k] = y4[k];
   }
-  if (drain == 1) __threadfence_system();
-  else if (drain == 3) asm volatile("s_wait_storecnt 0x0" ::: "memory");
+  __threadfence_system();
   __syncthreads();
   if (tid == 0) {
     if (drain == 2) __threadfence_system();
@@ -175,7 +177,7 @@ __global__ void r4d_ar_hc_write_kernel(
     }
   }
   __syncthreads();
-  if (acq) __threadfence_system();
+  r4d_ar_acquire(acq);
 
   const int wpr = n >> 3;                 // 16B words a row
   for (int k = start + tid; k < end; k += nt) {
@@ -274,8 +276,7 @@ __global__ void r4d_ar_gather_hc_write_kernel(
     y4[k] = out;
     ps[k] = out;
   }
-  if (drain == 1) __threadfence_system();
-  else if (drain == 3) asm volatile("s_wait_storecnt 0x0" ::: "memory");
+  __threadfence_system();
   __syncthreads();
   if (tid == 0) {
     if (drain == 2) __threadfence_system();
@@ -286,7 +287,7 @@ __global__ void r4d_ar_gather_hc_write_kernel(
     }
   }
   __syncthreads();
-  if (acq) __threadfence_system();
+  r4d_ar_acquire(acq);
 
   for (int k = start + tid; k < end; k += nt) {
     const int4 r = vadd<__hip_bfloat16, 8>(y4[k], ms[k]);

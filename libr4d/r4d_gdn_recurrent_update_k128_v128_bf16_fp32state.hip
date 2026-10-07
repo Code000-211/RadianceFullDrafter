@@ -1038,19 +1038,25 @@ extern "C" int r4d_gdn_recurrent_update_k128_v128_bf16_fp32state(
 // ordered by the dependency between them.
 constexpr unsigned kMaxConvCtr = 4096;
 
-static unsigned int* ru_conv_ctr(RadStream s, const void* out) {
+static unsigned int* ru_conv_ctr(RadStream s, const void* out, size_t required = 4096) {
   static std::mutex m;
-  static std::map<std::pair<RadStream, const void*>, unsigned int*> blocks;
+  struct Entry { unsigned int* ptr; size_t cap; };
+  static std::map<std::pair<RadStream, const void*>, Entry> blocks;
   std::lock_guard<std::mutex> lk(m);
   const auto key = std::make_pair(s, out);
-  if (auto it = blocks.find(key); it != blocks.end()) return it->second;
+  const size_t needed = std::max<size_t>(4096, required);
+  if (auto it = blocks.find(key); it != blocks.end()) {
+    if (it->second.cap >= needed) return it->second.ptr;
+    (void)hipFree(it->second.ptr);
+    blocks.erase(it);
+  }
   void* p = nullptr;
-  if (hipMalloc(&p, (size_t)kMaxConvCtr * sizeof(unsigned int)) != hipSuccess) return nullptr;
-  if (hipMemset(p, 0, (size_t)kMaxConvCtr * sizeof(unsigned int)) != hipSuccess) {
+  if (hipMalloc(&p, needed * sizeof(unsigned int)) != hipSuccess) return nullptr;
+  if (hipMemset(p, 0, needed * sizeof(unsigned int)) != hipSuccess) {
     (void)hipFree(p);
     return nullptr;
   }
-  blocks.emplace(key, (unsigned int*)p);
+  blocks.emplace(key, Entry{ (unsigned int*)p, needed });
   return (unsigned int*)p;
 }
 
@@ -1332,7 +1338,7 @@ extern "C" int r4d_rad_gdn_conv_recurrent_update(const RadArgs* a, RadStream s) 
     cv.cs_seq = (long)cst->stride[0]; cv.cs_dim = (long)cst->stride[1];
     cv.cs_tok = (long)cst->stride[2];
     cv.cidx = (const int*)cidx->data; cv.ci_stride = (long)cidx->stride[0];
-    cv.ctr = ru_conv_ctr(s, o->data);
+    cv.ctr = ru_conv_ctr(s, o->data, (size_t)N * Hg);
     if (!cv.ctr) return R4D_NO(RAD_E_NOMEM);
 
     return ru_conv_recurrent_launch(

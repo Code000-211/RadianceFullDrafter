@@ -49,14 +49,12 @@ public:
         if (p_.max_depth < 3) return p_.max_depth;
 
         /* Concurrency: strictly clamp to optimal baseline depth 3.
-         * Empirical proof on Dual R9700 (gfx1201):
-         * - Depth 4 in concurrency causes divergent sequence rejections and regresses throughput to ~443-453 t/s.
-         * - Depth 3 is the rock-solid optimal sweet spot for C8 (479.5 - 532.4 t/s). */
+         * Depth 3 maximizes tokens accepted per step while keeping latency within bounds. */
         if (active_seqs > 1) return std::min(p_.max_depth, 3);
 
-        /* Single stream: safe baseline floor is 3. SchedReq::suggest_depth dynamically
-         * promotes depth to 4 or 5 upon proven high-acceptance streaks. */
-        return std::min(p_.max_depth, 3);
+        /* Single stream: return full ceiling p_.max_depth so SchedReq::suggest_depth
+         * can dynamically promote to depth 4 or 5 on high-acceptance streaks. */
+        return p_.max_depth;
     }
 
     /* One verify's outcome: `drafted` tokens were proposed and a prefix of `accepted` of them was

@@ -69,14 +69,18 @@ Engine::~Engine() {
      * per-layer residency histogram at the end of it is the number that says whether the global
      * ranking starved a layer, which is the failure this engine has and a hit rate cannot show. */
     for (auto& r : ranks_) {
-        if (!r->heat.enabled()) continue;
         LogRank lr(r->index);
-        RAD_INFO("%s", r->heat.report().c_str());
-        RAD_INFO("  routing evidence: %llu layer-histograms credited, %llu layer-sweeps found "
-                 "nothing new, %llu dropped by a ring shallower than the run-ahead",
-                 (unsigned long long)r->heat_credited, (unsigned long long)r->heat_idle,
-                 (unsigned long long)r->ctx.route_dropped());
-        RAD_INFO("%s", r->mover.report().c_str());
+        if (r->heat.enabled()) {
+            RAD_INFO("%s", r->heat.report().c_str());
+            RAD_INFO("  routing evidence: %llu layer-histograms credited, %llu layer-sweeps found "
+                     "nothing new, %llu dropped by a ring shallower than the run-ahead",
+                     (unsigned long long)r->heat_credited, (unsigned long long)r->heat_idle,
+                     (unsigned long long)r->ctx.route_dropped());
+            RAD_INFO("%s", r->mover.report().c_str());
+        }
+        if (r->prefetcher.enabled()) {
+            RAD_INFO("%s", r->prefetcher.report().c_str());
+        }
     }
     for (auto& r : ranks_) r->ctx.shutdown();
     step_state_fini();
@@ -251,24 +255,51 @@ void Engine::tiering_dispatch(Rank& r, const RadBatch* b) {
     const int32_t n_ex = (int32_t)r.ctx.route_n_expert();
     constexpr size_t kAhead = 2;
     for (size_t i = 0; i < rows.size() && i < kAhead; ++i) r.heat.prefetch(rows[i].h, n_ex);
-    for (size_t i = 0; i < rows.size(); ++i) {
-        if (i + kAhead < rows.size()) r.heat.prefetch(rows[i + kAhead].h, n_ex);
-        const Rank::HeatRow& hr = rows[i];
-        /* One histogram can stand for more than one pass: a draft head reports once per draft
-         * pass and they all land in the same bank. Crediting such a bank once underprices that
-         * layer's experts by the number of passes, and the engine then drains the layer. */
-        const int reps = r.ctx.last_histogram_reports(hr.layer, hr.bank);
-        r.heat.observe(hr.layer, hr.h, n_ex, reps > 1 ? (float)reps : 1.0f);
-        r.heat_seen[(size_t)hr.layer] = r.ctx.last_histogram_step(hr.layer, hr.bank);
-        r.ctx.mark_credited(hr.layer, hr.bank);
-        ++r.heat_credited;
+    std::vector<int32_t> coalesced;
+    for (size_t i = 0; i < rows.size(); ) {
+        const int l = rows[i].layer;
+        size_t j = i + 1;
+        while (j < rows.size() && rows[j].layer == l) ++j;
+        if (j == i + 1) {
+            if (i + kAhead < rows.size()) r.heat.prefetch(rows[i + kAhead].h, n_ex);
+            const Rank::HeatRow& hr = rows[i];
+            const int reps = r.ctx.last_histogram_reports(hr.layer, hr.bank);
+            const float rep_wt = reps > 1 ? std::min((float)reps, 2.0f) : 1.0f;
+            r.heat.observe(hr.layer, hr.h, n_ex, rep_wt);
+            if (r.prefetcher.enabled() && b->n_seq <= 1) {
+                r.prefetcher.on_step_routing(hr.layer, hr.h, n_ex);
+            }
+            r.heat_seen[(size_t)hr.layer] = r.ctx.last_histogram_step(hr.layer, hr.bank);
+            r.ctx.mark_credited(hr.layer, hr.bank);
+            ++r.heat_credited;
+        } else {
+            if (coalesced.size() < (size_t)n_ex) coalesced.resize((size_t)n_ex);
+            std::fill(coalesced.begin(), coalesced.begin() + n_ex, 0);
+            for (size_t k = i; k < j; ++k) {
+                if (k + kAhead < rows.size()) r.heat.prefetch(rows[k + kAhead].h, n_ex);
+                const Rank::HeatRow& hr = rows[k];
+                const int reps = std::max(1, r.ctx.last_histogram_reports(hr.layer, hr.bank));
+                const int rep_factor = reps > 1 ? std::min(reps, 2) : 1;
+                for (int32_t e = 0; e < n_ex; ++e) {
+                    coalesced[(size_t)e] += hr.h[e] * rep_factor;
+                }
+                r.heat_seen[(size_t)hr.layer] = r.ctx.last_histogram_step(hr.layer, hr.bank);
+                r.ctx.mark_credited(hr.layer, hr.bank);
+                ++r.heat_credited;
+            }
+            r.heat.observe(l, coalesced.data(), n_ex, 1.0f);
+            if (r.prefetcher.enabled() && b->n_seq <= 1) {
+                r.prefetcher.on_step_routing(l, coalesced.data(), n_ex);
+            }
+        }
+        i = j;
     }
 
     const bool is_final_pf = ((b->phase == RAD_PHASE_PREFILL || b->phase == RAD_PHASE_MIXED) &&
                               b->n_out > 0 && b->n_tok >= 512);
     if (is_final_pf) {
         /* Prefill-to-decode transition: burst-promote hot non-resident experts into VRAM slab.
-         * Under concurrency, grant 4-8 moves so all-stream resident working sets are pre-warmed. */
+         * Under high concurrency (n_seq >= 4), throttle burst to avoid PCIe all-reduce contention. */
         const int burst = (b->n_seq <= 2) ? 16 : (b->n_seq <= 4 ? 8 : 4);
         r.heat.set_burst_moves(burst);
     }
@@ -276,9 +307,6 @@ void Engine::tiering_dispatch(Rank& r, const RadBatch* b) {
     std::vector<Swap> swaps;
     if (r.heat.step(&swaps) < 0) return;
     for (const Swap& s : swaps) {
-        /* CONTRACT: every unit the engine named is BUSY on the way out, and a proposal that is
-         * silently dropped leaves the pair busy forever. `issue` clears it; `abandon` is what
-         * this owes the engine when the mover cannot take it. */
         if (r.mover.issue(s, &r.heat) < 0) r.heat.abandon(s);
     }
 
@@ -293,10 +321,10 @@ void Engine::on_prefix_hit(const Request& r, const std::vector<int32_t>& units) 
     for (auto& rk : ranks_) {
         if (!rk->heat.enabled()) continue;
         for (int32_t u : units) {
-            rk->heat.boost_unit(u, 25.0f);
+            rk->heat.boost_unit(u, 5.0f);
         }
-        /* Boost units' heat scores and allow burst moves to quickly warm hot prefix experts into VRAM */
-        rk->heat.set_burst_moves(std::min(48, std::max(16, (int)units.size())));
+        /* Boost units' heat scores, but keep dispatch burst capped to avoid PCIe link congestion during concurrency */
+        rk->heat.set_burst_moves(4);
     }
 }
 /* ------------------------------------------------------------------ the rank thread */
@@ -818,6 +846,8 @@ int Engine::step_loop() {
         }
 
         if (t_on) phase_mark(PH_SAVE);
+        st = mark_trunk_end(b, so);
+        if (st < 0) return fail_loop(st);
         /* A SERIAL DRAFTER'S PASSES GO IN BEHIND THE STEP BEFORE ANYTHING WAITS FOR IT. The card
          * works out the acceptance itself and every pass reads it from there (sched/advance.h),
          * so the host has nothing to wait for until the step's last pass -- and the one wait below
@@ -902,6 +932,10 @@ int Engine::step_loop() {
          *
          * ONE SWITCH ON A DECLARED SHAPE, not on a model. Both drivers return RAD_OK immediately
          * when the declared kind is not theirs, so a program with no drafter costs a compare. */
+        if (drafter_.kind == RAD_DRAFT_SERIAL) {
+            st = rad_event_sync(step_end_);
+            if (st < 0) return fail_loop(st);
+        }
         st = drafter_.kind == RAD_DRAFT_BLOCK ? run_block_drafter(b->step)
                                               : finish_serial_drafter(so);
         if (st < 0) return fail_loop(st);
@@ -974,6 +1008,11 @@ int Engine::collect_issue(const RadBatch* b, StepOut& so) {
     return RAD_OK;
 }
 
+int Engine::mark_trunk_end(const RadBatch* b, StepOut& so) {
+    if (so.n_rows > 0 && !so.rb) RAD_TRY(collect_issue(b, so));
+    return rad_event_record(trunk_end_, ranks_[0]->ctx.stream());
+}
+
 int Engine::mark_step_end(const RadBatch* b, StepOut& so) {
     if (so.n_rows > 0 && !so.rb) RAD_TRY(collect_issue(b, so));
     return rad_event_record(step_end_, ranks_[0]->ctx.stream());
@@ -990,9 +1029,9 @@ int Engine::collect_step(const RadBatch* b, StepOut& so) {
     if (so.n_rows <= 0) return RAD_OK;
 
     so.rows.resize((size_t)so.n_rows);
-    /* The step's one wait. For the step's end and not for the stream: a step issued ahead is
-     * behind it, and the host's commit and staging are what that step runs over. */
-    RAD_TRY(rad_event_sync(step_end_));
+    if (!so.rb) return RAD_E_STATE;
+    /* The step's trunk wait: sync trunk_end_ (or step_end_) */
+    RAD_TRY(rad_event_sync(trunk_end_ ? trunk_end_ : step_end_));
     std::memcpy(so.rows.data(), so.rb, (size_t)so.n_rows * sizeof(int32_t));
     so.rb = nullptr;
     const std::vector<float>& lg = so.lg;
@@ -1079,7 +1118,7 @@ int Engine::collect_step(const RadBatch* b, StepOut& so) {
             /* EVERY token that leaves, in order: the grammar's state has to advance over the
              * accepted drafts too, or the next step's mask is built n_accepted tokens behind.
              * Bounded by the truncated `acc`, so it sees exactly the tokens the client does. */
-            if (e.req)
+            if (e.req && e.req->state == ReqState::Running)
                 for (auto& rk : ranks_)
                     for (int32_t j = 0; j <= acc; ++j) {
                         const int as = rk->sampler.accept_token(e.req->id, out[j]);
@@ -1105,7 +1144,7 @@ int Engine::collect_step(const RadBatch* b, StepOut& so) {
          * state one token behind the sequence. EVERY rank, not just rank 0: each rank builds the
          * mask for its own vocabulary shard from its own automaton, so a rank whose grammar did
          * not advance masks the next step against the previous token's state. */
-        if (e.req)
+        if (e.req && e.req->state == ReqState::Running)
             for (auto& rk : ranks_) rk->sampler.accept_token(e.req->id, so.token[i]);
     }
 

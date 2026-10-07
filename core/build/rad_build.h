@@ -286,8 +286,10 @@ extern "C" {
 int rad_op_reads (RadBuilder* b, rad_op h, const rad_buf* bufs, int n);
 int rad_op_writes(RadBuilder* b, rad_op h, const rad_buf* bufs, int n);
 
+#ifndef RAD_BUFS
 #define RAD_BUFS(...)  ((const rad_buf[]){ __VA_ARGS__ }), \
                        (int)(sizeof((const rad_buf[]){ __VA_ARGS__ }) / sizeof(rad_buf))
+#endif
 
 #ifdef __cplusplus
 }   /* extern "C" */

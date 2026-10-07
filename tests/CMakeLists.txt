@@ -191,6 +191,20 @@ add_test(NAME ops_doc
                  ${RAD_OPSDOC_PLUGINS})
 set_tests_properties(ops_doc PROPERTIES SKIP_RETURN_CODE 77)
 
+# ================================================================== RDNA4 ISA compliance check
+#
+# Holds libr4d.so and built HIP kernels to the RDNA4 (gfx1201) ISA engineering standards
+# documented in docs/RDNA4_ISA_ENGINEERING_RULES.md: 24-VGPR allocation boundaries, zero-waterfall
+# loops on hot decode/draft paths, and zero scratch spills on prefill/decode kernels.
+if(RAD_HIP_FOUND AND TARGET libr4d)
+  add_test(NAME isa_compliance
+           COMMAND ${CMAKE_SOURCE_DIR}/scripts/check_isa_compliance.sh
+                   ${RAD_PLUGIN_OUT}/kernels/libr4d.so)
+  set_tests_properties(isa_compliance PROPERTIES
+    TIMEOUT 120
+    ENVIRONMENT "RADIANCE_HOME=${CMAKE_BINARY_DIR}/radiance_home")
+endif()
+
 # ================================================================== the shipped plugins, out of tree
 #
 # Every plugin radiance ships is a plugin like any other, and this is what holds that to be true:

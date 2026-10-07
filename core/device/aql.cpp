@@ -657,7 +657,8 @@ inline void publish(Stream* s, uint64_t idx, uint16_t header, uint16_t setup) {
                          static_cast<hsa_kernel_dispatch_packet_t*>(s->q->base_address) +
                          (idx & s->mask)),
                      (uint32_t)header | ((uint32_t)setup << 16), __ATOMIC_RELEASE);
-    hsa_signal_store_relaxed(s->q->doorbell_signal, (hsa_signal_value_t)idx);
+    _mm_sfence();
+    hsa_signal_store_screlease(s->q->doorbell_signal, (hsa_signal_value_t)idx);
 }
 
 /* ------------------------------------------------------------------ recorded passes
@@ -865,8 +866,9 @@ struct PlayRun {
 
     void ring() {
         if (!unrung) return;
+        _mm_sfence();
         hsa_queue_store_write_index_relaxed(s->q, next);
-        hsa_signal_store_relaxed(s->q->doorbell_signal, (hsa_signal_value_t)(next - 1));
+        hsa_signal_store_screlease(s->q->doorbell_signal, (hsa_signal_value_t)(next - 1));
         unrung = 0;
     }
     void end() {

@@ -215,14 +215,21 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
         const double f = (double)(b.expert_ceiling - b.experts) / (double)b.expert_ceiling;
         int64_t one = ((int64_t)std::ceil(f * (double)layer_max) + RAD_ALIGN_UNIT - 1) /
                             RAD_ALIGN_UNIT * RAD_ALIGN_UNIT;
+        int n_bufs = 2;
         if (cfg.prefill_stage_mib > 0) {
             const int64_t target_one = cfg.prefill_stage_mib * kMiB;
-            if (target_one > one && 2 * target_one < b.experts) {
+            if (target_one > one && 3 * target_one < b.experts) {
                 one = target_one;
             }
         }
-        if (2 * one < b.experts) {
-            b.stage    = 2 * one;
+        if (const char* env = std::getenv("RADIANCE_PREFILL_BUFFERS")) {
+            const int v = std::atoi(env);
+            if (v >= 2 && v <= 4) n_bufs = v;
+        } else if (cfg.prefill_stage_mib >= 220) {
+            n_bufs = 3;
+        }
+        if (n_bufs * one < b.experts) {
+            b.stage    = n_bufs * one;
             b.experts -= b.stage;
             b.weights  = b.statics + b.experts;
         }

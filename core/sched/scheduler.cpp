@@ -646,7 +646,8 @@ int Scheduler::draft_ngram(SchedReq& s, int depth) const {
     };
     for (int k = kNgramMax; k >= kNgramMin; --k) {
         if (n < (int64_t)k + 1) continue;
-        for (int64_t j = n - k - 1; j >= 0; --j) {
+        const int64_t min_j = std::max<int64_t>(0, n - 2048);
+        for (int64_t j = n - k - 1; j >= min_j; --j) {
             bool hit = true;
             for (int t = 0; t < k && hit; ++t) hit = (at(j + t) == at(n - k + t));
             if (!hit) continue;
@@ -748,7 +749,7 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget) {
         s.hit_owed = true;
     }
 
-    if (r.n_computed == 0 && cfg_.prefix_cache) {
+    if (r.n_computed == 0 && cfg_.prefix_cache && pc_) {
         /* BEFORE the lookup, because the lookup stops at the first block the tiers hold -- an
          * honest shorter hit, but a shorter one. This is where a cold session gets its
          * context back instead of re-prefilling it: it costs a copy, and the alternative
@@ -1060,7 +1061,7 @@ const RadBatch* Scheduler::step() {
             /* The checkpoint is the state AFTER the last token of the chunk, and that token sits
              * at the interval boundary because the split put it there. */
             int32_t cs = -1;
-            if (pc_->reserve_checkpoint(r, ckpt, &cs) >= 0 && cs >= 0) {
+            if (pc_ && pc_->reserve_checkpoint(r, ckpt, &cs) >= 0 && cs >= 0) {
                 e.ckpt_tok = (int32_t)(want - 1);
                 e.ckpt_slot = cs;
                 ++m_.checkpoints_written;
@@ -1141,7 +1142,7 @@ const RadBatch* Scheduler::step() {
             s.ckpt_src = -1;
             if (s.pending_ckpt > 0) {
                 int32_t cs = -1;
-                if (pc_->reserve_checkpoint(r, s.pending_ckpt, &cs) >= 0 && cs >= 0) {
+                if (pc_ && pc_->reserve_checkpoint(r, s.pending_ckpt, &cs) >= 0 && cs >= 0) {
                     e.ckpt_tok = s.sched_tokens - 1;
                     e.ckpt_slot = cs;
                     ++m_.checkpoints_written;
@@ -1328,15 +1329,24 @@ const RadBatch* Scheduler::step_next_locked() {
     if (!waiting_.empty() && (int64_t)plan_.e.size() < cfg_.max_seqs) return nullptr;
 
     plan_next_.reset();
+    std::vector<std::pair<uint64_t, int64_t>> extended_kv;
+    auto rollback_extended = [&]() {
+        for (const auto& item : extended_kv) {
+            kv_->rollback(item.first, item.second);
+        }
+        extended_kv.clear();
+        plan_next_.reset();
+    };
+
     for (const StepEntry& e : plan_.e) {
-        if (e.slot < 0 || (size_t)e.slot >= reqs_.size()) return nullptr;
+        if (e.slot < 0 || (size_t)e.slot >= reqs_.size()) { rollback_extended(); return nullptr; }
         SchedReq& s = *reqs_[(size_t)e.slot];
-        if (!s.req || s.req->state != ReqState::Running || !s.running) return nullptr;
+        if (!s.req || s.req->state != ReqState::Running || !s.running) { rollback_extended(); return nullptr; }
         Request& r = *s.req;
         /* A chunk in the middle of a prompt continues as a prefill, from where the host knows it
          * is. And a grammar that cannot rewind decides, when this step commits, whether the next
          * may speculate; one that can -- and a request with no grammar -- answers as it did. */
-        if (!e.produces_token || !r.speculation_fixed) return nullptr;
+        if (!e.produces_token || !r.speculation_fixed) { rollback_extended(); return nullptr; }
 
         const bool surely_terminal = (r.max_tokens > 0) &&
                                      ((int64_t)r.max_tokens - (int64_t)r.output.size() <= 1) &&
@@ -1355,8 +1365,9 @@ const RadBatch* Scheduler::step_next_locked() {
         const int64_t ctx_up = r.n_computed + e.n_tokens;
         const int32_t d      = s.draft_next;
         const int64_t want   = 1 + d;
-        if (ctx_limit_ > 0 && ctx_up + want > ctx_limit_) return nullptr;
-        if (kv_->ensure(r.id, ctx_up + want) < 0) return nullptr;
+        if (ctx_limit_ > 0 && ctx_up + want > ctx_limit_) { rollback_extended(); return nullptr; }
+        if (kv_->ensure(r.id, ctx_up + want) < 0) { rollback_extended(); return nullptr; }
+        extended_kv.push_back({r.id, ctx_up});
 
         StepEntry n;
         n.req            = &r;
@@ -1377,7 +1388,7 @@ const RadBatch* Scheduler::step_next_locked() {
         plan_next_.n_tok += want;
         if (d > plan_next_.n_spec) plan_next_.n_spec = d;
     }
-    if (plan_next_.e.empty()) { plan_next_.reset(); return nullptr; }
+    if (plan_next_.e.empty()) { rollback_extended(); return nullptr; }
     plan_next_.phase        = RAD_PHASE_DECODE;
     plan_next_.n_seq_decode = (int64_t)plan_next_.e.size();
     plan_next_.n_tok_decode = plan_next_.n_tok;
@@ -1393,7 +1404,7 @@ const RadBatch* Scheduler::step_next_locked() {
         }
     }
     const RadBatch* b = builder_.build(plan_next_, *kv_, step_);
-    if (!b) { plan_next_.reset(); return nullptr; }
+    if (!b) { rollback_extended(); return nullptr; }
     for (size_t i = 0; i < plan_next_.e.size(); ++i)
         reqs_[(size_t)plan_next_.e[i].slot]->entry_next = (int32_t)i;
     next_open_ = true;
@@ -1757,7 +1768,7 @@ int Scheduler::serial_begin(int* rounds, SerialRow* out, int max) {
         const bool surely_terminal = (r.max_tokens > 0) &&
                                      ((int64_t)r.max_tokens - (int64_t)r.output.size() <= 1) &&
                                      e.produces_token;
-        bool can_draft = may_draft && e.produces_token && !surely_terminal;
+        bool can_draft = may_draft && r.may_speculate && e.produces_token && !surely_terminal;
 
         /* THE LOOKAHEAD KV. Round k writes the head's K and V at position head + k - 1, which runs
          * past the committed end, so the blocks have to exist before the round does -- for the

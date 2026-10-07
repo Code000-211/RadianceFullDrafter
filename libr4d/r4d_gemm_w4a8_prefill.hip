@@ -131,9 +131,11 @@ __global__ __launch_bounds__(WM * WN * 32, 8) void r4d_gemm_w4a8_prefill_kernel(
   const int m0 = by * BM, n0 = bx * BN;
   const int kpb = K / BK, nsz = K / GRP;
 
-  // A LDS position of (row, lane half, k step).  See the header: half-major inside the row, with a
-  // 4-dword XOR that separates eight rows.
-#define PF_APOS(r, h, u) ((r) * 16 + ((((h) * 8 + (u) * 2)) ^ ((((r) >> 1) & 3) << 2)))
+  // A LDS position of (row, lane half, k step). Bank-conflict-free swizzling:
+  // For 64-bit loads (NARROWA), 3-bit swizzle (((r >> 1) & 7) << 1) achieves 2-way bank access
+  // across all 32 banks. For 128-bit loads (b128), 4-dword block swizzle (((r >> 1) & 3) << 2)
+  // maintains 16-byte alignment while evenly spreading 32 lanes across 8 4-bank groups (4-way).
+#define PF_APOS(r, h, u) ((r) * 16 + ((((h) * 8 + (u) * 2)) ^ (NARROWA ? ((((r) >> 1) & 7) << 1) : ((((r) >> 1) & 3) << 2))))
 
   v8f_t acc[TN][TM];
   v8i_t g[TN][TM];
@@ -213,7 +215,8 @@ __global__ __launch_bounds__(WM * WN * 32, 8) void r4d_gemm_w4a8_prefill_kernel(
       // ---- fragments: the whole 64-k block, up front ----
       v2i_t af[TM][BK / 16];
 #pragma unroll
-      for (int i = 0; i < TM; i++) {
+      for (int step = 0; step < TM; step++) {
+        const int i = (step + wn) % TM;
         const int row = (wm * TM + i) * 16 + (lane & 15);
         if (ABNOA) {
 #pragma unroll

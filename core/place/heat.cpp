@@ -25,21 +25,20 @@ int HeatEngine::init(const Plan& plan, const HeatParams& params) {
     layer_of_.assign(n, -1);
     bytes_.assign(n, 0);
     ever_.assign(n, 0u);
+    promoted_at_.assign(n, UINT64_MAX);
 
     /* The movable units' slab classes, as dense indices -- see heat.h's `cls_`. */
     cls_.assign(n, -1);
-    {
-        std::vector<int32_t> dense;
-        for (size_t u = 0; u < n; ++u) {
-            const MoveUnit& mu = plan.units[u];
-            if (!mu.movable) continue;
-            const int32_t k = mu.slab_class;
-            auto it = std::find(dense.begin(), dense.end(), k);
-            if (it == dense.end()) { dense.push_back(k); it = dense.end() - 1; }
-            cls_[u] = (int32_t)(it - dense.begin());
-        }
-        n_cls_ = dense.empty() ? 1 : (int32_t)dense.size();
+    dense_classes_.clear();
+    for (size_t u = 0; u < n; ++u) {
+        const MoveUnit& mu = plan.units[u];
+        if (!mu.movable) continue;
+        const int32_t k = mu.slab_class;
+        auto it = std::find(dense_classes_.begin(), dense_classes_.end(), k);
+        if (it == dense_classes_.end()) { dense_classes_.push_back(k); it = dense_classes_.end() - 1; }
+        cls_[u] = (int32_t)(it - dense_classes_.begin());
     }
+    n_cls_ = dense_classes_.empty() ? 1 : (int32_t)dense_classes_.size();
     n_hot_.assign((size_t)n_cls_, 0);
     n_cold_.assign((size_t)n_cls_, 0);
     m_of_.assign((size_t)n_cls_, 0);
@@ -123,6 +122,7 @@ int HeatEngine::init(const Plan& plan, const HeatParams& params) {
     end_n_on_.assign((size_t)n_layer_ + 1, 0);
     end_n_cold_.assign((size_t)n_layer_ + 1, 0);
     end_ok_.assign((size_t)n_layer_ + 1, 0);
+    lease_expire_at_.assign((size_t)n_layer_ + 1, UINT64_MAX);
 
     /* Two ways to be off, and they are different facts worth different lines. A static plan is a
      * mode the operator asked for; a plan with nothing movable is a model that does not need this
@@ -267,11 +267,13 @@ void HeatEngine::set_tier(int32_t unit, Tier t) {
 
     if (was != Tier::VRAM && t == Tier::VRAM) {
         ++stats_.promotions;
+        promoted_at_[(size_t)unit] = stats_.dispatches;
         if (ever_[(size_t)unit] & 2u) ++stats_.readmits;
         if (!(ever_[(size_t)unit] & 1u)) { ++stats_.distinct_promoted; ever_[(size_t)unit] |= 1u; }
     } else if (was == Tier::VRAM && t != Tier::VRAM) {
         ++stats_.demotions;
         ever_[(size_t)unit] |= 2u;
+        promoted_at_[(size_t)unit] = UINT64_MAX;
     }
 }
 
@@ -293,17 +295,27 @@ void HeatEngine::set_place(int32_t unit) {
 void HeatEngine::end_rebuild(size_t slot) {
     float hot = 0.0f, cold = 0.0f;
     int32_t n_off = 0, n_on = 0, n_cold = 0;
+    uint64_t next_lease = UINT64_MAX;
     for (int32_t p = slot_lo_[slot], e = slot_lo_[slot + 1]; p < e; ++p) {
         const uint8_t r = rank_as_[(size_t)p];
         if (!r) continue;
         const float h = heat_[(size_t)p];
         if (r == 2) {
+            const int32_t u = unit_at_[(size_t)p];
+            if (u >= 0 && params_.min_residency_dispatches > 0 && promoted_at_[(size_t)u] != UINT64_MAX) {
+                uint64_t exp = promoted_at_[(size_t)u] + (uint64_t)params_.min_residency_dispatches;
+                if (stats_.dispatches < exp) {
+                    next_lease = std::min(next_lease, exp);
+                    continue;
+                }
+            }
             if (n_on++ == 0 || h < cold) { cold = h; n_cold = 1; }
             else if (h == cold) ++n_cold;
         } else {
             if (n_off++ == 0 || h > hot) hot = h;
         }
     }
+    lease_expire_at_[slot] = next_lease;
     end_hot_[slot] = hot;
     end_cold_[slot] = cold;
     end_n_off_[slot] = n_off;
@@ -337,6 +349,11 @@ bool HeatEngine::pick(Swap* out) const {
         const int32_t rc = l >= 0 ? res_count_[(size_t)l] : 0;
         const float h = heat_[(size_t)pos_[i]];
         if (tier_[i] == Tier::VRAM) {
+            /* Hold-down lease: a unit promoted within min_residency_dispatches cannot be demoted */
+            if (params_.min_residency_dispatches > 0 &&
+                promoted_at_[i] != UINT64_MAX &&
+                stats_.dispatches < promoted_at_[i] + (uint64_t)params_.min_residency_dispatches)
+                continue;
             /* Colder wins; on an exact tie take from the layer holding the MOST resident units,
              * which is the layer that can spare it. */
             if (cold[c] < 0 || h < cold_h[c] || (h == cold_h[c] && rc > cold_res[c])) {
@@ -366,7 +383,8 @@ bool HeatEngine::pick(Swap* out) const {
     int32_t best = -1;
     for (int32_t c = 0; c < n_cls_; ++c) {
         if (hot[(size_t)c] < 0 || cold[(size_t)c] < 0) continue;
-        if (hot_h[(size_t)c] < cold_h[(size_t)c] * params_.hysteresis + params_.min_gain) continue;
+        const float penalty = (ever_[(size_t)hot[(size_t)c]] & 2u) ? params_.readmit_penalty : 0.0f;
+        if (hot_h[(size_t)c] < cold_h[(size_t)c] * params_.hysteresis + params_.min_gain + penalty) continue;
         if (best < 0 || hot_h[(size_t)c] > hot_h[(size_t)best] ||
             (hot_h[(size_t)c] == hot_h[(size_t)best] &&
              (hot_res[(size_t)c] < hot_res[(size_t)best] ||
@@ -427,7 +445,8 @@ int HeatEngine::step(std::vector<Swap>* out) {
     {
         float hot_h = 0.0f, cold_h = 0.0f;
         for (size_t l = 0; l < end_ok_.size(); ++l) {
-            if (!end_ok_[l]) end_rebuild(l);
+            if (!end_ok_[l] || (params_.min_residency_dispatches > 0 && stats_.dispatches >= lease_expire_at_[l]))
+                end_rebuild(l);
             if (end_n_off_[l] > 0 && (n_off == 0 || end_hot_[l] > hot_h)) hot_h = end_hot_[l];
             if (end_n_on_[l] > 0 && (n_on == 0 || end_cold_[l] < cold_h)) cold_h = end_cold_[l];
             n_off += end_n_off_[l];
@@ -524,8 +543,15 @@ int HeatEngine::step(std::vector<Swap>* out) {
                 const int32_t l = layer_of_[(size_t)u];
                 const int32_t c = cls_[(size_t)u];
                 const Ranked r{ hp[b + j], l >= 0 ? res_count_[(size_t)l] : 0, u };
-                if (pass[j] & 2) keep_best(cold + c * k, &n_cold[c], k, r, colder);
-                else             keep_best(hot + c * k, &n_hot[c], k, r, hotter);
+                if (pass[j] & 2) {
+                    if (params_.min_residency_dispatches == 0 ||
+                        promoted_at_[(size_t)u] == UINT64_MAX ||
+                        stats_.dispatches >= promoted_at_[(size_t)u] + (uint64_t)params_.min_residency_dispatches) {
+                        keep_best(cold + c * k, &n_cold[c], k, r, colder);
+                    }
+                } else {
+                    keep_best(hot + c * k, &n_hot[c], k, r, hotter);
+                }
             }
         }
     }
@@ -545,7 +571,8 @@ int HeatEngine::step(std::vector<Swap>* out) {
             if (m >= k) continue;
             if (m >= n_hot[c] || m >= n_cold[c]) { short_of_budget = true; continue; }
             const Ranked& h = hot[c * k + m];
-            if (h.h < cold[c * k + m].h * params_.hysteresis + params_.min_gain) {
+            const float penalty = (ever_[(size_t)h.unit] & 2u) ? params_.readmit_penalty : 0.0f;
+            if (h.h < cold[c * k + m].h * params_.hysteresis + params_.min_gain + penalty) {
                 short_of_budget = true;
                 continue;
             }
@@ -646,4 +673,55 @@ std::vector<int32_t> HeatEngine::active_units(float min_heat, size_t max_units) 
     return res;
 }
 
+int32_t HeatEngine::slab_to_dense(int32_t slab_class) const {
+    auto it = std::find(dense_classes_.begin(), dense_classes_.end(), slab_class);
+    return it != dense_classes_.end() ? static_cast<int32_t>(it - dense_classes_.begin()) : -1;
+}
+
+int32_t HeatEngine::find_eviction_candidate(int32_t slab_class) const {
+    if (!enabled_) return -1;
+    const int32_t dense = slab_to_dense(slab_class);
+    if (dense < 0 || dense >= n_cls_) return -1;
+
+    int32_t cold_u = -1;
+    float cold_h = 0.0f;
+    int32_t cold_res = 0;
+
+    for (size_t i = 0; i < movable_.size(); ++i) {
+        if (!movable_[i] || busy_[i]) continue;
+        if (cls_[i] != dense) continue;
+        if (tier_[i] != Tier::VRAM) continue;
+
+        /* Hold-down lease: a unit promoted within min_residency_dispatches cannot be evicted */
+        if (params_.min_residency_dispatches > 0 &&
+            promoted_at_[i] != UINT64_MAX &&
+            stats_.dispatches < promoted_at_[i] + (uint64_t)params_.min_residency_dispatches) {
+            continue;
+        }
+
+        const int32_t l = layer_of_[i];
+        const int32_t rc = l >= 0 ? res_count_[(size_t)l] : 0;
+        const float h = heat_[(size_t)pos_[i]];
+
+        if (cold_u < 0 || h < cold_h || (h == cold_h && rc > cold_res)) {
+            cold_u = (int32_t)i;
+            cold_h = h;
+            cold_res = rc;
+        }
+    }
+    return cold_u;
+}
+
+void HeatEngine::register_speculative_prefetch(int32_t unit, int transient_lease) {
+    if (unit < 0 || (size_t)unit >= tier_.size()) return;
+    if (tier_[(size_t)unit] != Tier::VRAM) {
+        set_tier(unit, Tier::VRAM);
+    }
+    // Set lease expiration to transient_lease dispatches instead of full min_residency_dispatches
+    const uint64_t offset = (uint64_t)std::max(0, params_.min_residency_dispatches - transient_lease);
+    promoted_at_[(size_t)unit] = stats_.dispatches >= offset ? stats_.dispatches - offset : 0;
+    end_invalidate(unit);
+}
+
 }  /* namespace rad */
+

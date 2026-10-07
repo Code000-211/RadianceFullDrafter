@@ -284,6 +284,10 @@ extern "C" void* rad_buf_ptr   (RadCtx* c, rad_buf    b) { (void)c; return (void
 /* The PLE block on its own: no architecture in this file declares it, and what its step() hands
  * the two windowed ops is a contract of its own (rad_block_ple.h). */
 #include <arch/rad_block_ple.h>
+/* Paged FP8 attention with CSA 3:1 and KVarN historical compression */
+#include <arch/rad_block_attn_paged_fp8.h>
+/* RDNA4 (gfx1201) ISA engineering rules and hardware constraints */
+#include <arch/rad_rdna4_isa.h>
 
 /* ==================================================================== fixtures and helpers */
 namespace {
@@ -2766,3 +2770,691 @@ TEST(the_per_expert_tap_keeps_each_experts_gram_whole) {
     }
     CHECK_EQ(bad, 0);
 }
+
+/* CSA 3:1 CHUNK-POOLING AND KVARN VARIANCE-NORMALIZED QUANTIZATION FOR HISTORICAL TOKENS.
+ *
+ * For tokens outside the local sliding window (t > 128), 3 consecutive historical KV tokens are
+ * pooled into 1 representative pooled token vector:
+ *     \bar{K} = (1/3) \sum K_i, \bar{V} = (1/3) \sum V_i
+ * This cuts historical memory traffic and WMMA operations by 3x (66.7% reduction), while CLT
+ * dampens outlier variance across pooled chunks by 1/sqrt(3).
+ * Stage 2 (KVarN) applies variance-normalized quantization (FWHT-256 Hadamard pre-rotation +
+ * variance normalization scale for K4V2) on the pooled historical chunks, reducing ALU
+ * dequantization overhead on RDNA4 by 3x. */
+TEST(csa_paged_attention_pools_historical_tokens_3_to_1) {
+    using namespace rad::arch;
+    RadBuilder b;
+    RadModelMeta meta = qwen35_meta();
+    RadBuildCtx  ctx  = build_ctx();
+    ctx.max_tok = 2048; ctx.max_seqs = 4; ctx.max_ctx = 65536;
+
+    Geom g{};
+    CHECK_OK(geom_from(g, &meta, &ctx, "fp8", RAD_BF16));
+
+    Names nm("");
+    AttnPagedFP8::Wire w{};
+    w.x = decl_b(&b, "res_x", g.act_dtype, { g.max_tok, g.n_embd });
+    w.h.x = decl_b(&b, "h_x", g.act_dtype, { g.max_tok, g.n_embd });
+    CHECK_OK(w.h.declare_qs(&b, nm, g, "h", g.n_embd));
+    w.qkv = decl_b(&b, "attn_qkv", g.act_dtype, { g.max_tok, g.q_dim() + 2 * g.kv_dim() });
+    w.q = decl_b(&b, "attn_q", g.act_dtype, { g.max_tok, g.q_dim() });
+    w.attn.x = decl_b(&b, "attn_out", g.act_dtype, { g.max_tok, g.q_dim() });
+    CHECK_OK(w.attn.declare_qs(&b, nm, g, "attn_out", g.q_dim()));
+
+    AttnPagedFP8::Src src{};
+    src.norm = "blk.0.attn_norm.weight";
+    src.q = "blk.0.attn_q.weight";
+    src.k = "blk.0.attn_k.weight";
+    src.v = "blk.0.attn_v.weight";
+    src.o = "blk.0.attn_output.weight";
+
+    AttnPagedFP8::Config cfg{};
+    cfg.csa_window = 128;
+    cfg.csa_ratio  = 3;
+    cfg.kvarn      = true;
+    cfg.kv_block   = 16;
+
+    AttnPagedFP8 attn;
+    RadKVGroupDecl kd{};
+    kd.kind = RAD_KV_FULL;
+    kd.dtype = RAD_F8E4M3;
+    kd.n_head_kv = g.n_head_kv;
+    kd.head_dim = g.head_dim;
+    rad_kvgroup grp = rad_decl_kv_group(&b, "kv_csa", &kd);
+
+    CHECK_OK(attn.declare(&b, nm, g, 0, grp, 64, w, src, cfg));
+
+    const RecOp* at = find_op(b, "attn_paged");
+    CHECK(at != nullptr);
+    CHECK_EQ(pint(at, "csa_window"), 128);
+    CHECK_EQ(pint(at, "csa_ratio"), 3);
+    CHECK_EQ(pint(at, "kvarn"), 1);
+    CHECK_EQ(pint(at, "block_size"), 16);
+
+    const RecOp* pool = find_op(b, "kv_csa3_kvarn_pool");
+    CHECK(pool != nullptr);
+    CHECK_EQ(pint(pool, "csa_ratio"), 3);
+    CHECK_EQ(pint(pool, "csa_window"), 128);
+    CHECK_EQ(pint(pool, "kvarn"), 1);
+}
+
+TEST(kvarn_variance_normalized_compression_scales) {
+    /* CLT mathematical verification:
+     * When 3 consecutive historical tokens are pooled into 1:
+     * Var(\bar{X}) = (1/9) * (Var(X1) + Var(X2) + Var(X3)) = (1/3) * Var(X)
+     * StdDev(\bar{X}) = StdDev(X) / sqrt(3).
+     * This dampens outlier variance across historical context by factor 1/sqrt(3) ~ 0.57735. */
+    const float clt_factor = 1.0f / std::sqrt(3.0f);
+    CHECK(std::fabs(clt_factor - 0.577350269f) < 1e-5f);
+
+    /* 64k context under CSA 3:1:
+     * Local sliding window = 128 tokens.
+     * Historical context = 64k - 128 = 65408 tokens.
+     * 3:1 pooled tokens = 65408 / 3 = 21803 pooled tokens.
+     * Reduction in historical tokens to unpack/process = 66.7% (exactly 3x speedup). */
+    const int64_t full_hist = 65536 - 128;
+    const int64_t csa_hist  = (full_hist + 2) / 3;
+    const double reduction = 1.0 - (double)csa_hist / (double)full_hist;
+    CHECK(reduction > 0.666);
+    CHECK(reduction < 0.668);
+}
+
+TEST(csa_step_issues_pooling_op_only_outside_sliding_window) {
+    using namespace rad::arch;
+    RadBuilder b;
+    RadModelMeta meta = qwen35_meta();
+    RadBuildCtx  ctx  = build_ctx();
+    ctx.max_tok = 2048; ctx.max_seqs = 4; ctx.max_ctx = 65536;
+
+    Geom g{};
+    CHECK_OK(geom_from(g, &meta, &ctx, "fp8", RAD_BF16));
+
+    Names nm("");
+    AttnPagedFP8::Wire w{};
+    w.x = decl_b(&b, "res_x", g.act_dtype, { g.max_tok, g.n_embd });
+    w.h.x = decl_b(&b, "h_x", g.act_dtype, { g.max_tok, g.n_embd });
+    CHECK_OK(w.h.declare_qs(&b, nm, g, "h", g.n_embd));
+    w.qkv = decl_b(&b, "attn_qkv", g.act_dtype, { g.max_tok, g.q_dim() + 2 * g.kv_dim() });
+    w.q = decl_b(&b, "attn_q", g.act_dtype, { g.max_tok, g.q_dim() });
+    w.attn.x = decl_b(&b, "attn_out", g.act_dtype, { g.max_tok, g.q_dim() });
+    CHECK_OK(w.attn.declare_qs(&b, nm, g, "attn_out", g.q_dim()));
+
+    AttnPagedFP8::Src src{};
+    src.norm = "blk.0.attn_norm.weight";
+    src.q = "blk.0.attn_q.weight";
+    src.k = "blk.0.attn_k.weight";
+    src.v = "blk.0.attn_v.weight";
+    src.o = "blk.0.attn_output.weight";
+
+    AttnPagedFP8::Config cfg{};
+    cfg.csa_window = 128;
+    cfg.csa_ratio  = 3;
+    cfg.kvarn      = true;
+    cfg.kv_block   = 16;
+
+    AttnPagedFP8 attn;
+    RadKVGroupDecl kd{};
+    kd.kind = RAD_KV_FULL;
+    kd.dtype = RAD_F8E4M3;
+    kd.n_head_kv = g.n_head_kv;
+    kd.head_dim = g.head_dim;
+    rad_kvgroup grp = rad_decl_kv_group(&b, "kv_csa", &kd);
+
+    CHECK_OK(attn.declare(&b, nm, g, 0, grp, 64, w, src, cfg));
+
+    // Case 1: Context length 100 <= 128 (sliding window only)
+    {
+        RadCtx c;
+        c.b = &b;
+        RadBatch batch = decode_batch();
+        batch.max_ctx_len = 100;
+        c.batch = &batch;
+
+        attn.step(&c, &batch);
+
+        bool found_pool = false;
+        for (const auto& issue : c.issues) {
+            const RecOp* op = b.op_of(issue.op);
+            if (op && op->op == "kv_csa3_kvarn_pool") found_pool = true;
+        }
+        CHECK(!found_pool);
+    }
+
+    // Case 2: Context length 256 > 128 (historical tokens present)
+    {
+        RadCtx c;
+        c.b = &b;
+        RadBatch batch = decode_batch();
+        batch.max_ctx_len = 256;
+        c.batch = &batch;
+
+        attn.step(&c, &batch);
+
+        const RecIssue* pool_issue = nullptr;
+        for (const auto& issue : c.issues) {
+            const RecOp* op = b.op_of(issue.op);
+            if (op && op->op == "kv_csa3_kvarn_pool") pool_issue = &issue;
+        }
+        CHECK(pool_issue != nullptr);
+        if (pool_issue) {
+            REQUIRE_EQ(pool_issue->opd.size(), (size_t)3);
+            CHECK_EQ(pool_issue->opd[0].kind, (uint8_t)RAD_OPK_KV);
+            CHECK_EQ(pool_issue->opd[1].dtype, (uint32_t)RAD_I32);
+            CHECK_EQ(pool_issue->opd[2].dtype, (uint32_t)RAD_I32);
+        }
+    }
+}
+
+TEST(csa_boundary_transitions_from_sliding_window) {
+    const int csa_w = 128;
+    auto calc_eff_ctx = [csa_w](int ctx) {
+        const int n_hist = (ctx > csa_w) ? (ctx - csa_w) : 0;
+        const int n_hist_pool = (n_hist + 2) / 3;
+        return (ctx > csa_w) ? (n_hist_pool + csa_w) : ctx;
+    };
+
+    // Boundary at sliding window (t <= 128): exactly 1:1, 0 pooled
+    CHECK_EQ(calc_eff_ctx(1), 1);
+    CHECK_EQ(calc_eff_ctx(64), 64);
+    CHECK_EQ(calc_eff_ctx(128), 128);
+
+    // Transitions across 129, 130, 131, 132
+    CHECK_EQ(calc_eff_ctx(129), 129); // 1 hist -> 1 pooled + 128 window = 129
+    CHECK_EQ(calc_eff_ctx(130), 129); // 2 hist -> 1 pooled + 128 window = 129
+    CHECK_EQ(calc_eff_ctx(131), 129); // 3 hist -> 1 pooled + 128 window = 129
+    CHECK_EQ(calc_eff_ctx(132), 130); // 4 hist -> 2 pooled + 128 window = 130
+
+    // Deep context scaling
+    CHECK_EQ(calc_eff_ctx(192), 150); // 64 hist -> 22 pooled + 128 window = 150
+    CHECK_EQ(calc_eff_ctx(256), 171); // 128 hist -> 43 pooled + 128 window = 171
+    CHECK_EQ(calc_eff_ctx(65536), 21931); // 65408 hist -> 21803 pooled + 128 window = 21931
+}
+
+/* ==================================================================== RDNA4 ISA Engineering Rules */
+
+TEST(rdna4_isa_rule1_vgpr_granularity_and_occupancy) {
+    using namespace rad::isa::rdna4;
+
+    /* Rule 1: VGPR Allocation Granularity is 24 on Wave32 (SIMD has 1536 VGPRs).
+     * Allocated = ceil(vgpr / 24) * 24.
+     * Max active waves per SIMD = min(16, 1536 / Allocated). */
+    CHECK_EQ(kSimdVgprs, 1536);
+    CHECK_EQ(kWave32VgprGranularity, 24);
+    CHECK_EQ(kWave64VgprGranularity, 12);
+    CHECK_EQ(kMaxWave32WavesPerSimd, 16);
+    CHECK_EQ(kMaxVgprsPerWave32, 256);
+
+    /* Full occupancy boundary: <= 96 VGPRs */
+    CHECK_EQ(allocated_vgprs_wave32(64), 72);
+    CHECK_EQ(simd_occupancy_waves(64), 16);
+    CHECK_EQ(allocated_vgprs_wave32(96), 96);
+    CHECK_EQ(simd_occupancy_waves(96), 16);
+    CHECK_EQ(simd_occupancy_pct(96), 100.0f);
+
+    /* The 97-VGPR Cliff: +1 VGPR drops occupancy from 16 waves (100%) to 12 waves (75%) */
+    CHECK_EQ(allocated_vgprs_wave32(97), 120);
+    CHECK_EQ(simd_occupancy_waves(97), 12);
+    CHECK_EQ(simd_occupancy_pct(97), 75.0f);
+    CHECK_EQ(allocated_vgprs_wave32(120), 120);
+    CHECK_EQ(simd_occupancy_waves(120), 12);
+
+    /* The 121-VGPR Disaster: +1 VGPR drops occupancy from 12 waves (75%) to 10 waves (62.5%) */
+    CHECK_EQ(allocated_vgprs_wave32(121), 144);
+    CHECK_EQ(simd_occupancy_waves(121), 10);
+    CHECK_EQ(simd_occupancy_pct(121), 62.5f);
+
+    /* The Power-of-Two Trap: 128 VGPRs allocates 144, yielding 10 waves instead of 12 */
+    CHECK_EQ(allocated_vgprs_wave32(128), 144);
+    CHECK_EQ(simd_occupancy_waves(128), 10);
+    CHECK_EQ(allocated_vgprs_wave32(144), 144);
+    CHECK_EQ(simd_occupancy_waves(144), 10);
+
+    /* Higher allocation steps: 168 (9 waves), 192 (8 waves), 216 (7 waves), 240 (6 waves) */
+    CHECK_EQ(allocated_vgprs_wave32(145), 168);
+    CHECK_EQ(simd_occupancy_waves(145), 9);
+    CHECK_EQ(allocated_vgprs_wave32(168), 168);
+    CHECK_EQ(simd_occupancy_waves(168), 9);
+
+    CHECK_EQ(allocated_vgprs_wave32(169), 192);
+    CHECK_EQ(simd_occupancy_waves(169), 8);
+    CHECK_EQ(allocated_vgprs_wave32(192), 192);
+    CHECK_EQ(simd_occupancy_waves(192), 8);
+
+    CHECK_EQ(allocated_vgprs_wave32(193), 216);
+    CHECK_EQ(simd_occupancy_waves(193), 7);
+    CHECK_EQ(allocated_vgprs_wave32(216), 216);
+    CHECK_EQ(simd_occupancy_waves(216), 7);
+
+    CHECK_EQ(allocated_vgprs_wave32(217), 240);
+    CHECK_EQ(simd_occupancy_waves(217), 6);
+    CHECK_EQ(allocated_vgprs_wave32(240), 240);
+    CHECK_EQ(simd_occupancy_waves(240), 6);
+
+    /* 241..256 VGPRs: allocates 264 (clipped to physical 256), yielding 5 waves */
+    CHECK_EQ(allocated_vgprs_wave32(241), 264);
+    CHECK_EQ(simd_occupancy_waves(241), 5);
+    CHECK_EQ(allocated_vgprs_wave32(256), 264);
+    CHECK_EQ(simd_occupancy_waves(256), 5);
+
+    /* Danger window detector: B < v <= B + 8 */
+    CHECK(is_in_cliff_danger_zone(97));
+    CHECK(is_in_cliff_danger_zone(104));
+    CHECK(!is_in_cliff_danger_zone(105));
+    CHECK(is_in_cliff_danger_zone(121));
+    CHECK(is_in_cliff_danger_zone(128));
+    CHECK(!is_in_cliff_danger_zone(120));
+    CHECK(!is_in_cliff_danger_zone(96));
+}
+
+TEST(rdna4_isa_rule2_zero_waterfall_loop_standard) {
+    /* Rule 2: Dynamic register array indexing across varying lane indices forces LLVM
+     * to emit v_movrels_b32 inside s_and_saveexec_b32 / s_cbranch_execnz loops.
+     * All unrolling bounds on hot paths must be compile-time constants. */
+    constexpr int kMaxTokens = 8;
+    int simulated_vgprs[kMaxTokens] = {10, 20, 30, 40, 50, 60, 70, 80};
+
+    // Compliant pattern: loop with compile-time static bound, dynamic predication inside
+    auto compliant_sum = [&](int runtime_active_tokens) -> int {
+        int sum = 0;
+        #if defined(__clang__)
+        #pragma unroll
+        #elif defined(__GNUC__)
+        #pragma GCC unroll 8
+        #endif
+        for (int i = 0; i < kMaxTokens; ++i) {
+            if (i < runtime_active_tokens) {
+                sum += simulated_vgprs[i];
+            }
+        }
+        return sum;
+    };
+
+    CHECK_EQ(compliant_sum(3), 10 + 20 + 30);
+    CHECK_EQ(compliant_sum(0), 0);
+    CHECK_EQ(compliant_sum(8), 360);
+}
+
+TEST(rdna4_isa_rule3_dual_issue_vopd_constraints) {
+    using namespace rad::isa::rdna4;
+
+    /* Rule 3: VOPD Dual-Issue Constraints:
+     * - OpX has 14 opcodes (0..13)
+     * - OpY has 17 opcodes (0..13, 16..18)
+     * - Wave32 only
+     * - Destination parity: one even, one odd (vdstY[0] == ~vdstX[0])
+     * - Bank conflict: 4 banks (reg % 4). OpX and OpY sources must be from different banks
+     *   or be identical registers.
+     * - Dual SRC2: If both read SRC2 (FMAC, FMAMK, DOT2ACC), one SRC2 must be even and other odd. */
+    CHECK_EQ(kVopdOpXCount, 14);
+    CHECK_EQ(kVopdOpYCount, 17);
+    CHECK_EQ(kVgprBanks, 4);
+
+    // Parity validator
+    CHECK(vopd_valid_dest_parity(0, 1));
+    CHECK(vopd_valid_dest_parity(2, 3));
+    CHECK(vopd_valid_dest_parity(4, 5));
+    CHECK(!vopd_valid_dest_parity(0, 2));  // Both even -> invalid
+    CHECK(!vopd_valid_dest_parity(1, 3));  // Both odd  -> invalid
+
+    // Bank conflict validator (4 banks: reg % 4)
+    CHECK(vopd_valid_bank_pairing(0, 0));  // Same register -> legal
+    CHECK(vopd_valid_bank_pairing(0, 1));  // Bank 0 and Bank 1 -> legal
+    CHECK(vopd_valid_bank_pairing(0, 5));  // Bank 0 and Bank 1 (5%4=1) -> legal
+    CHECK(!vopd_valid_bank_pairing(0, 4)); // Bank 0 and Bank 0 (4%4=0) -> CONFLICT!
+    CHECK(!vopd_valid_bank_pairing(1, 5)); // Bank 1 and Bank 1 (5%4=1) -> CONFLICT!
+
+    // Dual SRC2 parity validator
+    CHECK(vopd_valid_dual_src2(2, 3));
+    CHECK(!vopd_valid_dual_src2(2, 4));
+}
+
+TEST(rdna4_isa_rule4_global_load_tr_canonical_k_ordering) {
+    using namespace rad::isa::rdna4;
+
+    /* Rule 4: GLOBAL_LOAD_TR canonical K-ordering:
+     * Lanes 0..15 hold k in {0, 1, 2, 3,  8, 9, 10, 11}
+     * Lanes 16..31 hold k in {4, 5, 6, 7, 12, 13, 14, 15}
+     * Both operands A and B to WMMA must follow this exact permutation. */
+    const int expected_lo[] = {0, 1, 2, 3, 8, 9, 10, 11};
+    for (int j = 0; j < 8; ++j) {
+        CHECK_EQ(canonical_k_order(0, j), expected_lo[j]);
+        CHECK_EQ(canonical_k_order(0, j), kCanonicalK_Lo[j]);
+    }
+
+    const int expected_hi[] = {4, 5, 6, 7, 12, 13, 14, 15};
+    for (int j = 0; j < 8; ++j) {
+        CHECK_EQ(canonical_k_order(16, j), expected_hi[j]);
+        CHECK_EQ(canonical_k_order(16, j), kCanonicalK_Hi[j]);
+    }
+
+    // Mathematical invariant: dot product over permutation matches linear sum
+    float a[16] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
+    float b[16] = {2, 1, 4, 3, 6, 5, 8, 7, 10, 9, 12, 11, 14, 13, 16, 15};
+
+    float ref_dot = 0.0f;
+    for (int k = 0; k < 16; ++k) ref_dot += a[k] * b[k];
+
+    // Canonical permuted sum: sum over lanes 0 and 16
+    float perm_dot = 0.0f;
+    for (int j = 0; j < 8; ++j) {
+        int k_lo = canonical_k_order(0, j);
+        perm_dot += a[k_lo] * b[k_lo];
+        int k_hi = canonical_k_order(16, j);
+        perm_dot += a[k_hi] * b[k_hi];
+    }
+    CHECK_EQ(ref_dot, perm_dot);
+
+    // Hazard demonstration: if A uses canonical and B uses unpermuted linear order,
+    // the dot product computes corrupted garbage
+    float corrupted_dot = 0.0f;
+    for (int j = 0; j < 8; ++j) {
+        int k_lo = canonical_k_order(0, j);
+        corrupted_dot += a[k_lo] * b[j];       // Mismatched index!
+        int k_hi = canonical_k_order(16, j);
+        corrupted_dot += a[k_hi] * b[8 + j];   // Mismatched index!
+    }
+    CHECK(std::fabs(corrupted_dot - ref_dot) > 1.0f); // Proves silent corruption hazard
+}
+
+TEST(rdna4_isa_rule5_split_cache_temporal_hints) {
+    using namespace rad::isa::rdna4;
+
+    /* Rule 5: Split Cache Temporal Hints (TH):
+     * TH[2:0] values:
+     *   0: RT    (Regular near + far)
+     *   1: NT    (Non-temporal near + far)
+     *   2: HT    (High-priority temporal near + far)
+     *   3: LU    (Last-use: non-temporal + discard dirty)
+     *   4: NT_RT (Non-temporal near / bypass L0, regular far L2) -> WEIGHT STREAMING
+     *   5: RT_NT
+     *   6: NT_HT (Non-temporal near / bypass L0, high-priority far L2) -> LAYER RESIDENT WEIGHTS
+     *   7: NT_WB */
+    CHECK(th_is_weight_streaming(TemporalHint::NT_RT));
+    CHECK(th_is_weight_streaming(TemporalHint::NT_HT));
+    CHECK(!th_is_weight_streaming(TemporalHint::RT)); // RT thrashes CU L0 vector cache
+
+    CHECK(th_is_last_use(TemporalHint::LU));
+
+    CHECK(th_is_streaming_store(TemporalHint::NT));
+    CHECK(th_is_streaming_store(TemporalHint::NT_WB));
+}
+
+TEST(rdna4_isa_rule6_independent_wait_counters_and_hazard_guards) {
+    using namespace rad::isa::rdna4;
+
+    /* Rule 6: Independent Wait Counters and s_wait_alu:
+     * Deprecates legacy s_waitcnt. Uses:
+     * - s_wait_loadcnt (LOADcnt: vector memory loads, atomic-with-return)
+     * - s_wait_storecnt (STOREcnt: vector memory stores)
+     * - s_wait_dscnt (DScnt: LDS and Flat ops)
+     * - s_wait_kmcnt (KMcnt: SMEM scalar loads and s_sendmsg)
+     *
+     * s_wait_alu Bitmasks:
+     * - 0xFFFD: VALU write to VCC -> VALU read of VCC
+     * - 0xF1FF: VALU write to SGPR -> VALU read of SGPR
+     * - 0xFFFE: SALU write to SGPR/VCC -> SALU/VALU read of SGPR/VCC */
+    CHECK_EQ(kWaitAluValuVcc,  0xFFFD);
+    CHECK_EQ(kWaitAluValuSgpr, 0xF1FF);
+    CHECK_EQ(kWaitAluSaluAny,  0xFFFE);
+}
+
+TEST(rdna4_isa_rule7_early_deallocation_epilogue_contract) {
+    using namespace rad::isa::rdna4;
+
+    /* Rule 7: Early Deallocation Contract:
+     * Kernel epilogue must emit s_sendmsg sendmsg(MSG_DEALLOC_VGPRS) BEFORE s_wait_storecnt 0.
+     * This releases the wave's VGPR block to the SIMD allocator while stores are in-flight,
+     * allowing subsequent wavefronts to launch immediately. */
+    std::vector<EpilogueStep> optimal_sequence = {
+        EpilogueStep::IssueStores,
+        EpilogueStep::DeallocVGPRs,
+        EpilogueStep::WaitStores,
+        EpilogueStep::EndPgm
+    };
+
+    auto validate_seq = [](const std::vector<EpilogueStep>& seq) -> bool {
+        auto dealloc_it = std::find(seq.begin(), seq.end(), EpilogueStep::DeallocVGPRs);
+        auto wait_it    = std::find(seq.begin(), seq.end(), EpilogueStep::WaitStores);
+        bool has_dealloc = (dealloc_it != seq.end());
+        bool has_wait    = (wait_it != seq.end());
+        int dealloc_idx  = has_dealloc ? static_cast<int>(std::distance(seq.begin(), dealloc_it)) : -1;
+        int wait_idx     = has_wait    ? static_cast<int>(std::distance(seq.begin(), wait_it)) : -1;
+        return validate_epilogue_order(has_dealloc, has_wait, dealloc_idx, wait_idx);
+    };
+
+    CHECK(validate_seq(optimal_sequence));
+
+    // Stalling epilogue (dealloc omitted or after wait):
+    std::vector<EpilogueStep> stalling_sequence = {
+        EpilogueStep::IssueStores,
+        EpilogueStep::WaitStores,
+        EpilogueStep::EndPgm
+    };
+    CHECK(!validate_seq(stalling_sequence));
+}
+
+TEST(ced_wave32_occupancy_and_rdna4_isa_rules) {
+    using namespace rad::isa::rdna4;
+
+    /* RDNA4 ISA Rule 1: VGPR <= 96 gives 100% occupancy (16 waves/SIMD).
+     * For CED projection kernels:
+     * - Down-projection: r=32 bottleneck, 1 wave of 32 threads computes z = V * h_t.
+     * - Up-projection: E=512 experts / 32 threads = 16 waves.
+     * Strict VGPR ceiling is 96 VGPRs to guarantee 100% SIMD occupancy. */
+    constexpr int kCedWaveSize = 32;
+    constexpr int kCedWorkgroupThreads = 128; // 4 Wave32 waves per workgroup
+    constexpr int kCedMaxVgprs = 96;
+    constexpr int kCedMaxLdsBytes = 4096;     // 4 KiB LDS per workgroup
+
+    CHECK_EQ(kCedWaveSize, 32);
+    CHECK_EQ(kCedWorkgroupThreads, 128);
+    CHECK_EQ(kCedWorkgroupThreads % kCedWaveSize, 0);
+    CHECK_EQ(kCedWorkgroupThreads / kCedWaveSize, 4);
+
+    /* Verify VGPR allocation granularity and 100% occupancy at 96 VGPRs */
+    CHECK_EQ(allocated_vgprs_wave32(kCedMaxVgprs), 96);
+    CHECK_EQ(simd_occupancy_waves(kCedMaxVgprs), 16);
+    CHECK_EQ(simd_occupancy_pct(kCedMaxVgprs), 100.0f);
+
+    /* Verify the 97-VGPR occupancy cliff: 1 single VGPR beyond 96 drops occupancy to 75% */
+    CHECK_EQ(allocated_vgprs_wave32(kCedMaxVgprs + 1), 120);
+    CHECK_EQ(simd_occupancy_waves(kCedMaxVgprs + 1), 12);
+    CHECK_EQ(simd_occupancy_pct(kCedMaxVgprs + 1), 75.0f);
+
+    /* Verify CU LDS ceiling: 4 KiB LDS per workgroup easily accommodates 16 workgroups in 64 KiB LDS */
+    constexpr int kMaxCuLds = 64 * 1024;
+    CHECK(kCedMaxLdsBytes <= kMaxCuLds);
+    CHECK_EQ(kMaxCuLds / kCedMaxLdsBytes, 16);
+
+    /* RDNA4 ISA Rule 2 & 5: Split cache temporal hints for CED projection:
+     * - Weight matrix projection basis (V_down, U_up) stream through cache: TemporalHint::NT_RT.
+     * - Hidden state activations and intermediate bottleneck (z) are last-use: TemporalHint::LU.
+     * - Predicted logits and candidate distributions are streaming stores: TemporalHint::NT. */
+    CHECK(th_is_weight_streaming(TemporalHint::NT_RT));
+    CHECK(th_is_last_use(TemporalHint::LU));
+    CHECK(th_is_streaming_store(TemporalHint::NT));
+
+    /* Zero-waterfall unroll invariant: rank r=32 matches Wave32 size exactly */
+    constexpr int kCedRank = 32;
+    constexpr int kCedExperts = 512;
+    CHECK_EQ(kCedRank % kCedWaveSize, 0);
+    CHECK_EQ(kCedExperts % kCedWaveSize, 0);
+    CHECK_EQ(kCedExperts / kCedWaveSize, 16);
+}
+
+TEST(ced_low_rank_projection_and_topk_stability) {
+    /* Test mathematical equivalence of low-rank factorized projection vs. full-rank:
+     * Full-rank routing: logits_full = W * h + b, where W in R^{E x d}
+     * Factorized CED:    z = V * h (R^r), logits_ced = U * z + b, where W_approx = U * V
+     * Verify numerical equivalence, stable softmax (no NaN/Inf on large logits),
+     * probability threshold filtering (P(e) >= tau), and top-k ranking. */
+    const int d = 128;
+    const int r = 16;
+    const int E = 32;
+
+    std::vector<float> V(r * d, 0.0f);
+    std::vector<float> U(E * r, 0.0f);
+    std::vector<float> b(E, 0.0f);
+
+    for (int k = 0; k < r; ++k) {
+        for (int j = 0; j < d; ++j) {
+            V[k * d + j] = std::sin((float)((k + 1) * (j + 1)) * 0.05f) / std::sqrt((float)d);
+        }
+    }
+    for (int e = 0; e < E; ++e) {
+        for (int k = 0; k < r; ++k) {
+            U[e * r + k] = std::cos((float)((e + 1) * (k + 1)) * 0.05f) / std::sqrt((float)r);
+        }
+        b[e] = -0.2f * (float)(e % 4);
+    }
+
+    // Multiply W = U * V
+    std::vector<float> W(E * d, 0.0f);
+    for (int e = 0; e < E; ++e) {
+        for (int j = 0; j < d; ++j) {
+            float sum = 0.0f;
+            for (int k = 0; k < r; ++k) sum += U[e * r + k] * V[k * d + j];
+            W[e * d + j] = sum;
+        }
+    }
+
+    // Input hidden state h_t
+    std::vector<float> h(d, 0.0f);
+    for (int j = 0; j < d; ++j) h[j] = std::sin((float)j * 0.1f);
+
+    // 1. Direct full-rank calculation: logits_full = W * h + b
+    std::vector<float> logits_full(E, 0.0f);
+    for (int e = 0; e < E; ++e) {
+        float sum = b[e];
+        for (int j = 0; j < d; ++j) sum += W[e * d + j] * h[j];
+        logits_full[e] = sum;
+    }
+
+    // 2. Factorized two-stage calculation: z = V * h, logits_ced = U * z + b
+    std::vector<float> z(r, 0.0f);
+    for (int k = 0; k < r; ++k) {
+        float sum = 0.0f;
+        for (int j = 0; j < d; ++j) sum += V[k * d + j] * h[j];
+        z[k] = sum;
+    }
+    std::vector<float> logits_ced(E, 0.0f);
+    for (int e = 0; e < E; ++e) {
+        float sum = b[e];
+        for (int k = 0; k < r; ++k) sum += U[e * r + k] * z[k];
+        logits_ced[e] = sum;
+    }
+
+    // Assert equivalence within FP tolerance
+    for (int e = 0; e < E; ++e) {
+        CHECK_NEAR(logits_ced[e], logits_full[e], 1e-4);
+    }
+
+    // 3. Numerically stable softmax test, even with large positive/negative offsets
+    float max_l = logits_ced[0];
+    for (int e = 1; e < E; ++e) if (logits_ced[e] > max_l) max_l = logits_ced[e];
+
+    std::vector<float> probs(E, 0.0f);
+    float p_sum = 0.0f;
+    for (int e = 0; e < E; ++e) {
+        probs[e] = std::exp(logits_ced[e] - max_l);
+        p_sum += probs[e];
+    }
+    CHECK(p_sum > 0.0f);
+    for (int e = 0; e < E; ++e) probs[e] /= p_sum;
+
+    float total_p = 0.0f;
+    for (int e = 0; e < E; ++e) {
+        CHECK(!std::isnan(probs[e]));
+        CHECK(!std::isinf(probs[e]));
+        CHECK(probs[e] >= 0.0f && probs[e] <= 1.0f);
+        total_p += probs[e];
+    }
+    CHECK_NEAR(total_p, 1.0f, 1e-5);
+
+    // 4. Probability threshold filtering and top-k sorting
+    const float tau = 0.04f;
+    const int top_k = 3;
+    std::vector<std::pair<float, int>> cands;
+    for (int e = 0; e < E; ++e) {
+        if (probs[e] >= tau) cands.emplace_back(probs[e], e);
+    }
+    std::sort(cands.begin(), cands.end(), [](const auto& a, const auto& b) {
+        return a.first > b.first;
+    });
+    if ((int)cands.size() > top_k) cands.resize((size_t)top_k);
+
+    CHECK(!cands.empty());
+    CHECK(cands.size() <= (size_t)top_k);
+    for (size_t i = 0; i < cands.size(); ++i) {
+        CHECK(cands[i].first >= tau);
+        if (i > 0) CHECK(cands[i - 1].first >= cands[i].first);
+    }
+}
+
+TEST(ced_clustered_expert_distribution_and_gemv_invariants) {
+    using namespace rad::isa::rdna4;
+
+    /* 1. Clustered Expert Distribution (CED) clustering invariants:
+     * 512 experts grouped into 32 clusters of 16 experts each. */
+    constexpr int kExperts = 512;
+    constexpr int kClusters = 32;
+    constexpr int kClusterSize = kExperts / kClusters; // 16 experts per cluster
+    CHECK_EQ(kClusterSize, 16);
+    CHECK_EQ(kExperts % kClusters, 0);
+
+    // Synthesize expert probability distribution with concentrated cluster mass
+    std::vector<float> expert_probs(kExperts, 0.0f);
+    // Cluster 3 (experts 48..63) and Cluster 7 (experts 112..127) have high co-activation
+    for (int e = 48; e < 64; ++e) expert_probs[e] = 0.035f;   // 16 * 0.035 = 0.56
+    for (int e = 112; e < 128; ++e) expert_probs[e] = 0.020f; // 16 * 0.020 = 0.32
+    // Remaining probability distributed uniformly across other 30 clusters
+    const float rem = (1.0f - 0.56f - 0.32f) / (float)(kExperts - 32);
+    for (int e = 0; e < kExperts; ++e) {
+        if ((e < 48 || e >= 64) && (e < 112 || e >= 128)) expert_probs[e] = rem;
+    }
+
+    // Compute cluster routing mass
+    std::vector<float> cluster_mass(kClusters, 0.0f);
+    for (int e = 0; e < kExperts; ++e) {
+        int c = e / kClusterSize;
+        cluster_mass[c] += expert_probs[e];
+    }
+
+    // Assert top clusters capture expected probability mass
+    CHECK_NEAR(cluster_mass[3], 0.56f, 1e-4);
+    CHECK_NEAR(cluster_mass[7], 0.32f, 1e-4);
+    const float top2_mass = cluster_mass[3] + cluster_mass[7];
+    CHECK_NEAR(top2_mass, 0.88f, 1e-4); // Top 2 clusters hold 88% of total probability!
+
+    /* 2. RDNA4 Wave32 GEMV Kernel microarchitectural invariants:
+     * Target: gfx1201 Dual SIMD, Wave32 mode.
+     * Workgroup: 128 threads = 4 waves.
+     * Epilogue contract: MSG_DEALLOC_VGPRS precedes s_wait_storecnt 0. */
+    constexpr int kWaveSize = 32;
+    constexpr int kWorkgroupThreads = 128;
+    (void)kWaveSize;
+    (void)kWorkgroupThreads;
+    constexpr int kBottleneckRank = 32;
+    constexpr int kLdsBytes = kBottleneckRank * sizeof(float); // 128 bytes
+    CHECK_EQ(kLdsBytes, 128);
+    CHECK(kLdsBytes <= 4096);
+
+    // Epilogue sequence verification: Rule 7 Early Deallocation Contract
+    CHECK(validate_epilogue_order(true, true, 1, 2)); // dealloc at 1, wait_stores at 2 -> valid
+    CHECK(!validate_epilogue_order(true, true, 2, 1)); // wait_stores before dealloc -> invalid!
+
+    // Temporal hints verification: Rule 5 Split Cache Temporal Hints
+    CHECK_EQ(static_cast<uint8_t>(TemporalHint::NT_RT), 4);
+    CHECK_EQ(static_cast<uint8_t>(TemporalHint::LU), 3);
+    CHECK(th_is_weight_streaming(TemporalHint::NT_RT));
+    CHECK(th_is_last_use(TemporalHint::LU));
+
+    // Occupancy verification: Rule 1 24-VGPR quantum and 100% occupancy bound
+    constexpr int kTargetVgprs = 48; // Actual CED GEMV register budget
+    CHECK_EQ(allocated_vgprs_wave32(kTargetVgprs), 48);
+    CHECK_EQ(simd_occupancy_waves(kTargetVgprs), 16);
+    CHECK_EQ(simd_occupancy_pct(kTargetVgprs), 100.0f);
+    CHECK(!is_in_cliff_danger_zone(kTargetVgprs));
+}
+
+

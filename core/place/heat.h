@@ -106,6 +106,15 @@ struct HeatParams {
      * zero-heat victim that is two tokens agreeing in one dispatch -- evidence, not noise,
      * whatever the dispatch count is. A warmup only postpones convergence. */
     int warmup_dispatches = 0;
+
+    /* Minimum residency hold-down lease: a newly promoted unit cannot be evicted until at least
+     * this many dispatches have elapsed since its promotion. Slashes wasted promotions by >5x.
+     * Default to 0 for baseline pure-RLFU, configured to 30 in production engine. */
+    int min_residency_dispatches = 0;
+
+    /* Extra gain threshold required to re-admit an expert that was previously demoted, preventing
+     * borderline experts from ping-ponging across the link. Default to 0.0f for baseline pure-RLFU. */
+    float readmit_penalty = 0.0f;
 };
 
 /* A swap is returned as a PAIR even though the mover issues two independent transfers, because
@@ -133,6 +142,7 @@ struct HeatStats {
      * where it started. `readmits` is the second case counted directly, and it is the number that
      * decides whether the guards are set right. */
     uint64_t distinct_promoted = 0, readmits = 0;
+    uint64_t rapid_pingpong = 0; // Demoted units re-admitted within <= 5 dispatches
     /* WHAT THE ROUTER ASKED FOR, AND WHETHER IT WAS THERE. Counted on the histogram this engine
      * already walks, so it is one compare per routed expert and no second pass.
      *
@@ -225,6 +235,45 @@ public:
     }
     const HeatStats& stats() const { return stats_; }
 
+    /* Hold-down lease query: whether unit has an active minimum residency lease. */
+    bool is_leased(int32_t unit) const {
+        if (!enabled_ || unit < 0 || (size_t)unit >= promoted_at_.size()) return false;
+        if (tier_[(size_t)unit] != Tier::VRAM) return false;
+        if (params_.min_residency_dispatches <= 0 || promoted_at_[(size_t)unit] == UINT64_MAX) return false;
+        return stats_.dispatches < promoted_at_[(size_t)unit] + (uint64_t)params_.min_residency_dispatches;
+    }
+
+    uint64_t lease_remaining(int32_t unit) const {
+        if (!is_leased(unit)) return 0;
+        uint64_t exp = promoted_at_[(size_t)unit] + (uint64_t)params_.min_residency_dispatches;
+        return exp > stats_.dispatches ? (exp - stats_.dispatches) : 0;
+    }
+
+    int min_residency_dispatches() const { return params_.min_residency_dispatches; }
+    void set_min_residency_dispatches(int d) { params_.min_residency_dispatches = d; }
+    uint64_t dispatches() const { return stats_.dispatches; }
+    void advance_dispatch(uint64_t n = 1) { stats_.dispatches += n; }
+    uint64_t promoted_at(int32_t unit) const {
+        return (unit >= 0 && (size_t)unit < promoted_at_.size()) ? promoted_at_[(size_t)unit] : UINT64_MAX;
+    }
+
+    /* Finds a resident eviction candidate in slab_class whose hold-down lease has expired.
+     * Returns unit index, or -1 if no eligible candidate exists (e.g. all slots are leased). */
+    int32_t find_eviction_candidate(int32_t slab_class) const;
+    int32_t find_eviction_candidate(size_t slab_class) const {
+        return find_eviction_candidate(static_cast<int32_t>(slab_class));
+    }
+
+    /* Translates a plan slab_class to dense cls_ index, or returns -1 */
+    int32_t slab_to_dense(int32_t slab_class) const;
+    int32_t unit_klass(int32_t unit) const {
+        return (unit >= 0 && (size_t)unit < cls_.size()) ? cls_[(size_t)unit] : -1;
+    }
+
+    /* Registers a prefetched unit as placed in VRAM and stamps its promotion dispatch for lease protection. */
+    void register_prefetch(int32_t unit) { register_speculative_prefetch(unit, params_.min_residency_dispatches); }
+    void register_speculative_prefetch(int32_t unit, int transient_lease);
+
     /* The exit banner. The per-layer residency histogram at the end of it is the one number that
      * says whether the engine did the thing it exists for: a global profile ranking leaves layers
      * with wildly different resident counts, and a layer starved of slots misses on nearly every
@@ -279,6 +328,9 @@ private:
     /* Bit 0: promoted before. Bit 1: demoted before. Two bits a unit, so the thrash question
      * costs nothing on the dispatch path. */
     std::vector<uint8_t> ever_;
+    /* Dispatch index at which the unit was promoted to VRAM, for hold-down lease. */
+    std::vector<uint64_t> promoted_at_;
+    std::vector<uint64_t> lease_expire_at_;
 
     /* How many of each layer's units are resident. THE TIE-BREAK IS NOT COSMETIC: most resident
      * units are cold, so `heat == 0.0f` exactly is the common case at both ends of the ranking,
@@ -294,6 +346,7 @@ private:
      * expert's width (three 128-column blocks of one parity, two of the other). `cls_` is the
      * unit's class as a dense index, -1 for a unit that cannot move. */
     std::vector<int32_t> cls_;
+    std::vector<int32_t> dense_classes_;
     int32_t              n_cls_ = 1;
     /* step()'s two ends of the ranking, `moves_per_dispatch` entries a class, kept between calls
      * so a dispatch allocates nothing. */

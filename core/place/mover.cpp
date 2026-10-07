@@ -351,7 +351,7 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
     }
 
     /* ---- streams, events, move records ------------------------------------------------------ */
-    RAD_TRY(rad_stream_create(&mover_, /*high_priority=*/1));
+    RAD_TRY(rad_stream_create(&mover_, /*high_priority=*/0));
     /* EVERY EVENT HERE IS LOCAL. They order the mover's queue against this card's compute queue
      * and tell the host WHEN a slot is free; the bytes they order are read by this card's kernels
      * and never by the host through them. A copy out to host memory carries the system scope on
@@ -596,6 +596,94 @@ int Mover::start_stage(int32_t unit, int64_t slab_slot) {
     const MoveUnit& mu = plan_->units[(size_t)unit];
     for (size_t i = 0; i < mu.weights.size(); ++i)
         res_.begin_transfer(mu.weights[i], base + mu.offset[i], m.ev);
+    return RAD_OK;
+}
+
+bool Mover::is_unit_resident(int32_t unit) const {
+    if (unit < 0 || (size_t)unit >= unit_.size()) return false;
+    return unit_[(size_t)unit].tier == Tier::VRAM && unit_[(size_t)unit].slab_slot >= 0;
+}
+
+int32_t Mover::unit_klass(int32_t unit) const {
+    if (unit < 0 || (size_t)unit >= unit_.size()) return -1;
+    return unit_[(size_t)unit].klass;
+}
+
+int64_t Mover::unit_bytes(int32_t unit) const {
+    if (unit < 0 || (size_t)unit >= unit_.size()) return 0;
+    return unit_[(size_t)unit].bytes;
+}
+
+bool Mover::has_free_slab_slot(size_t klass) const {
+    if (klass >= pools_.size()) return false;
+    return pools_[klass].slab.n_free() > 0;
+}
+
+int64_t Mover::free_slab_slots(size_t klass) const {
+    if (klass >= pools_.size()) return 0;
+    return pools_[klass].slab.n_free();
+}
+
+int Mover::prefetch_unit_async(int32_t unit, int32_t victim, HeatEngine* heat, int lease_dispatches) {
+    if (!plan_ || !plan_->dynamic) return RAD_OK;
+    if (heat && heat->busy(unit)) return RAD_E_STATE;
+    if (unit < 0 || (size_t)unit >= unit_.size()) return RAD_E_INVAL;
+    UnitState& us = unit_[(size_t)unit];
+    if (us.tier == Tier::VRAM && us.slab_slot >= 0) return RAD_OK;
+    if (us.klass < 0 || us.pool_slot < 0) return RAD_E_STATE;
+    ClassPools& cp = pools_[(size_t)us.klass];
+
+    int64_t slot = -1;
+    if (victim >= 0) {
+        if ((size_t)victim >= unit_.size()) return RAD_E_INVAL;
+        UnitState& vs = unit_[(size_t)victim];
+        if (vs.slab_slot < 0 || vs.klass != us.klass) return RAD_E_INVAL;
+
+        int64_t pool_slot = vs.pool_slot;
+        if (pool_slot < 0) {
+            pool_slot = cp.pool.take();
+            if (pool_slot < 0) {
+                ++stats_.starved_pool;
+                return RAD_E_FULL;
+            }
+            char* dst = (char*)cp.pool_base + pool_slot * cp.stride;
+            const void* src = cp.slot_ptr(vs.slab_slot);
+            if (rad_memcpy_async(dst, src, vs.bytes, mover_) < 0) {
+                cp.pool.add_free(pool_slot);
+                return RAD_E_DEVICE;
+            }
+            stats_.d2h_bytes += (uint64_t)vs.bytes;
+        }
+
+        slot = vs.slab_slot;
+        vs.slab_slot = -1;
+        vs.pool_slot = pool_slot;
+        vs.tier = Tier::HostPinned;
+        vs.site = Site::DeviceZeroCopy;
+        republish(victim);
+        if (heat) heat->set_tier(victim, Tier::HostPinned);
+        ++stats_.demotions;
+        ++stats_.dropped;
+    } else {
+        slot = cp.slab.take();
+        if (slot < 0) {
+            ++stats_.starved_slab;
+            return RAD_E_FULL;
+        }
+    }
+
+    if (slot < 0) return RAD_E_FULL;
+    int rc = promote_to(unit, slot);
+    if (rc < 0) {
+        cp.slab.add_free(slot);
+        return rc;
+    }
+    if (heat) {
+        const int lease = (lease_dispatches > 0) ? lease_dispatches : heat->min_residency_dispatches();
+        heat->register_speculative_prefetch(unit, lease);
+    }
+    ++stats_.prefetched;
+    stats_.prefetch_bytes += (uint64_t)us.bytes;
     return RAD_OK;
 }
 
@@ -1145,7 +1233,8 @@ int Mover::balance(HeatEngine* heat) {
                 if (us.klass != (int32_t)c || us.slab_slot < 0 || cp.slab.covered(us.slab_slot)) continue;
                 /* Anything else still past the loan -- a promotion that has not retired, a staged
                  * unit -- becomes droppable later, so the sweep has to come back for it. */
-                if (us.tier != Tier::VRAM || us.site != Site::Device || (heat && heat->busy(u))) {
+                if (us.tier != Tier::VRAM || us.site != Site::Device ||
+                    (heat && (heat->busy(u) || heat->is_leased(u)))) {
                     left = true;
                     continue;
                 }
@@ -1177,7 +1266,7 @@ int Mover::balance(HeatEngine* heat) {
                 const UnitState& us = unit_[(size_t)u];
                 if (us.klass != (int32_t)c || us.slab_slot < 0 || !cp.is_flex(us.slab_slot)) continue;
                 if (us.tier != Tier::VRAM || us.site != Site::Device || us.pool_slot < 0) continue;
-                if (heat && heat->busy(u)) continue;
+                if (heat && (heat->busy(u) || heat->is_leased(u))) continue;
                 const float h = heat ? heat->heat(u) : 0.0f;
                 if (victim < 0 || h < coldest) { victim = u; coldest = h; }
             }
@@ -1197,7 +1286,7 @@ int Mover::balance(HeatEngine* heat) {
                 if (us.klass != (int32_t)c || us.slab_slot < 0 || cp.is_flex(us.slab_slot)) continue;
                 if (us.tier != Tier::VRAM || us.site != Site::Device || us.pool_slot >= 0) continue;
                 if (!plan_->units[(size_t)u].movable) continue;
-                if (heat && heat->busy(u)) continue;
+                if (heat && (heat->busy(u) || heat->is_leased(u))) continue;
                 const float h = heat ? heat->heat(u) : 0.0f;
                 if (victim < 0 || h < coldest) { victim = u; coldest = h; }
             }
@@ -1267,6 +1356,7 @@ int Mover::reclaim(int lender, int64_t amount, HeatEngine* heat) {
      * quarantine barrier rests on the same fact -- so once it has drained, nothing already issued
      * can reach a slot past the loan, and everything issued from here reads the host copies. */
     RAD_TRY(rad_stream_sync(compute_));
+    RAD_TRY(retire(heat));
     for (const auto& f : freed) pools_[f.first].slab.add_free(f.second);
 
     /* EVERY RECORD WAITING ON ONE OF THOSE SLOTS IS DONE WAITING: its barrier is behind the
@@ -1278,14 +1368,24 @@ int Mover::reclaim(int lender, int64_t amount, HeatEngine* heat) {
         if (klass < 0) continue;
         ClassPools& cp = pools_[(size_t)klass];
         if (!cp.is_flex(m.slab_slot) || cp.slab.covered(m.slab_slot)) continue;
-        if (m.kind == Move::Kind::Drop || m.kind == Move::Kind::Demote ||
-            m.kind == Move::Kind::Release)
-            cp.slab.add_free(m.slab_slot);
+        cp.slab.add_free(m.slab_slot);
         if (heat && m.kind != Move::Kind::Stage && m.kind != Move::Kind::Release)
             heat->set_busy(m.unit, false);
         m.state = Move::State::Free;
         m.unit = -1;
         m.slab_slot = m.pool_slot = -1;
+    }
+    /* Drain any stranded held slots in the recalled lender's segment: compute stream has drained,
+     * so no device kernel can access them. */
+    for (ClassPools& cp : pools_) {
+        for (const ClassPools::Lent& l : cp.lent) {
+            if (l.lender != lender) continue;
+            while (true) {
+                const int64_t top = cp.slab.top_held(l.seg);
+                if (top < l.first) break;
+                cp.slab.add_free(top);
+            }
+        }
     }
     count_flex();
     if (loan_held(lender) > loan_[lender]) {

@@ -104,7 +104,7 @@ int rv_barrier(int world) {
  * ASCENDING GLOBAL RANK WITH THIS RANK REMOVED, which is the order libr4d's wide entry points
  * take their pointer arguments in. */
 struct ArInst {
-    int  rank = 0, world = 0;
+    int  rank = 0, world = 0, dev = 0;
     long my_scratch = 0, my_flags = 0, my_seq = 0, locpack = 0;
     long peer_scratch[R4D_MAX_PEERS] = { 0 };
     long peer_flags  [R4D_MAX_PEERS] = { 0 };
@@ -198,6 +198,7 @@ int build(ArInst* in, int rank, int world, long long max_numel, int dtype_code) 
     int fine_sc = 1, fine_fl = 1, fine_sq = 1;
     R4D_TRY("ar_ipc_alloc",
         if (hipGetDevice(&dev) != hipSuccess) return RAD_E_DEVICE;
+        in->dev = dev;
         sc = r4d_ar_ipc_alloc((long)nslots * in->slot_bytes, 1, handle, &hlen);
         if (!sc) { fine_sc = 0; sc = r4d_ar_ipc_alloc((long)nslots * in->slot_bytes, 0, handle, &hlen); }
         fl = r4d_ar_ipc_alloc(flag_words * 4, 1, handle, &hlen);
@@ -343,10 +344,17 @@ void release(ArInst* in) {
     }
     /* Only this rank's own allocations. A peer pointer is the peer's to free, and freeing it here
      * would be a double free the moment two ranks tear down in either order. */
+    int orig_dev = -1;
+    if (hipGetDevice(&orig_dev) == hipSuccess && orig_dev != in->dev) {
+        (void)hipSetDevice(in->dev);
+    }
     r4d_ar_ipc_free(in->my_scratch);
     r4d_ar_ipc_free(in->my_flags);
     r4d_ar_ipc_free(in->my_seq);
     r4d_ar_ipc_free(in->locpack);
+    if (orig_dev >= 0 && orig_dev != in->dev) {
+        (void)hipSetDevice(orig_dev);
+    }
     delete in;
 }
 

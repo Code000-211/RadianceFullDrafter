@@ -1268,7 +1268,7 @@ static void r4d_gemm_w4a8_tiled_impl(long a, long ascale, long wq, long ws, long
       case 118: R4D_TILED_LAUNCH(1, 8, 6, 1, 2, 0, 147 | 8192 | 16384, 8, 0, UNRG); break; // BM96 BN128 256thr
       case 119: R4D_TILED_LAUNCH(1, 8, 5, 1, 2, 0, 147 | 8192, 8, 0, UNRG); break;  // BM 80, BN 128, f32 fold
       case 120: R4D_TILED_LAUNCH(1, 8, 5, 2, 2, 0, 147, 8, 0, UNRG); break;         // BM 80, BN 256, 256 thr
-      case 121: R4D_TILED_LAUNCH(1, 4, 5, 2, 2, 0, 147, 8, 0, UNRG); break;         // BM 80, BN 128, 128 thr
+      case 121: R4D_TILED_LAUNCH(1, 4, 5, 2, 2, 0, 147, 4, 0, UNRG); break;         // BM 80, BN 128, 128 thr
       case 122: R4D_TILED_LAUNCH(1, 8, 5, 1, 2, 0, 147, 4, 0, UNRG); break;         // BM 80, BN 128, WPE 4
       case 123: R4D_TILED_LAUNCH(1, 8, 5, 1, 2, 0, 147 | 16384, 8, 0, UNRG); break; // BM 80, A prefetch
       case 124: R4D_TILED_LAUNCH(1, 8, 4, 1, 2, 0, 147, 8, 0, UNRG); break;         // BM 64, BN 128, 256 thr

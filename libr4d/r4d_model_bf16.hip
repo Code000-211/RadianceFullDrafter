@@ -364,6 +364,7 @@ __global__ __launch_bounds__(kThreads) void embed_lookup_q_kernel(
 __global__ __launch_bounds__(kThreads) void gather_rows_kernel(
     const uint16_t* __restrict__ x, const int32_t* __restrict__ idx, uint16_t* __restrict__ y,
     uint32_t n, int32_t src_rows, uint32_t x_ld, uint32_t y_ld) {
+    if (!x || !idx || !y) return;
     const uint32_t m = blockIdx.x;
     const int32_t r = idx[m];
     uint16_t* __restrict__ dst = y + (size_t)m * y_ld;
@@ -392,6 +393,7 @@ __global__ __launch_bounds__(kThreads) void gather_rows_kernel(
 __global__ __launch_bounds__(kThreads) void gather_rows_u8_kernel(
     const uchar4* __restrict__ x, const int32_t* __restrict__ idx, uchar4* __restrict__ y,
     uint32_t n4, int32_t src_rows, uint32_t x_ld4, uint32_t y_ld4) {
+    if (!x || !idx || !y) return;
     const uint32_t m = blockIdx.x;
     const int32_t r = idx[m];
     uchar4* __restrict__ dst = y + (size_t)m * y_ld4;
@@ -787,7 +789,7 @@ static int embed_lookup_q_emit(const int32_t* tok, const void* wte, bool q, cons
     const bool quad = n_embd % 4 == 0 && x_ld % 4 == 0 && r4d_aligned(x, 8) &&
                       r4d_aligned(wte, q ? 4 : 8);
 
-    if (q && quad && n_embd == 160) {
+    if (q && quad && n_embd == 160 && M <= 64) {
         int dev = 0;
         hipPointerAttribute_t attr;
         if (hipPointerGetAttributes(&attr, (const void*)x) == hipSuccess) {

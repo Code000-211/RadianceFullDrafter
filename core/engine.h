@@ -226,10 +226,12 @@ private:
      * wait left until after them. */
     int  collect_issue(const RadBatch* b, StepOut& so);
     int  collect_step(const RadBatch* b, StepOut& so);
+    int  mark_trunk_end(const RadBatch* b, StepOut& so);
     /* WHERE THE STEP ENDS ON THE CARD: after its last draft pass and the copies the host reads,
      * and before the step issued ahead of it. collect_step waits for this and not for the
      * stream, so the card runs the next step while the host commits this one. */
     int  mark_step_end(const RadBatch* b, StepOut& so);
+    RadEvent trunk_end_ = nullptr;
     RadEvent step_end_ = nullptr;
 
     /* THE DRAFT HEAD, exactly as the plugin declared it (rad_declare_drafter), and zeroed when

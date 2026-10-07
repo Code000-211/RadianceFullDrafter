@@ -99,6 +99,13 @@ inline std::string show(const A& a, const B& b) {
          if (_s < 0) ::radtest::fail(__FILE__, __LINE__,                               \
              std::string("CHECK_OK(" #expr "): ") + rad_strerror(_s)); } while (0)
 
+#define REQUIRE_OK(expr)                                                              \
+    do { ++::radtest::checks();                                                       \
+         int _s = (expr);                                                             \
+         if (_s < 0) { ::radtest::fail(__FILE__, __LINE__,                            \
+             std::string("REQUIRE_OK(" #expr "): ") + rad_strerror(_s));              \
+             return; } } while (0)
+
 /* 77 is ctest's SKIP_RETURN_CODE, set in tests/CMakeLists.txt. Returned ONLY when nothing failed
  * and nothing was checked -- a file whose every case guarded itself out. */
 #define RAD_TEST_MAIN()                                                               \

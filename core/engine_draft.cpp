@@ -54,6 +54,7 @@ int Engine::step_state_init() {
     slots_host_ = static_cast<StepSlot*>(rad_dev_alloc(slot_bytes, RAD_MEM_HOST_PINNED));
     if (!slots_host_) return RAD_E_NOMEM;
     RAD_TRY(rad_event_create_as(&step_end_, RAD_EVENT_LOCAL | RAD_EVENT_HOST_WAIT));
+    RAD_TRY(rad_event_create_as(&trunk_end_, RAD_EVENT_LOCAL | RAD_EVENT_HOST_WAIT));
     return RAD_OK;
 }
 
@@ -67,6 +68,8 @@ void Engine::step_state_fini() {
     }
     if (slots_host_) rad_dev_free(slots_host_, RAD_MEM_HOST_PINNED);
     slots_host_ = nullptr;
+    if (trunk_end_) rad_event_destroy(trunk_end_);
+    trunk_end_ = nullptr;
     if (step_end_) rad_event_destroy(step_end_);
     step_end_ = nullptr;
 }
@@ -153,7 +156,7 @@ int Engine::issue_serial_drafter(int step, const RadBatch* b, StepOut& so) {
     }
 
     RAD_TRY(advance_all(ADV_ACCEPT, 0, false));
-    RAD_TRY(collect_issue(b, so));
+    if (!so.rb) RAD_TRY(collect_issue(b, so));
 
     int rounds = drafter_.depth;
     serial_row_.resize((size_t)cfg_.max_seqs);

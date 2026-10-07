@@ -90,10 +90,9 @@ __global__ __launch_bounds__(kMaxN) void qsa_block_key_kernel(
     for (int i = 0; i < nw; ++i) sum += red[i];
     const float inv = rsqrtf(sum / (float)n + eps);
 
-    /* f32 THROUGH THE NORM AND THE ROTATION, rounded once at the store. That is
-     * r4d_qk_norm_rope_gate's choice for the model's own K and this follows it rather than
-     * rounding again after the gain, so the two rotations in a layer are the same arithmetic. */
-    if (t < n) sh[t] = acc * inv * (wadd + w[t]);
+    /* Rounded to bf16 before the rotation, matching r4d_qk_norm_rope_gate for the model's own K
+     * so that block key rotations match model K rotations bit-identically. */
+    if (t < n) sh[t] = __bfloat162float(__float2bfloat16(acc * inv * (wadd + w[t])));
     __syncthreads();
 
     if (t >= n) return;

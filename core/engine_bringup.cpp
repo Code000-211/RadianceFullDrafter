@@ -2123,10 +2123,14 @@ int Engine::load_weights() {
          * `enabled() == false`, which is a mode and not a failure -- all_vram and
          * --deterministic both land there -- so there is nothing to branch on here. */
         HeatParams hp;
+        hp.min_residency_dispatches = 30;
+        hp.readmit_penalty = 1.0f;
         if (const char* e = getenv("RADIANCE_HEAT_MOVES")) hp.moves_per_dispatch = std::atoi(e);
         if (const char* e = getenv("RADIANCE_HEAT_MIN_GAIN")) hp.min_gain = (float)std::atof(e);
         if (const char* e = getenv("RADIANCE_HEAT_HYSTERESIS")) hp.hysteresis = (float)std::atof(e);
         if (const char* e = getenv("RADIANCE_HEAT_DECAY")) hp.decay = (float)std::atof(e);
+        if (const char* e = getenv("RADIANCE_HEAT_RESIDENCY")) hp.min_residency_dispatches = std::atoi(e);
+        if (const char* e = getenv("RADIANCE_HEAT_READMIT_PENALTY")) hp.readmit_penalty = (float)std::atof(e);
         RAD_TRY(r->heat.init(r->plan, hp));
 
         /* A DESTINATION HAS TO LIE INSIDE THE POOL IT WAS CARVED FROM. A slot pointer that runs
@@ -3227,6 +3231,18 @@ int Engine::start() {
             r->ctx.set_stager(&r->stager);
         } else if (r->fstager.enabled()) {
             r->ctx.set_stager(&r->fstager);
+        }
+
+        CedConfig ced_cfg;
+        ced_cfg.enabled = cfg_.ced_prefetch;
+        ced_cfg.lookahead = cfg_.ced_lookahead;
+        ced_cfg.threshold = cfg_.ced_threshold;
+        ced_cfg.top_k = cfg_.ced_top_k;
+        ced_cfg.reuse_ridgefill = cfg_.ced_reuse_ridgefill;
+        RAD_TRY(r->prefetcher.init(r->program, r->plan, &r->mover, &r->heat, ced_cfg));
+        if (ced_cfg.enabled && r->index == 0) {
+            RAD_INFO("CED prefetcher: lookahead=%d tau=%.2f top_k=%d (RDNA4 Wave32 async DMA on mover)",
+                     ced_cfg.lookahead, ced_cfg.threshold, ced_cfg.top_k);
         }
 
         /* RADIANCE_HOST_DOMAIN puts EVERY op on the host domain, which is how you run the whole

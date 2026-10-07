@@ -50,6 +50,9 @@ if(RAD_HIP_FOUND)
   # WEIGHT-TABLE ENTRIES WRITTEN IN STREAM ORDER, their values carried in the arguments (runtime/wtab.h).
   target_sources(rad_core PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/runtime/wtab.hip)
   set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/runtime/wtab.hip PROPERTIES LANGUAGE HIP)
+  # CED LOW-RANK GEMV PROJECTION KERNEL FOR PREDICTIVE MOE PREFETCHING (place/ced_gemv.h).
+  target_sources(rad_core PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/place/ced_gemv.hip)
+  set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/place/ced_gemv.hip PROPERTIES LANGUAGE HIP)
   # THE CORE'S OWN KERNELS ARE BUILT FOR EVERY AMD GPU FAMILY, not only for the cards this build
   # targets. They are what every copy and fill on a card runs, so an engine without a code object
   # for a card cannot start on it -- whatever kernel plugin is installed for that card, and a plugin

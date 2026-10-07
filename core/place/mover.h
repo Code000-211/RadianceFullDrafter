@@ -569,6 +569,18 @@ public:
      * unit that has not been staged. */
     void* unit_base(int32_t unit) const;
 
+    /* Unit residency and slab slot state queries for CED prefetching */
+    bool is_unit_resident(int32_t unit) const;
+    int32_t unit_klass(int32_t unit) const;
+    int64_t unit_bytes(int32_t unit) const;
+    bool has_free_slab_slot(size_t klass) const;
+    int64_t free_slab_slots(size_t klass) const;
+
+    /* Asynchronous lookahead prefetch of a unit from host-pinned pool to VRAM slab slot.
+     * If victim >= 0, evicts victim (which must have an expired lease) to reuse its slab slot.
+     * Queues DMA on transfer_stream(). */
+    int prefetch_unit_async(int32_t unit, int32_t victim = -1, HeatEngine* heat = nullptr, int lease_dispatches = -1);
+
     /* ---- STAGING WITHIN A PASS: the prefill stager (core/place/stager.h) ----------------------
      *
      * Everything else the mover does happens between steps, and a unit's address is fixed for the

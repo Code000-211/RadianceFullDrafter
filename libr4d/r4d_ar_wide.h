@@ -77,7 +77,7 @@ __device__ __forceinline__ void r4d_ar_handshake(const R4DArWidePeers<S, NPEERS>
     if (pub) {
       // One system writeback for the whole publish, then relaxed stores: the extra writebacks
       // a per-peer release store inserts add no ordering, since the flags go to different peers.
-      __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");
+      __threadfence_system();
 #pragma unroll
       for (int p = 0; p < NPEERS; ++p)
         r4d_ar_store_sys_rlx(&peers.flags[p][(size_t)b * WS + rank], val);

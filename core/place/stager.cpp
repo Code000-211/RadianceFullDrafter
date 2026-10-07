@@ -224,9 +224,8 @@ int PrefillStager::after_op(rad_op h, RadStream s) {
                 /* CHUNK-TO-CHUNK PREFETCH:
                  * As the final layers of this chunk (e.g. layers 45, 46, 47) complete, wrap around
                  * and pre-stage Layer 0, Layer 1, Layer 2 for the upcoming chunk! */
-                const int32_t wrap_layer = next - (int32_t)layers_.size();
-                if (wrap_layer >= 0 && wrap_layer < n_bufs_) {
-                    RAD_TRY(start_wrap(wrap_layer, b));
+                if (b < (int32_t)layers_.size()) {
+                    RAD_TRY(start_wrap(b, b));
                 }
             }
         }

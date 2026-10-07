@@ -1511,8 +1511,8 @@ static void step(RadCtx* c, const RadBatch* batch) {
     }
 
     if (batch->n_out > 0) {
-        if (batch->n_seq == 1 && batch->n_out < T)
-            m.mixer.read(c, T, T - batch->n_out, batch->n_out);
+        if (batch->n_seq == 1 && batch->n_out == 1)
+            m.mixer.read(c, T, T - 1, 1);
         else
             m.mixer.read(c, T, 0, T);
         RAD_ISSUE_N(c, m.op_gather, batch->n_out,
