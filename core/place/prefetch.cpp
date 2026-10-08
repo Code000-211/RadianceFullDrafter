@@ -186,6 +186,7 @@ void CedProjector::compute_cluster_mass(const std::vector<float>& probs,
 }
 
 int CedProjector::project_device(const float* d_h_t, float* d_out_logits, void* stream) const {
+#if defined(RAD_HAVE_HIP) && RAD_HAVE_HIP
     CedGemvArgs args{};
     args.h_t = d_h_t;
     args.v_down = v_down_.data();
@@ -196,6 +197,12 @@ int CedProjector::project_device(const float* d_h_t, float* d_out_logits, void* 
     args.r = cfg_.rank;
     args.n_experts = cfg_.n_experts;
     return rad_ced_gemv_launch(args, stream);
+#else
+    /* ced_gemv.hip is only built with HIP; the host backend must still link and must not report
+     * a projection it did not compute (docs/IMPLEMENTATION.md). */
+    (void)d_h_t; (void)d_out_logits; (void)stream;
+    return RAD_E_UNSUPPORTED;
+#endif
 }
 
 int CedProjector::project_with_ridgefill(int target_layer, const float* h_t, int d,
