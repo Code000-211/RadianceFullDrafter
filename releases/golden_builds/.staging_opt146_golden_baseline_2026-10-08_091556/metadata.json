@@ -1,0 +1,8 @@
+{
+  "label": "opt146_golden_baseline",
+  "timestamp": "2026-10-08_091556",
+  "commit_sha": "1a4455d26871100a6a97e1dd3b5c83d4431764b6",
+  "archived_by": "orca@vllm-radiance",
+  "arch": "gfx1201",
+  "archive_file": "opt146_golden_baseline_2026-10-08_091556.zip"
+}

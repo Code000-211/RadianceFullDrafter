@@ -1,8 +1,80 @@
-/build*/
-compile_commands.json
+# ==============================================================================
+# RadianceMine Production-Grade .gitignore
+# ==============================================================================
+
+# Build directories & artifacts
+/build/
+/build_*/
+/cmake-build-*/
+/bin/
+/lib/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.cmake.in
+
+# Compiled objects, shared libraries, and AMDGPU binaries
 *.o
+*.obj
 *.so
+*.so.*
+*.dylib
+*.a
 *.rad
-/sync-jarvis.sh
+*.co
+*.rkb
+*.bin
+*.elf
+*.isa
+*.hsaco
+
+# Compilation database & IDE configurations
+compile_commands.json
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.cache/
+.clangd/
+
+# Python caches and test artifacts
 __pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+
+# Runtime logs and process outputs
 *.log
+*.out
+engine_active.log
+selftest.log
+nohup.out
+gdb.txt
+
+# Git Worktrees (isolate development worktrees from trunk tracking)
+worktrees/*
+!worktrees/.gitkeep
+
+# Golden builds large binary archives (keep checksums and catalog)
+releases/golden_builds/*.zip
+releases/golden_builds/*.tar.gz
+releases/golden_builds/*.tmp
+!releases/golden_builds/.gitkeep
+!releases/golden_builds/catalog.json
+
+# Benchmark run telemetry and scratch dumps
+benchmarks/runs/*
+!benchmarks/runs/.gitkeep
+tmp/
+*.tmp
+
+# Local shell and environment overrides
+.env
+.env.local
+local_config.sh

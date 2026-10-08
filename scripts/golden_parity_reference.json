@@ -1,0 +1,82 @@
+[
+  {
+    "id": "sanity_arithmetic",
+    "category": "sanity",
+    "prompt": "What is 2+2? Answer with only the number.",
+    "max_tokens": 16,
+    "temperature": 0.0,
+    "golden_tokens": 2,
+    "golden_sha256": "4b227777d4dd1fc61c6f884f48641d02b4d121d3fd328cb08b5531fcacdabf8a",
+    "expected_finish_reason": "stop",
+    "golden_text": "4",
+    "required_patterns": [
+      "4"
+    ],
+    "forbidden_patterns": [
+      "<|im_start|>",
+      "<|im_end|>",
+      "error"
+    ]
+  },
+  {
+    "id": "code_is_prime",
+    "category": "code",
+    "prompt": "Write a Python function `is_prime(n)` that returns True if n is prime, False otherwise. Include brief docstring.",
+    "max_tokens": 150,
+    "temperature": 0.0,
+    "golden_tokens": 106,
+    "golden_sha256": "c64cb592bbd1fa7232429fadddcf9be0e5cf303d04171f92ef9788f352f5d303",
+    "expected_finish_reason": "stop",
+    "golden_text": "```python\ndef is_prime(n):\n    \"\"\"Return True if n is a prime number, False otherwise.\"\"\"\n    if n < 2:\n        return False\n    if n == 2:\n        return True\n    if n % 2 == 0:\n        return False\n    for i in range(3, int(n**0.5) + 1, 2):\n        if n % i == 0:\n            return False\n    return True\n```",
+    "required_patterns": [
+      "def is_prime(n",
+      "if n < 2:",
+      "return False",
+      "return True"
+    ],
+    "forbidden_patterns": [
+      "<|im_start|>",
+      "<|im_end|>"
+    ]
+  },
+  {
+    "id": "math_linear_eq",
+    "category": "math",
+    "prompt": "Solve the following equation step by step: 3*x + 7 = 22.",
+    "max_tokens": 256,
+    "temperature": 0.0,
+    "golden_tokens": 249,
+    "golden_sha256": "ea132a258966e7ce338bcd0b78850c94ff278292ffa81176dbf5e06713070042",
+    "expected_finish_reason": "stop",
+    "golden_text": "To solve the equation $3x + 7 = 22$, we need to isolate the variable $x$. Here is the step-by-step solution:\n\n**Step 1: Subtract 7 from both sides of the equation.**\nTo move the constant term ($7$) to the right side, we subtract $7$ from both sides:\n$$3x + 7 - 7 = 22 - 7$$\n\nSimplifying this gives:\n$$3x = 15$$\n\n**Step 2: Divide both sides by 3.**\nTo isolate $x$, we divide both sides by the coefficient of $x$ (which is $3$):\n$$\\frac{3x}{3} = \\frac{15}{3}$$\n\nSimplifying this gives:\n$$x = 5$$\n\n**Verification:**\nSubstitute $x = 5$ back into the original equation to check the answer:\n$$3(5) + 7 = 15 + 7 = 22$$\nSince $22 = 22$, the solution is correct.\n\n**Final Answer:**\n$$x = 5$$",
+    "required_patterns": [
+      "3x = 15",
+      "x = 5",
+      "Final Answer"
+    ],
+    "forbidden_patterns": [
+      "<|im_start|>",
+      "<|im_end|>"
+    ]
+  },
+  {
+    "id": "reasoning_probability",
+    "category": "reasoning",
+    "prompt": "A box contains 3 red balls and 5 blue balls. If you pick one ball at random, what is the probability it is blue? Explain your answer.",
+    "max_tokens": 256,
+    "temperature": 0.0,
+    "golden_tokens": 251,
+    "golden_sha256": "d69334e0d3bb73970362cf31a61ae3131f711978ba4e2da12b41ba7a67a851f5",
+    "expected_finish_reason": "stop",
+    "golden_text": "To find the probability of picking a blue ball, we follow these steps:\n\n### Step 1: Determine the total number of possible outcomes\nFirst, we calculate the total number of balls in the box. This represents the total number of possible outcomes when picking one ball.\n\n$$ \\text{Total balls} = \\text{Red balls} + \\text{Blue balls} $$\n$$ \\text{Total balls} = 3 + 5 = 8 $$\n\n### Step 2: Determine the number of favorable outcomes\nNext, we identify the number of outcomes that satisfy the condition (picking a blue ball).\n\n$$ \\text{Favorable outcomes (Blue balls)} = 5 $$\n\n### Step 3: Calculate the probability\nThe probability of an event is calculated using the formula:\n\n$$ P(\\text{Event}) = \\frac{\\text{Number of favorable outcomes}}{\\text{Total number of possible outcomes}} $$\n\nSubstituting our values:\n\n$$ P(\\text{Blue}) = \\frac{5}{8} $$\n\n### Conclusion\nThe probability of picking a blue ball is **$\\frac{5}{8}$** (or **0.625**).",
+    "required_patterns": [
+      "3 + 5 = 8",
+      "frac{5}{8}",
+      "0.625"
+    ],
+    "forbidden_patterns": [
+      "<|im_start|>",
+      "<|im_end|>"
+    ]
+  }
+]

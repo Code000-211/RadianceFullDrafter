@@ -1,169 +1,144 @@
-# radiance
+# RadianceMine ⚡
 
-An LLM inference server for AMD GPUs, in C++ and HIP, with an OpenAI-compatible HTTP API. Model
-architectures, kernel libraries and quantisers are `.so` plugins; the ones in this tree are built
-and loaded the same way a third party's are ([`docs/PLUGIN.md`](docs/PLUGIN.md)).
+> **Pristine, Production-Grade Inference Engine & Architectural Governance System for AMD RDNA4 (gfx1201)**
 
-The bundled device kernels (`libr4d`) target **AMD RDNA4** (`gfx1200`, `gfx1201`). The serve flags
-below are for **two 32 GB cards** (Radeon AI PRO R9700). The engine itself starts on any AMD GPU
-family; another card needs a kernel library for it. A machine with no GPU builds the host backend,
-which runs the full test suite but does not serve these models at any useful speed.
+[![Target Baseline: Opt 146](https://img.shields.io/badge/Baseline-Opt%20146%20(1a4455d)-blue.svg)](#the-golden-baseline)
+[![Dual AMD R9700](https://img.shields.io/badge/Hardware-Dual%20R9700%20gfx1201-orange.svg)](#hardware-specification)
+[![3-Tier Zero-Regression Gate](https://img.shields.io/badge/Quality%20Gate-3--Tier%20Zero--Regression-green.svg)](ENGINEERING_CONSTITUTION.md)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-lightgrey.svg)](LICENSE)
 
-If you wish to support the developement of the radiance engine you can do so [here](https://patreon.com/StillDeadCode?utm_medium=unknown&utm_source=join_link&utm_campaign=creatorshare_creator&utm_content=copyLink)
+---
 
-## Models
+## 1. Overview & Mandate
 
-| model | container | get it | compose file |
-|---|---|---|---|
-| Qwen3.8-Flash-Next: 4-bit experts, int8 trunk, MTP, vision | `qwen3.8-next-flash-fp8-iq4r-moe.rad` (114 GiB) | [download](https://huggingface.co/StillDeadcode/qwen3.8-next-flash-fp8-iq4r-moe) | `flashnext.yaml` |
-| Qwen3.8-27B FP8, DFlash2 drafter, vision | `qwen3.8-27b-fp8.rad` (29 GiB) | [download](https://huggingface.co/StillDeadcode/qwen3.8-27b-fp8) | `qwen3.8-27b-fp8.yaml` |
-| Qwen3.6-35B-A3B FP8, MTP | `qwen3.6-35b-a3b-fp8.rad` (35 GiB) | [download](https://huggingface.co/StillDeadcode/qwen3.6-35b-a3b-fp8) | `qwen3.6-35b-a3b.yaml` |
-| MiniCPM5-2B FP8, DSpark drafter | `minicpm5-2b-fp8.rad` (3 GiB) | [download](https://huggingface.co/StillDeadcode/minicpm5-2b-fp8) | `minicpm5-2b.yaml` |
-| MiniCPM5-2B bf16, DSpark drafter | `minicpm5-2b-bf16.rad` (5 GiB) | [download](https://huggingface.co/StillDeadcode/minicpm5-2b-bf16) | `minicpm5-2b-bf16.yaml` |
-| Qwen3.8-27B bf16 | `qwen3.8-27b-bf16.rad` (50 GiB) | [convert](#convert-a-checkpoint) | `qwen3.8-27b-bf16.yaml` |
-| Qwen3.8-Flash-Next bf16, a disk-streamed reference | `qwen3.8-flash-next-bf16.rad` (335 GiB) | [convert](#convert-a-checkpoint) | `flashnext-bf16.yaml` |
+**RadianceMine** is the hardened, regression-proof successor to Radiance, engineered specifically for dual **AMD Radeon AI PRO R9700 (gfx1201)** workstations.
 
-A container holds everything the server needs: the weights, the tokeniser, the chat template and
-any drafter. Each download link's repository has the recipe and the exact command that made the
-file. Download one into your models directory (the transfer resumes if interrupted):
+Following the forensic analysis of post-Opt146 performance regressions (where un-gated concurrent experiments and toxic runtime flags caused throughput to crash from 210.3 tok/s to 75.6 tok/s), RadianceMine institutes an **inviolable 4-rule Engineering Constitution**, an **automated 3-Tier hardware regression gate**, and a **bulletproof worktree workflow**.
 
-```sh
-mkdir -p /srv/models/rad && cd /srv/models/rad
-curl -LC - -O https://huggingface.co/StillDeadcode/minicpm5-2b-fp8/resolve/main/minicpm5-2b-fp8.rad
+---
+
+## 2. The Golden Baseline: Opt 146
+
+- **Commit**: `1a4455d26871100a6a97e1dd3b5c83d4431764b6`
+- **Model**: Qwen3.8-Flash-Next / Qwen4Exp (FP8 trunk linears, IQ4R/W4 MoE 512 experts, top-$k=10$, GDN linear attention, MTP Spec 3–5)
+- **Certified Performance**:
+  - **Combined Decode Median**: `210.3 tok/s` (Code: 238.7, JSON: 264.5, Math: 228.3, File Edit: 233.7)
+  - **Cold 64k Context Prefill**: `9,331.8 tok/s`
+  - **C8 Concurrency Aggregate**: `448.2 tok/s`
+  - **Composite Score**: `631.3 / 1000` (Zenith record: 685.2)
+
+---
+
+## 3. The Four Immutable Engineering Laws
+
+All contributors and autonomous agents are strictly bound by [`ENGINEERING_CONSTITUTION.md`](file:///home/orca/RadianceMine/ENGINEERING_CONSTITUTION.md) and [`AGENTS.md`](file:///home/orca/RadianceMine/AGENTS.md):
+
+1. **Rule 1: The Zero-Regression Invariant (Push/Merge Gate)**  
+   No code is merged into `main` unless it passes all 3 tiers on physical GPUs:
+   - **Tier 1**: Parity Check Gate (`scripts/parity_check.py --suite full`): Greedy bit-exact tokens (0 divergence); Code $\ge 230$ tok/s, Reasoning $\ge 240$ tok/s, Math $\ge 210$ tok/s.
+   - **Tier 2**: BetterBench Composite Score Gate (`scripts/check_composite_gate.py`): Score $\ge$ baseline; zero throughput regression; strict latency guardrails (C1 P99 $\le 4.5\,\text{ms}$, C8 P99 $\le 15.0\,\text{ms}$, TTFT $\le 100\,\text{ms}$).
+   - **Tier 3**: RDNA4 ISA & Hardware Invariants (`scripts/verify_rdna4_invariants.sh`): Zero LDS 32-bank conflicts; VGPR count $\le 84$ (optimal) / $\le 96$ (cliff ceiling); 128-bit coalesced global memory access; zero CPU-GPU synchronous spinlocks in decode.
+2. **Rule 2: Mandatory Full Standalone Build Archival for Winning Arms**  
+   Every winning arm is frozen with executables, `radiance_home` kernels, configs, commit SHA, and environment variables into `releases/golden_builds/<arm>.zip` with SHA256 hashes and an instant $<5\text{-second}$ rollback wrapper.
+3. **Rule 3: Strict Worktree Isolation**  
+   Trunk (`main`) is permanently frozen to the latest winning build. All work happens in dedicated, isolated Git worktrees (`worktrees/<feature>`).
+4. **Rule 4: Zero Destructive Deletions**  
+   Deprecated or failed experiments are never deleted; they are quarantined in `attic/` or preserved in `candidates/` with full post-mortem documentation.
+
+---
+
+## 4. Repository Structure
+
+```
+/home/orca/RadianceMine/
+├── ENGINEERING_CONSTITUTION.md  # Binding 4-rule constitution & 3-tier gate specifications
+├── AGENTS.md                    # Operational directives and machine rules for AI agents
+├── MASTER_PLAN.md               # Master architectural roadmap & sequential integration order
+├── README.md                    # This master overview
+│
+├── scripts/                     # Bulletproof automation toolchain
+│   ├── gate_check.sh            # Automated 3-tier regression gate runner
+│   ├── parity_check.py          # Tier 1 greedy exactness & throughput floor verifier
+│   ├── check_composite_gate.py  # Tier 2 BetterBench composite score & latency validator
+│   ├── verify_rdna4_invariants.sh # Tier 3 RDNA4 ISA & hardware invariant checker
+│   ├── check_isa_compliance.py  # RDNA4 kernel binary & disassembly inspector
+│   ├── archive_winner.sh        # Complete build archival with SHA256 & instant rollback wrapper
+│   ├── rollback_to_winner.sh    # Instant < 5-second rollback engine
+│   └── create_worktree.sh       # Isolated git worktree provisioner
+│
+├── baselines/                   # Certified performance baselines
+│   ├── baseline_opt146.json     # Opt 146 calibrated ladder benchmark results
+│   └── golden_parity_reference.json # Bit-exact greedy token reference vectors
+│
+├── candidates/                  # Standalone candidate levers for sequential integration
+│   ├── README.md                # Master index of candidate levers
+│   ├── POST_OPT146_FORENSIC_AUDIT_AND_EVALUATION.md # Forensic autopsy of regressions
+│   ├── lever1_gdn_qsa_fusion/   # Lever 1: GDN Weight Concat & Fused QSA op_qprep
+│   ├── lever2_fused_moe_router/ # Lever 2: Fused MoE Router (router_gemm_topk_scatter)
+│   ├── lever3_qsa_offload_kvarn/# Lever 3: QSA Host Offload & KVarN INT4 KV
+│   ├── lever4_fr_spec_draft_head/# Lever 4: FR-Spec Reduced-Vocab Draft Head
+│   └── lever5_adaptive_bandit_controller/ # Lever 5: SOTA MTP Adaptive Bandit Controller
+│
+├── releases/golden_builds/      # Archived standalone winning builds with SHA256 & restore.sh
+├── attic/                       # Quarantined failed experiments and post-mortems
+├── worktrees/                   # Dedicated staging for isolated git worktrees
+│
+├── arch/                        # Model architecture definitions (qwen4exp, qwen35, etc.)
+├── core/                        # Engine scheduler, allocator, and dispatch core
+├── libr4d/                      # RDNA4 HIP/assembly kernel library
+└── tests/                       # Unit and architecture test suites
 ```
 
-## Run with Docker
+---
 
-The host needs Docker and an `amdgpu` driver that supports ROCm 7.2; it does not need ROCm. The
-image is [`stilldeadcode/radiance`](https://hub.docker.com/r/stilldeadcode/radiance), with its
-kernels built for `gfx1201`. Pull it, clone this repository for its compose files, then start a
-model from one of them:
+## 5. Quickstart & Workflow Guide
 
-```sh
-docker pull stilldeadcode/radiance
-git clone https://codeberg.org/StillDeadcode/radiance.git
-cp -r radiance/deploy/compose ~/radiance-compose && cd ~/radiance-compose
-cp .env.example .env                         # set RADIANCE_MODELS, RADIANCE_STATE, RADIANCE_API_KEY, the GIDs
-docker compose -f minicpm5-2b.yaml up -d     # or any file from the table
-docker compose -f minicpm5-2b.yaml logs -f
-docker compose -f minicpm5-2b.yaml down
+### Spawning a Clean Worktree
+```bash
+# Provision isolated worktree branched from golden baseline main
+bash scripts/create_worktree.sh lever1_gdn_qsa_fusion
+cd worktrees/lever1_gdn_qsa_fusion
 ```
 
-Every model uses both cards and the same port, so run one at a time. Running without compose, and
-the reason for each `docker run` option, is in [`docs/DOCKER.md`](docs/DOCKER.md).
+### Applying a Candidate Lever
+```bash
+# Apply clean candidate patch
+git apply ../../candidates/lever1_gdn_qsa_fusion/lever.patch
 
-To build the image yourself, for example for other cards, run `docker/build.sh -t 'gfx1200;gfx1201'`
-in the clone (it needs `docker buildx` and tests the build as it goes). Then set
-`RADIANCE_IMAGE=radiance:latest` in `.env`.
-
-## Build from source
-
-You need Linux, git, a C++20 compiler, CMake 3.21+ and Ninja. For the device kernels you also need
-ROCm 7.2 (`hipcc`; set `ROCM_PATH` if it is not `/opt/rocm`). Clone the repository and build in it:
-
-```sh
-git clone https://codeberg.org/StillDeadcode/radiance.git && cd radiance
-./build.sh                                   # configure, build for the cards present, run the tests
-./build.sh --no-hip                          # host backend only
-cmake -S . -B build -G Ninja -DRAD_GPU_TARGETS='gfx1201'   # build for cards this machine lacks
-cmake --install build --prefix /opt/radiance # optional; bin/, include/, share/radiance/
+# Build and run unit tests
+cmake -B build_hip -S . -DCMAKE_BUILD_TYPE=Release
+cmake --build build_hip --target arch_test -j$(nproc)
+./build_hip/tests/arch_test qwen4exp_gdn_in_proj_concat_and_qsa_qprep_fusion
 ```
 
-## Run without Docker
-
-```sh
-export RADIANCE_HOME=$PWD/build/radiance_home   # the plugins; an installed prefix finds its own
-build/bin/radiance --model /srv/models/rad/minicpm5-2b-fp8.rad --port 8000 <flags>
+### Running the 3-Tier Regression Gate
+```bash
+# Executes Tier 3 (ISA), Tier 2 (BetterBench), and Tier 1 (Parity)
+bash scripts/gate_check.sh --all
 ```
 
-These are the flags each model is served with. They match its compose file, minus Flash-Next's
-prefix-cache tiers:
-
-| model | flags |
-|---|---|
-| Qwen3.8-Flash-Next | `--tp 2 --tp-wire wht6 --max-num-seqs 8 --max-model-len 200000 --placement expert_tiered --host-pool-mib 12288 --gpu-headroom-mib 96 --expert-vs-cache-ratio 0.82 --kv-cache-dtype fp8 --num-speculative-tokens 3 --max-num-batched-tokens 2048` |
-| Qwen3.8-Flash-Next, four ranks | `--tp 4 --max-num-seqs 8 --max-model-len 200000 --placement expert_tiered --host-pool-mib 12288 --gpu-headroom-mib 96 --expert-vs-cache-ratio 0.82 --kv-cache-dtype fp8 --num-speculative-tokens 3 --max-num-batched-tokens 2048` |
-| Qwen3.8-Flash-Next, three ranks (the checkpoint padded first, [`docs/TP3.md`](docs/TP3.md)) | `--tp 3 --max-num-seqs 8 --max-model-len 200000 --placement expert_tiered --host-pool-mib 8192 --gpu-headroom-mib 96 --expert-vs-cache-ratio 0.82 --kv-cache-dtype fp8 --num-speculative-tokens 3 --max-num-batched-tokens 2048` |
-| Qwen3.8-27B FP8, Qwen3.6-35B-A3B | `--tp 2 --max-num-seqs 32 --max-model-len 200000 --kv-cache-dtype fp8` |
-| Qwen3.8-27B bf16 | `--tp 2 --max-num-seqs 8 --max-model-len 200000 --kv-cache-dtype fp8` |
-| MiniCPM5-2B FP8 and bf16 | `--tp 2 --max-num-seqs 32 --max-model-len 131072 --kv-cache-dtype fp8 --gpu-headroom-mib 160 --max-num-batched-tokens 512` |
-| Qwen3.8-Flash-Next bf16 | `--tp 2 --max-model-len 32768 --placement expert_tiered --weights-disk-tier --host-pool-mib 12288 --gpu-headroom-mib 768 --deterministic --max-num-seqs 32 --max-num-batched-tokens 32768 --num-speculative-tokens 0` |
-
-Every model serves up to 32 sequences a step. Two rows keep 8, because on a hybrid model each
-sequence holds its own recurrent state and 32 of them leave the attention cache short of one
-200K-token request: Flash-Next at ratio 0.82 (`--max-num-seqs 32 --expert-vs-cache-ratio 0.78`
-keeps the 200K request and costs single-stream decode about 15%) and the 27B in bf16. See
-[`docs/GUIDE.md`](docs/GUIDE.md) §4.4.
-
-At `--tp 4` the gated residual's write carries the exact all-reduce, with the MoE gather in front
-of it, on decode and verify steps; a prefill chunk runs the unfused chain. That chain's exact
-all-reduce is one-shot up to 1 MiB a message and two-shot above that, which sends half the bytes
-on a prefill chunk; both produce the same bits. The row above runs exact.
-`--tp-wire wht6` at four ranks selects a different lossy wire, tiered int8 over the two-shot,
-above `--tp-wire-min-kb`. Eight ranks have no lossy wire, so `--tp 8 --tp-wire wht6` stops at
-startup naming the all-reduce. Four ranks is a capacity configuration; its per-step rate against
-`--tp 2` on the same cards has not been measured. The
-tiering flags are the tp2 recipe carried over. Above two ranks each rank still owns a **slice of
-every expert's width** — each parity's 128-column blocks are cut contiguously over the ranks and the
-odd block alternates with the parity, so every rank's share is whole blocks and every block has
-exactly one owner — and the resident expert bytes per rank are smaller, so the elastic window is a
-different shape: read the boot log's `elastic` line and re-derive `--expert-vs-cache-ratio` and
-`--host-pool-mib` before trusting them. **`--host-pool-mib` is pinned on every card**, so the row
-above pins 4 × 12 GiB = 48 GiB, and the amdgpu driver caps pinned memory at `ttm.pages_limit`, half
-of RAM by default: that row needs 96 GiB of RAM or a raised limit
-([`docs/GUIDE.md`](docs/GUIDE.md) §7).
-
-Add `--api-key KEY` to require `Authorization: Bearer KEY`. Add `--debug-graph` to print every op
-and the kernel it resolved to, then exit without serving. Then:
-
-```sh
-curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' \
-  -d '{"model":"m","messages":[{"role":"user","content":"hi"}],"max_tokens":50}'
+### Archiving a New Winner
+```bash
+# Once certified by gate_check.sh:
+bash scripts/archive_winner.sh --name opt147_lever1_gdn_fusion
 ```
 
-`http://localhost:8000/` is the dashboard. [`docs/GUIDE.md`](docs/GUIDE.md) covers the API, memory
-budgets, long context, speculative decoding and operating a server.
+### Instant 5-Second Rollback
+```bash
+# List available golden releases:
+bash scripts/rollback_to_winner.sh --list
 
-## Convert a checkpoint
-
-`rad-convert` turns a Hugging Face checkpoint into a container, quantising what a recipe in
-`data/recipes/` names. Download checkpoints with `scripts/hfget.sh <org/repo> <dir>`.
-
-```sh
-build/bin/rad-convert ~/models/Qwen/Qwen3.8-27B -o qwen3.8-27b-bf16.rad \
-    --recipe data/recipes/q38-27b-bf16.recipe
-build/bin/rad-convert ~/models/Qwen/Qwen3.8-Flash-Next -o qwen3.8-flash-next-bf16.rad --max-ctx 4096
+# Instantly restore latest certified golden build:
+bash scripts/rollback_to_winner.sh --latest
 ```
 
-With Docker, use `docker run --rm -v ~/models:/models --entrypoint rad-convert stilldeadcode/radiance ...`. In
-the image the recipes are in `/opt/radiance/share/radiance/recipes/`. A checkpoint served at its own
-precision needs no container: `radiance --model ~/models/Qwen/Qwen3.8-27B-FP8`.
+---
 
-## Test
+## 6. Sequential Integration Order
 
-```sh
-ctest --test-dir build -LE 'gpu|oot'   # everything that runs without a card (a few minutes)
-ctest --test-dir build -L gpu          # device suites; they need the cards to themselves
-ctest --test-dir build -L oot          # rebuilds every bundled plugin out of tree against an install
-```
-
-## Documentation
-
-| | |
-|---|---|
-| [`docs/GUIDE.md`](docs/GUIDE.md) | installing, converting, serving, the HTTP API, operating a server |
-| [`docs/TOOLS.md`](docs/TOOLS.md) | every flag of every tool, and the recipe syntax |
-| [`docs/DOCKER.md`](docs/DOCKER.md) | the image and the compose files |
-| [`docs/PLUGIN.md`](docs/PLUGIN.md) | writing a kernel library, architecture or quantiser plugin, including one for another AMD card |
-| [`docs/ARCHITECTURES.md`](docs/ARCHITECTURES.md) | the supported model families and their geometry |
-| [`docs/TP3.md`](docs/TP3.md) | padding a checkpoint, exactly, to a world its head counts do not divide; three ranks |
-| [`docs/OPS.md`](docs/OPS.md), [`docs/KERNELS.md`](docs/KERNELS.md) | the op vocabulary, and what `rad-kbench` last measured |
-| [`spec.md`](spec.md) | the design |
-
-## License
-
-[Apache-2.0](LICENSE), copyright Deadcode and the radiance contributors. Keep [`NOTICE`](NOTICE)
-with any copy or derivative. It credits the authors and lists the MIT-licensed code the tree
-includes. The model weights are not covered: each keeps the license of the model it was converted
-from. The Docker image also holds third-party libraries under their own licenses, GPL and LGPL
-among them; `/usr/share/doc/THIRD-PARTY` in the image lists each one with its version and source.
+Per [`MASTER_PLAN.md`](file:///home/orca/RadianceMine/MASTER_PLAN.md), candidate levers must be admitted in strict linear sequence:
+1. **Phase 1: Lever 1** — GDN Weight Concat & Fused QSA (`-14.0 ms/step`)
+2. **Phase 2: Lever 2** — Fused MoE Router (`-96 dispatches/step`)
+3. **Phase 3: Lever 3** — QSA Host Offload & KVarN INT4 KV (`4x KV compression`)
+4. **Phase 4: Lever 4** — FR-Spec Reduced-Vocab Draft Head (`3x faster draft head`)
+5. **Phase 5: Lever 5** — SOTA MTP Adaptive Bandit Controller (`+15-28% TPS`)

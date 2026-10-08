@@ -1,0 +1,10 @@
+[
+  {
+    "label": "opt146_baseline",
+    "timestamp": "2026-10-08_091603",
+    "commit_sha": "1a4455d26871100a6a97e1dd3b5c83d4431764b6",
+    "archive": "opt146_baseline_2026-10-08_091603.zip",
+    "sha256": "4ac567716f4a51a49a91d326a1d69e6fc541d3d69fdcd67fe4cac6b3e3852449",
+    "size_bytes": 45394
+  }
+]
