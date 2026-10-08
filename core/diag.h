@@ -122,6 +122,12 @@ json phase_report(const PhaseInput& in);
  * slow because it carried more from one that was slow carrying the same. */
 json slow_steps(const std::vector<StepRecord>& steps, int phase);
 
+/* DRAFT ACCEPTANCE BY POSITION, POOLED OVER A POINT'S RUNS: at each position the verifies that
+ * reached it and the share of those that took it, summed over the runs rather than a median of
+ * per-run rates, because a run reaches the deep positions only a few times. This is the curve an
+ * adaptive draft depth is tuned against. */
+json pool_draft_positions(const std::vector<json>& runs);
+
 /* THE RUNS OF ONE MEASUREMENT POINT, reduced to what a reader compares: for each headline number
  * of phase_report, the median over the runs and the smallest and largest run. A run that has no
  * value for a number does not count toward it; a number no run had is null. */
@@ -147,6 +153,10 @@ json interference_report(const std::vector<StepRecord>& steps, int64_t from_ns, 
  * requests and names, for each difference, the first token where they part; a point or run that
  * only one side has is listed as missing rather than counted as either. Two reports of different
  * workloads (workload.fingerprint) are refused with RAD_E_INVAL: their prompts differ. */
+/* Beside the tokens it compares each matched point's draft acceptance, overall and at every
+ * position, pooled over the runs: identical for bit-identical builds, and the first number to
+ * move when a build computes less accurately. A drop with z below -3 (two-proportion test on the
+ * pooled counts) is listed in `acceptance_dropped` and makes `acceptance_verdict` "DROPPED". */
 int compare_outputs(const json& now, const json& base, json* out, std::string* why);
 
 /* The part of a report's workload that decides which prompts and seeds it ran: equal fingerprints

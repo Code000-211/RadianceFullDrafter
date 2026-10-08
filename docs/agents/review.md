@@ -35,7 +35,9 @@ Dann den Diff gegen diese Liste:
    Stimmt die Zeile `numerik:` des Plans mit dem Diff überein (`AGENTS.md` §3, Numerik)? Ändert
    der Diff eine Reihenfolge, obwohl der Plan `bitgenau` sagt, ist das blockierend. Bei
    `verlustfrei-nicht-bitgenau`: hält jeder Beleg (Akkumulator, Zwischenformate gleich oder
-   genauer)? Jede Verringerung von Genauigkeit ist blockierend.
+   genauer)? Jede Verringerung von Genauigkeit ist blockierend. Liegt ein Diagnose-Vergleich mit
+   `acceptance_verdict: DROPPED` vor, ist der Hebel blockiert, bis die Ursache gefunden und
+   behoben ist.
 4. **RDNA4.** `docs/RDNA4_ISA_ENGINEERING_RULES.md`: VGPR-Granularität, keine Waterfall-Schleifen,
    VOPD-Regeln. Wave32.
 5. **Hardware.** Keine Peer-Reads auf dem Hot Path, keine Annahme von PCIe 5.0

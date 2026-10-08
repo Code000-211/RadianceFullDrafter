@@ -78,7 +78,7 @@ Jeder Schritt einzeln baubar, mit Tests im Host-Backend, und einzeln als PR an U
 | Prefix-Cache (VRAM, Host- und Disk-Tier) | Jeder Prompt trägt am Anfang ein Tag, eindeutig pro Prozess und Request (die Tiers überleben einen Neustart, also enthält das Tag Zeit und PID). Cache vor jedem Lauf geleert. Nach jedem Lauf wird `n_cached` jedes Requests geprüft; ein Treffer macht das Urteil „NOT A MEASUREMENT“ und den Exit-Code ungleich 0. Der Cache bleibt an, damit Lookup, Publizieren und Checkpoints wie im Betrieb bezahlt werden. `--no-prefix-cache` geht auch, steht dann als Warnung im Bericht |
 | Erste Ausführung einer Form (Tape-Aufnahme, Code-Objekte laden) | Jeder Messpunkt läuft einmal unbewertet vorher, in derselben Form |
 | `ignore_eos` erzeugt Text nach dem EOS, auf dem der Drafter anders trifft | Kategorien enden auf dem EOS des Modells (Anzahl wird berichtet); nur Concurrency und Prefill nutzen `ignore_eos`, damit alle Streams die ganze Zeit dekodieren |
-| Greedy oder falsches Sampling verfälscht die Annahmequote | Server-Defaults (`generation_config`), feste Seeds pro Request |
+| Greedy oder falsches Sampling verfälscht die Annahmequote | Temperatur 1 (Betriebstemperatur, auf die das adaptive MTP abgestimmt wird), top_k/top_p/min_p aus den Server-Defaults, feste Seeds pro Request |
 | Reasoning an/aus ändert die Ausgabeverteilung | Deployment-Default (`--reasoning-effort`), im Bericht festgehalten |
 | Decode-Geschwindigkeit hängt von der Kontexttiefe ab | Prefill-Sweep misst Decode in jeder Tiefe |
 | Rauschen von Lauf zu Lauf | `--diagnose-runs`, Median mit Min–Max |
@@ -99,8 +99,9 @@ Temperatur dieselben Tokens. `--diagnose-baseline ALT/diagnose.json` vergleicht 
 Concurrency und Prefill Token für Token, nennt je abweichendem Request die erste abweichende Stelle
 und beendet den Lauf mit Fehler. Interferenz wird nicht verglichen (Abbruchzeitpunkt hängt am
 Timing). Vorher die Baseline zweimal gegen sich selbst laufen lassen: Weicht sie dort ab, ist ein
-Pfad nicht deterministisch und taugt nicht für Bitparität. Regel für nicht bitgenaue Hebel:
-`AGENTS.md` §3, Numerik.
+Pfad nicht deterministisch und taugt nicht für Bitparität. Daneben die Draft-Annahme je Punkt und
+Position, gepoolt über die Läufe; ein Einbruch (z < −3) heißt `DROPPED` und lässt den Lauf
+scheitern. Regel für nicht bitgenaue Hebel und Annahme-Einbrüche: `AGENTS.md` §3, Numerik.
 
 ## Messregeln, die der Bericht einhält
 

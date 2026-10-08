@@ -544,6 +544,83 @@ TEST(fingerprint_is_stable_and_sensitive) {
     CHECK_EQ(workload_fingerprint(a).size(), (size_t)16);
 }
 
+namespace {
+/* A report whose one category ran two runs, each proposing `n` drafts and taking `k`, with
+ * position 1 reached `n` times and taken `k1` times. Outputs identical, so only acceptance moves. */
+json acceptance_report(int64_t n, int64_t k, int64_t k1) {
+    std::vector<json> runs;
+    for (int r = 0; r < 2; ++r) {
+        PhaseInput in;
+        in.after.draft_tokens = n;
+        in.after.draft_accepted = k;
+        in.after.draft_depth_seen = 1;
+        in.after.draft_pos_reached[0] = n;
+        in.after.draft_pos_accepted[0] = k1;
+        RequestTiming t;
+        t.output = { 7, 8 };
+        in.requests.push_back(t);
+        runs.push_back(phase_report(in));
+    }
+    json rep;
+    rep["workload"] = { { "fingerprint", "f" } };
+    rep["categories"] = json::array({ { { "category", "code" }, { "runs", runs },
+                                        { "summary", summarize_runs(runs) },
+                                        { "draft_by_position", pool_draft_positions(runs) } } });
+    return rep;
+}
+}  /* namespace */
+
+TEST(draft_positions_pool_counts_not_rates) {
+    std::vector<json> runs(2);
+    runs[0]["counters"]["draft_by_position"] = json::array({ { { "position", 1 }, { "reached", 10 }, { "accepted_n", 9 } },
+                                                              { { "position", 2 }, { "reached", 9 }, { "accepted_n", 3 } } });
+    runs[1]["counters"]["draft_by_position"] = json::array({ { { "position", 1 }, { "reached", 90 }, { "accepted_n", 45 } } });
+    const json p = pool_draft_positions(runs);
+    REQUIRE(p.size() == 2);
+    CHECK_EQ(p[0]["reached"].get<int64_t>(), (int64_t)100);
+    CHECK(near(p[0]["accepted"].get<double>(), 0.54));   /* 54 of 100, not the mean of 0.9 and 0.5 */
+    CHECK(near(p[1]["accepted"].get<double>(), 1.0 / 3.0));
+    CHECK(pool_draft_positions({}).empty());
+}
+
+TEST(an_acceptance_drop_fails_the_comparison) {
+    json out;
+    std::string why;
+    /* 2 x 1000 drafts, 70% taken in the baseline. */
+    REQUIRE(compare_outputs(acceptance_report(1000, 700, 800), acceptance_report(1000, 700, 800), &out, &why) == RAD_OK);
+    CHECK_EQ(out["verdict"].get<std::string>(), std::string("identical"));
+    CHECK_EQ(out["acceptance_verdict"].get<std::string>(), std::string("no drop"));
+    CHECK(near(out["acceptance"][0]["z"].get<double>(), 0.0));
+
+    /* 70% -> 60% over 2000 drafts each: z is about -4.7. */
+    REQUIRE(compare_outputs(acceptance_report(1000, 600, 800), acceptance_report(1000, 700, 800), &out, &why) == RAD_OK);
+    CHECK_EQ(out["acceptance_verdict"].get<std::string>(), std::string("DROPPED"));
+    REQUIRE(out["acceptance_dropped"].size() == 1);
+    CHECK_EQ(out["acceptance_dropped"][0]["what"].get<std::string>(), std::string("overall"));
+    CHECK(out["acceptance_dropped"][0]["z"].get<double>() < -4.0);
+
+    /* A collapse at one position alone is caught there. */
+    REQUIRE(compare_outputs(acceptance_report(1000, 700, 500), acceptance_report(1000, 700, 800), &out, &why) == RAD_OK);
+    REQUIRE(out["acceptance_dropped"].size() == 1);
+    CHECK_EQ(out["acceptance_dropped"][0]["what"].get<std::string>(), std::string("position 1"));
+
+    /* 70% -> 69%: within noise at this many drafts (z about -0.5), not a drop. */
+    REQUIRE(compare_outputs(acceptance_report(1000, 690, 800), acceptance_report(1000, 700, 800), &out, &why) == RAD_OK);
+    CHECK_EQ(out["acceptance_verdict"].get<std::string>(), std::string("no drop"));
+
+    /* A rise is never a drop. */
+    REQUIRE(compare_outputs(acceptance_report(1000, 800, 900), acceptance_report(1000, 700, 800), &out, &why) == RAD_OK);
+    CHECK_EQ(out["acceptance_verdict"].get<std::string>(), std::string("no drop"));
+
+    const std::string md = render_markdown([&] {
+        json r = acceptance_report(1000, 600, 800);
+        compare_outputs(r, acceptance_report(1000, 700, 800), &out, &why);
+        r["parity"] = out;
+        return r;
+    }());
+    CHECK(md.find("**DROPPED**") != std::string::npos);
+}
+
 TEST(parity_renders_with_its_differences) {
     json rep = report_with({ { 1, 2, 3 } });
     json cmp;

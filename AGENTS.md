@@ -75,6 +75,12 @@ eine grobe Zusatzprüfung. Der Schutz ist die Deklaration mit Beleg; über jede 
 Abweichung entscheidet Leon anhand des Paritätsberichts (erste abweichende Stelle je Request,
 `radiance --diagnose --diagnose-baseline`).
 
+**Draft-Annahme ist ein Pflichtsignal.** Der Diagnose-Lauf misst bei Temperatur 1, der
+Betriebstemperatur, und vergleicht die Annahmerate je Kategorie und Draft-Position mit der
+Baseline. Bitgenaue Builds nehmen identisch an. Meldet der Vergleich `DROPPED` (gepoolte Zählungen,
+z < −3), ist das blockierend, auch für einen deklarierten Hebel: Review des numerischen Pfads und
+ein Fix, bevor der Hebel weiter darf.
+
 ## 4. Laufzeit-Umgebung
 
 Verboten beim Benchmarken und im Gate:

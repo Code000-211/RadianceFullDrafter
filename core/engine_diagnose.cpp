@@ -83,8 +83,9 @@ json env_snapshot() {
 /* One request of a run. */
 struct Job {
     std::vector<int32_t> prompt;
-    int  max_tokens = 0;
-    bool ignore_eos = true;
+    int   max_tokens = 0;
+    bool  ignore_eos = true;
+    float temp = -1.0f;   /* < 0: the server's default */
 };
 
 double loadavg1() {
@@ -210,6 +211,12 @@ int Engine::run_diagnose() {
 
     const SamplingParams sp0 = resolve_sampling_defaults(meta_, file_ != nullptr, cfg_);
     uint64_t next_id = 1;
+    /* TEMPERATURE 1 FOR EVERY REQUEST, whatever the server's default: it is the temperature the
+     * model is served at, and draft acceptance -- what an adaptive draft depth is tuned on -- falls
+     * with temperature, so a greedy workload would tune it for traffic that never comes. top_k,
+     * top_p and min_p stay the server's. Parity does not need greedy: a fixed seed per request
+     * makes bit-identical logits sample identical tokens at any temperature. */
+    const float kTemp = 1.0f;
 
     /* ---- one run: submit, wait, collect ----
      * `late` is submitted once every request of `early` has produced `late_after` tokens; the
@@ -239,6 +246,7 @@ int Engine::run_diagnose() {
                 r->max_tokens = jb.max_tokens;
                 r->ignore_eos = jb.ignore_eos;
                 r->sp = sp0;
+                if (jb.temp >= 0.0f) r->sp.temp = jb.temp;
                 r->sp.seed = 0x5eedull * 7919ull + r->id;   /* fixed per request, so reruns sample alike */
                 r->sink = sinks.back().get();
                 sinks.back()->id = r->id;
@@ -392,6 +400,7 @@ int Engine::run_diagnose() {
                                 RAD_TRY(render(e.messages, &jb.prompt));
                                 jb.max_tokens = warm ? std::min(mt, 32) : mt;
                                 jb.ignore_eos = false;   /* the model's own lengths: that is the category */
+                                jb.temp = kTemp;
                                 jobs->push_back(std::move(jb));
                                 return RAD_OK;
                             },
@@ -402,9 +411,10 @@ int Engine::run_diagnose() {
             reqs += r["requests"]["count"].get<int64_t>();
             stopped += r["requests"]["stopped_on_eos"].get<int64_t>();
         }
-        categories.push_back({ { "category", cat }, { "prompts", (int64_t)es.size() }, { "requests", reqs },
-                               { "stopped_on_eos", stopped }, { "summary", diag::summarize_runs(rs) },
-                               { "runs", rs } });
+        categories.push_back({ { "category", cat }, { "prompts", (int64_t)es.size() },
+                               { "requests", reqs }, { "stopped_on_eos", stopped },
+                               { "summary", diag::summarize_runs(rs) },
+                               { "draft_by_position", diag::pool_draft_positions(rs) }, { "runs", rs } });
     }
 
     /* ---- concurrency ---- */
@@ -422,12 +432,14 @@ int Engine::run_diagnose() {
                                 RAD_TRY(render(corpus[(size_t)s % corpus.size()].messages, &jb.prompt));
                                 jb.max_tokens = warm ? std::min(dec_tokens, 32) : dec_tokens;
                                 jb.ignore_eos = true;   /* every stream decodes the whole run */
+                                jb.temp = kTemp;
                                 jobs->push_back(std::move(jb));
                             }
                             return RAD_OK;
                         },
                         &rs));
-        concurrency.push_back({ { "streams", n }, { "summary", diag::summarize_runs(rs) }, { "runs", rs } });
+        concurrency.push_back({ { "streams", n }, { "summary", diag::summarize_runs(rs) },
+                                { "draft_by_position", diag::pool_draft_positions(rs) }, { "runs", rs } });
     }
 
     /* ---- prefill ---- */
@@ -449,6 +461,7 @@ int Engine::run_diagnose() {
                             got = (int64_t)jb.prompt.size();
                             jb.max_tokens = warm ? 1 : depth_tokens;
                             jb.ignore_eos = true;
+                            jb.temp = kTemp;
                             jobs->push_back(std::move(jb));
                             return RAD_OK;
                         },
@@ -483,11 +496,13 @@ int Engine::run_diagnose() {
                     RAD_TRY(render(corpus[(size_t)s % corpus.size()].messages, &jb.prompt));
                     jb.max_tokens = run_tokens;
                     jb.ignore_eos = true;
+                    jb.temp = kTemp;
                     early.push_back(std::move(jb));
                 }
                 RAD_TRY(sized_prompt(want, doc_salt++, &late[0].prompt));
                 late[0].max_tokens = after;
                 late[0].ignore_eos = true;
+                late[0].temp = kTemp;
                 diag::PhaseInput in;
                 const std::string name = "interference/" + (r < 0 ? std::string("warmup") : std::to_string(r + 1));
                 RAD_TRY(run_set(name, diag::PhaseKind::Decode, early, late, after, &in));
@@ -532,9 +547,9 @@ int Engine::run_diagnose() {
                        (cfg_.diagnose_corpus.empty() ? std::string("the built-in corpus") : cfg_.diagnose_corpus) +
                        " up to " + std::to_string(dec_tokens) + " tokens, ending on EOS; concurrency streams " +
                        std::to_string(dec_tokens) + " tokens with ignore_eos; prefill then " +
-                       std::to_string(depth_tokens) + " tokens of decode; server sampling defaults with a fixed "
-                       "seed per request; prefix cache emptied before every run";
-    w["sampling"] = { { "temp", sp0.temp }, { "top_k", sp0.top_k }, { "top_p", sp0.top_p }, { "min_p", sp0.min_p } };
+                       std::to_string(depth_tokens) + " tokens of decode; temperature 1 with the server's "
+                       "top_k/top_p/min_p and a fixed seed per request; prefix cache emptied before every run";
+    w["sampling"] = { { "temp", kTemp }, { "top_k", sp0.top_k }, { "top_p", sp0.top_p }, { "min_p", sp0.min_p } };
     w["reasoning_effort"] = cfg_.reasoning_effort;
     w["runs"] = runs;
     w["tokens"] = dec_tokens;
@@ -584,9 +599,10 @@ int Engine::run_diagnose() {
         } else if (diag::compare_outputs(rep, base, &cmp, &why) == RAD_OK) {
             cmp["baseline"] = cfg_.diagnose_baseline;
             rep["parity"] = cmp;
-            parity_ok = cmp["verdict"] == "identical";
-            RAD_INFO("diagnose: parity %s, %lld of %lld requests identical", cmp["verdict"].get<std::string>().c_str(),
-                     (long long)cmp["identical"].get<int64_t>(), (long long)cmp["compared"].get<int64_t>());
+            parity_ok = cmp["verdict"] == "identical" && cmp["acceptance_verdict"] == "no drop";
+            RAD_INFO("diagnose: parity %s, %lld of %lld requests identical; draft acceptance: %s",
+                     cmp["verdict"].get<std::string>().c_str(), (long long)cmp["identical"].get<int64_t>(),
+                     (long long)cmp["compared"].get<int64_t>(), cmp["acceptance_verdict"].get<std::string>().c_str());
         }
         if (!why.empty()) {
             rep["parity"] = { { "baseline", cfg_.diagnose_baseline }, { "verdict", "not compared: " + why } };

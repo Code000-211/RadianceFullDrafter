@@ -93,6 +93,24 @@ json coeff_var(const std::vector<double>& v) {
     return round3(std::sqrt(ss / (double)(v.size() - 1)) / m);
 }
 
+std::string num(const json& v, const char* unit = "") {
+    if (v.is_null()) return "–";
+    char b[64];
+    if (v.is_number_integer()) std::snprintf(b, sizeof b, "%lld%s", (long long)v.get<int64_t>(), unit);
+    else std::snprintf(b, sizeof b, "%.3g%s", v.get<double>(), unit);
+    return b;
+}
+
+/* Two-proportion z for k1/n1 against k0/n0, negative when the first is lower; NaN without data. */
+double drop_z(int64_t n1, int64_t k1, int64_t n0, int64_t k0) {
+    if (n1 <= 0 || n0 <= 0) return std::nan("");
+    const double p1 = (double)k1 / (double)n1, p0 = (double)k0 / (double)n0;
+    const double p = (double)(k1 + k0) / (double)(n1 + n0);
+    const double se = std::sqrt(p * (1.0 - p) * (1.0 / (double)n1 + 1.0 / (double)n0));
+    if (se <= 0) return p1 == p0 ? 0.0 : (p1 < p0 ? -INFINITY : INFINITY);
+    return (p1 - p0) / se;
+}
+
 const char* phase_name(int p) {
     return p == RAD_PHASE_DECODE ? "decode" : p == RAD_PHASE_PREFILL ? "prefill" : "mixed";
 }
@@ -127,6 +145,28 @@ json slow_steps(const std::vector<StepRecord>& steps, int phase) {
     for (size_t i = 0; i < k; ++i) slow.push_back(row(*s[s.size() - 1 - i]));
     j["slowest"] = slow;
     return j;
+}
+
+json pool_draft_positions(const std::vector<json>& runs) {
+    std::vector<int64_t> reached, taken;
+    for (const json& r : runs) {
+        if (!r.contains("counters") || !r["counters"].contains("draft_by_position")) continue;
+        for (const json& x : r["counters"]["draft_by_position"]) {
+            const size_t p = (size_t)x.value("position", 0);
+            if (p < 1) continue;
+            if (reached.size() < p) {
+                reached.resize(p, 0);
+                taken.resize(p, 0);
+            }
+            reached[p - 1] += x.value("reached", (int64_t)0);
+            taken[p - 1] += x.value("accepted_n", (int64_t)0);
+        }
+    }
+    json out = json::array();
+    for (size_t p = 0; p < reached.size(); ++p)
+        out.push_back({ { "position", (int64_t)p + 1 }, { "reached", reached[p] }, { "accepted_n", taken[p] },
+                        { "accepted", ratio((double)taken[p], (double)reached[p]) } });
+    return out;
 }
 
 json phase_report(const PhaseInput& in) {
@@ -223,6 +263,7 @@ json phase_report(const PhaseInput& in) {
         json x;
         x["position"] = p + 1;
         x["reached"] = reached;
+        x["accepted_n"] = b.draft_pos_accepted[p] - a.draft_pos_accepted[p];
         x["accepted"] = ratio((double)(b.draft_pos_accepted[p] - a.draft_pos_accepted[p]), (double)reached);
         pos.push_back(x);
     }
@@ -368,7 +409,7 @@ int compare_outputs(const json& now, const json& base, json* out, std::string* w
     static const Section kSections[] = { { "categories", "category" }, { "concurrency", "streams" },
                                          { "prefill", "requested_tokens" } };
     int64_t compared = 0, identical = 0;
-    json differing = json::array(), missing = json::array();
+    json differing = json::array(), missing = json::array(), acceptance = json::array(), dropped = json::array();
     for (const Section& sec : kSections) {
         const json empty = json::array();
         const json& a = now.contains(sec.name) ? now[sec.name] : empty;
@@ -378,13 +419,52 @@ int compare_outputs(const json& now, const json& base, json* out, std::string* w
                 if (p.contains(sec.key) && p[sec.key] == key) return &p;
             return nullptr;
         };
+        auto label = [&](const json& p) {
+            const json& key = p[sec.key];
+            return std::string(sec.name) + " " + (key.is_string() ? key.get<std::string>() : key.dump());
+        };
         for (const json& pa : a) {
             const json& key = pa[sec.key];
-            const std::string point = std::string(sec.name) + " " + (key.is_string() ? key.get<std::string>() : key.dump());
+            const std::string point = label(pa);
             const json* pb = find(b, key);
             if (!pb) {
                 missing.push_back(point + ": not in the baseline");
                 continue;
+            }
+            /* DRAFT ACCEPTANCE BESIDE THE TOKENS. Bit-identical builds accept identically; a build
+             * that is not shows here first, because the draft head reads the trunk's hidden state
+             * and an inaccuracy there costs acceptance before it changes an answer. A DROP is
+             * judged on the pooled counts of all runs, overall and at every position, by a
+             * two-proportion test: z below -3 is a drop noise alone produces about once in a
+             * thousand comparisons, and it fails the comparison. */
+            auto pooled = [](const json& p) {
+                int64_t n = 0, k = 0;
+                for (const json& r : p.value("runs", json::array()))
+                    if (r.contains("counters")) {
+                        n += r["counters"].value("draft_tokens", (int64_t)0);
+                        k += r["counters"].value("draft_accepted", (int64_t)0);
+                    }
+                return std::make_pair(n, k);
+            };
+            auto check = [&](const std::string& what, int64_t n1, int64_t k1, int64_t n0, int64_t k0) {
+                const double z = drop_z(n1, k1, n0, k0);
+                json x = { { "point", point }, { "what", what },
+                           { "now", ratio((double)k1, (double)n1) }, { "baseline", ratio((double)k0, (double)n0) },
+                           { "n_now", n1 }, { "n_baseline", n0 },
+                           { "z", std::isfinite(z) ? json(round3(z)) : json(nullptr) } };
+                acceptance.push_back(x);
+                if (std::isfinite(z) && z < -3.0) dropped.push_back(x);
+            };
+            {
+                const auto [n1, k1] = pooled(pa);
+                const auto [n0, k0] = pooled(*pb);
+                if (n1 > 0 || n0 > 0) check("overall", n1, k1, n0, k0);
+                const json pn = pa.value("draft_by_position", json::array());
+                const json pbp = (*pb).value("draft_by_position", json::array());
+                for (size_t q = 0; q < std::min(pn.size(), pbp.size()); ++q)
+                    check("position " + std::to_string(q + 1), pn[q].value("reached", (int64_t)0),
+                          pn[q].value("accepted_n", (int64_t)0), pbp[q].value("reached", (int64_t)0),
+                          pbp[q].value("accepted_n", (int64_t)0));
             }
             const json& ra = pa.value("runs", json::array());
             const json& rb = (*pb).value("runs", json::array());
@@ -417,20 +497,20 @@ int compare_outputs(const json& now, const json& base, json* out, std::string* w
             }
         }
         for (const json& pb : b)
-            if (!find(a, pb[sec.key]))
-                missing.push_back(std::string(sec.name) + " " +
-                                  (pb[sec.key].is_string() ? pb[sec.key].get<std::string>() : pb[sec.key].dump()) +
-                                  ": only in the baseline");
+            if (!find(a, pb[sec.key])) missing.push_back(label(pb) + ": only in the baseline");
     }
     json j;
     j["compared"] = compared;
     j["identical"] = identical;
     j["differing"] = differing;
     j["missing"] = missing;
+    j["acceptance"] = acceptance;
+    j["acceptance_dropped"] = dropped;
     j["verdict"] = compared == 0           ? "nothing compared"
                  : !differing.empty()      ? "DIFFERS"
                  : !missing.empty()        ? "identical where both ran; points missing"
                                            : "identical";
+    j["acceptance_verdict"] = dropped.empty() ? "no drop" : "DROPPED";
     *out = j;
     return RAD_OK;
 }
@@ -613,13 +693,6 @@ json salt_messages(const json& messages, const std::string& tag) {
 
 namespace {
 
-std::string num(const json& v, const char* unit = "") {
-    if (v.is_null()) return "–";
-    char b[64];
-    if (v.is_number_integer()) std::snprintf(b, sizeof b, "%lld%s", (long long)v.get<int64_t>(), unit);
-    else std::snprintf(b, sizeof b, "%.3g%s", v.get<double>(), unit);
-    return b;
-}
 
 /* "12.3 (11.9–12.8)": the median of a summarised number with its range, or the median alone. */
 std::string cell(const json& summary, const char* key) {
@@ -661,6 +734,15 @@ std::string render_markdown(const json& rep) {
                  cell(s, "steps.decode_tok_per_step") + " | " + cell(s, "counters.draft_acceptance") + " | " +
                  cell(s, "requests.ttft_ms.p50") + " | " + cell(s, "steps.tok_s_1pct_low") + " | " +
                  num(c.value("stopped_on_eos", json())) + " of " + num(c.value("requests", json())) + " |\n";
+        }
+        m += "\nDraft acceptance by position (conditional, pooled over the runs):\n\n";
+        for (const auto& c : rep["categories"]) {
+            const json pos = c.value("draft_by_position", json::array());
+            if (pos.empty()) continue;
+            m += "- " + c.value("category", std::string("?")) + ":";
+            for (const auto& p : pos)
+                m += " " + num(p["position"]) + ": " + num(p["accepted"]) + " (" + num(p["reached"]) + ");";
+            m += "\n";
         }
         m += "\n";
     }
@@ -712,6 +794,18 @@ std::string render_markdown(const json& rep) {
             for (const auto& x : d)
                 m += "| " + x["point"].get<std::string>() + " | " + num(x["run"]) + " | " + num(x["request"]) + " | " +
                      num(x["first_different_token"]) + " | " + num(x["tokens"]) + " / " + num(x["tokens_baseline"]) + " |\n";
+            m += "\n";
+        }
+        const json acc = p.value("acceptance", json::array());
+        if (!acc.empty()) {
+            m += "Draft acceptance against the baseline, pooled over the runs (**" +
+                 p.value("acceptance_verdict", std::string()) + "**; a drop is z below -3):\n\n"
+                 "| Point | | Now | Baseline | Drafts now / baseline | z |\n|---|---|---|---|---|---|\n";
+            for (const auto& x : acc)
+                m += "| " + x.value("point", std::string()) + " | " + x.value("what", std::string()) + " | " +
+                     num(x.value("now", json())) + " | " + num(x.value("baseline", json())) + " | " +
+                     num(x.value("n_now", json())) + " / " + num(x.value("n_baseline", json())) + " | " +
+                     num(x.value("z", json())) + " |\n";
             m += "\n";
         }
         for (const auto& x : p.value("missing", json::array())) m += "- missing: " + x.get<std::string>() + "\n";

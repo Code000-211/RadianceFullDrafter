@@ -1505,7 +1505,9 @@ exits. Non-zero exit means a request failed or the run is not a measurement (bel
 | interference | up to 4 streams decoding, then one prompt arriving | its TTFT under load beside its idle TTFT, and the longest gap it put into the running streams |
 
 What makes the numbers those of a server and not of a benchmark mode: the chat template and the
-deployment's reasoning default, the server's sampling defaults (with a fixed seed per request),
+deployment's reasoning default, temperature 1 with the server's top-k/top-p/min-p (draft
+acceptance falls with temperature, so a draft depth tuned on greedy output is tuned for traffic
+that does not come) and a fixed seed per request,
 drafting and pipelining as configured, the prefix cache on. What makes them repeatable: every
 point is run once unmeasured -- a new batch shape records its passes and loads code on first use --
 then `--diagnose-runs` times from an idle engine, and each cell is the median with the range of
@@ -1521,6 +1523,10 @@ identical seeds, and every request's tokens are in the report. Bit-identical log
 identical tokens at any temperature, so `--diagnose-baseline OLD/diagnose.json` turns the whole
 workload -- categories, batched decode, long prefills -- into a parity check: the report lists
 each request whose tokens differ and the first token where they part, and the run exits non-zero.
+Beside the tokens it compares draft acceptance per point, overall and at every draft position,
+pooled over the runs; a drop with z below -3 (two-proportion test) is reported as `DROPPED` and
+fails the run too. Bit-identical builds accept identically, and a build that computes less
+accurately usually loses acceptance before it changes an answer.
 The interference point is not compared, because when its streams are cancelled depends on timing.
 Run the baseline twice against itself first: a difference there means a path is not
 deterministic, and that path cannot be held to bit parity.
