@@ -135,7 +135,8 @@ last_c = data.get("last_checked", 0)
 print(f" • Screened PRs: {len(prs)}")
 if last_c:
     import time
-    print(f" • Last Poll:    {time.strftime(\"%Y-%m-%d %H:%M:%S\", time.localtime(last_c))}")
+    ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last_c))
+    print(f" • Last Poll:    {ts}")
 ' "${REPO_ROOT}/telemetry/upstream_seen.json"
         fi
         echo ""
