@@ -111,7 +111,11 @@ if [ -x "/usr/local/bin/with_render" ]; then
     WRAPPER="/usr/local/bin/with_render"
 fi
 
-$WRAPPER "${BIN_PATH}" \
+# RADIANCE_ENGINE_PREFIX puts a launcher directly in front of the binary, e.g. rocprofv3 for
+# scripts/profile_engine.py: the profiler then wraps only bin/radiance, as libr4d/isa/trace.sh's
+# callers do, and not this script and every helper it runs. Split on spaces on purpose.
+# shellcheck disable=SC2086
+$WRAPPER ${RADIANCE_ENGINE_PREFIX:-} "${BIN_PATH}" \
   --model "${MODEL_PATH}" \
   --port "${PORT}" \
   --tp "${TP}" \

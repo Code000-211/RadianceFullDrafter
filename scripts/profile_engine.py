@@ -127,17 +127,27 @@ def prefill_messages(bb_path: str, depth: int) -> list[dict[str, str]]:
 # ---------------------------------------------------------------- engines
 
 class TracedEngine:
-    """scripts/start_engine.sh under libr4d/isa/trace.sh; stops bin/radiance with SIGTERM only."""
+    """scripts/start_engine.sh with rocprofv3 in front of bin/radiance only (RADIANCE_ENGINE_PREFIX),
+    the same rocprofv3 call as libr4d/isa/trace.sh. Wrapping the whole script made rocprofv3
+    instrument every helper process, and on epyc the traced engine then failed ar_ipc_alloc
+    ("hip: invalid argument") and never served. Stops bin/radiance with SIGTERM only."""
 
     def __init__(self, build_dir: Path, port: int, trace_dir: Path, log_path: Path):
         self.build_dir, self.port, self.trace_dir, self.log_path = build_dir.resolve(), port, trace_dir, log_path
         self.proc: subprocess.Popen | None = None
 
     def start(self, timeout_s: int) -> None:
-        cmd = ["sh", str(ISA / "trace.sh"), str(self.trace_dir), "--",
-               "bash", str(SCRIPT_DIR / "start_engine.sh"), "--build-dir", str(self.build_dir), "--port", str(self.port)]
+        if self.trace_dir.exists():
+            shutil.rmtree(self.trace_dir)
+        self.trace_dir.mkdir(parents=True)
+        free_mib = shutil.disk_usage(self.trace_dir).free >> 20
+        if free_mib < 4096:  # trace.sh's floor: a decode trace writes ~85 MB a minute
+            raise RuntimeError(f"only {free_mib} MiB free under {self.trace_dir}, refusing to trace")
+        rocm = os.environ.get("ROCM_PATH", "/opt/rocm")
+        prefix = f"{rocm}/bin/rocprofv3 --kernel-trace --output-format csv -d {self.trace_dir} -o k --"
+        cmd = ["bash", str(SCRIPT_DIR / "start_engine.sh"), "--build-dir", str(self.build_dir), "--port", str(self.port)]
         self.proc = subprocess.Popen(cmd, stdout=self.log_path.open("w"), stderr=subprocess.STDOUT,
-                                     start_new_session=True)
+                                     env={**os.environ, "RADIANCE_ENGINE_PREFIX": prefix}, start_new_session=True)
         t0 = time.time()
         while not ab_gate.endpoint_up(self.port):
             if self.proc.poll() is not None:
@@ -419,6 +429,10 @@ def render(summary: dict[str, Any]) -> str:
             L += [f"| `{x['kernel']}` | {x['where']} | {x['extra_us']} |" for x in so["contributors"]]
         L += ["", f"Vollständige Tabellen: `tsum_c{c['streams']}.txt`, `gaps_c{c['streams']}.txt`."]
         L += [f"**Warnung:** {w}" for w in c.get("warnings", [])] + [""]
+    if summary.get("trace_error"):
+        L += ["## Trace fehlgeschlagen", "",
+              f"Die getracten Teile wurden abgebrochen: `{summary['trace_error']}`. Der Score oben ist davon "
+              "unberührt; Kernel-Zeiten, Lücken und langsamste Schritte fehlen in diesem Profil.", ""]
     pf = summary.get("prefill")
     if pf:
         a = pf["analysis"]
@@ -466,7 +480,15 @@ def main() -> int:
         (out / "betterbench_raw.json").write_text(json.dumps(raw, indent=1, default=str))
         summary["score"] = bench_metrics.calculate_metrics(raw)
         (out / "score.json").write_text(json.dumps(summary["score"], indent=2))
+    except (RuntimeError, OSError, ab_gate.SetupError, subprocess.SubprocessError, ValueError, KeyError) as e:
+        (out / "ERROR.txt").write_text(str(e) + "\n")
+        print(f"profile failed: {e}", file=sys.stderr)
+        return 2
 
+    # THE TRACES ARE THE SECOND HALF, AND THEIR FAILURE IS A FINDING, NOT A LOST PROFILE. The score
+    # above stands on its own (the target is judged on it); a trace that cannot be taken stops the
+    # remaining traced parts, because each costs an engine start, and is reported in PROFILE.md.
+    try:
         for n in levels:
             csv_path, traced_run = traced(args.build_dir, out, f"c{n}", args.startup_timeout,
                                           lambda n=n: drive(PORT, n, args.tokens))
@@ -498,9 +520,9 @@ def main() -> int:
                               "analysis": analyse(rows, overhead_c1, last_burst(rows)), "warnings": []}
         keep_trace(csv_path)
     except (RuntimeError, OSError, ab_gate.SetupError, subprocess.SubprocessError, ValueError, KeyError) as e:
-        (out / "ERROR.txt").write_text(str(e) + "\n")
-        print(f"profile failed: {e}", file=sys.stderr)
-        return 2
+        summary["trace_error"] = str(e)
+        (out / "ERROR.txt").write_text(f"trace part: {e}\n")
+        print(f"profile: trace part failed, score kept: {e}", file=sys.stderr)
     shutil.rmtree(out / "tsum_tmp", ignore_errors=True)
     (out / "summary.json").write_text(json.dumps(summary, indent=2))
     (out / "PROFILE.md").write_text(render(summary))

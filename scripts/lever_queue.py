@@ -64,7 +64,10 @@ REPORTS_DIR = REPO_ROOT / "reports"
 RELEASES_DIR = REPO_ROOT / "releases"
 LOCK_FILE = QUEUE_DIR / "runner.lock"
 PROFILE_LATEST = REPORTS_DIR / "profile_latest"
-PROFILE_TRIED = QUEUE_DIR / "profile_tried.json"  # {"sha", "attempts"} of the last profiled main, pass or fail
+PROFILE_TRIED = QUEUE_DIR / "profile_tried.json"  # {"sha", "attempts", "time"} of the last profiled main, pass or fail
+# A profile holds both GPUs for most of an hour; main can move several times an hour. Automatic
+# profiles therefore wait this long after the last attempt; `lever_queue.py profile` does not.
+PROFILE_MIN_INTERVAL_S = 6 * 3600
 BASELINE_WT = REPO_ROOT / "worktrees" / "_baseline"
 ROCM = os.environ.get("ROCM_PATH", "/opt/rocm")
 # The systemd unit starts with a bare environment; cmake's HIP detection needs these.
@@ -270,7 +273,7 @@ def profile_baseline() -> Path:
         head = git_out("rev-parse", "origin/main")
         tried = json.loads(PROFILE_TRIED.read_text()) if PROFILE_TRIED.is_file() else {}
         attempts = tried.get("attempts", 0) + 1 if tried.get("sha") == head else 1
-        PROFILE_TRIED.write_text(json.dumps({"sha": head, "attempts": attempts}))
+        PROFILE_TRIED.write_text(json.dumps({"sha": head, "attempts": attempts, "time": time.time()}))
         baseline_build, sha = ensure_baseline(log_f)
         out = REPORTS_DIR / f"profile_{sha[:10]}_{ts}"
         staging.rename(out)
@@ -296,7 +299,7 @@ def profile_due() -> bool:
     head = git_out("rev-parse", "origin/main")
     tried = json.loads(PROFILE_TRIED.read_text()) if PROFILE_TRIED.is_file() else {}
     if tried.get("sha") != head:
-        return True
+        return time.time() - tried.get("time", 0) >= PROFILE_MIN_INTERVAL_S
     status = goal.load_status()
     # Confirm a first hit on the same main once; never loop on it.
     return bool(status and status.get("needs_confirmation") and status["latest"]["sha"] == head
