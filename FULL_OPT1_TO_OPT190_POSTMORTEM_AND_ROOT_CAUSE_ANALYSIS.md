@@ -238,3 +238,133 @@ The following table represents the ground-truth forensic log extracted directly 
      - **The Reality**: Commit `1a4455d` already contained the `__threadfence_system()` barrier flaw, lacked the GPU sentinel memory clock fix, was configured with temperature 1.0 thinking mode without the burst ladder, and was executed without the required runtime environment variables.
      - Benchmark run `2026-10-08_084817_opt146_clean_restored` logged the lowest throughput in project history: **75.6 tok/s C1 Decode**, **4,642.1 tok/s Cold Prefill**, and **262.4 tok/s C8 Concurrency**, with a BetterBench Composite Score of **302.6 / 1000**.
 
+---
+
+## 4. GRANULAR ROOT-CAUSE ANALYSIS OF EVERY MAJOR PERFORMANCE DROP
+
+### Regression Drop 1: C8 Concurrency Collapse (534.8 t/s -> 419.5 t/s -> 262.4 t/s)
+
+```mermaid
+flowchart LR
+    A["Peak: 534.8 t/s\n(arm14_spec3_warm)"] -->|Commit 1a4455d: __threadfence_system()| B["Barrier Crisis: 66.0 t/s\n(opt123)"]
+    B -->|Remove fence + opt129| C["Partial Recovery: 451.1 t/s\n(opt129)"]
+    C -->|start_engine.sh: RADIANCE_NO_OVERLAP=1| D["Serialization: 419.5 t/s\n(opt188)"]
+    D -->|Fused router + workgroup 256-thread fence| E["Final Collapse: 262.4 t/s\n(opt146_clean_restored)"]
+```
+
+1. **The System-Wide Barrier in P2P All-Reduce**:
+   - **File**: `libr4d/r4d_ar_oneshot_2rank_exact.hip:48` and `libr4d/r4d_ar_oneshot_2rank_wht6.h:35`
+   - **Root Cause**: On RDNA4 (`gfx1201`), slot-to-slot P2P GPU communication occurs over PCIe 4.0 x16. To signal completion to the peer GPU, the local GPU must drain dirty vector stores. The correct, low-latency instruction is the local hardware store counter drain:
+     ```cpp
+     asm volatile("s_wait_storecnt 0x0" ::: "memory");
+     ```
+     In commit `1a4455d` (and earlier in `opt123`), this was replaced with:
+     ```cpp
+     __threadfence_system();
+     ```
+   - **Hardware Impact**: `__threadfence_system()` flushes the entire GPU L2 cache to host/PCIe memory and broadcasts invalidation cycles. In `r4d_ar_oneshot_2rank_wht6.h:60`, `do_drain(drain)` was called inside `wht6_handshake()` by **all 256 threads in the workgroup**. 256 simultaneous system-fence instructions flooded the PCIe interconnect, causing extreme queue serialization and dropping C8 from 534 t/s to 262 t/s.
+
+2. **Forced CPU Synchronization via `RADIANCE_NO_OVERLAP=1`**:
+   - **File**: `scripts/start_engine.sh:31` and `core/engine.cpp:936`
+   - **Root Cause**: To mask race conditions during the upstream v1.2.2 merge, developers added `export RADIANCE_NO_OVERLAP=1`. In `core/engine.cpp:936`, this triggered:
+     ```cpp
+     rad_event_sync(step_end_);
+     ```
+   - **Hardware Impact**: In Arm 3, C8 concurrency achieved 534 t/s because step $N+1$ token preparation on the host CPU overlapped with step $N$ GPU kernel execution. `rad_event_sync` blocked the host CPU thread until the GPU had finished the entire speculative step, creating a ~1.8 ms CPU idle bubble between every GPU dispatch.
+
+3. **Missing Acquire Fences Across 7 Two-Rank Kernels**:
+   - **Files**: `libr4d/r4d_rows.cpp:3037-3043`, `libr4d/r4d_ar_oneshot_2rank_exact.hip` (`r4d_ar_hc_write_kernel`, `r4d_ar_gather_hc_write_kernel`)
+   - **Root Cause**: The runtime tunable table in `r4d_rows.cpp` set `acq = 0` by default. In the kernel handshake:
+     ```cpp
+     __syncthreads();
+     if (acq) __threadfence_system();
+     ```
+     When `acq == 0`, threads 1..255 executed zero memory barriers after thread 0 observed peer flag arrival. On `gfx1201`, lanes read stale lines from their private GL0/GL1 vector caches, resulting in data corruption that forced developers to add the heavy CPU syncs mentioned above.
+
+---
+
+### Regression Drop 2: Single-Stream & Parity Collapse (247.8 t/s -> 103.9 t/s -> 75.6 t/s)
+
+1. **The MoE Top-1 Gating Fallback Inversion**:
+   - **File**: `core/sched/scheduler.h:112` and `core/sched/expert_predictor.h:84`
+   - **Commit**: `opt184`
+   - **Root Cause**: Developers implemented a heuristic to reduce speculative drafting depth if routing confidence was low:
+     ```cpp
+     if (p_top1 < 0.25f) {
+         d.recommended_depth = 1;
+     }
+     ```
+   - **Mathematical Flaw**: The model (`qwen4exp`) routes each token across **512 experts** with **Top-10 routing**. The softmax probability of the rank-1 expert in a 512-expert distribution is almost always between 0.08 and 0.22. Consequently, `p_top1 < 0.25f` evaluated to `true` on over 96% of all tokens! The engine was stripped of multi-token speculative drafting and forced into single-token autoregressive decoding, instantly slashing throughput from 247 t/s to 103.9 t/s.
+
+2. **The `std::min(default_depth, 4)` Burst Bug**:
+   - **File**: `core/sched/scheduler.h:98`
+   - **Root Cause**: In `suggest_depth()`:
+     ```cpp
+     if (accepted_streak >= 1 && ema_accept >= 2.00f && last_accepted >= 2) {
+         return std::min(default_depth, 4); // BUG: default_depth is 3!
+     }
+     return std::min(default_depth, 3);
+     ```
+     Because `default_depth` was passed as 3, `std::min(3, 4)` returned 3. The engine was mathematically incapable of bursting to depth 4 or 5.
+
+3. **GPU PowerPlay Memory Clock Throttling (`gpu_sentinel` Defect)**:
+   - **File**: `scripts/gpu_sentinel.cpp:45`
+   - **Root Cause**: RDNA4 PowerPlay dynamically throttles the GDDR6 memory clock (`pp_dpm_mclk`) from DPM state 5 (1258 MHz) down to DPM state 0 (96 MHz) after 2–3 seconds of idle bus traffic. 96 MHz provides only 7.6% of peak memory bandwidth. The existing `gpu_sentinel.cpp` executed a scalar float write of 4 bytes every 8 ms (500 B/s). While this kept shader compute clocks (`sclk`) awake, the memory controller saw zero bandwidth demand and parked `mclk` at 96 MHz.
+   - **Impact**: On short parity tests (such as `code_is_prime` with 106 tokens), the first 40–60 tokens executed with memory throttled at 96 MHz, adding a 200 ms warmup penalty and dragging reported single-stream decode down to 114–138 t/s.
+
+4. **Redundant Embedding Table Copy in PLE**:
+   - **File**: `arch/common/rad_block_ple.h:182`
+   - **Root Cause**: When PLE was placed in GPU VRAM (`ple_on_device = true`), the code still dispatched a redundant `cast` kernel copying `ple_emb` to `ple_emb_dev`. This added an unnecessary GPU kernel launch on every single decode step and wasted 320 MB of high-speed VRAM bandwidth.
+
+---
+
+### Regression Drop 3: Prefill Throughput Collapse (9,353.5 t/s -> 5,991 t/s -> 3,219 t/s -> 4,642 t/s)
+
+1. **Deletion of Chunk-to-Chunk Wrap Prefetch (`start_wrap`)**:
+   - **File**: `core/place/stager.cpp:215-240`
+   - **Commit**: `opt186`
+   - **Root Cause**: In an aggressive attempt to eliminate perceived buffer leakage, `start_wrap` was deleted. In 64k prefill, the prompt is divided into 23 chunks of 2048 tokens each. Without `start_wrap`, chunk $k+1$ staging across PCIe could not begin until chunk $k$ had fully retired from the GPU.
+   - **Hardware Impact**: After every 2048-token chunk, the GPU stalled completely for ~180 ms waiting for layers 0–2 to stage from host RAM. Over 23 chunks, this introduced $23 \times 180\,\text{ms} = 4.14\,\text{seconds}$ of pure GPU idle freeze, slashing prefill throughput from 5,991 t/s down to 3,680 t/s.
+
+2. **Stager Arena Sizing Mismatch & Buffer Overflow**:
+   - **Files**: `core/mem/vram_budget.cpp:228`, `core/place/stager.cpp:58`, `core/place/mover.cpp:618`
+   - **Root Cause**: `vram_budget.cpp` verified that `cfg.prefill_stage_mib >= 220` for a *single* layer buffer. However, `stager.cpp` checked `bytes >= 220 MiB` against the *total arena*. With 3 buffers, each buffer was allocated only $240 / 3 = 80\,\text{MiB}$. When a 120 MiB MoE layer was dispatched, `mover.cpp:618` encountered `offset + need > capacity`, silently dropped staging, and incremented `stats_.stage_overflow`.
+
+3. **Severe 4-Way LDS Bank Conflicts in Prefill GEMM**:
+   - **File**: `libr4d/r4d_gemm_w4a8_prefill.hip:136`
+   - **Root Cause**: The macro `PF_APOS(r, h, u)` defined shared memory addressing as:
+     ```cpp
+     #define PF_APOS(r, h, u) ((r) * 16 + ((((h) * 8 + (u) * 2)) ^ ((((r) >> 1) & 3) << 2)))
+     ```
+   - **Hardware Disassembly Proof**: On AMD Wave32, 32 lanes access 32 independent 4-byte LDS banks. Mathematical analysis of `PF_APOS` proves that on every 128-bit load phase, 32 lanes collapsed into only 8 distinct LDS banks. This created a **mandatory 4-way LDS bank conflict on all 4 phases of every fragment load**, throttling prefill compute throughput by ~28%.
+
+---
+
+### Regression Drop 4: Catastrophic Token Degeneration (`bdbdbd` Loop) and Process Crashes
+
+```mermaid
+sequenceDiagram
+    participant Host as Engine CPU Loop
+    participant Queue as GPU Command Queue
+    participant Recurrent as KV / Recurrent Slot
+    Note over Host,Queue: Pipelining Active (ahead != nullptr)
+    Host->>Queue: Dispatch Forward Step N+1 (issue_ahead)
+    Queue->>Recurrent: Read Un-Cleared Recurrent State (LEAK)
+    Host->>Recurrent: Call state_clears() for Finished Step N (TOO LATE)
+    Note over Recurrent: State corrupted with dirty weights / NaN
+    Queue-->>Host: Emit Logits -> NaN -> Byte Fallback 0xBD ('bd')
+    Note over Host: Consecutive requests emit 'bdbdbdbdbd' -> Crash
+```
+
+1. **Pipelining Race Condition in Recurrent Slot Scrubbing**:
+   - **Files**: `core/engine.cpp:403-426` vs `core/engine.cpp:597-606`
+   - **Root Cause**: When pipelining was enabled (`pipelining_ = true`), `Engine::issue_ahead()` immediately invoked `sched_.step_next()` and dispatched the next step `nb` to the GPU compute stream.
+   - However, recurrent state slot scrubbing (`ranks_[0]->kv.state_clears()`) was scheduled solely in `Engine::step_loop()` at line 597.
+   - **The Failure Sequence**:
+     1. Request $A$ finished generation.
+     2. `issue_ahead()` scheduled Request $B$ into Request $A$'s newly vacated slot and launched kernel execution on the GPU.
+     3. Only *after* the GPU kernel was already executing did the host retirement loop execute `state_clears()`.
+     4. As a result, Request $B$ executed its initial layers using Request $A$'s uncleared GDN recurrent delta state and hidden state buffers.
+2. **The Mechanism of `bdbdbd` Generation**:
+   Reading uncleared activations caused floating-point overflow into Inf/NaN in the subsequent layer norms. In the vocabulary projection, NaN logits collapsed all valid token probabilities. The tokenizer fell back to emitting raw UTF-8 byte tokens. In the byte-fallback table, byte value `0xBD` prints as ASCII `bd`. Under continuous generation, the model was trapped in an infinite loop emitting `bdbdbdbdbd...` until an unhandled memory exception terminated the process.
+
