@@ -13,6 +13,9 @@
     "passed": true,
     "violations": []
   },
+  "mergeable_clean": true,
+  "github_issue": "https://github.com/OoguroRyuuya/RadianceMine/issues/5",
+  "github_pr": "https://github.com/OoguroRyuuya/RadianceMine/pull/6",
   "jev_evaluation": {
     "subsystem": {
       "type": "choice",

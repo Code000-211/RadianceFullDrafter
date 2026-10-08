@@ -7,7 +7,8 @@ Monitors the upstream Radiance repository (https://codeberg.org/StillDeadcode/ra
   2. Evaluates relevance using TypeSafe AI (Jev System One) in <100ms.
   3. Downloads .patch files and runs deterministic safety checks (eval_patch_safety.py).
   4. Automatically queues candidate optimizations into candidates/upstream/ with full audit logs.
-  5. Tracks seen state in telemetry/upstream_seen.json to eliminate redundant processing.
+  5. Optionally creates GitHub tracking Issues and Draft Pull Requests for autonomous agent dispatch.
+  6. Tracks seen state in telemetry/upstream_seen.json to eliminate redundant processing.
 
 Zero-Token Rule:
   Trivial docs, markdown-only, or CI-only changes are classified deterministically without burning Jev tokens.
@@ -18,6 +19,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -46,6 +48,7 @@ REPO_NAME = "radiance"
 API_BASE = f"{CODEBERG_BASE}/api/v1/repos/{REPO_OWNER}/{REPO_NAME}"
 RSS_URL = f"{CODEBERG_BASE}/{REPO_OWNER}/{REPO_NAME}.rss"
 USER_AGENT = "RadianceMine-Watcher/1.0"
+GITHUB_REPO = "OoguroRyuuya/RadianceMine"
 
 
 def http_get_json(url: str, timeout: float = 15.0) -> Any:
@@ -53,7 +56,7 @@ def http_get_json(url: str, timeout: float = 15.0) -> Any:
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
-    except Exception as e:
+    except (urllib.error.URLError, OSError, RuntimeError) as e:
         raise RuntimeError(f"HTTP GET failed for {url}: {e}") from e
 
 
@@ -62,7 +65,7 @@ def http_get_text(url: str, timeout: float = 15.0) -> str:
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.read().decode("utf-8", errors="replace")
-    except Exception as e:
+    except (urllib.error.URLError, OSError, RuntimeError) as e:
         raise RuntimeError(f"HTTP GET failed for {url}: {e}") from e
 
 
@@ -177,6 +180,234 @@ def run_deterministic_safety_audit(patch_path: Path) -> tuple[bool, list[str]]:
     return proc.returncode == 0, violations
 
 
+def check_patch_mergeable(patch_path: Path) -> tuple[bool, str]:
+    """Checks whether the patch applies cleanly to the current HEAD without conflicts."""
+    proc = subprocess.run(
+        ["git", "apply", "--check", str(patch_path)],
+        cwd=str(BASE_DIR),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return proc.returncode == 0, proc.stderr.strip()
+
+
+def create_github_issue(
+    pr_id: int,
+    title: str,
+    author: str,
+    url: str,
+    status: str,
+    folder_name: str,
+    patch_clean: bool,
+    jev_result: dict[str, Any] | None,
+    safety_violations: list[str],
+) -> str | None:
+    """Creates a GitHub tracking issue for this upstream candidate."""
+    if not shutil.which("gh"):
+        return None
+
+    subsystem = (jev_result or {}).get("subsystem", {}).get("choice", "N/A")
+    feasibility = (jev_result or {}).get("feasibility", {}).get("score", 0.0)
+    violates_rdna4 = (jev_result or {}).get("violates_rdna4_limits", {}).get("noul", 0.0)
+    roi = (jev_result or {}).get("performance_roi", {}).get("score", 0.0)
+
+    # Determine labels
+    labels = ["upstream:candidate"]
+    if status == "READY_TO_TEST":
+        labels.append("status:ready-to-test" if patch_clean else "status:needs-review")
+    elif status == "DOCS_OR_TOOLING":
+        labels.append("documentation")
+    elif status == "SERVING_ENDPOINT":
+        labels.append("enhancement")
+    elif status == "REJECTED_UNFEASIBLE":
+        labels.append("invalid")
+    elif status == "REJECTED_SAFETY_VIOLATION":
+        labels.append("regression:detected")
+
+    issue_title = f"🚀 Upstream PR #{pr_id}: {title} ({folder_name})"
+
+    safety_str = chr(10).join(f"  * ⚠️ {v}" for v in safety_violations) if safety_violations else "  * Zero dangerous anti-patterns detected."
+    merge_str = "✅ Clean drop-in" if patch_clean else "⚠️ Merge conflict (rebase / adaptation required)"
+
+    body = f"""## 🎯 Upstream Pull Request Summary
+- **PR Number**: #{pr_id}
+- **Author**: @{author}
+- **Upstream Codeberg URL**: {url}
+- **Triage Status**: `{status}`
+- **Candidate Package**: `candidates/upstream/{folder_name}`
+
+## 🧠 TypeSafe AI (Jev System One) Evaluation
+- **Target Subsystem**: `{subsystem}`
+- **RDNA4 Hardware Violation Risk**: `{violates_rdna4:.2f}` (lower is safer)
+- **Architectural Feasibility**: `{feasibility:.2f} / 4.00`
+- **Expected Performance ROI**: `{roi:.2f} / 4.00`
+
+## 🛡️ Deterministic Safety & Mergeability Audit
+- **Deterministic Safety**: {"PASS" if not safety_violations else "FAIL"}
+{safety_str}
+- **Clean Mergeability (`git apply --check`)**: {merge_str}
+
+## 📋 Instructions for Autonomous Agent
+1. **Spawn isolated worktree from golden baseline**:
+   ```bash
+   bash scripts/create_worktree.sh test_upstream_pr_{pr_id}
+   cd worktrees/test_upstream_pr_{pr_id}
+   ```
+2. **Apply candidate patch**:
+   ```bash
+   git apply ../../candidates/upstream/{folder_name}/pr.patch
+   ```
+3. **Verify Ground Truth & Hardware Invariants**:
+   ```bash
+   bash scripts/verify_ground_truth.sh
+   ninja -C build_hip
+   bash scripts/verify_rdna4_invariants.sh build_hip
+   ```
+4. **Execute Master Gate (when authorized)**:
+   ```bash
+   bash scripts/gate_check.sh
+   ```
+"""
+
+    cmd = ["gh", "issue", "create", "--repo", GITHUB_REPO, "--title", issue_title, "--body", body]
+    for lbl in labels:
+        cmd.extend(["--label", lbl])
+
+    try:
+        proc = subprocess.run(cmd, cwd=str(BASE_DIR), capture_output=True, text=True, check=False)
+        if proc.returncode == 0:
+            issue_url = proc.stdout.strip()
+            print(f"  🏷️ Created GitHub Issue: {issue_url}")
+            return issue_url
+        print(f"  ⚠️ Failed to create GitHub issue: {proc.stderr.strip()}")
+        return None
+    except (OSError, RuntimeError) as e:
+        print(f"  ⚠️ Error calling gh issue create: {e}")
+        return None
+
+
+def create_github_draft_pr(
+    pr_id: int,
+    title: str,
+    author: str,
+    url: str,
+    folder_name: str,
+    patch_path: Path,
+) -> str | None:
+    """Creates an isolated branch, applies the patch, pushes to origin, and opens a Draft PR on GitHub."""
+    if not shutil.which("gh"):
+        return None
+
+    branch_name = f"upstream/pr_{pr_id}_{slugify(title)[:25]}"
+
+    # Check if branch already exists remotely
+    proc = subprocess.run(
+        ["git", "ls-remote", "--heads", "origin", branch_name],
+        cwd=str(BASE_DIR),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode == 0 and branch_name in proc.stdout:
+        print(f"  🌿 Remote branch origin/{branch_name} already exists.")
+        return None
+
+    # Use a temporary worktree to apply and commit the patch cleanly without touching current HEAD
+    tmp_worktree = BASE_DIR / "worktrees" / f"tmp_pr_{pr_id}"
+    tmp_worktree.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        # 1. Create worktree on new branch from main
+        subprocess.run(
+            ["git", "worktree", "add", "-b", branch_name, str(tmp_worktree), "main"],
+            cwd=str(BASE_DIR),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+
+        # 2. Apply patch
+        apply_res = subprocess.run(
+            ["git", "apply", str(patch_path.resolve())],
+            cwd=str(tmp_worktree),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if apply_res.returncode != 0:
+            print(f"  ⚠️ Could not apply patch on clean branch: {apply_res.stderr.strip()}")
+            return None
+
+        # 3. Commit
+        subprocess.run(
+            ["git", "add", "-A"],
+            cwd=str(tmp_worktree),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        commit_msg = (
+            f"feat(upstream): Upstream PR #{pr_id} by @{author}: {title}\n\n"
+            f"Upstream URL: {url}\nImported via RadianceMine Upstream Watcher."
+        )
+        subprocess.run(
+            ["git", "commit", "-m", commit_msg],
+            cwd=str(tmp_worktree),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+
+        # 4. Push branch to origin
+        push_res = subprocess.run(
+            ["git", "push", "-u", "origin", branch_name],
+            cwd=str(tmp_worktree),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if push_res.returncode != 0:
+            print(f"  ⚠️ Failed to push branch {branch_name} to origin: {push_res.stderr.strip()}")
+            return None
+
+        # 5. Create Draft PR
+        pr_body = f"""## Upstream Pull Request #{pr_id}
+**Author**: @{author}  
+**Upstream Codeberg URL**: {url}  
+**Candidate Directory**: `candidates/upstream/{folder_name}`  
+
+This draft PR imports Upstream PR #{pr_id} from `StillDeadcode/radiance` into an isolated branch for testing and review.
+"""
+        pr_cmd = [
+            "gh", "pr", "create", "--draft",
+            "--repo", GITHUB_REPO,
+            "--title", f"Upstream PR #{pr_id}: {title}",
+            "--body", pr_body,
+            "--head", branch_name,
+            "--base", "main",
+        ]
+        pr_proc = subprocess.run(pr_cmd, cwd=str(BASE_DIR), capture_output=True, text=True, check=False)
+        if pr_proc.returncode == 0:
+            pr_url = pr_proc.stdout.strip()
+            print(f"  🔀 Created GitHub Draft PR: {pr_url}")
+            return pr_url
+        print(f"  ⚠️ Failed to create Draft PR: {pr_proc.stderr.strip()}")
+        return None
+    except (subprocess.SubprocessError, OSError) as e:
+        print(f"  ⚠️ Error creating draft PR: {e}")
+        return None
+    finally:
+        # Cleanup temporary worktree
+        subprocess.run(
+            ["git", "worktree", "remove", "--force", str(tmp_worktree)],
+            cwd=str(BASE_DIR),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+
 def package_candidate(
     pr_id: int,
     title: str,
@@ -187,21 +418,60 @@ def package_candidate(
     safety_passed: bool,
     safety_violations: list[str],
     status: str,
-) -> Path:
+    create_issue: bool = False,
+    create_pr: bool = False,
+    existing_issue: str | None = None,
+    existing_pr: str | None = None,
+) -> tuple[Path, str | None, str | None]:
     """Packages candidate into candidates/upstream/pr_{id}_{slug}/."""
     UPSTREAM_CANDIDATES_DIR.mkdir(parents=True, exist_ok=True)
     folder_name = f"pr_{pr_id}_{slugify(title)}"
     candidate_dir = UPSTREAM_CANDIDATES_DIR / folder_name
     candidate_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. Save patch
+    # 1. Save patch files (both pr.patch and lever.patch for seamless tooling compatibility)
     patch_file = candidate_dir / "pr.patch"
     patch_file.write_text(patch_content, encoding="utf-8", errors="replace")
+    lever_file = candidate_dir / "lever.patch"
+    lever_file.write_text(patch_content, encoding="utf-8", errors="replace")
 
-    # 2. Extract modified files from patch
+    # 2. Check mergeability against HEAD
+    patch_clean, _ = check_patch_mergeable(patch_file)
+
+    # 3. Create GitHub Issue if requested
+    issue_url = existing_issue
+    if create_issue and not issue_url:
+        issue_url = create_github_issue(
+            pr_id=pr_id,
+            title=title,
+            author=author,
+            url=url,
+            status=status,
+            folder_name=folder_name,
+            patch_clean=patch_clean,
+            jev_result=jev_result,
+            safety_violations=safety_violations,
+        )
+
+    # 4. Create GitHub Draft PR if requested and patch applies cleanly
+    pr_url = existing_pr
+    if create_pr and not pr_url:
+        if patch_clean:
+            pr_url = create_github_draft_pr(
+                pr_id=pr_id,
+                title=title,
+                author=author,
+                url=url,
+                folder_name=folder_name,
+                patch_path=patch_file,
+            )
+        else:
+            print("  ⚠️ Skipping Draft PR creation: patch has merge conflicts against main.")
+
+    # 5. Extract modified files from patch
     modified_files = re.findall(r"diff --git a/(.*?) b/", patch_content)
 
-    # 3. Save METADATA.json
+    # 6. Save METADATA.json
     meta = {
         "pr_id": pr_id,
         "title": title,
@@ -213,15 +483,24 @@ def package_candidate(
             "passed": safety_passed,
             "violations": safety_violations,
         },
+        "mergeable_clean": patch_clean,
+        "github_issue": issue_url,
+        "github_pr": pr_url,
         "jev_evaluation": jev_result or {},
     }
     (candidate_dir / "METADATA.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
-    # 4. Generate README.md
+    # 7. Generate README.md
     subsystem = (jev_result or {}).get("subsystem", {}).get("choice", "N/A")
     feasibility = (jev_result or {}).get("feasibility", {}).get("score", 0.0)
     violates_rdna4 = (jev_result or {}).get("violates_rdna4_limits", {}).get("noul", 0.0)
     roi = (jev_result or {}).get("performance_roi", {}).get("score", 0.0)
+
+    issue_link = f"- **GitHub Issue**: [Issue Link]({issue_url})\n" if issue_url else ""
+    pr_link = f"- **GitHub Draft PR**: [Draft PR Link]({pr_url})\n" if pr_url else ""
+
+    safety_lines = chr(10).join(f"- {v}" for v in safety_violations) if safety_violations else "- Zero dangerous anti-patterns detected."
+    modified_lines = chr(10).join(f"- `{f}`" for f in modified_files)
 
     readme_content = f"""# Upstream PR #{pr_id}: {title}
 
@@ -229,7 +508,7 @@ def package_candidate(
 **Upstream URL**: {url}  
 **Status**: `{status}`  
 **Candidate Directory**: `candidates/upstream/{folder_name}`  
-
+{issue_link}{pr_link}
 ---
 
 ## 1. TypeSafe AI (Jev System One) Evaluation
@@ -242,12 +521,13 @@ def package_candidate(
 
 ## 2. Deterministic Safety Audit
 - **Safety Gate Result**: `{"PASS" if safety_passed else "FAIL (REJECTED)"}`
-{chr(10).join(f"- {v}" for v in safety_violations) if safety_violations else "- Zero dangerous anti-patterns detected."}
+{safety_lines}
+- **Clean Mergeability (`git apply --check`)**: `{"PASS" if patch_clean else "CONFLICT (Requires rebase)"}`
 
 ---
 
 ## 3. Modified Files ({len(modified_files)})
-{chr(10).join(f"- `{f}`" for f in modified_files)}
+{modified_lines}
 
 ---
 
@@ -273,7 +553,7 @@ bash scripts/gate_check.sh
 ```
 """
     (candidate_dir / "README.md").write_text(readme_content, encoding="utf-8")
-    return candidate_dir
+    return candidate_dir, issue_url, pr_url
 
 
 def update_master_queue_doc(seen_state: dict[str, Any]) -> None:
@@ -290,8 +570,8 @@ def update_master_queue_doc(seen_state: dict[str, Any]) -> None:
         "",
         "---",
         "",
-        "| PR # | Title | Author | Subsystem | Feasibility | ROI | Safety | Status | Link |",
-        "|------|-------|--------|-----------|-------------|-----|--------|--------|------|",
+        "| PR # | Title | Author | Subsystem | Feas. | ROI | Safety | Status | GitHub Issue | Draft PR | Candidate |",
+        "|------|-------|--------|-----------|-------|-----|--------|--------|--------------|----------|-----------|",
     ]
 
     # Sort PRs by PR number descending
@@ -299,22 +579,26 @@ def update_master_queue_doc(seen_state: dict[str, Any]) -> None:
 
     for item in sorted_prs:
         pr_id = item.get("pr_id")
-        title = item.get("title", "")[:35]
+        title = item.get("title", "")[:30]
         author = item.get("author", "")
         jev = item.get("jev", {})
         sub = jev.get("subsystem", {}).get("choice", "-")
         feas = f"{jev.get('feasibility', {}).get('score', 0.0):.1f}" if jev else "-"
         roi = f"{jev.get('performance_roi', {}).get('score', 0.0):.1f}" if jev else "-"
-        safety = "✅ PASS" if item.get("safety", {}).get("passed", True) else "❌ FAIL"
+        safety = "✅" if item.get("safety", {}).get("passed", True) else "❌"
         status = item.get("status", "QUEUED")
-        url = item.get("url", f"{CODEBERG_BASE}/{REPO_OWNER}/{REPO_NAME}/pulls/{pr_id}")
         slug = slugify(item.get("title", ""))
         rel_dir = f"pr_{pr_id}_{slug}/README.md"
 
-        link = f"[Inspect]({rel_dir})" if (UPSTREAM_CANDIDATES_DIR / f"pr_{pr_id}_{slug}").exists() else f"[PR #{pr_id}]({url})"
+        gh_issue = item.get("github_issue")
+        gh_pr = item.get("github_pr")
+
+        issue_col = f"[#{gh_issue.split('/')[-1]}]({gh_issue})" if gh_issue else "-"
+        pr_col = f"[#{gh_pr.split('/')[-1]}]({gh_pr})" if gh_pr else "-"
+        cand_col = f"[Inspect]({rel_dir})" if (UPSTREAM_CANDIDATES_DIR / f"pr_{pr_id}_{slug}").exists() else "-"
 
         lines.append(
-            f"| #{pr_id} | {title} | @{author} | `{sub}` | {feas} | {roi} | {safety} | `{status}` | {link} |"
+            f"| #{pr_id} | {title} | @{author} | `{sub}` | {feas} | {roi} | {safety} | `{status}` | {issue_col} | {pr_col} | {cand_col} |"
         )
 
     lines.extend([
@@ -332,7 +616,11 @@ def update_master_queue_doc(seen_state: dict[str, Any]) -> None:
 
 
 def check_and_triage_pull_requests(
-    use_typesafe: bool = True, force: bool = False
+    use_typesafe: bool = True,
+    force: bool = False,
+    create_issues: bool = False,
+    create_prs: bool = False,
+    filter_pr: int | None = None,
 ) -> list[dict[str, Any]]:
     """Polls open PRs, screens them, and updates queue."""
     seen = load_seen_state()
@@ -343,6 +631,9 @@ def check_and_triage_pull_requests(
 
     for pr in prs_data:
         pr_id = pr["number"]
+        if filter_pr is not None and pr_id != filter_pr:
+            continue
+
         pr_key = str(pr_id)
         title = pr["title"]
         author = pr["user"]["username"]
@@ -350,12 +641,20 @@ def check_and_triage_pull_requests(
         pr_url = f"{CODEBERG_BASE}/{REPO_OWNER}/{REPO_NAME}/pulls/{pr_id}"
         updated_at = pr.get("updated_at", "")
 
-        # Check if already screened and not updated
-        if (
-            not force
-            and pr_key in seen.get("prs", {})
-            and seen["prs"][pr_key].get("updated_at") == updated_at
-        ):
+        existing_entry = seen.get("prs", {}).get(pr_key, {})
+        existing_issue = existing_entry.get("github_issue")
+        existing_pr = existing_entry.get("github_pr")
+
+        # Check if already screened and not updated (and issue/pr flags satisfied)
+        needs_action = (
+            force
+            or pr_key not in seen.get("prs", {})
+            or existing_entry.get("updated_at") != updated_at
+            or (create_issues and not existing_issue)
+            or (create_prs and not existing_pr)
+        )
+
+        if not needs_action:
             continue
 
         print(f"\n⚡ Triage PR #{pr_id}: '{title}' (@{author})")
@@ -370,11 +669,14 @@ def check_and_triage_pull_requests(
 
         # 2. Check if docs-only (Deterministic 0-token rule)
         is_doc = is_docs_or_ci_only(patch_content)
-        jev_result = None
+        jev_result = existing_entry.get("jev")
 
         if is_doc:
             status = "DOCS_OR_CI"
             print("  📄 PR touches only docs / CI / text files (Deterministic 0-token rule).")
+        elif jev_result is not None and not force:
+            status = existing_entry.get("status", "QUEUED")
+            print("  🧠 Reusing previously cached Jev System One evaluation.")
         elif use_typesafe:
             try:
                 print("  🧠 Querying TypeSafe AI (Jev System One)...")
@@ -413,8 +715,8 @@ def check_and_triage_pull_requests(
         else:
             print("  🛡️ Patch safety audit: PASSED")
 
-        # 4. Package candidate directory
-        c_dir = package_candidate(
+        # 4. Package candidate directory and optionally create GitHub Issue / PR
+        c_dir, issue_url, pr_url = package_candidate(
             pr_id=pr_id,
             title=title,
             author=author,
@@ -424,6 +726,10 @@ def check_and_triage_pull_requests(
             safety_passed=safety_passed,
             safety_violations=violations,
             status=status,
+            create_issue=create_issues,
+            create_pr=create_prs,
+            existing_issue=existing_issue,
+            existing_pr=existing_pr,
         )
         print(f"  📦 Packaged candidate into {c_dir.relative_to(BASE_DIR)}")
 
@@ -435,6 +741,8 @@ def check_and_triage_pull_requests(
             "url": pr_url,
             "updated_at": updated_at,
             "status": status,
+            "github_issue": issue_url,
+            "github_pr": pr_url,
             "jev": jev_result,
             "safety": {
                 "passed": safety_passed,
@@ -469,6 +777,8 @@ def main() -> int:
     parser.add_argument("--force", action="store_true", help="Force re-evaluation of seen PRs")
     parser.add_argument("--no-typesafe", action="store_true", help="Disable Jev System One queries")
     parser.add_argument("--pr", type=int, help="Triage a specific PR number")
+    parser.add_argument("--create-issues", action="store_true", help="Create GitHub tracking issues for screened PRs")
+    parser.add_argument("--create-prs", action="store_true", help="Create GitHub Draft PRs for clean patches")
 
     args = parser.parse_args()
 
@@ -476,14 +786,25 @@ def main() -> int:
 
     if args.pr:
         print(f"Targeting single PR #{args.pr}...")
-        check_and_triage_pull_requests(use_typesafe=use_typesafe, force=True)
+        check_and_triage_pull_requests(
+            use_typesafe=use_typesafe,
+            force=args.force,
+            create_issues=args.create_issues,
+            create_prs=args.create_prs,
+            filter_pr=args.pr,
+        )
         return 0
 
     if args.daemon:
         print(f"🚀 Starting watch_upstream daemon (polling every {args.interval}s)...")
         while True:
             try:
-                check_and_triage_pull_requests(use_typesafe=use_typesafe, force=args.force)
+                check_and_triage_pull_requests(
+                    use_typesafe=use_typesafe,
+                    force=args.force,
+                    create_issues=args.create_issues,
+                    create_prs=args.create_prs,
+                )
                 check_recent_commits()
             except (urllib.error.URLError, OSError, RuntimeError) as e:
                 print(f"⚠️ Error during polling cycle: {e}")
@@ -492,7 +813,12 @@ def main() -> int:
         return 0
 
     # Default: single run
-    check_and_triage_pull_requests(use_typesafe=use_typesafe, force=args.force)
+    check_and_triage_pull_requests(
+        use_typesafe=use_typesafe,
+        force=args.force,
+        create_issues=args.create_issues,
+        create_prs=args.create_prs,
+    )
     check_recent_commits()
     return 0
 

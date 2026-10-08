@@ -4,6 +4,8 @@
 **Upstream URL**: https://codeberg.org/StillDeadcode/radiance/pulls/56  
 **Status**: `DOCS_OR_TOOLING`  
 **Candidate Directory**: `candidates/upstream/pr_56_scriptscardclockpy_what_holds_each_cards`  
+- **GitHub Issue**: [Issue Link](https://github.com/OoguroRyuuya/RadianceMine/issues/5)
+- **GitHub Draft PR**: [Draft PR Link](https://github.com/OoguroRyuuya/RadianceMine/pull/6)
 
 ---
 
@@ -18,6 +20,7 @@
 ## 2. Deterministic Safety Audit
 - **Safety Gate Result**: `PASS`
 - Zero dangerous anti-patterns detected.
+- **Clean Mergeability (`git apply --check`)**: `PASS`
 
 ---
 

@@ -44,8 +44,19 @@ fi
 
 # Resolve candidate path
 CANDIDATE_SLUG="$(basename "${CANDIDATE_NAME}")"
-CANDIDATE_DIR="${REPO_ROOT}/candidates/${CANDIDATE_SLUG}"
-PATCH_FILE="${CANDIDATE_DIR}/lever.patch"
+if [ -d "${REPO_ROOT}/candidates/upstream/${CANDIDATE_SLUG}" ]; then
+    CANDIDATE_DIR="${REPO_ROOT}/candidates/upstream/${CANDIDATE_SLUG}"
+elif [ -d "${REPO_ROOT}/candidates/${CANDIDATE_SLUG}" ]; then
+    CANDIDATE_DIR="${REPO_ROOT}/candidates/${CANDIDATE_SLUG}"
+else
+    CANDIDATE_DIR="${REPO_ROOT}/candidates/${CANDIDATE_SLUG}"
+fi
+
+if [ -f "${CANDIDATE_DIR}/pr.patch" ]; then
+    PATCH_FILE="${CANDIDATE_DIR}/pr.patch"
+else
+    PATCH_FILE="${CANDIDATE_DIR}/lever.patch"
+fi
 
 if [ ! -d "${CANDIDATE_DIR}" ]; then
     echo "❌ ERROR: Candidate directory not found at '${CANDIDATE_DIR}'." >&2

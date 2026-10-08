@@ -56,12 +56,13 @@ for issue in issues:
         title = issue["title"]
         body = issue.get("body", "")
         
-        # Look for candidate directory pattern: lever<N>_<name>
-        match = re.search(r"lever\d+_[a-zA-Z0-9_]+", title + " " + body)
+        # Look for candidate directory pattern: lever<N>_<name> or pr_<N>_<name>
+        match = re.search(r"(lever\d+_[a-zA-Z0-9_]+|pr_\d+_[a-zA-Z0-9_]+)", title + " " + body)
         if match:
             candidate_slug = match.group(0)
             candidate_dir = os.path.join(repo_root, "candidates", candidate_slug)
-            if os.path.isdir(candidate_dir):
+            upstream_dir = os.path.join(repo_root, "candidates", "upstream", candidate_slug)
+            if os.path.isdir(candidate_dir) or os.path.isdir(upstream_dir):
                 print(f"[FOUND] Issue #{num}: {title} -> Candidate: {candidate_slug}")
                 runner_cmd = [
                     os.path.join(repo_root, "scripts", "test_candidate_lever.sh"),
