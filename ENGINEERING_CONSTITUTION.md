@@ -154,6 +154,13 @@ Whenever an experimental arm satisfies all three tiers of the push gate and esta
      * Why the code was retired
 3. **Candidate Isolation (`candidates/`)**:
    - Candidate levers are maintained in clean, self-contained directories with unified patches (`lever.patch`), reference sources (`src/`), and mathematical documentation (`README.md`).
+4. **The Net Differential Impact Invariant (Anti-Blind-Deletion Law)**:
+   - A subsystem, caching mechanism, prefetcher, speculative heuristic, or kernel must NEVER be deleted or disabled simply because an overhead profiler shows it consumes cycles in isolation.
+   - *The Hidden Leverage Fallacy*: Deleting an 80 µs CPU cache or scheduling heuristic is catastrophic if that heuristic prevents a 1,500 µs PCIe DMA bus stall or saves 2,000 µs of redundant VRAM transfers.
+   - Every proposed simplification or deletion MUST be verified via empirical A/B benchmarking on the dual R9700 GPUs:
+     * Does removing it *measurably increase or preserve* the BetterBench Composite Score across all 3 workloads (C1 Decode, C8 Concurrency, Cold 64k Prefill)?
+     * If the overall score drops, the component provides a genuine performance bonus and MUST be preserved.
+   - Simplification without differential hardware verification is classified as blind vandalism.
 
 ---
 
