@@ -4,7 +4,7 @@
 Orca runs an automation's agent only when its precheck exits 0, so each check answers
 "is there work for this agent right now?" without starting an LLM session.
 
-    orca_precheck.py needs-review   open issue with status:needs-review (not blocked)
+    orca_precheck.py needs-review   open issue with status:needs-review that the queue has gated (not blocked)
     orca_precheck.py new-lever      open issue with research:new-lever and no candidate yet
     orca_precheck.py upstream       REVIEW.md lists a PR to look at that has no assessment
 
@@ -20,6 +20,7 @@ from pathlib import Path
 
 REPO = "OoguroRyuuya/RadianceMine"
 REPO_ROOT = Path("/home/orca/RadianceMine")
+RESULT_MARKER = "<!-- radiance-gate-result -->"
 
 
 def issues(label: str) -> list[dict]:
@@ -33,10 +34,21 @@ def issues(label: str) -> list[dict]:
     return json.loads(proc.stdout)
 
 
+def has_gate_result(number: int) -> bool:
+    proc = subprocess.run(
+        ["gh", "issue", "view", str(number), "--repo", REPO, "--json", "comments"],
+        capture_output=True, text=True, check=False, timeout=60,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.strip())
+    return any(RESULT_MARKER in (c.get("body") or "") for c in json.loads(proc.stdout).get("comments", []))
+
+
 def check_needs_review() -> str | None:
+    """Only issues the lever queue has actually gated (a gate-result comment exists)."""
     for issue in issues("status:needs-review"):
         names = {l["name"] for l in issue["labels"]}
-        if "status:blocked" not in names and "status:queued" not in names:
+        if "status:blocked" not in names and "status:queued" not in names and has_gate_result(issue["number"]):
             return f"#{issue['number']} {issue['title']}"
     return None
 

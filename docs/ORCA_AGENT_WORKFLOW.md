@@ -8,14 +8,15 @@ Sie gilt zusammen mit `AGENTS.md`.
 | Aufgabe | Wer | Wie |
 |---|---|---|
 | Hebel erfinden, Patch schreiben, Fehlschlag analysieren, Upstream-PR bewerten | Agent (Orca-Automation) | in einem eigenen Orca-Worktree, Ergebnis als Branch + Issue-Kommentar |
-| Bauen, Parität prüfen, A/B messen, PASS/FAIL | `scripts/lever_queue.py` (systemd-Dienst `radiance-lever-queue`) | deterministisch, mit den Skripten aus `origin/main` |
+| Bauen, Parität prüfen, A/B messen, PASS/FAIL | `scripts/lever_queue.py` (systemd-Dienst `radiance-lever-queue`) | deterministisch, mit den Skripten des Primary-Checkouts `/home/orca/RadianceMine` |
 | Gate-Ergebnis ins Issue schreiben, Labels `queued`/`gate-passed`/`needs-review`/`blocked`, PR öffnen | `scripts/gh_bridge.py` | nur dieser Code setzt diese Labels |
 | Hebel aufgeben (`status:blocked` setzen, mit Begründung im Issue) | Agent oder Queue | |
 | PR mergen, `status:blocked` aufheben, Gate-Einstellungen ändern | Leon | |
 
-Ein Agent kann kein PASS erzeugen: Das Gate läuft immer mit den Skripten und Schwellen aus
-`origin/main`, Änderungen an `scripts/` oder `baselines/` auf einem Agent-Branch wirken sich
-auf den Test des eigenen Hebels nicht aus.
+Ein Agent kann kein PASS erzeugen: Das Gate läuft immer mit den Skripten und Schwellen des
+Primary-Checkouts `/home/orca/RadianceMine` (Branch `main`); Änderungen an `scripts/` oder
+`baselines/` auf einem Agent-Branch wirken sich auf den Test des eigenen Hebels nicht aus.
+Nach einem Merge auf GitHub den Primary-Checkout mit `git pull --ff-only` nachziehen.
 
 ## Zustände eines Hebel-Issues
 
@@ -28,7 +29,7 @@ nach 3 Gate-Läufen ohne PASS, oder Agent hält den Hebel für aussichtslos ─�
 
 ## Ein Hebel-Paket
 
-Auf einem eigenen Branch `agent/<slug>-<kurzbeschreibung>`, abgeleitet von `origin/main`:
+Im Orca-Worktree der Automation (Branch `OoguroRyuuya/<name>`, abgeleitet von `origin/main`, `build_hip` ist durch das Setup schon gebaut):
 
 ```
 candidates/<slug>/
@@ -59,11 +60,11 @@ Stelle lesen und im Issue erklären, was diesmal anders ist.
 
 ## Übergabe an das Gate
 
-1. Branch pushen: `git push -u origin HEAD`
+1. Committen und den Worktree-Branch pushen: `git push -u origin HEAD` (Name merken: `git branch --show-current`)
 2. Im Issue kommentieren (genau dieser Block, die Queue liest den neuesten):
    ```
    candidate: <slug>
-   ref: <branch>
+   ref: <ausgabe von git branch --show-current>
    ```
 3. Label setzen: `gh issue edit <nr> --add-label status:ready-to-test --remove-label status:needs-review`
 
@@ -95,7 +96,7 @@ Alle laufen mit `claude` in einem neuen Worktree pro Lauf (Basis `origin/main`, 
 
 | Automation | Precheck | Aufgabe |
 |---|---|---|
-| Radiance: Lever-Fix | `orca_precheck.py needs-review` | ältestes `status:needs-review`-Issue: Ursache aus dem Gate-Bericht bestimmen, Patch korrigieren und erneut übergeben, oder begründet aufgeben |
+| Radiance: Lever-Fix | `orca_precheck.py needs-review` | ältestes `status:needs-review`-Issue mit Gate-Kommentar der Queue: Ursache aus dem Gate-Bericht bestimmen, Patch korrigieren und erneut übergeben, oder begründet aufgeben |
 | Radiance: Neue Hebel | `orca_precheck.py new-lever` | ältestes `research:new-lever`-Issue ohne Status: Idee prüfen (`similar`, Hardware), Hebel-Paket bauen und übergeben, oder begründet ablehnen |
 | Radiance: Upstream-Bewertung | `orca_precheck.py upstream` | bis zu 3 Upstream-PRs aus `REVIEW.md` ohne Bewertung: Diff lesen, gegen unseren Stand prüfen, Bewertung per `watch_upstream.py --assess` hinterlegen. Nichts anwenden, keine Issues |
 
