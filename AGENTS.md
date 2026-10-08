@@ -16,6 +16,7 @@ Details stehen in genau einem Dokument je Thema:
 | Arbeitsablauf der Agents (Start, Modelle, Rückfragen), Hebel-Pakete, Issue-Labels | `docs/ORCA_AGENT_WORKFLOW.md` |
 | Rollen-Prompts der Agents | `docs/agents/<rolle>.md` |
 | Upstream übernehmen (PR-Bewertung, Sync von Codeberg-main, eigenes Kernel-Plugin) | `docs/UPSTREAM.md` |
+| Diagnose-Modus der Engine und Vorab-Bewertung von Kerneln und Ideen (Entwurf) | `docs/DIAGNOSE.md` |
 | Engine-Architektur | `spec.md`, Quellcode |
 | Geschichte (frühere Optimierungen, Postmortems, Hebel-Katalog) | `docs/history/` |
 
