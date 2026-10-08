@@ -54,14 +54,11 @@ else
     git -C "${REPO_ROOT}" worktree add -b "${BRANCH_NAME}" "${WORKTREE_DIR}" "${BASE_BRANCH}"
 fi
 
-# Initialize isolated build environment directory
-mkdir -p "${WORKTREE_DIR}/build_hip/bin"
-mkdir -p "${WORKTREE_DIR}/build_hip/radiance_home"
-if [ -d "${REPO_ROOT}/build_hip/radiance_home" ]; then
-    cp -rn "${REPO_ROOT}/build_hip/radiance_home/"* "${WORKTREE_DIR}/build_hip/radiance_home/" 2>/dev/null || true
-fi
-if [ -d "${REPO_ROOT}/build_hip/bin" ]; then
-    cp -rn "${REPO_ROOT}/build_hip/bin/"* "${WORKTREE_DIR}/build_hip/bin/" 2>/dev/null || true
+# Initialize isolated build environment directory by cloning the baseline build state
+mkdir -p "${WORKTREE_DIR}/build_hip"
+if [ -d "${REPO_ROOT}/build_hip" ]; then
+    echo "⚡ Cloning baseline build cache to worktree for fast incremental builds..."
+    cp -r "${REPO_ROOT}/build_hip/"* "${WORKTREE_DIR}/build_hip/" 2>/dev/null || true
 fi
 
 # Check if corresponding candidate lever exists
