@@ -45,7 +45,7 @@ export RADIANCE_RIDGEFILL_FORCE_STREAM=1
 
 export ROCM_PATH="${ROCM_PATH:-/opt/rocm}"
 export LD_LIBRARY_PATH="${ROCM_PATH}/lib:${ROCM_PATH}/core-10.0/lib:${LD_LIBRARY_PATH:-}"
-export RADIANCE_PREFILL_BUFFERS=3
+export RADIANCE_PREFILL_BUFFERS="${RADIANCE_PREFILL_BUFFERS:-2}"
 export RADIANCE_RIDGEFILL_SHARE=0.25
 export RADIANCE_RIDGEFILL_ALPHA=1.0
 export RADIANCE_ADAPTIVE_SPEC=1
@@ -124,11 +124,11 @@ ENGINE_ARGS=(
   --placement expert_tiered
   --ngram-placement auto
   --host-pool-mib 12288
-  --gpu-headroom-mib "${GPU_HEADROOM_MIB:-64}"
-  --checkpoint-slots 4
-  --vram-kv-mib 1600
+  --gpu-headroom-mib "${GPU_HEADROOM_MIB:-96}"
+  --checkpoint-slots "${CHECKPOINT_SLOTS:-0}"
+  --vram-kv-mib "${VRAM_KV_MIB:-1600}"
   --kv-cache-dtype fp8
-  --num-speculative-tokens 3
+  --num-speculative-tokens "${NUM_SPECULATIVE_TOKENS:-5}"
   --adaptive-spec
   --prefix-cache-host-mib 8192
   --prefix-cache-disk-mib 0
