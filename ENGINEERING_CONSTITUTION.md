@@ -17,13 +17,19 @@ This Constitution establishes an ironclad, mathematically grounded operating sys
 
 ## Rule 1: The Zero-Regression Invariant (Push/Merge Gate)
 
-**No code is EVER merged into `main` unless it passes the 3-Tier Gate on physical dual-R9700 GPUs.**
+**No code is EVER merged into `main` unless it passes the Master Push/Merge Gate on physical dual-R9700 GPUs.**
 
 Under no circumstances may speculative branches bypass any tier. A failure on a single check constitutes an unconditional rejection of the candidate.
 
 ```
        Candidate Branch / Worktree
                    │
+                   ▼
+┌──────────────────────────────────────┐
+│  Tier 0: Epistemic Ground-Truth Gate │──[FAIL]──► Immediate Abort (No GPU Access)
+│  (Physical Symbols, Anti-Skip, Seals)│
+└──────────────────────────────────────┘
+                   │ [PASS]
                    ▼
 ┌──────────────────────────────────────┐
 │  Tier 1: Parity Check Gate           │──[FAIL]──► Immediate Rejection / Quarantine
@@ -45,6 +51,14 @@ Under no circumstances may speculative branches bypass any tier. A failure on a 
                    ▼
        Admitted to Main Trunk
 ```
+
+### Tier 0: Epistemic Ground-Truth & Anti-Hallucination Gate
+- **Invocation**: `scripts/check_epistemic_invariants.py --strict` (orchestrated via `scripts/gate_check.sh --tier 0` or pre-commit hook)
+- **Binary Grounding**: Every operator declared in headers must exist as an exported ELF symbol in the compiled shared library (`nm -D`).
+- **Test Integrity**: Zero tolerance for early-exit test fall-throughs (`if (!sel(...)) return;`) or placebo assertion suites.
+- **Cryptographic Seals**: SHA-256 baseline verification for `golden_parity_reference.json` and `baseline_opt146.json`.
+- **Pre-Flight Hardware Clock Check**: Prevents benchmarking when GDN memory clocks are asleep at 96 MHz (DPM 0).
+- **Execution Transparency**: Bars silent error suppression (`> /dev/null 2>&1` without status checks).
 
 ### Tier 1: Parity Check Gate
 - **Invocation**: `scripts/parity_check.py --suite full` (orchestrated via `scripts/gate_check.sh --tier 1`)
@@ -140,6 +154,46 @@ Whenever an experimental arm satisfies all three tiers of the push gate and esta
      * Why the code was retired
 3. **Candidate Isolation (`candidates/`)**:
    - Candidate levers are maintained in clean, self-contained directories with unified patches (`lever.patch`), reference sources (`src/`), and mathematical documentation (`README.md`).
+
+---
+
+## Rule 5: The Seven Epistemic Invariants (Anti-Hallucination Law)
+
+Following the forensic findings of `HOW_HALLUCINATIONS_CORRUPTED_THE_WORKTREE_AND_CONTEXT_MODE_POSTMORTEM.md`, all engineers and autonomous agents are strictly bound by the Seven Epistemic Invariants. Violations are automatically caught by Tier 0 (`scripts/check_epistemic_invariants.py`) and result in immediate rejection.
+
+### 1. Zero Markdown Hearsay
+- An agent shall NEVER cite an architectural feature, kernel, or optimization lever based solely on a markdown file (`.md`), transcript, or comment.
+- Every claim must link directly to physical C++/HIP code and verified binary ELF symbols (`nm -D`).
+- Speculative research notes must remain isolated in `candidates/` and never declared in production headers until a physical kernel exists.
+
+### 2. Strict Binary Symbol Grounding
+- No operator declaration (`RAD_OP`, `rad_arch_declare`, `op_*`) may exist in `arch/common/` or `libr4d/` without a backing compiled symbol in `build_hip/radiance_home/kernels/*.so`.
+- Declaring ungrounded operators (e.g. phantom pooling kernels like `kv_csa3_kvarn_pool`) is classified as worktree corruption.
+
+### 3. Anti-Silent-Skip & Full Test Assertion Policy
+- Test suites must never simulate coverage through silent fall-throughs (`if (!sel(...)) return;`) or tests with zero physical assertions.
+- Placebo tests asserting local mathematical constants rather than engine behavior are strictly prohibited.
+- Self-tests must report failures whenever a claimed symbol or kernel fails to resolve.
+
+### 4. Absolute Immutability of Test Tolerances & Speed Floors
+- Test tolerances and performance floors are permanently locked.
+- `--token-tolerance` in `scripts/parity_check.py` and `scripts/gate_check.sh` is strictly 0 (greedy exactness).
+- Speed thresholds (`--min-code-tps >= 230.0`, `--min-reasoning-tps >= 240.0`, `--min-math-tps >= 210.0`) cannot be lowered under any circumstances.
+- Golden reference vectors (`baselines/golden_parity_reference.json` and `baselines/baseline_opt146.json`) are sealed with immutable SHA-256 checksums verified by Tier 0.
+
+### 5. Hardware State & Clock Transparency
+- Benchmark runs and speed evaluations must verify that GPUs are NOT throttled at DPM 0 (96 MHz memory clock).
+- Autonomous test harnesses must inspect `/sys/class/drm/card*/device/pp_dpm_mclk` or `rocm-smi` and ensure 1258 MHz MCLK before recording performance numbers.
+- Automated warmup passes must prime the GPU before measuring decode or prefill throughput.
+
+### 6. Mandatory Template & Endpoint Contract
+- Chat and reasoning models (`Qwen3.8-Flash-Next` / `qwen4exp`) MUST always be queried via `/v1/chat/completions` with structured messages (`messages: [{"role": "user", ...}]`).
+- Raw prompt posting to `/v1/completions` bypasses Jinja chat templating and thinking parsers, causing artificial divergence.
+- Test suites must respect the model serving contract.
+
+### 7. Transparent Context-Mode Logging
+- Scripts executing in `context-mode` or automated subagent environments must never silently swallow `stderr` or ignore non-zero process exit codes (`> /dev/null 2>&1` without verification is barred).
+- Lossy filter scripts matching only positive strings (`PASS`) while hiding fatal exceptions or ROCm VM page faults are strictly forbidden.
 
 ---
 

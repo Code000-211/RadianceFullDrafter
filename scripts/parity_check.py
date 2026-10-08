@@ -191,10 +191,10 @@ def query_radiance(
     temperature: float = 0.0,
     timeout: float = 60.0,
 ) -> dict[str, Any]:
-    url = f"{endpoint.rstrip('/')}/completions"
+    url = f"{endpoint.rstrip('/')}/chat/completions"
     payload = {
         "model": model,
-        "prompt": prompt,
+        "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
         "temperature": temperature,
         "stream": False,
@@ -239,7 +239,11 @@ def run_single_prompt(
     )
 
     choice = data.get("choices", [{}])[0]
-    content = choice.get("text", "")
+    msg = choice.get("message")
+    if isinstance(msg, dict) and "content" in msg and msg["content"] is not None:
+        content = msg["content"]
+    else:
+        content = choice.get("text", "")
     finish_reason = choice.get("finish_reason", "unknown")
 
     usage = data.get("usage", {})

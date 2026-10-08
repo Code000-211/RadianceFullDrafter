@@ -1,0 +1,78 @@
+{
+  "system": {
+    "cpu": {
+      "model": "AMD EPYC 7402P 24-Core Processor",
+      "architecture": "x86_64 (Zen 2 Rome)",
+      "physical_cores": 24,
+      "logical_cores": 48,
+      "pcie_generation_supported": 4
+    },
+    "ram": {
+      "total_kb": 179200000,
+      "total_gb": 170.89,
+      "type": "DDR4 ECC Registered"
+    },
+    "hypervisor": {
+      "type": "Proxmox VE (PVE)",
+      "kernel": "Linux 7.0.2-6-pve-x86_64"
+    }
+  },
+  "gpus": [
+    {
+      "index": 0,
+      "model": "AMD Radeon AI PRO R9700",
+      "arch": "gfx1201",
+      "family": "RDNA4",
+      "cu_count": 64,
+      "vram_total_bytes": 34208743424,
+      "vram_total_gb": 31.86,
+      "mclk_max_mhz": 1258,
+      "mclk_idle_mhz": 96,
+      "memory_bandwidth_gb_s": 576.0,
+      "pcie": {
+        "pci_bus_id": "0000:43:00.0",
+        "physical_generation": 4,
+        "negotiated_width": "x16",
+        "measured_dma_h2d_gb_s": 28.29,
+        "measured_dma_d2h_gb_s": 27.97,
+        "hallucination_warning": "Hypervisor may report 32.0 GT/s virtual link, but physical bus is strictly PCIe 4.0 x16 capped by EPYC 7402P root complex (~28.3 GB/s practical ceiling)"
+      }
+    },
+    {
+      "index": 1,
+      "model": "AMD Radeon AI PRO R9700",
+      "arch": "gfx1201",
+      "family": "RDNA4",
+      "cu_count": 64,
+      "vram_total_bytes": 34208743424,
+      "vram_total_gb": 31.86,
+      "mclk_max_mhz": 1258,
+      "mclk_idle_mhz": 96,
+      "memory_bandwidth_gb_s": 576.0,
+      "pcie": {
+        "pci_bus_id": "0000:c3:00.0",
+        "physical_generation": 4,
+        "negotiated_width": "x16",
+        "measured_dma_h2d_gb_s": 28.29,
+        "measured_dma_d2h_gb_s": 27.97,
+        "hallucination_warning": "Hypervisor may report 32.0 GT/s virtual link, but physical bus is strictly PCIe 4.0 x16 capped by EPYC 7402P root complex (~28.3 GB/s practical ceiling)"
+      }
+    }
+  ],
+  "interconnect": {
+    "type": "PCIe 4.0 x16 slot-to-slot (No dedicated Infinity Fabric bridges)",
+    "measured_p2p_gb_s": 16.95,
+    "tp_wire_protocol": "wht6 (Walsh-Hadamard 6-bit rotated payload, 2.67x compression)",
+    "all_reduce_efficiency": "Exact wire at 1-stream decode, wht6 compression at chunk >= 128 KiB"
+  },
+  "runtime_invariants": {
+    "vram_weights_slab_gib": 28.65,
+    "vram_kv_pool_gib": 1.56,
+    "host_pool_gib": 12.00,
+    "gpu_headroom_mib": 64,
+    "prefix_cache_host_mib": 8192,
+    "checkpoint_slots": 4,
+    "chunk_tokens": 2048,
+    "speculative_depth": 3
+  }
+}

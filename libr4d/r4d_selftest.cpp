@@ -2237,64 +2237,6 @@ static void kv_store_case(const Plugin& pl, const char* name, const char* kv_dty
        pad_touched == 0, pad_touched ? "written: " + first : "");
 }
 
-static void csa3_kvarn_case(const Plugin& pl) {
-    if (!sel("kv_csa3_kvarn_pool") && !sel("csa3_kvarn_pool")) return;
-    int (*pool_fn)(uint8_t*, const int32_t*, const int32_t*, int64_t, int64_t, int, int, int, hipStream_t) = nullptr;
-    if (!sym(pl.h, "r4d_kv_csa3_kvarn_pool", &pool_fn) || !pool_fn) {
-        ok("csa3_kvarn_pool", false, "r4d_kv_csa3_kvarn_pool symbol missing");
-        return;
-    }
-    const int n_heads = 2, bs = 16, hd = 256;
-    const int n_chunks = 1;
-    const int64_t kv_block_stride = (int64_t)n_heads * bs * (2 * hd);
-    const int64_t kv_head_stride = (int64_t)bs * (2 * hd);
-    const size_t total_bytes = (size_t)(4 * kv_block_stride);
-
-    void* d_kv  = dalloc(total_bytes);
-    void* d_src = dalloc(4 * sizeof(int32_t));
-    void* d_dst = dalloc(1 * sizeof(int32_t));
-    if (!d_kv || !d_src || !d_dst) { ok("csa3_kvarn_pool", false, "hipMalloc failed"); return; }
-
-    const std::vector<int32_t> h_src = { 0, 1, 2, 0 };
-    const std::vector<int32_t> h_dst = { 3 };
-    st_memcpy(d_src, h_src.data(), 4 * sizeof(int32_t), hipMemcpyHostToDevice);
-    st_memcpy(d_dst, h_dst.data(), 1 * sizeof(int32_t), hipMemcpyHostToDevice);
-
-    std::vector<uint8_t> h_kv(total_bytes, 0);
-    for (int t = 0; t < 48; ++t) {
-        const float val = 0.5f + (float)(t % 7);
-        const uint8_t fp8_val = rad_f32_to_fp8e4m3(val);
-        const int b_idx = t / bs;
-        const int t_sub = t % bs;
-        for (int h = 0; h < n_heads; ++h) {
-            for (int d = 0; d < hd; ++d) {
-                const size_t off_k = (size_t)h_src[(size_t)b_idx] * kv_block_stride + (size_t)h * kv_head_stride + (size_t)t_sub * (2 * hd) + d;
-                const size_t off_v = off_k + hd;
-                h_kv[off_k] = fp8_val;
-                h_kv[off_v] = fp8_val;
-            }
-        }
-    }
-    st_memcpy(d_kv, h_kv.data(), total_bytes, hipMemcpyHostToDevice);
-
-    int rc = pool_fn((uint8_t*)d_kv, (const int32_t*)d_src, (const int32_t*)d_dst,
-                     kv_block_stride, kv_head_stride, n_chunks, n_heads, 128, nullptr);
-    if (rc != 0) {
-        ok("csa3_kvarn_pool", false, "kernel launch failed");
-        return;
-    }
-    (void)hipDeviceSynchronize();
-    st_memcpy(h_kv.data(), d_kv, total_bytes, hipMemcpyDeviceToHost);
-
-    const size_t out_off = (size_t)h_dst[0] * kv_block_stride;
-    bool all_finite_and_nonzero = true;
-    for (size_t i = 0; i < (size_t)bs * 2 * (size_t)hd; ++i) {
-        if (h_kv[out_off + i] == 0) { all_finite_and_nonzero = false; break; }
-    }
-    ok("csa3_kvarn_pool pools 3:1 historical tokens with KVarN compression", all_finite_and_nonzero,
-       all_finite_and_nonzero ? "" : "pooled chunk contains unexpected zero entries");
-}
-
 /* THE FP8 GEMM, CHECKED AGAINST A HOST REFERENCE ON THE SAME BYTES.
  *
  * A kernel that produces plausible numbers is not evidence (spec §17). This builds a weight's two
@@ -9537,7 +9479,6 @@ static void device_phase(const Plugin& pl) {
     attn_case(pl, "attn_decode_h256_gqa6_bf16kv",  256, 6,  1, "bf16",     0);
     attn_case(pl, "attn_decode_h128_gqa4_fp8kv",   128, 4,  1, "fp8_e4m3", 0);
     attn_case(pl, "attn_decode_h128_gqa4_bf16kv",  128, 4,  1, "bf16",     0);
-    csa3_kvarn_case(pl);
     attn_gq_fold_case(pl, 3, false);
     attn_gq_fold_case(pl, 24, false);
     attn_gq_fold_case(pl, 3, true);

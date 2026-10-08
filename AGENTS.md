@@ -31,8 +31,14 @@ Forensic analysis proved that previous 60% performance crashes were caused by co
 2. `NUM_SPECULATIVE_TOKENS > 3` (Static): Forcing static depth 5 without adaptive LCB fallback wastes GPU cycles on rejected speculative rounds.
 3. `GPU_KEEP_ALIVE=1` or `gpu_sentinel`: Background polling daemons launch periodic GPU pulse kernels that inject PCIe contention and command-queue stalls during benchmarks.
 
-### ⛔ Prohibited Action 4: Merging Without Passing the 3-Tier Gate
+### ⛔ Prohibited Action 4: Merging Without Passing the Master Gate
 No code may be promoted to candidate status or merged into `main` without a clean pass of `scripts/gate_check.sh`:
+- **Tier 0**: Epistemic Ground-Truth & Anti-Hallucination Gate (`scripts/check_epistemic_invariants.py --strict`)
+  * Strict binary symbol grounding (`nm -D` & `.so` check)
+  * Zero tolerance for silent test skips (`if (!sel(...)) return;`) or placebo assertions
+  * SHA-256 cryptographic baseline seal integrity
+  * Memory clock verification (no DPM 0 96 MHz throttle)
+  * Transparent logging (zero masked `stderr` or unverified exit codes)
 - **Tier 1**: Parity & Speed Floor (`scripts/parity_check.py --suite full`)
   * Greedy bit-exact tokens (0 divergence)
   * Code TPS $\ge 230.0$
@@ -99,3 +105,32 @@ Step 5: Process Results
 
 - Every file created or edited must satisfy the Zero-Error Standard.
 - Immediately inspect and resolve any compiler warnings, syntax errors, or linter diagnostics before signaling task completion.
+
+---
+
+## 6. The Seven Epistemic Invariants (Anti-Hallucination Operational Law)
+
+Derived from Rule 5 of [`ENGINEERING_CONSTITUTION.md`](file:///home/orca/RadianceMine/ENGINEERING_CONSTITUTION.md), every agent operating in `RadianceMine` is legally and technically bound by these seven operational laws:
+
+1. **Zero Markdown Hearsay**:
+   - Never cite an architectural lever, optimization, or kernel capability based on an audit report or markdown file.
+   - Ground every statement in physical C++/HIP code and verified binary ELF symbols (`nm -D`).
+2. **Strict Binary Grounding**:
+   - Before claiming a kernel or operator is complete, verify that its symbol is exported in `build_hip/radiance_home/kernels/*.so`.
+   - Never declare graph nodes (`RAD_OP`) for non-existent symbols.
+3. **Anti-Silent-Skip & Full Test Assertion Policy**:
+   - Tests must never mask errors with silent early returns (`if (!sel(...)) return;`).
+   - Every test must execute physical assertions against engine functions, not local arithmetic tautologies.
+4. **Absolute Immutability of Test Tolerances & Speed Floors**:
+   - Never alter `--token-tolerance` (strictly 0) or reduce speed thresholds (`--min-code-tps >= 230`, `--min-reasoning-tps >= 240`, `--min-math-tps >= 210`).
+   - Baselines (`golden_parity_reference.json`, `baseline_opt146.json`) are cryptographically sealed with SHA-256.
+5. **Hardware State & Clock Transparency**:
+   - Always verify that GPU memory clocks are not throttled at 96 MHz (DPM 0) before running benchmarks.
+   - Run warmup passes to elevate clocks to DPM 5 (1258 MHz).
+6. **Mandatory Template & Endpoint Contract**:
+   - Always query chat/reasoning models (`qwen4exp`) via `/v1/chat/completions` with structured message payloads (`messages: [{"role": "user", ...}]`).
+   - Raw `/v1/completions` bypasses the Jinja template and reasoning parser, inducing artificial discrepancies.
+7. **Transparent Context-Mode Logging**:
+   - Never pipe critical test or benchmark execution to `/dev/null` without status checks.
+   - Preserve `stderr` and check return codes for all subprocesses.
+

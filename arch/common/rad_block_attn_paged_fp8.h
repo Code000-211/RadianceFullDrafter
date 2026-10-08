@@ -52,7 +52,6 @@ struct AttnPagedFP8 {
         rad_buf qkv        = 0;   /* [max_tok, q_dim + 2*kv_dim]         the fused projection */
         rad_buf q          = 0;   /* [max_tok, q_dim]                    the query, CONTIGUOUS */
         ActFP8  attn{};           /* [max_tok, q_dim]                    attention output */
-        rad_buf csa_pooled = 0;   /* historical 3:1 pooled KV cache */
     };
 
     /* The checkpoint tensor names. */
@@ -76,7 +75,7 @@ struct AttnPagedFP8 {
     LinearFP8  qkv{}, o{};
     NormQuantFP8 nq_h{};
     QuantFP8     q_attn{};
-    rad_op     op_rope = 0, op_qlift = 0, op_attn = 0, op_kv_store = 0, op_csa_pool = 0;
+    rad_op     op_rope = 0, op_qlift = 0, op_attn = 0, op_kv_store = 0;
     rad_op     op_ar = 0, op_add = 0;
     bool       ar_out = false;
 
@@ -104,10 +103,10 @@ inline int AttnPagedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
         return RAD_E_INVAL;
     }
 
-    if (cfg.csa_ratio != 0 && cfg.csa_ratio != 3) {
-        fprintf(stderr, "radiance: CSA pooling ratio %lld unsupported (expected 0 or 3 for CSA 3:1)\n",
+    if (cfg.csa_ratio != 0) {
+        fprintf(stderr, "radiance: CSA pooling ratio %lld unsupported (kv_csa3_kvarn_pool kernel ungrounded in binary, see postmortem)\n",
                 (long long)cfg.csa_ratio);
-        return RAD_E_INVAL;
+        return RAD_E_UNSUPPORTED;
     }
 
     if (g.world > g.n_head_kv_all) {
@@ -143,14 +142,11 @@ inline int AttnPagedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
                       RAD_NOWEIGHTS),
                   {w.qkv}, {w.q});
 
-    /* Paged attention with CSA 3:1 and KVarN historical token parameters */
+    /* Paged attention */
     op_attn = rw(b, RAD_OP(b, "attn_paged",
                      RAD_PARAMS(RAD_RANGE("q_len", 1, g.max_tok), RAD_INT("head_dim", g.head_dim),
                                 RAD_INT("gqa", g.gqa()), RAD_INT("causal", 1),
                                 RAD_INT("window", cfg.csa_window),
-                                RAD_INT("csa_window", cfg.csa_window),
-                                RAD_INT("csa_ratio", cfg.csa_ratio),
-                                RAD_INT("kvarn", cfg.kvarn ? 1 : 0),
                                 RAD_INT("n_head", g.n_head),
                                 RAD_INT("block_size", cfg.kv_block > 0 ? cfg.kv_block : (int64_t)RAD_KV_BLOCK),
                                 RAD_INT("max_seqs", g.max_seqs), RAD_INT("max_ctx", g.max_ctx),
@@ -166,19 +162,6 @@ inline int AttnPagedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
                                     RAD_STR("kv_dtype", g.kv_dtype)),
                          RAD_NOWEIGHTS),
                      {w.qkv}, {});
-
-    /* Stage 1 + Stage 2: CSA 3:1 Chunk-Pooling and KVarN compression kernel op */
-    if (cfg.csa_ratio == 3) {
-        op_csa_pool = rw(b, RAD_OP(b, "kv_csa3_kvarn_pool",
-                              RAD_PARAMS(RAD_INT("head_dim", g.head_dim),
-                                         RAD_INT("n_head_kv", g.n_head_kv),
-                                         RAD_INT("csa_ratio", cfg.csa_ratio),
-                                         RAD_INT("csa_window", cfg.csa_window),
-                                         RAD_INT("kvarn", cfg.kvarn ? 1 : 0),
-                                         RAD_STR("kv_dtype", g.kv_dtype)),
-                              RAD_NOWEIGHTS),
-                          {}, {});
-    }
 
     RAD_ARCH_TRY(q_attn.declare(b, g, w.attn, q_dim));
     RAD_ARCH_TRY(o.declare(b, nm, g, nm.f("blk.%d.attn_output", l), g.n_embd, q_dim,
@@ -218,14 +201,6 @@ inline void AttnPagedFP8::step(RadCtx* c, const RadBatch* batch) const {
     RAD_ISSUE(c, op_kv_store,
               bcol(w.qkv, q_dim, kv_dim, T), bcol(w.qkv, q_dim + kv_dim, kv_dim, T),
               praw(slot, RAD_I32, T), kv_cache(kv, layer));
-
-    /* When context tokens exceed the sliding window, historical tokens are pooled 3:1 */
-    if (batch->max_ctx_len > cfg.csa_window && op_csa_pool) {
-        RAD_ISSUE(c, op_csa_pool,
-                  kv_cache(kv, layer),
-                  praw2(table, RAD_I32, batch->n_seq, kvb ? kvb->block_table_pitch : 0),
-                  praw(used, RAD_I32, batch->n_seq));
-    }
 
     RAD_ISSUE(c, op_qlift, bcol(w.qkv, 0, q_dim, T), brows(w.q, T));
 

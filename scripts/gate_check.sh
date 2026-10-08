@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# gate_check.sh — RadianceMine 3-Tier Master Regression & Quality Gate
+# gate_check.sh — RadianceMine Master Regression & Quality Gate
 # ==============================================================================
-# Rule 1 of ENGINEERING_CONSTITUTION.md:
-# No code is EVER merged into main unless it passes the 3-Tier Gate:
+# Rule 1 & Rule 5 of ENGINEERING_CONSTITUTION.md:
+# No code is EVER merged into main unless it passes the Master Quality Gates:
+#   - Tier 0: Epistemic Ground-Truth Gate (scripts/check_epistemic_invariants.py)
 #   - Tier 1: Parity Check Gate (scripts/parity_check.py --suite full)
 #   - Tier 2: BetterBench Composite Gate (scripts/check_composite_gate.py)
 #   - Tier 3: RDNA4 ISA & Hardware Invariants (scripts/verify_rdna4_invariants.sh)
@@ -48,11 +49,11 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --help|-h)
-            echo "Usage: $0 [--tier 1|2|3|all] [--endpoint URL] [--bench-json PATH] [--build-dir PATH]"
+            echo "Usage: $0 [--tier 0|1|2|3|all] [--endpoint URL] [--bench-json PATH] [--build-dir PATH]"
             exit 0
             ;;
         *)
-            if [[ "$1" =~ ^(1|2|3|all)$ ]]; then
+            if [[ "$1" =~ ^(0|1|2|3|all)$ ]]; then
                 TARGET_TIER="$1"
             fi
             shift
@@ -104,6 +105,19 @@ if [ ${ENV_DIRTY} -ne 0 ]; then
     exit 1
 fi
 echo "✓ Pre-flight environment certified clean."
+
+# ==============================================================================
+# Tier 0: Epistemic Ground-Truth & Anti-Hallucination Gate
+# ==============================================================================
+run_tier0() {
+    echo ""
+    echo "================================================================================"
+    echo " Executing Tier 0: Epistemic Ground-Truth & Anti-Hallucination Gate"
+    echo "================================================================================"
+    python3 "${SCRIPT_DIR}/check_epistemic_invariants.py" \
+        --strict \
+        --endpoint "${ENDPOINT}"
+}
 
 # ==============================================================================
 # Tier 1: Parity Check Gate (Greedy Bit-Exactness & Throughput Floors)
@@ -181,7 +195,11 @@ run_tier3() {
 # Dispatch Execution
 # ==============================================================================
 case "${TARGET_TIER}" in
+    0)
+        run_tier0
+        ;;
     1)
+        run_tier0
         run_tier1
         ;;
     2)
@@ -191,9 +209,12 @@ case "${TARGET_TIER}" in
         run_tier3
         ;;
     all)
-        # In all mode, run Tier 3 first (static fast), then Tier 2, then Tier 1
-        run_tier3
-        run_tier2
+        # Execution order mandated by Rule 1 & Rule 5:
+        # Tier 0 (Epistemic Ground-Truth Gate)
+        # Tier 1 (Parity & Greedy Exactness Gate)
+        # Tier 2 (BetterBench Composite Score Gate)
+        # Tier 3 (RDNA4 Hardware & ISA Compliance Gate)
+        run_tier0
         if curl -s --max-time 2 "${ENDPOINT}/models" >/dev/null 2>&1 || [ "${DRY_RUN:-0}" = "1" ]; then
             run_tier1
         else
@@ -201,9 +222,11 @@ case "${TARGET_TIER}" in
             echo "ℹ️  Tier 1 skipped: server not currently running at ${ENDPOINT}."
             echo "   (To run live Tier 1 parity check, launch: scripts/start_engine.sh)"
         fi
+        run_tier2
+        run_tier3
         ;;
     *)
-        echo "❌ Unknown tier '${TARGET_TIER}'. Must be 1, 2, 3, or all." >&2
+        echo "❌ Unknown tier '${TARGET_TIER}'. Must be 0, 1, 2, 3, or all." >&2
         exit 1
         ;;
 esac

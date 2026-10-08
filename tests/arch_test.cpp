@@ -2771,17 +2771,10 @@ TEST(the_per_expert_tap_keeps_each_experts_gram_whole) {
     CHECK_EQ(bad, 0);
 }
 
-/* CSA 3:1 CHUNK-POOLING AND KVARN VARIANCE-NORMALIZED QUANTIZATION FOR HISTORICAL TOKENS.
- *
- * For tokens outside the local sliding window (t > 128), 3 consecutive historical KV tokens are
- * pooled into 1 representative pooled token vector:
- *     \bar{K} = (1/3) \sum K_i, \bar{V} = (1/3) \sum V_i
- * This cuts historical memory traffic and WMMA operations by 3x (66.7% reduction), while CLT
- * dampens outlier variance across pooled chunks by 1/sqrt(3).
- * Stage 2 (KVarN) applies variance-normalized quantization (FWHT-256 Hadamard pre-rotation +
- * variance normalization scale for K4V2) on the pooled historical chunks, reducing ALU
- * dequantization overhead on RDNA4 by 3x. */
-TEST(csa_paged_attention_pools_historical_tokens_3_to_1) {
+/* Epistemic Invariant Verification:
+ * AttnPagedFP8 must reject ungrounded CSA 3:1 historical pooling (kv_csa3_kvarn_pool).
+ * Rule 5 Law 2: No operator may be declared without a matching physical ELF symbol. */
+TEST(attn_paged_fp8_rejects_ungrounded_csa_ratio) {
     using namespace rad::arch;
     RadBuilder b;
     RadModelMeta meta = qwen35_meta();
@@ -2808,12 +2801,6 @@ TEST(csa_paged_attention_pools_historical_tokens_3_to_1) {
     src.v = "blk.0.attn_v.weight";
     src.o = "blk.0.attn_output.weight";
 
-    AttnPagedFP8::Config cfg{};
-    cfg.csa_window = 128;
-    cfg.csa_ratio  = 3;
-    cfg.kvarn      = true;
-    cfg.kv_block   = 16;
-
     AttnPagedFP8 attn;
     RadKVGroupDecl kd{};
     kd.kind = RAD_KV_FULL;
@@ -2822,152 +2809,16 @@ TEST(csa_paged_attention_pools_historical_tokens_3_to_1) {
     kd.head_dim = g.head_dim;
     rad_kvgroup grp = rad_decl_kv_group(&b, "kv_csa", &kd);
 
-    CHECK_OK(attn.declare(&b, nm, g, 0, grp, 64, w, src, cfg));
+    // Standard valid configuration (csa_ratio == 0) succeeds
+    AttnPagedFP8::Config valid_cfg{};
+    valid_cfg.csa_ratio = 0;
+    valid_cfg.csa_window = 128;
+    CHECK_OK(attn.declare(&b, nm, g, 0, grp, 64, w, src, valid_cfg));
 
-    const RecOp* at = find_op(b, "attn_paged");
-    CHECK(at != nullptr);
-    CHECK_EQ(pint(at, "csa_window"), 128);
-    CHECK_EQ(pint(at, "csa_ratio"), 3);
-    CHECK_EQ(pint(at, "kvarn"), 1);
-    CHECK_EQ(pint(at, "block_size"), 16);
-
-    const RecOp* pool = find_op(b, "kv_csa3_kvarn_pool");
-    CHECK(pool != nullptr);
-    CHECK_EQ(pint(pool, "csa_ratio"), 3);
-    CHECK_EQ(pint(pool, "csa_window"), 128);
-    CHECK_EQ(pint(pool, "kvarn"), 1);
-}
-
-TEST(kvarn_variance_normalized_compression_scales) {
-    /* CLT mathematical verification:
-     * When 3 consecutive historical tokens are pooled into 1:
-     * Var(\bar{X}) = (1/9) * (Var(X1) + Var(X2) + Var(X3)) = (1/3) * Var(X)
-     * StdDev(\bar{X}) = StdDev(X) / sqrt(3).
-     * This dampens outlier variance across historical context by factor 1/sqrt(3) ~ 0.57735. */
-    const float clt_factor = 1.0f / std::sqrt(3.0f);
-    CHECK(std::fabs(clt_factor - 0.577350269f) < 1e-5f);
-
-    /* 64k context under CSA 3:1:
-     * Local sliding window = 128 tokens.
-     * Historical context = 64k - 128 = 65408 tokens.
-     * 3:1 pooled tokens = 65408 / 3 = 21803 pooled tokens.
-     * Reduction in historical tokens to unpack/process = 66.7% (exactly 3x speedup). */
-    const int64_t full_hist = 65536 - 128;
-    const int64_t csa_hist  = (full_hist + 2) / 3;
-    const double reduction = 1.0 - (double)csa_hist / (double)full_hist;
-    CHECK(reduction > 0.666);
-    CHECK(reduction < 0.668);
-}
-
-TEST(csa_step_issues_pooling_op_only_outside_sliding_window) {
-    using namespace rad::arch;
-    RadBuilder b;
-    RadModelMeta meta = qwen35_meta();
-    RadBuildCtx  ctx  = build_ctx();
-    ctx.max_tok = 2048; ctx.max_seqs = 4; ctx.max_ctx = 65536;
-
-    Geom g{};
-    CHECK_OK(geom_from(g, &meta, &ctx, "fp8", RAD_BF16));
-
-    Names nm("");
-    AttnPagedFP8::Wire w{};
-    w.x = decl_b(&b, "res_x", g.act_dtype, { g.max_tok, g.n_embd });
-    w.h.x = decl_b(&b, "h_x", g.act_dtype, { g.max_tok, g.n_embd });
-    CHECK_OK(w.h.declare_qs(&b, nm, g, "h", g.n_embd));
-    w.qkv = decl_b(&b, "attn_qkv", g.act_dtype, { g.max_tok, g.q_dim() + 2 * g.kv_dim() });
-    w.q = decl_b(&b, "attn_q", g.act_dtype, { g.max_tok, g.q_dim() });
-    w.attn.x = decl_b(&b, "attn_out", g.act_dtype, { g.max_tok, g.q_dim() });
-    CHECK_OK(w.attn.declare_qs(&b, nm, g, "attn_out", g.q_dim()));
-
-    AttnPagedFP8::Src src{};
-    src.norm = "blk.0.attn_norm.weight";
-    src.q = "blk.0.attn_q.weight";
-    src.k = "blk.0.attn_k.weight";
-    src.v = "blk.0.attn_v.weight";
-    src.o = "blk.0.attn_output.weight";
-
-    AttnPagedFP8::Config cfg{};
-    cfg.csa_window = 128;
-    cfg.csa_ratio  = 3;
-    cfg.kvarn      = true;
-    cfg.kv_block   = 16;
-
-    AttnPagedFP8 attn;
-    RadKVGroupDecl kd{};
-    kd.kind = RAD_KV_FULL;
-    kd.dtype = RAD_F8E4M3;
-    kd.n_head_kv = g.n_head_kv;
-    kd.head_dim = g.head_dim;
-    rad_kvgroup grp = rad_decl_kv_group(&b, "kv_csa", &kd);
-
-    CHECK_OK(attn.declare(&b, nm, g, 0, grp, 64, w, src, cfg));
-
-    // Case 1: Context length 100 <= 128 (sliding window only)
-    {
-        RadCtx c;
-        c.b = &b;
-        RadBatch batch = decode_batch();
-        batch.max_ctx_len = 100;
-        c.batch = &batch;
-
-        attn.step(&c, &batch);
-
-        bool found_pool = false;
-        for (const auto& issue : c.issues) {
-            const RecOp* op = b.op_of(issue.op);
-            if (op && op->op == "kv_csa3_kvarn_pool") found_pool = true;
-        }
-        CHECK(!found_pool);
-    }
-
-    // Case 2: Context length 256 > 128 (historical tokens present)
-    {
-        RadCtx c;
-        c.b = &b;
-        RadBatch batch = decode_batch();
-        batch.max_ctx_len = 256;
-        c.batch = &batch;
-
-        attn.step(&c, &batch);
-
-        const RecIssue* pool_issue = nullptr;
-        for (const auto& issue : c.issues) {
-            const RecOp* op = b.op_of(issue.op);
-            if (op && op->op == "kv_csa3_kvarn_pool") pool_issue = &issue;
-        }
-        CHECK(pool_issue != nullptr);
-        if (pool_issue) {
-            REQUIRE_EQ(pool_issue->opd.size(), (size_t)3);
-            CHECK_EQ(pool_issue->opd[0].kind, (uint8_t)RAD_OPK_KV);
-            CHECK_EQ(pool_issue->opd[1].dtype, (uint32_t)RAD_I32);
-            CHECK_EQ(pool_issue->opd[2].dtype, (uint32_t)RAD_I32);
-        }
-    }
-}
-
-TEST(csa_boundary_transitions_from_sliding_window) {
-    const int csa_w = 128;
-    auto calc_eff_ctx = [csa_w](int ctx) {
-        const int n_hist = (ctx > csa_w) ? (ctx - csa_w) : 0;
-        const int n_hist_pool = (n_hist + 2) / 3;
-        return (ctx > csa_w) ? (n_hist_pool + csa_w) : ctx;
-    };
-
-    // Boundary at sliding window (t <= 128): exactly 1:1, 0 pooled
-    CHECK_EQ(calc_eff_ctx(1), 1);
-    CHECK_EQ(calc_eff_ctx(64), 64);
-    CHECK_EQ(calc_eff_ctx(128), 128);
-
-    // Transitions across 129, 130, 131, 132
-    CHECK_EQ(calc_eff_ctx(129), 129); // 1 hist -> 1 pooled + 128 window = 129
-    CHECK_EQ(calc_eff_ctx(130), 129); // 2 hist -> 1 pooled + 128 window = 129
-    CHECK_EQ(calc_eff_ctx(131), 129); // 3 hist -> 1 pooled + 128 window = 129
-    CHECK_EQ(calc_eff_ctx(132), 130); // 4 hist -> 2 pooled + 128 window = 130
-
-    // Deep context scaling
-    CHECK_EQ(calc_eff_ctx(192), 150); // 64 hist -> 22 pooled + 128 window = 150
-    CHECK_EQ(calc_eff_ctx(256), 171); // 128 hist -> 43 pooled + 128 window = 171
-    CHECK_EQ(calc_eff_ctx(65536), 21931); // 65408 hist -> 21803 pooled + 128 window = 21931
+    // Phantom ungrounded ratio (csa_ratio == 3) must be strictly rejected
+    AttnPagedFP8::Config invalid_cfg{};
+    invalid_cfg.csa_ratio = 3;
+    CHECK_EQ(attn.declare(&b, nm, g, 0, grp, 64, w, src, invalid_cfg), RAD_E_UNSUPPORTED);
 }
 
 /* ==================================================================== RDNA4 ISA Engineering Rules */
