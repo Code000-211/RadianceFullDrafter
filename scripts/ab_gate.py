@@ -22,8 +22,10 @@ tier2.slack_pct. In "abba" mode the A/A spread is checked against the slack as w
 a spread larger than the slack makes the result inconclusive, which fails the gate.
 
 Tier 4, after the blocks: the engine's own diagnose run (`radiance --diagnose`, docs/GUIDE.md
-§6.8) once on the baseline build and once on the candidate build, the candidate compared with
-the baseline's report (`--diagnose-baseline`). Same prompts, same seeds, temperature 1, over the
+§6.8) twice on the baseline build and once on the candidate build, the second baseline run and
+the candidate each compared with the first (`--diagnose-baseline`). The engine is not
+bit-reproducible between processes (spec §19.7), so only what the baseline reproduces against
+itself is held against the candidate. Same prompts, same seeds, temperature 1, over the
 BetterBench categories, a concurrency sweep and a prefill sweep, so it checks token parity on the
 paths the goldens do not reach (batched decode, long prefill) and draft acceptance per category
 and position. A drop in draft acceptance (DROPPED) always fails. Differing tokens fail unless the
@@ -290,7 +292,11 @@ def export_bb_corpus(bb_path: str, out: Path) -> tuple[Path | None, str]:
     def field(item: Any, name: str) -> Any:
         return item.get(name) if isinstance(item, dict) else getattr(item, name, None)
 
-    items = list(corpus.values()) if isinstance(corpus, dict) else list(corpus)
+    # load_corpus() returns {category: [Prompt, ...]}, Prompt a dataclass with id, category,
+    # max_tokens and messages. A flat list of entries is taken as well.
+    items: list[Any] = []
+    for v in (corpus.values() if isinstance(corpus, dict) else [corpus]):
+        items.extend(v if isinstance(v, (list, tuple)) else [v])
     rows = []
     for item in items:
         category = field(item, "category")
@@ -299,6 +305,8 @@ def export_bb_corpus(bb_path: str, out: Path) -> tuple[Path | None, str]:
             messages = [{"role": "user", "content": field(item, "prompt")}]
         if not isinstance(category, str) or not isinstance(messages, list) or not messages:
             return None, f"BetterBench corpus entry without category and messages: {type(item).__name__}"
+        # The messages as the corpus holds them, without BetterBench's per-request nonce: the
+        # diagnose run salts every request itself, the same way on both builds.
         row: dict[str, Any] = {"category": category, "messages": messages}
         if isinstance(field(item, "max_tokens"), int) and field(item, "max_tokens") > 0:
             row["max_tokens"] = field(item, "max_tokens")
@@ -352,30 +360,57 @@ def run_diagnose(build_dir: Path, out_dir: Path, dcfg: dict[str, Any], corpus: P
             "report_path": str(report_path), "log": str(log_path)}
 
 
-def judge_diagnose(base: dict[str, Any], cand: dict[str, Any], declared_reordered: bool) -> dict[str, Any]:
-    """Tier 4's verdict from the two runs. `kind` is pass, fail (the candidate's) or setup (the
-    baseline's run is not usable, so nothing was compared)."""
-    if base["rc"] is None or base["report"] is None:
-        return {"kind": "setup", "why": f"baseline diagnose run did not finish (rc {base['rc']}), see {base['log']}"}
+def judge_diagnose(base: dict[str, Any], again: dict[str, Any] | None, cand: dict[str, Any] | None,
+                   declared_reordered: bool) -> dict[str, Any]:
+    """Tier 4's verdict. `base` is the baseline's run, `again` the baseline run a second time
+    against the first, `cand` the candidate against the first. `kind` is pass, fail (the
+    candidate's) or setup (the baseline's runs are not usable, so nothing was compared).
+
+    The engine is not bit-reproducible between two processes (spec §19.7): what the baseline does
+    not reproduce against itself cannot be held against the candidate. Token parity is therefore
+    checked on the requests `again` reproduced, and an acceptance drop counts only where `again`
+    shows none."""
+    def usable(r: dict[str, Any] | None) -> bool:
+        return r is not None and r.get("rc") is not None and r.get("report") is not None
+
+    if not usable(base):
+        return {"kind": "setup", "why": f"baseline diagnose run did not finish (rc {base and base.get('rc')}), see {base and base.get('log')}"}
     if base["report"].get("verdict") != "valid":
         return {"kind": "setup", "why": f"baseline diagnose run is not a measurement: {base['report'].get('problems')}"}
-    if cand["rc"] is None or cand["report"] is None:
-        return {"kind": "fail", "why": f"candidate diagnose run did not finish (rc {cand['rc']}), see {cand['log']}"}
+    if not usable(again) or again["report"].get("verdict") != "valid" or "compared" not in (again["report"].get("parity") or {}):
+        return {"kind": "setup", "why": f"second baseline run gave no comparison (rc {again and again.get('rc')}), see {again and again.get('log')}"}
+    if not usable(cand):
+        return {"kind": "fail", "why": f"candidate diagnose run did not finish (rc {cand and cand.get('rc')}), see {cand and cand.get('log')}"}
     rep = cand["report"]
     if rep.get("verdict") != "valid":
         return {"kind": "fail", "why": f"candidate diagnose run is not a measurement: {rep.get('problems')}"}
     parity = rep.get("parity") or {}
     if "compared" not in parity:
         return {"kind": "setup", "why": f"no comparison with the baseline: {parity.get('verdict', 'missing')}"}
-    if parity.get("acceptance_verdict") != "no drop":
-        return {"kind": "fail", "why": f"draft acceptance dropped: {parity.get('acceptance_dropped')}"}
-    if parity.get("verdict") != "identical":
+
+    ref = again["report"]["parity"]
+    unstable = {(x["point"], x["run"], x["request"]) for x in ref.get("differing", [])}
+    unstable_acc = {(x["point"], x["what"]) for x in ref.get("acceptance_dropped", [])}
+    reproducible = int(ref.get("identical", 0))
+    coverage = (f"{reproducible} of {ref.get('compared', 0)} requests reproducible on the baseline itself"
+                f"{'; ' + str(len(unstable_acc)) + ' acceptance tests unstable there' if unstable_acc else ''}")
+
+    drops = [x for x in parity.get("acceptance_dropped", []) if (x["point"], x["what"]) not in unstable_acc]
+    if drops:
+        return {"kind": "fail", "coverage": coverage, "drops": drops,
+                "why": "draft acceptance dropped: " + "; ".join(f"{x['point']} {x['what']} {x['now']} vs {x['baseline']}" for x in drops)}
+    diffs = [x for x in parity.get("differing", []) if (x["point"], x["run"], x["request"]) not in unstable]
+    if diffs:
         if declared_reordered:
-            return {"kind": "pass", "declared": True,
-                    "why": f"tokens differ ({parity.get('verdict')}), declared reordered numerics: Leon decides at the merge"}
-        return {"kind": "fail", "why": f"token parity {parity.get('verdict')}: "
-                                       f"{parity.get('identical')} of {parity.get('compared')} requests identical"}
-    return {"kind": "pass", "why": f"{parity.get('compared')} requests identical, no acceptance drop"}
+            return {"kind": "pass", "declared": True, "coverage": coverage, "diffs": diffs,
+                    "why": f"{len(diffs)} reproducible requests differ, declared reordered numerics: Leon decides at the merge"}
+        return {"kind": "fail", "coverage": coverage, "diffs": diffs,
+                "why": f"{len(diffs)} requests the baseline reproduces differ in the candidate"}
+    if reproducible == 0:
+        return {"kind": "pass", "unchecked": True, "coverage": coverage,
+                "why": "token parity not checkable: the baseline reproduces no request; acceptance checked"}
+    return {"kind": "pass", "coverage": coverage,
+            "why": f"all {reproducible} reproducible requests identical, no acceptance drop"}
 
 
 def run_block(name: str, role: str, engine: Engine, cfg: dict[str, Any], out_dir: Path) -> dict[str, Any]:
@@ -451,16 +486,17 @@ def render_report(summary: dict[str, Any]) -> str:
         lines += ["", "## Tier 4: diagnose parity and draft acceptance", ""]
         lines.append(f"- Verdict: **{d['judgement']['kind'].upper()}**: {d['judgement']['why']}")
         lines.append(f"- Corpus: {d['corpus_note']}")
-        for role in ("baseline", "candidate"):
+        if d["judgement"].get("coverage"):
+            lines.append(f"- Coverage: {d['judgement']['coverage']}")
+        for role in ("baseline", "baseline_again", "candidate"):
             r = d.get(role)
             if r:
                 lines.append(f"- {role}: exit {r['rc']}, {r['wall_s']} s, report `{r['report_path']}`")
-        parity = ((d.get("candidate") or {}).get("report") or {}).get("parity") or {}
-        for x in parity.get("differing", [])[:20]:
+        for x in d["judgement"].get("diffs", [])[:20]:
             lines.append(f"  - differs: {x['point']} run {x['run']} request {x['request']} "
                          f"from token {x['first_different_token']}")
-        for x in parity.get("acceptance_dropped", []):
-            lines.append(f"  - acceptance dropped: {x['point']} {x['what']} {x['now']} vs {x['baseline']} (z {x['z']})")
+        for x in d["judgement"].get("drops", []):
+            lines.append(f"  - acceptance dropped: {x['point']} {x['what']} {x['now']} vs {x['baseline']}")
     lines += ["", "## Engines", ""]
     for b in summary["blocks"]:
         m = b["manifest"]
@@ -540,12 +576,15 @@ def main() -> int:
             corpus_note = f"engine built-in ({corpus_note})"
         base = run_diagnose(args.baseline_build, args.out / "diagnose_baseline", dcfg, corpus, None, [], {})
         log(f"tier 4: baseline exit {base['rc']} after {base['wall_s']} s")
-        cand = None
+        again = cand = None
         if base["rc"] == 0 and base["report"] is not None:
+            again = run_diagnose(args.baseline_build, args.out / "diagnose_baseline_again", dcfg, corpus,
+                                 Path(base["report_path"]), [], {})
+            log(f"tier 4: baseline again exit {again['rc']} after {again['wall_s']} s")
             cand = run_diagnose(args.candidate_build, args.out / "diagnose_candidate", dcfg, corpus,
                                 Path(base["report_path"]), args.candidate_arg, cand_env)
             log(f"tier 4: candidate exit {cand['rc']} after {cand['wall_s']} s")
-        judgement = judge_diagnose(base, cand or {"rc": None, "report": None, "log": "-"}, declared_reordered)
+        judgement = judge_diagnose(base, again, cand, declared_reordered)
         def slim(r: dict[str, Any] | None) -> dict[str, Any] | None:
             # The full reports stay in their directories; the summary keeps the verdicts.
             if r is None:
@@ -553,7 +592,8 @@ def main() -> int:
             rep = r["report"] or {}
             return {**r, "report": {"verdict": rep.get("verdict"), "problems": rep.get("problems"),
                                     "parity": rep.get("parity")}}
-        diagnose = {"judgement": judgement, "corpus_note": corpus_note, "baseline": slim(base), "candidate": slim(cand)}
+        diagnose = {"judgement": judgement, "corpus_note": corpus_note, "baseline": slim(base),
+                    "baseline_again": slim(again), "candidate": slim(cand)}
         log(f"tier 4: {judgement['kind']}: {judgement['why']}")
         if judgement["kind"] == "setup":
             verdict, rc = f"SETUP_ERROR (diagnose: {judgement['why']})", 3
@@ -561,6 +601,8 @@ def main() -> int:
             verdict, rc = f"FAIL (diagnose: {judgement['why']})", 2
         elif judgement.get("declared"):
             notes.append("diagnose tokens differ, declared reordered numerics")
+        elif judgement.get("unchecked"):
+            notes.append("diagnose token parity not checkable, baseline not reproducible")
     if rc == 0 and notes:
         verdict = f"PASS (Leon decides at the merge: {'; '.join(notes)})"
 

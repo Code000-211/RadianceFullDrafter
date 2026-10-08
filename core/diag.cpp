@@ -111,6 +111,45 @@ double drop_z(int64_t n1, int64_t k1, int64_t n0, int64_t k0) {
     return (p1 - p0) / se;
 }
 
+/* The regularised incomplete beta function I_x(a, b), by its continued fraction (Lentz). */
+double inc_beta(double x, double a, double b) {
+    if (x <= 0) return 0;
+    if (x >= 1) return 1;
+    if (x > (a + 1) / (a + b + 2)) return 1.0 - inc_beta(1.0 - x, b, a);
+    const double lbeta = std::lgamma(a + b) - std::lgamma(a) - std::lgamma(b);
+    const double front = std::exp(std::log(x) * a + std::log(1.0 - x) * b + lbeta) / a;
+    const double tiny = 1e-300;
+    double f = 1, c = 1, d = 1 - (a + b) * x / (a + 1);
+    if (std::fabs(d) < tiny) d = tiny;
+    d = 1 / d;
+    f = d;
+    for (int m = 1; m <= 300; ++m) {
+        for (int odd = 0; odd < 2; ++odd) {
+            const double num = odd ? -(a + m) * (a + b + m) * x / ((a + 2 * m) * (a + 2 * m + 1))
+                                   : m * (b - m) * x / ((a + 2 * m - 1) * (a + 2 * m));
+            d = 1 + num * d;
+            if (std::fabs(d) < tiny) d = tiny;
+            c = 1 + num / c;
+            if (std::fabs(c) < tiny) c = tiny;
+            d = 1 / d;
+            f *= c * d;
+        }
+        if (std::fabs(c * d - 1) < 1e-12) break;
+    }
+    return front * f;
+}
+
+/* P(T <= t) for Student's t with `df` degrees of freedom. */
+double t_cdf(double t, double df) {
+    if (std::isinf(t)) return t < 0 ? 0.0 : 1.0;
+    const double tail = 0.5 * inc_beta(df / (df + t * t), df / 2, 0.5);
+    return t < 0 ? tail : 1.0 - tail;
+}
+
+/* The one-sided probability of z = -3: the threshold every acceptance test below uses, so a
+ * request-level t test and a pooled z test call the same thing a drop. */
+constexpr double kDropP = 0.0013498980316301;
+
 const char* phase_name(int p) {
     return p == RAD_PHASE_DECODE ? "decode" : p == RAD_PHASE_PREFILL ? "prefill" : "mixed";
 }
@@ -212,9 +251,14 @@ json phase_report(const PhaseInput& in) {
      * means the phase measured a cache hit, and the driver says so. */
     req["cached_prompt_tokens"] = cached;
     {
-        json outs = json::array();
-        for (const RequestTiming& r : in.requests) outs.push_back(r.output);
+        json outs = json::array(), drafts = json::array();
+        for (const RequestTiming& r : in.requests) {
+            outs.push_back(r.output);
+            drafts.push_back(json::array({ r.drafted, r.accepted }));
+        }
         req["outputs"] = outs;
+        /* [proposed, accepted] a request: the unit the acceptance comparison pairs on. */
+        req["drafts"] = drafts;
     }
     /* TTFT FROM ADMISSION, and the queue wait beside it: the first is the engine's latency, the
      * second is how long the scheduler kept the request waiting, and a client sees their sum. */
@@ -433,10 +477,16 @@ int compare_outputs(const json& now, const json& base, json* out, std::string* w
             }
             /* DRAFT ACCEPTANCE BESIDE THE TOKENS. Bit-identical builds accept identically; a build
              * that is not shows here first, because the draft head reads the trunk's hidden state
-             * and an inaccuracy there costs acceptance before it changes an answer. A DROP is
-             * judged on the pooled counts of all runs, overall and at every position, by a
-             * two-proportion test: z below -3 is a drop noise alone produces about once in a
-             * thousand comparisons, and it fails the comparison. */
+             * and an inaccuracy there costs acceptance before it changes an answer.
+             *
+             * THE UNIT IS THE REQUEST, NOT THE DRAFT. Drafts within one text are not independent --
+             * a stretch of boilerplate is accepted wholesale -- so a test that counts every draft as
+             * a coin flip takes two texts that differ for any reason for a drop: two runs of the
+             * same build that diverged a few tokens in did exactly that. The overall rate is tested
+             * on the requests, paired (the same prompt and seed on both sides), by a one-sided t
+             * test; a drop is p below that of z = -3. The positions have only pooled counts, so
+             * their two-proportion z is divided by the square root of the dispersion the requests
+             * show beyond a binomial one, and a drop is that z below -3. */
             auto pooled = [](const json& p) {
                 int64_t n = 0, k = 0;
                 for (const json& r : p.value("runs", json::array()))
@@ -446,25 +496,70 @@ int compare_outputs(const json& now, const json& base, json* out, std::string* w
                     }
                 return std::make_pair(n, k);
             };
-            auto check = [&](const std::string& what, int64_t n1, int64_t k1, int64_t n0, int64_t k0) {
-                const double z = drop_z(n1, k1, n0, k0);
-                json x = { { "point", point }, { "what", what },
-                           { "now", ratio((double)k1, (double)n1) }, { "baseline", ratio((double)k0, (double)n0) },
-                           { "n_now", n1 }, { "n_baseline", n0 },
-                           { "z", std::isfinite(z) ? json(round3(z)) : json(nullptr) } };
-                acceptance.push_back(x);
-                if (std::isfinite(z) && z < -3.0) dropped.push_back(x);
-            };
+            std::vector<double> diffs;
             {
-                const auto [n1, k1] = pooled(pa);
-                const auto [n0, k0] = pooled(*pb);
-                if (n1 > 0 || n0 > 0) check("overall", n1, k1, n0, k0);
+                const json& ra = pa.value("runs", json::array());
+                const json& rb = (*pb).value("runs", json::array());
+                for (size_t r = 0; r < std::min(ra.size(), rb.size()); ++r) {
+                    const json da = ra[r].contains("requests") ? ra[r]["requests"].value("drafts", json::array()) : json::array();
+                    const json db = rb[r].contains("requests") ? rb[r]["requests"].value("drafts", json::array()) : json::array();
+                    for (size_t k = 0; k < std::min(da.size(), db.size()); ++k) {
+                        const double n1 = da[k][0].get<double>(), k1 = da[k][1].get<double>();
+                        const double n0 = db[k][0].get<double>(), k0 = db[k][1].get<double>();
+                        if (n1 > 0 && n0 > 0) diffs.push_back(k1 / n1 - k0 / n0);
+                    }
+                }
+            }
+            const auto [n1, k1] = pooled(pa);
+            const auto [n0, k0] = pooled(*pb);
+            double phi = 1.0;
+            if (n1 > 0 || n0 > 0) {
+                json x = { { "point", point }, { "what", "overall" },
+                           { "now", ratio((double)k1, (double)n1) }, { "baseline", ratio((double)k0, (double)n0) },
+                           { "n_now", n1 }, { "n_baseline", n0 }, { "requests", (int64_t)diffs.size() } };
+                bool drop = false;
+                if (diffs.size() >= 2) {
+                    const double m = (double)diffs.size();
+                    const double mean = std::accumulate(diffs.begin(), diffs.end(), 0.0) / m;
+                    double ss = 0;
+                    for (double d : diffs) ss += (d - mean) * (d - mean);
+                    const double se = std::sqrt(ss / (m - 1) / m);
+                    const double t = se > 0 ? mean / se : (mean == 0 ? 0.0 : (mean < 0 ? -INFINITY : INFINITY));
+                    const double p = t_cdf(t, m - 1);
+                    x["test"] = "paired t over requests";
+                    x["t"] = std::isfinite(t) ? json(round3(t)) : json(nullptr);
+                    x["p"] = p;
+                    drop = p < kDropP;
+                    /* The requests' spread against a binomial one, for the positions below. */
+                    if (n1 > 0 && n0 > 0) {
+                        const double pp = (double)(k1 + k0) / (double)(n1 + n0);
+                        const double se_bin = std::sqrt(pp * (1 - pp) * (1.0 / (double)n1 + 1.0 / (double)n0));
+                        if (se_bin > 0) phi = std::max(1.0, (se / se_bin) * (se / se_bin));
+                    }
+                } else {
+                    const double z = drop_z(n1, k1, n0, k0);
+                    x["test"] = "pooled z (fewer than two requests to pair)";
+                    x["z"] = std::isfinite(z) ? json(round3(z)) : json(nullptr);
+                    drop = std::isfinite(z) && z < -3.0;
+                }
+                acceptance.push_back(x);
+                if (drop) dropped.push_back(x);
+            }
+            {
                 const json pn = pa.value("draft_by_position", json::array());
                 const json pbp = (*pb).value("draft_by_position", json::array());
-                for (size_t q = 0; q < std::min(pn.size(), pbp.size()); ++q)
-                    check("position " + std::to_string(q + 1), pn[q].value("reached", (int64_t)0),
-                          pn[q].value("accepted_n", (int64_t)0), pbp[q].value("reached", (int64_t)0),
-                          pbp[q].value("accepted_n", (int64_t)0));
+                for (size_t q = 0; q < std::min(pn.size(), pbp.size()); ++q) {
+                    const int64_t a1 = pn[q].value("reached", (int64_t)0), b1 = pn[q].value("accepted_n", (int64_t)0);
+                    const int64_t a0 = pbp[q].value("reached", (int64_t)0), b0 = pbp[q].value("accepted_n", (int64_t)0);
+                    const double z = drop_z(a1, b1, a0, b0) / std::sqrt(phi);
+                    json x = { { "point", point }, { "what", "position " + std::to_string(q + 1) },
+                               { "now", ratio((double)b1, (double)a1) }, { "baseline", ratio((double)b0, (double)a0) },
+                               { "n_now", a1 }, { "n_baseline", a0 }, { "test", "pooled z / sqrt(dispersion)" },
+                               { "dispersion", round3(phi) },
+                               { "z", std::isfinite(z) ? json(round3(z)) : json(nullptr) } };
+                    acceptance.push_back(x);
+                    if (std::isfinite(z) && z < -3.0) dropped.push_back(x);
+                }
             }
             const json& ra = pa.value("runs", json::array());
             const json& rb = (*pb).value("runs", json::array());
@@ -798,14 +893,25 @@ std::string render_markdown(const json& rep) {
         }
         const json acc = p.value("acceptance", json::array());
         if (!acc.empty()) {
-            m += "Draft acceptance against the baseline, pooled over the runs (**" +
-                 p.value("acceptance_verdict", std::string()) + "**; a drop is z below -3):\n\n"
-                 "| Point | | Now | Baseline | Drafts now / baseline | z |\n|---|---|---|---|---|---|\n";
-            for (const auto& x : acc)
+            m += "Draft acceptance against the baseline (**" + p.value("acceptance_verdict", std::string()) +
+                 "**): overall by a paired t test over the requests, positions by the pooled z corrected for "
+                 "the requests' dispersion; a drop is as unlikely as z below -3:\n\n"
+                 "| Point | | Now | Baseline | Drafts now / baseline | Test |\n|---|---|---|---|---|---|\n";
+            for (const auto& x : acc) {
+                std::string test;
+                if (x.contains("t")) {
+                    char b[64];
+                    std::snprintf(b, sizeof b, "t %s, p %.2g, %lld requests", num(x["t"]).c_str(),
+                                  x.value("p", 1.0), (long long)x.value("requests", (int64_t)0));
+                    test = b;
+                } else {
+                    test = "z " + num(x.value("z", json()));
+                    if (x.contains("dispersion")) test += ", dispersion " + num(x["dispersion"]);
+                }
                 m += "| " + x.value("point", std::string()) + " | " + x.value("what", std::string()) + " | " +
                      num(x.value("now", json())) + " | " + num(x.value("baseline", json())) + " | " +
-                     num(x.value("n_now", json())) + " / " + num(x.value("n_baseline", json())) + " | " +
-                     num(x.value("z", json())) + " |\n";
+                     num(x.value("n_now", json())) + " / " + num(x.value("n_baseline", json())) + " | " + test + " |\n";
+            }
             m += "\n";
         }
         for (const auto& x : p.value("missing", json::array())) m += "- missing: " + x.get<std::string>() + "\n";

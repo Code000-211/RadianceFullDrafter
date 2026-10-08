@@ -42,43 +42,67 @@ DROPPED = {**IDENTICAL, "acceptance_verdict": "DROPPED",
                                    "baseline": 0.55, "z": -5.2}]}
 
 
+AGAIN_CLEAN = run(parity=IDENTICAL)                       # the baseline reproduces every request
+AGAIN_UNSTABLE = run(parity={**IDENTICAL, "identical": 9, "verdict": "DIFFERS",
+                             "differing": [{"point": "concurrency 8", "run": 1, "request": 3, "first_different_token": 5}]})
+
+
 class JudgeTest(unittest.TestCase):
     def test_identical_passes(self):
-        j = ag.judge_diagnose(run(), run(parity=IDENTICAL), False)
+        j = ag.judge_diagnose(run(), AGAIN_CLEAN, run(parity=IDENTICAL), False)
         self.assertEqual(j["kind"], "pass")
         self.assertNotIn("declared", j)
+        self.assertIn("10 of 10 requests reproducible", j["coverage"])
 
     def test_differing_tokens_fail_a_bitexact_lever(self):
-        j = ag.judge_diagnose(run(), run(rc=4, parity=DIFFERS), False)
+        j = ag.judge_diagnose(run(), AGAIN_CLEAN, run(rc=4, parity=DIFFERS), False)
         self.assertEqual(j["kind"], "fail")
-        self.assertIn("7 of 10", j["why"])
+        self.assertEqual(len(j["diffs"]), 1)
+
+    def test_a_request_the_baseline_does_not_reproduce_is_not_held_against_the_candidate(self):
+        j = ag.judge_diagnose(run(), AGAIN_UNSTABLE, run(rc=4, parity=DIFFERS), False)
+        self.assertEqual(j["kind"], "pass")
+        self.assertIn("9 of 10", j["coverage"])
+
+    def test_no_reproducible_request_leaves_tokens_unchecked(self):
+        none = run(parity={**IDENTICAL, "identical": 0, "verdict": "DIFFERS", "differing": []})
+        j = ag.judge_diagnose(run(), none, run(parity=IDENTICAL), False)
+        self.assertEqual(j["kind"], "pass")
+        self.assertTrue(j["unchecked"])
 
     def test_differing_tokens_go_to_leon_when_declared(self):
-        j = ag.judge_diagnose(run(), run(rc=4, parity=DIFFERS), True)
+        j = ag.judge_diagnose(run(), AGAIN_CLEAN, run(rc=4, parity=DIFFERS), True)
         self.assertEqual(j["kind"], "pass")
         self.assertTrue(j["declared"])
         self.assertIn("Leon", j["why"])
 
     def test_an_acceptance_drop_fails_even_when_declared(self):
         for declared in (False, True):
-            j = ag.judge_diagnose(run(), run(rc=4, parity=DROPPED), declared)
+            j = ag.judge_diagnose(run(), AGAIN_CLEAN, run(rc=4, parity=DROPPED), declared)
             self.assertEqual(j["kind"], "fail", declared)
             self.assertIn("acceptance", j["why"])
 
-    def test_a_baseline_run_that_is_not_a_measurement_is_a_setup_error(self):
-        j = ag.judge_diagnose(run(verdict="NOT A MEASUREMENT", problems=["cache hit"]), run(parity=IDENTICAL), False)
-        self.assertEqual(j["kind"], "setup")
-        j = ag.judge_diagnose({"rc": None, "report": None, "log": "x"}, run(parity=IDENTICAL), False)
-        self.assertEqual(j["kind"], "setup")
+    def test_a_drop_the_baseline_shows_against_itself_does_not_count(self):
+        again = run(parity={**IDENTICAL, "acceptance_verdict": "DROPPED", "acceptance_dropped": DROPPED["acceptance_dropped"]})
+        j = ag.judge_diagnose(run(), again, run(rc=4, parity=DROPPED), False)
+        self.assertEqual(j["kind"], "pass")
+        self.assertIn("1 acceptance tests unstable", j["coverage"])
+
+    def test_unusable_baseline_runs_are_a_setup_error(self):
+        self.assertEqual(ag.judge_diagnose(run(verdict="NOT A MEASUREMENT", problems=["cache hit"]), AGAIN_CLEAN,
+                                           run(parity=IDENTICAL), False)["kind"], "setup")
+        self.assertEqual(ag.judge_diagnose({"rc": None, "report": None, "log": "x"}, None, None, False)["kind"], "setup")
+        self.assertEqual(ag.judge_diagnose(run(), None, run(parity=IDENTICAL), False)["kind"], "setup")
+        self.assertEqual(ag.judge_diagnose(run(), run(), run(parity=IDENTICAL), False)["kind"], "setup")
 
     def test_a_candidate_run_that_breaks_is_the_candidates_failure(self):
-        self.assertEqual(ag.judge_diagnose(run(), {"rc": None, "report": None, "log": "x"}, False)["kind"], "fail")
-        self.assertEqual(ag.judge_diagnose(run(), run(rc=4, verdict="NOT A MEASUREMENT"), False)["kind"], "fail")
+        self.assertEqual(ag.judge_diagnose(run(), AGAIN_CLEAN, {"rc": None, "report": None, "log": "x"}, False)["kind"], "fail")
+        self.assertEqual(ag.judge_diagnose(run(), AGAIN_CLEAN, None, False)["kind"], "fail")
+        self.assertEqual(ag.judge_diagnose(run(), AGAIN_CLEAN, run(rc=4, verdict="NOT A MEASUREMENT"), False)["kind"], "fail")
 
     def test_no_comparison_is_a_setup_error(self):
-        j = ag.judge_diagnose(run(), run(rc=4, parity={"verdict": "not compared: different workloads"}), False)
+        j = ag.judge_diagnose(run(), AGAIN_CLEAN, run(rc=4, parity={"verdict": "not compared: different workloads"}), False)
         self.assertEqual(j["kind"], "setup")
-        self.assertEqual(ag.judge_diagnose(run(), run(), False)["kind"], "setup")
 
 
 class CorpusExportTest(unittest.TestCase):
@@ -115,6 +139,30 @@ class CorpusExportTest(unittest.TestCase):
         self.assertNotIn("max_tokens", rows[0])
         self.assertEqual(rows[1]["max_tokens"], 300)
         self.assertIn("2 prompts in 2 categories", note)
+
+    def test_betterbench_shape_categories_to_prompt_lists(self):
+        # load_corpus() as BetterBench has it: {category: [Prompt dataclass, ...]}.
+        bb = self.fake_bb("""
+            from dataclasses import dataclass, field
+            @dataclass
+            class Prompt:
+                id: str
+                category: str
+                input_len_bucket: str
+                output_len_bucket: str
+                max_tokens: int
+                messages: list = field(default_factory=list)
+            def load_corpus(a, b):
+                return {"code": [Prompt("c1", "code", "s", "m", 400, [{"role": "user", "content": "a"}]),
+                                 Prompt("c2", "code", "s", "m", 120, [{"role": "user", "content": "b"}])],
+                        "math": [Prompt("m1", "math", "s", "s", 900, [{"role": "user", "content": "c"}])]}
+        """)
+        path, note = ag.export_bb_corpus(bb, self.dir / "c.jsonl")
+        self.assertIsNotNone(path, note)
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        self.assertEqual([(r["category"], r["max_tokens"]) for r in rows], [("code", 400), ("code", 120), ("math", 900)])
+        self.assertEqual(rows[2]["messages"], [{"role": "user", "content": "c"}])
+        self.assertIn("3 prompts in 2 categories", note)
 
     def test_objects_with_a_prompt(self):
         bb = self.fake_bb("""
@@ -196,22 +244,24 @@ class RunDiagnoseTest(unittest.TestCase):
 
 class ReportTest(unittest.TestCase):
     def test_tier4_section(self):
+        judgement = ag.judge_diagnose(run(), AGAIN_CLEAN, run(rc=4, parity={**DIFFERS, **{k: DROPPED[k] for k in ("acceptance_verdict", "acceptance_dropped")}}), False)
         summary = {
             "verdict": "FAIL (diagnose: ...)", "baseline_build": "/a", "candidate_build": "/b", "mode": "ab",
             "blocks": [], "comparison": {"rows": []},
             "diagnose": {
-                "judgement": {"kind": "fail", "why": "draft acceptance dropped"},
+                "judgement": judgement,
                 "corpus_note": "BetterBench corpus, 2 prompts",
                 "baseline": {"rc": 0, "wall_s": 10.0, "report_path": "/a/diagnose.json"},
-                "candidate": {"rc": 4, "wall_s": 11.0, "report_path": "/b/diagnose.json",
-                              "report": {"parity": {**DIFFERS, **{k: DROPPED[k] for k in ("acceptance_verdict", "acceptance_dropped")}}}},
+                "baseline_again": {"rc": 0, "wall_s": 10.5, "report_path": "/a2/diagnose.json"},
+                "candidate": {"rc": 4, "wall_s": 11.0, "report_path": "/b/diagnose.json"},
             },
         }
         md = ag.render_report(summary)
         self.assertIn("## Tier 4", md)
         self.assertIn("**FAIL**", md)
-        self.assertIn("differs: concurrency 8 run 1 request 3 from token 41", md)
-        self.assertIn("acceptance dropped: categories code position 2 0.41 vs 0.55 (z -5.2)", md)
+        self.assertIn("Coverage: 10 of 10 requests reproducible", md)
+        self.assertIn("baseline_again: exit 0", md)
+        self.assertIn("acceptance dropped: categories code position 2 0.41 vs 0.55", md)
 
 
 if __name__ == "__main__":

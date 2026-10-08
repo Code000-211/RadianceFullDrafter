@@ -153,10 +153,12 @@ json interference_report(const std::vector<StepRecord>& steps, int64_t from_ns, 
  * requests and names, for each difference, the first token where they part; a point or run that
  * only one side has is listed as missing rather than counted as either. Two reports of different
  * workloads (workload.fingerprint) are refused with RAD_E_INVAL: their prompts differ. */
-/* Beside the tokens it compares each matched point's draft acceptance, overall and at every
- * position, pooled over the runs: identical for bit-identical builds, and the first number to
- * move when a build computes less accurately. A drop with z below -3 (two-proportion test on the
- * pooled counts) is listed in `acceptance_dropped` and makes `acceptance_verdict` "DROPPED". */
+/* Beside the tokens it compares each matched point's draft acceptance: identical for
+ * bit-identical builds, and the first number to move when a build computes less accurately. The
+ * overall rate by a one-sided paired t test over the requests (same prompt and seed on both
+ * sides), the positions by the pooled two-proportion z divided by the square root of the
+ * dispersion the requests show; either as unlikely as z below -3 is a drop, listed in
+ * `acceptance_dropped`, and makes `acceptance_verdict` "DROPPED". */
 int compare_outputs(const json& now, const json& base, json* out, std::string* why);
 
 /* The part of a report's workload that decides which prompts and seeds it ran: equal fingerprints

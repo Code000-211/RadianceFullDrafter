@@ -621,6 +621,92 @@ TEST(an_acceptance_drop_fails_the_comparison) {
     CHECK(md.find("**DROPPED**") != std::string::npos);
 }
 
+namespace {
+/* A report whose one concurrency point ran `rates.size()` runs of one request each, request i
+ * proposing `n` drafts and taking `rates[i]` of them, position 1 counted the same way. */
+json request_report(const std::vector<double>& rates, int64_t n) {
+    std::vector<json> runs;
+    for (double rate : rates) {
+        PhaseInput in;
+        const int64_t k = (int64_t)std::llround(rate * (double)n);
+        in.after.draft_tokens = n;
+        in.after.draft_accepted = k;
+        in.after.draft_depth_seen = 1;
+        in.after.draft_pos_reached[0] = n;
+        in.after.draft_pos_accepted[0] = k;
+        RequestTiming t;
+        t.output = { 1 };
+        t.drafted = n;
+        t.accepted = k;
+        in.requests.push_back(t);
+        runs.push_back(phase_report(in));
+    }
+    json rep;
+    rep["workload"] = { { "fingerprint", "f" } };
+    rep["concurrency"] = json::array({ { { "streams", 8 }, { "runs", runs },
+                                         { "draft_by_position", pool_draft_positions(runs) } } });
+    return rep;
+}
+}  /* namespace */
+
+TEST(phase_report_keeps_every_requests_drafts) {
+    PhaseInput in;
+    RequestTiming t;
+    t.drafted = 30;
+    t.accepted = 21;
+    in.requests.push_back(t);
+    const json d = phase_report(in)["requests"]["drafts"];
+    REQUIRE(d.size() == 1);
+    CHECK(d[0] == json::array({ 30, 21 }));
+}
+
+TEST(texts_that_diverged_are_not_a_drop) {
+    /* Two runs of one build whose texts went different ways: every request's rate moves, by as
+     * much up as down, over 2000 drafts a request. Pooled as coin flips, 0.79 against 0.80 over
+     * 48000 drafts is z of about -3.8 -- a drop, which is the false alarm two runs of one build
+     * raised on epyc; tested on the requests, t is about -0.5. */
+    std::vector<double> base, now;
+    for (int i = 0; i < 24; ++i) {
+        base.push_back(0.80);
+        now.push_back(0.80 + ((i % 2) ? 0.08 : -0.10));
+    }
+    json out;
+    std::string why;
+    REQUIRE(compare_outputs(request_report(now, 2000), request_report(base, 2000), &out, &why) == RAD_OK);
+    CHECK_EQ(out["acceptance_verdict"].get<std::string>(), std::string("no drop"));
+    const json& overall = out["acceptance"][0];
+    CHECK_EQ(overall["test"].get<std::string>(), std::string("paired t over requests"));
+    CHECK_EQ(overall["requests"].get<int64_t>(), (int64_t)24);
+    /* The positions take the requests' dispersion: far above 1 here, so their z shrinks with it. */
+    const json& pos = out["acceptance"][1];
+    CHECK(pos["dispersion"].get<double>() > 10.0);
+    CHECK(pos["z"].get<double>() > -3.0);
+}
+
+TEST(a_drop_in_every_request_is_a_drop) {
+    /* Four requests, each 0.10 lower, give or take 0.02: t of about -12 on 3 degrees of freedom,
+     * p between 0.0005 and 0.001. */
+    json out;
+    std::string why;
+    REQUIRE(compare_outputs(request_report({ 0.68, 0.72, 0.70, 0.70 }, 1000), request_report({ 0.80, 0.80, 0.80, 0.80 }, 1000),
+                            &out, &why) == RAD_OK);
+    CHECK_EQ(out["acceptance_verdict"].get<std::string>(), std::string("DROPPED"));
+    const json& overall = out["acceptance"][0];
+    CHECK(near(overall["t"].get<double>(), -12.247, 0.01));
+    CHECK(overall["p"].get<double>() < 0.001);
+    CHECK(overall["p"].get<double>() > 0.0005);
+}
+
+TEST(identical_requests_test_to_zero) {
+    json out;
+    std::string why;
+    REQUIRE(compare_outputs(request_report({ 0.7, 0.8, 0.9 }, 500), request_report({ 0.7, 0.8, 0.9 }, 500), &out, &why) == RAD_OK);
+    CHECK_EQ(out["acceptance_verdict"].get<std::string>(), std::string("no drop"));
+    CHECK(near(out["acceptance"][0]["t"].get<double>(), 0.0));
+    CHECK(near(out["acceptance"][0]["p"].get<double>(), 0.5));
+    CHECK(near(out["acceptance"][1]["dispersion"].get<double>(), 1.0));
+}
+
 TEST(parity_renders_with_its_differences) {
     json rep = report_with({ { 1, 2, 3 } });
     json cmp;

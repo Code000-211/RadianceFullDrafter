@@ -20,7 +20,7 @@ Im Normalfall ruft `scripts/lever_queue.py` das Gate auf (siehe `docs/ORCA_AGENT
 | Tier 0 | `check_epistemic_invariants.py --repo-root <kandidat>` | Operatoren haben ELF-Symbole, keine stillen Test-Skips, Seals in `baselines/gate_thresholds.json` stimmen, keine verschluckten Fehler in Gate-Skripten | ja |
 | Tier 3 | `isa_diff.py <baseline> <kandidat>` | Bericht: Kernel mit mehr VGPRs, weniger Waves, neuen Spills. Harte Regel nur: keine neuen `v_movrel`-Waterfall-Loops im Hot-Path | nur Waterfall |
 | Tier 1 + 2 | `ab_gate.py` | je Block eigene Engine; Parität (Golden-Hashes, Toleranz 0) in jedem Block; BetterBench single-stream + C8 + Prefill mit Zufalls-Nonces; Kandidat gegen Baseline je Metrik innerhalb `tier2.slack_pct` | ja |
-| Tier 4 | `ab_gate.py` (nach den Blöcken, nur wenn bis dahin PASS) | `radiance --diagnose` einmal mit der Baseline, einmal mit dem Kandidaten gegen deren Bericht: gleiche Prompts (BetterBench-Korpus, sonst der eingebaute), gleiche Seeds, Temperatur 1; Token-Parität über Kategorien, Concurrency 1–8 und Prefill bis 60k; Draft-Annahme je Kategorie und Position. `DROPPED` scheitert immer; abweichende Tokens scheitern, außer der Kandidat deklariert `"numerics": "reordered"` (dann PASS mit Vermerk, Leon entscheidet beim Merge) | ja |
+| Tier 4 | `ab_gate.py` (nach den Blöcken, nur wenn bis dahin PASS) | `radiance --diagnose` zweimal mit der Baseline und einmal mit dem Kandidaten; zweiter Baseline-Lauf und Kandidat werden je gegen den ersten verglichen: gleiche Prompts (BetterBench-Korpus, sonst der eingebaute), gleiche Seeds, Temperatur 1; Kategorien, Concurrency 1–8, Prefill bis 60k. Die Engine ist zwischen zwei Prozessen nicht bitgenau reproduzierbar (spec §19.7), deshalb gilt Token-Parität nur für Requests, die die Baseline gegen sich selbst reproduziert, und ein Annahme-Einbruch nur dort, wo die Baseline gegen sich selbst keinen zeigt. `DROPPED` scheitert immer; abweichende reproduzierbare Tokens scheitern, außer der Kandidat deklariert `"numerics": "reordered"` (dann PASS mit Vermerk, Leon entscheidet beim Merge) | ja |
 
 Reihenfolge der Blöcke: `A, B` (Standard) oder `A, B, B, A` (`--abba`, zusätzlich A/A-Streuung;
 ist sie größer als die Toleranz, ist das Ergebnis INCONCLUSIVE und das Gate scheitert).
@@ -38,8 +38,10 @@ Tier 4 liest seine Einstellungen aus einem optionalen Abschnitt `"diagnose"` in
 `baselines/gate_thresholds.json` (`enabled`, `tokens`, `runs`, `concurrency`, `prefill`,
 `timeout_s`); fehlt er, gelten die Defaults in `ab_gate.py` (`DIAGNOSE_DEFAULTS`). `--no-diagnose`
 überspringt die Stufe für einen einzelnen Lauf. Ergebnisse: `<out>/ab/diagnose_baseline/`,
-`<out>/ab/diagnose_candidate/` (je `diagnose.md`, `diagnose.json`, `engine.log`) und der Abschnitt
-„Tier 4“ in `report.md`.
+`<out>/ab/diagnose_baseline_again/`, `<out>/ab/diagnose_candidate/` (je `diagnose.md`,
+`diagnose.json`, `engine.log`) und der Abschnitt „Tier 4“ in `report.md` mit der Abdeckung (wie
+viele Requests die Baseline reproduziert). Ein Diagnose-Lauf dauerte auf epyc 336 s (BetterBench-
+Korpus, 3 Läufe je Punkt, Prefill bis 16k); Tier 4 kostet also etwa das Dreifache davon.
 
 ## Einstellungen
 

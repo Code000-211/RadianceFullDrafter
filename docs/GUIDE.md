@@ -1523,13 +1523,18 @@ identical seeds, and every request's tokens are in the report. Bit-identical log
 identical tokens at any temperature, so `--diagnose-baseline OLD/diagnose.json` turns the whole
 workload -- categories, batched decode, long prefills -- into a parity check: the report lists
 each request whose tokens differ and the first token where they part, and the run exits non-zero.
-Beside the tokens it compares draft acceptance per point, overall and at every draft position,
-pooled over the runs; a drop with z below -3 (two-proportion test) is reported as `DROPPED` and
-fails the run too. Bit-identical builds accept identically, and a build that computes less
+Beside the tokens it compares draft acceptance per point. The overall rate is tested on the
+requests, paired by prompt and seed, with a one-sided t test: drafts within one text are not
+independent, and two texts that went different ways for any reason differ in acceptance far more
+than coin flips would. The positions, which have only pooled counts, use a two-proportion z
+divided by the square root of the dispersion the requests show. A drop as unlikely as z below -3
+is reported as `DROPPED` and fails the run too. Bit-identical builds accept identically, and a build that computes less
 accurately usually loses acceptance before it changes an answer.
 The interference point is not compared, because when its streams are cancelled depends on timing.
 Run the baseline twice against itself first: a difference there means a path is not
-deterministic, and that path cannot be held to bit parity.
+deterministic, and that path cannot be held to bit parity. Two processes of one build are not
+token-identical today (spec §19.7, and timing-dependent placement); the gate therefore holds a
+candidate to parity only on what the baseline reproduces.
 
 What it does not measure is listed in the report itself: per-kernel time (that needs dispatch
 timestamps, which are not built yet), the HTTP path and streaming to a client, and placement

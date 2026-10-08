@@ -99,9 +99,18 @@ Temperatur dieselben Tokens. `--diagnose-baseline ALT/diagnose.json` vergleicht 
 Concurrency und Prefill Token für Token, nennt je abweichendem Request die erste abweichende Stelle
 und beendet den Lauf mit Fehler. Interferenz wird nicht verglichen (Abbruchzeitpunkt hängt am
 Timing). Vorher die Baseline zweimal gegen sich selbst laufen lassen: Weicht sie dort ab, ist ein
-Pfad nicht deterministisch und taugt nicht für Bitparität. Daneben die Draft-Annahme je Punkt und
-Position, gepoolt über die Läufe; ein Einbruch (z < −3) heißt `DROPPED` und lässt den Lauf
-scheitern. Regel für nicht bitgenaue Hebel und Annahme-Einbrüche: `AGENTS.md` §3, Numerik.
+Pfad nicht deterministisch und taugt nicht für Bitparität. Daneben die Draft-Annahme je Punkt: insgesamt
+per gepaartem t-Test über die Requests (Drafts in einem Text sind nicht unabhängig), je Position
+per gepooltem z, korrigiert um die Dispersion der Requests; so unwahrscheinlich wie z < −3 heißt
+`DROPPED` und lässt den Lauf scheitern.
+
+**Erster Lauf auf epyc (8.10.2026, c7b9795, Gate-Konfiguration):** zwei Prozesse desselben Builds
+waren nur bei 43 von 141 Requests tokengleich, oft ab Token 0, in allen Punkten. Der Seed ist es
+nicht (zählerbasiert über Seed und Position, `core/sample/accept.cpp`); der Prefill selbst liefert
+also zwischen Prozessen verschiedene Logits. `--tp-wire wht6` ist verlustbehaftet, aber
+deterministisch. Verdächtig sind zeitabhängige Pfade (dynamische Platzierung und Mover, Ridgefill,
+adaptive Spekulation); Bisektion steht aus. Der alte gepoolte z-Test meldete zwischen den beiden
+Läufen `DROPPED` (C8 Position 3), daher der Test auf Request-Ebene. Regel für nicht bitgenaue Hebel und Annahme-Einbrüche: `AGENTS.md` §3, Numerik.
 
 ## Messregeln, die der Bericht einhält
 
