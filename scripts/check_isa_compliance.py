@@ -17,8 +17,18 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import urllib.error
+from typing import Any
 
 import yaml
+
+try:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from typesafe_triage import eval_isa_hazard, get_api_key
+    HAS_TYPESAFE = bool(get_api_key())
+except (ImportError, OSError, AttributeError):
+    eval_isa_hazard = None
+    HAS_TYPESAFE = False
 
 ROCM_DEFAULT = os.environ.get("ROCM") or os.environ.get("ROCM_PATH") or os.environ.get("HIP_PATH") or "/opt/rocm"
 GFX_ARCH = "gfx1201"
@@ -270,6 +280,10 @@ def main():
                         help="Path to ROCm installation")
     parser.add_argument("--strict", action="store_true",
                         help="Fail (exit non-zero) on any cliff risk or scratch usage")
+    parser.add_argument("--use-typesafe", action="store_true", default=None,
+                        help="Use TypeSafe AI (Jev System One) to arbitrate gray-zone ISA anomalies")
+    parser.add_argument("--no-typesafe", action="store_true",
+                        help="Disable TypeSafe AI evaluation (pure deterministic script only)")
     parser.add_argument("--json", action="store_true",
                         help="Output results in JSON format")
     parser.add_argument("--max-display", type=int, default=15,
@@ -336,11 +350,87 @@ def main():
            is_prefill_or_decode(k.name, k.tu_name)
     ]
 
+    use_typesafe = bool(args.use_typesafe or (not args.no_typesafe and HAS_TYPESAFE))
+
+    jev_evaluations: dict[str, Any] = {}
     has_fatal_error = False
-    if len(hot_waterfalls) > 0:
-        has_fatal_error = True
-    if args.strict and (len(cliff_violations) > 0 or len(prefill_decode_scratch) > 0):
-        has_fatal_error = True
+
+    if use_typesafe and eval_isa_hazard is not None and (len(hot_waterfalls) > 0 or len(cliff_violations) > 0 or len(prefill_decode_scratch) > 0):
+        sys.stderr.write("🧠 Arbitrating ISA anomalies with TypeSafe AI (Jev System One)...\n")
+
+        # 1. Hot waterfalls
+        for w in hot_waterfalls:
+            payload = {
+                "kernel": w.get("demangled") or w["kernel"],
+                "tu": w["tu"],
+                "hazard_type": "waterfall_loop",
+                "movrel_count": w["movrel_count"],
+                "loops": w["loops"],
+                "is_hot": True,
+                "context": "v_movrel execution mask loop detected on hot path",
+            }
+            try:
+                ans = eval_isa_hazard(payload)
+                jev_evaluations[w["kernel"]] = ans
+                verdict = ans.get("verdict", {}).get("choice", "")
+                if verdict == "reject_critical_hazard":
+                    has_fatal_error = True
+            except (RuntimeError, urllib.error.URLError, ValueError, OSError) as e:
+                sys.stderr.write(f"Warning: Jev arbitration error: {e}\n")
+                has_fatal_error = True
+
+        # 2. Cliff violations (only evaluate top 5)
+        for k in cliff_violations[:5]:
+            cw = k.cliff_warning
+            payload = {
+                "kernel": demangle(k.name),
+                "tu": k.tu_name,
+                "hazard_type": "vgpr_occupancy_cliff",
+                "vgpr": k.vgpr,
+                "boundary": cw["boundary"],
+                "excess": cw["excess"],
+                "current_waves": cw["current_waves"],
+                "target_waves": cw["target_waves"],
+                "occupancy_loss_pct": cw["occupancy_loss_pct"],
+                "context": f"Kernel uses {k.vgpr} VGPRs, sitting {cw['excess']} registers over 24-granularity boundary {cw['boundary']}.",
+            }
+            try:
+                ans = eval_isa_hazard(payload)
+                jev_evaluations[k.name] = ans
+                verdict = ans.get("verdict", {}).get("choice", "")
+                if verdict == "reject_critical_hazard":
+                    has_fatal_error = True
+            except (RuntimeError, urllib.error.URLError, ValueError, OSError) as e:
+                sys.stderr.write(f"Warning: Jev arbitration error: {e}\n")
+                if args.strict:
+                    has_fatal_error = True
+
+        # 3. Scratch spills (only evaluate top 5)
+        for k in prefill_decode_scratch[:5]:
+            payload = {
+                "kernel": demangle(k.name),
+                "tu": k.tu_name,
+                "hazard_type": "scratch_spill",
+                "scratch_bytes": k.scratch,
+                "vgpr_spills": k.vspill,
+                "sgpr_spills": k.sspill,
+                "context": f"Kernel spills {k.vspill} VGPRs ({k.scratch} bytes) to scratch memory.",
+            }
+            try:
+                ans = eval_isa_hazard(payload)
+                jev_evaluations[k.name] = ans
+                verdict = ans.get("verdict", {}).get("choice", "")
+                if verdict == "reject_critical_hazard":
+                    has_fatal_error = True
+            except (RuntimeError, urllib.error.URLError, ValueError, OSError) as e:
+                sys.stderr.write(f"Warning: Jev arbitration error: {e}\n")
+                if args.strict:
+                    has_fatal_error = True
+    else:
+        if len(hot_waterfalls) > 0:
+            has_fatal_error = True
+        if args.strict and (len(cliff_violations) > 0 or len(prefill_decode_scratch) > 0):
+            has_fatal_error = True
 
     if args.json:
         report = {
@@ -374,6 +464,7 @@ def main():
                 }
                 for k in prefill_decode_scratch
             ],
+            "jev_evaluations": jev_evaluations,
             "compliant": not has_fatal_error,
         }
         print(json.dumps(report, indent=2))
@@ -437,6 +528,21 @@ def main():
             print(f"    ... and {len(prefill_decode_scratch) - args.max_display} more kernels.")
     else:
         print("  ✓ PASS: Zero prefill/decode kernels allocate scratch memory.")
+
+    # Section 4: Jev Arbitration (if anomalies were evaluated)
+    if jev_evaluations:
+        print("\n[JEV TIER 3 ARBITRATION] TypeSafe AI Microarchitectural Assessments:")
+        print("-" * 80)
+        for name, ans in list(jev_evaluations.items())[:args.max_display]:
+            dname = demangle(name)
+            short_name = (dname[:40] + "...") if len(dname) > 43 else dname
+            v = ans.get("verdict", {}).get("choice", "unknown")
+            vc = ans.get("verdict", {}).get("confidence", 0.0)
+            act = ans.get("recommended_action", {}).get("choice", "unknown")
+            sev = ans.get("severity", {}).get("score", 0)
+            icon = "✅" if "pass" in v else ("⚠️" if "warn" in v else "❌")
+            print(f"  {icon} [{short_name}]")
+            print(f"     Verdict: {v} ({vc:.0%}) | Severity: Level {sev} | Action: {act}")
 
     # Final Summary
     print("\n" + "=" * 80)

@@ -165,6 +165,54 @@ def screen_candidate(readme_text: str) -> dict[str, Any]:
     return query_jev(readme_text[:4000], questions)
 
 
+def eval_isa_hazard(hazard_data: dict[str, Any] | str) -> dict[str, Any]:
+    if isinstance(hazard_data, str):
+        try:
+            data = json.loads(hazard_data)
+        except json.JSONDecodeError:
+            data = {"raw_description": hazard_data}
+    else:
+        data = hazard_data
+
+    questions = {
+        "verdict": {
+            "type": "choice",
+            "instructions": "What is the architectural and performance verdict for this RDNA4 (gfx1201) ISA condition?",
+            "criteria": {
+                "pass_benign": "Benign pattern or one-time initialization guard outside hot loops (e.g. tid == 0 guard, cold path)",
+                "pass_acceptable_tradeoff": "Acceptable engineering trade-off (e.g. minor occupancy delta offset by vector throughput or unrolled ILP)",
+                "warn_suboptimal": "Suboptimal instruction scheduling or register pressure that creates latency drag but does not deadlock or corrupt state",
+                "reject_critical_hazard": "Critical performance killer or deadlock hazard (e.g. divergent execution-mask waterfall in decode, severe spill, blocking system fence on hot path)",
+            },
+        },
+        "severity": {
+            "type": "score",
+            "instructions": "Severity of performance or architectural impact on dual AMD Radeon AI PRO R9700",
+            "criteria": [
+                "Negligible (<1% impact)",
+                "Minor performance drag (1-3% impact)",
+                "Moderate throughput drop (3-10% impact)",
+                "Severe regression (10-30% impact)",
+                "Catastrophic pipeline stall (>30% impact, crash, or GPU hang)",
+            ],
+        },
+        "recommended_action": {
+            "type": "choice",
+            "instructions": "What immediate kernel or compiler action is recommended?",
+            "criteria": {
+                "keep_as_is": "Keep implementation as is; verified benign or net beneficial",
+                "add_launch_bounds": "Constrain VGPR usage using __launch_bounds__(max_threads, min_waves)",
+                "reduce_unroll": "Reduce loop unrolling factor (#pragma unroll) to alleviate register pressure",
+                "replace_with_wave_intrinsic": "Replace divergent scalarization loop with Wave32 intrinsic (__shfl, __ballot)",
+                "scope_fence_to_workgroup": "Downgrade global/system fence to workgroup fence or s_wait_storecnt",
+                "split_fused_kernel": "Split kernel stages into separate launches to eliminate scratch memory spills",
+            },
+        },
+    }
+    state_str = json.dumps(data, indent=2)
+    return query_jev(state_str[:4000], questions)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="TypeSafe AI (Jev) Structured Triage Helper")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -181,17 +229,26 @@ def main() -> int:
     p_scr.add_argument("readme_path", type=Path, help="Path to candidate README.md")
     p_scr.add_argument("--json", action="store_true", help="Output raw JSON")
 
+    p_isa = subparsers.add_parser("eval-isa-hazard", help="Evaluate RDNA4 ISA microarchitectural anomaly or hazard with Jev")
+    p_isa.add_argument("hazard_input", type=str, help="JSON string or path to JSON file containing ISA hazard metadata")
+    p_isa.add_argument("--json", action="store_true", help="Output raw JSON")
+
     args = parser.parse_args()
 
     try:
         if args.command == "triage-suggestion":
             res = triage_suggestion(args.text)
         elif args.command == "classify-regression":
-            log_content = args.log_path.read_text(encoding="utf-8", errors="replace") if args.log_path.is_file() else str(args.log_path)
+            log_input = str(args.log_path)
+            log_content = Path(log_input).read_text(encoding="utf-8", errors="replace") if (len(log_input) < 260 and os.path.isfile(log_input)) else log_input
             res = classify_regression(log_content)
         elif args.command == "screen-candidate":
             readme_content = args.readme_path.read_text(encoding="utf-8", errors="replace")
             res = screen_candidate(readme_content)
+        elif args.command == "eval-isa-hazard":
+            hz_input = str(args.hazard_input)
+            content = Path(hz_input).read_text(encoding="utf-8", errors="replace") if (len(hz_input) < 260 and os.path.isfile(hz_input)) else hz_input
+            res = eval_isa_hazard(content)
         else:
             parser.print_help()
             return 1

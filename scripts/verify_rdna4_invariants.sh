@@ -50,7 +50,7 @@ echo "--- Invariant 1: VGPR Occupancy (Target <= 84, Max <= 96) ---"
 if [ -d "${BUILD_DIR}" ] && command -v llvm-objdump >/dev/null 2>&1; then
     if [ -f "${SCRIPT_DIR}/check_isa_compliance.py" ]; then
         echo "Running ISA compliance checker on build artifacts..."
-        if python3 "${SCRIPT_DIR}/check_isa_compliance.py" --target-dir "${BUILD_DIR}" 2>/dev/null; then
+        if python3 "${SCRIPT_DIR}/check_isa_compliance.py" "${BUILD_DIR}"; then
             pass "All compiled kernel objects satisfy RDNA4 VGPR occupancy limits."
         else
             warn "check_isa_compliance detected potential VGPR pressure or spills."
