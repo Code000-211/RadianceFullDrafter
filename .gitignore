@@ -71,6 +71,8 @@ releases/golden_builds/*.tmp
 # Benchmark run telemetry and scratch dumps
 benchmarks/runs/*
 !benchmarks/runs/.gitkeep
+telemetry/*.json
+!telemetry/.gitkeep
 tmp/
 *.tmp
 

@@ -147,6 +147,16 @@ DRY_RUN="${DRY_RUN}" bash "${SCRIPT_DIR}/gate_check.sh" --build-dir "${WORKTREE_
 GATE_RC=${PIPESTATUS[0]}
 set -e
 
+# Collect Structured Telemetry for TypeSafe AI (Jev)
+TELEMETRY_JSON="${REPO_ROOT}/telemetry/latest_run.json"
+if [ -f "${SCRIPT_DIR}/collect_telemetry.py" ]; then
+    python3 "${SCRIPT_DIR}/collect_telemetry.py" \
+        --candidate-slug "${CANDIDATE_SLUG}" \
+        --gate-log "${GATE_LOG}" \
+        --exit-code "${GATE_RC}" \
+        --out "${TELEMETRY_JSON}" || true
+fi
+
 # Evaluate Gate Outcome
 if [ ${GATE_RC} -eq 0 ]; then
     echo ""
@@ -185,11 +195,11 @@ else
     # Extract last 40 lines of gate log for diagnostic report
     FAILURE_SNIPPET=$(tail -n 40 "${GATE_LOG}")
     
-    # Run TypeSafe AI (Jev System One) Root-Cause Classification
+    # Run TypeSafe AI (Jev System One) Root-Cause Classification on structured telemetry!
     JEV_CLASSIFICATION=""
     if [ -f "${SCRIPT_DIR}/typesafe_triage.py" ]; then
         echo "🧠 Classifying regression root cause with TypeSafe AI (Jev)..."
-        JEV_CLASSIFICATION=$(python3 "${SCRIPT_DIR}/typesafe_triage.py" classify-regression "${GATE_LOG}" 2>/dev/null || true)
+        JEV_CLASSIFICATION=$(python3 "${SCRIPT_DIR}/typesafe_triage.py" classify-regression "${TELEMETRY_JSON}" 2>/dev/null || true)
     fi
     
     # Write local REGRESSION_REPORT.md
