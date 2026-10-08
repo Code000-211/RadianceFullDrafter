@@ -96,3 +96,29 @@ gh issue edit <nr> --add-label plan:ready --add-label tier:<stufe> --remove-labe
 ```
 
 Bei einer Überarbeitung eine alte, nicht mehr passende `tier:`-Marke entfernen.
+
+## Upstream-Sync (Label `upstream:sync`)
+
+Das Issue kommt von `scripts/upstream_sync.py` und listet die Upstream-Commits, die Konflikte und
+die von beiden Seiten geänderten Dateien. Regeln: `docs/UPSTREAM.md`, Abschnitt „Regeln für die
+Entscheidung“. Verwerfen gibt es hier nicht; im Zweifel wird ein Commit ausgeschlossen, nicht der
+ganze Sync.
+
+Der Plan (`<!-- radiance-plan -->`) enthält statt der Hebel-Abschnitte:
+
+- **Upstream-Stand:** die SHA aus der Zeile `upstream:` im Issue. Genau diesen Stand merged der
+  Code-Agent, auch wenn Upstream inzwischen weiter ist.
+- **Triage:** Tabelle mit jedem Upstream-Commit (oder Gruppen zusammengehöriger Commits):
+  `übernehmen` / `angepasst übernehmen` (was angepasst wird) / `ausschließen` (Grund mit
+  `datei:zeile`). Commits, die nur TP3/TP4, andere Modelle, Server oder Tooling betreffen,
+  werden übernommen, solange sie unseren Pfad nicht berühren.
+- **Konfliktregeln je Datei:** welche Seite gilt und was von der anderen nachzuziehen ist. Für
+  Kernel auf unserem Pfad gilt unsere Fassung (Korrektheitsfixes von Upstream übertragen); im
+  Engine-Kern die Upstream-Fassung mit unserer Änderung darauf.
+- **Semantik ohne Konflikt:** welche der „von beiden Seiten geänderten“ Dateien der Code-Agent
+  nach dem Merge gezielt prüfen muss (geänderte Signaturen, Op-Schemas, Konfiguration).
+- **Frühere Ausschlüsse:** je Eintrag weiter ausschließen oder jetzt übernehmen.
+- **Prüfungen ohne GPU** und **Abbruchkriterien** wie bei einem Hebel; kein `lever.patch`.
+
+Stufe: in der Regel `tier:heavy`; `tier:light` nur, wenn es keine Konflikte gibt und nichts
+unseren Pfad berührt.

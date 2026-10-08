@@ -9,6 +9,7 @@ aktuelle Baseline gemessen, bevor sie nach `main` kommen.
 
 ```
 Codeberg-PRs ──► watch_upstream.py (Jev: nützlich?) ──► candidates/upstream/REVIEW.md ──► Agent upstream (Bewertung)
+Codeberg-main ──► upstream_sync.py (kein Merge) ──► Issue upstream:sync ──► Agent plan ──► … wie ein Hebel (Modus merge)
 
 Agent research (Papers, andere Engines) ─┐
 Agent audit (Coverage-Karte des Codes) ──┼─► Issue research:new-lever
@@ -37,6 +38,7 @@ in einem eigenen Worktree in Orca; Opus plant, Gemini und GLM setzen um.
 | `docs/ORCA_AGENT_WORKFLOW.md` | Ablauf der Automationen, Hebel-Pakete, Labels, Modelle, Grenzen |
 | `docs/agents/` | Rollen-Prompts (plan, code, review, research, audit, upstream) |
 | `docs/GATE.md` | Was das Gate misst und wie streng |
+| `docs/UPSTREAM.md` | Upstream übernehmen: PR-Bewertung, Sync von Codeberg-main, eigenes Kernel-Plugin |
 | `HARDWARE_GROUND_TRUTH.md` | Gemessene Hardware-Werte |
 | `spec.md` | Engine-Architektur (Upstream) |
 | `docs/history/` | Frühere Optimierungsrunden, Postmortems, Hebel-Katalog |
@@ -60,6 +62,7 @@ bash scripts/measure_hardware.sh                   # Bandbreiten neu messen
 |---|---|
 | `radiance-upstream-watcher` | Codeberg-PRs abfragen, `REVIEW.md` pflegen |
 | `radiance-lever-queue` | GitHub-Issues `status:ready-to-test` bauen, gaten, Ergebnis zurückmelden |
+| `radiance-upstream-sync` (Timer, alle 6 h) | Codeberg-main spiegeln, Sync-Issue anlegen (merged nie selbst) |
 | `radiance-agent-tick` (Timer, alle 3 min) | Agents starten: Arbeit, Modell und Slot wählen, Worktree + Orca-Terminal |
 
 Unit-Dateien: `scripts/systemd/` (Queue, Upstream-Watcher, Agent-Tick). Agents: siehe `docs/ORCA_AGENT_WORKFLOW.md`.

@@ -10,6 +10,11 @@ An issue is testable when its body or a later comment contains a metadata block
 
     candidate: <slug under candidates/>
     ref: <branch on origin that contains candidates/<slug>/lever.patch>   (optional, default main)
+    mode: merge                                                           (optional, see below)
+
+`mode: merge` is for upstream syncs (docs/UPSTREAM.md): the branch itself is the candidate, it
+must contain origin/main, and its PR has to be merged with a merge commit so the upstream
+history stays an ancestor of main.
 
 The newest block wins, so an agent can point an issue at a corrected branch by commenting.
 Gate results are posted by this module only, marked with RESULT_MARKER; nothing here
@@ -27,7 +32,8 @@ from typing import Any
 REPO = "OoguroRyuuya/RadianceMine"
 RESULT_MARKER = "<!-- radiance-gate-result -->"
 MAX_ATTEMPTS = 3
-META_RE = re.compile(r"^candidate:\s*([A-Za-z0-9_.-]+)\s*$(?:\s*^ref:\s*(\S+)\s*$)?", re.MULTILINE)
+META_RE = re.compile(r"^candidate:\s*([A-Za-z0-9_.-]+)\s*$(?:\s*^ref:\s*(\S+)\s*$)?(?:\s*^mode:\s*(merge)\s*$)?",
+                     re.MULTILINE)
 
 LABELS = {
     "status:ready-to-test": ("0e8a16", "Candidate is ready for the GPU gate"),
@@ -57,13 +63,17 @@ def issue_texts(number: int) -> tuple[str, list[str]]:
     return data.get("body") or "", [c.get("body") or "" for c in data.get("comments", [])]
 
 
-def candidate_meta(number: int) -> tuple[str, str] | None:
-    body, comments = issue_texts(number)
+def parse_meta(texts: list[str]) -> tuple[str, str, str] | None:
     found = None
-    for text in [body, *comments]:
+    for text in texts:
         for m in META_RE.finditer(text):
-            found = (m.group(1), m.group(2) or "main")
+            found = (m.group(1), m.group(2) or "main", m.group(3) or "patch")
     return found
+
+
+def candidate_meta(number: int) -> tuple[str, str, str] | None:
+    body, comments = issue_texts(number)
+    return parse_meta([body, *comments])
 
 
 def attempts(number: int) -> int:
@@ -103,7 +113,7 @@ def pull_ready() -> list[dict[str, Any]]:
                        "(Label `status:blocked` entfernen und `status:ready-to-test` setzen).")
             continue
         set_labels(n, ["status:queued"], ["status:ready-to-test", "status:needs-review"])
-        jobs.append({"slug": meta[0], "ref": meta[1], "issue": n})
+        jobs.append({"slug": meta[0], "ref": meta[1], "mode": meta[2], "issue": n})
     return jobs
 
 
@@ -112,10 +122,16 @@ def push_and_open_pr(result: dict[str, Any], repo_root: Path) -> str:
     subprocess.run(["git", "push", "origin", f"{result['candidate_sha']}:refs/heads/{branch}"],
                    cwd=str(repo_root), capture_output=True, text=True, check=True)
     body = (repo_root / "reports" / Path(result["report"]).name / "RESULT.md").read_text()
+    title = f"lever: {result['slug']} (gate passed)"
+    if result.get("mode") == "merge":
+        title = f"upstream: {result['slug']} (gate passed)"
+        body = ("**Upstream-Sync: mit Merge-Commit mergen, nicht squashen und nicht rebasen**, sonst ist die "
+                "Upstream-Historie kein Vorfahre von main mehr und jeder Konflikt kommt beim nächsten Sync "
+                "wieder.\n\n" + body)
     if result.get("issue"):
         body += f"\n\nCloses #{result['issue']}\n"
     return gh("pr", "create", "--repo", REPO, "--head", branch, "--base", "main",
-              "--title", f"lever: {result['slug']} (gate passed)", "--body", body).strip()
+              "--title", title, "--body", body).strip()
 
 
 def report(result: dict[str, Any], repo_root: Path) -> None:

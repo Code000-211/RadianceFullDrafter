@@ -2,6 +2,7 @@
 """lever_queue.py — local, sequential test queue for candidate levers (replaces the GitHub-issue runner).
 
     lever_queue.py add <slug> [--ref <branch>] [--abba]   queue candidates/<slug>/lever.patch
+    lever_queue.py add <slug> --ref <branch> --mode merge test the branch itself (upstream sync)
     lever_queue.py list                                  show pending / done / failed jobs
     lever_queue.py run [--daemon] [--github]             process pending jobs one at a time
 
@@ -22,6 +23,10 @@ Per job, nothing else is reused:
      candidates/<slug>/gate.json ({"engine_args": [...], "engine_env": {...}}) if present
   5. reports/<slug>_<ts>/RESULT.md + run.log; on PASS the candidate SHA is tagged
      winner/<slug>-<ts> and its build is copied to releases/<slug>-<ts>/ with a sha256 manifest
+
+Mode "merge" (upstream syncs, docs/UPSTREAM.md) replaces steps 1-2: the candidate is
+origin/<ref> itself, which must contain origin/main, so the merge commit and with it the upstream
+history survive into the PR. gate.json is still read from candidates/<slug>/ on that branch.
 
 Jobs run under a file lock, so two runners never share the GPUs. Every step's output goes
 to run.log; a failing step ends the job as FAILED with the step named in RESULT.md.
@@ -75,14 +80,14 @@ def queue_path(state: str) -> Path:
 
 def enqueue(job: dict[str, Any]) -> Path:
     ts = time.strftime("%Y%m%d_%H%M%S")
-    job = {"queued_at": ts, "ref": "main", "issue": None, "abba": False, **job}
+    job = {"queued_at": ts, "ref": "main", "mode": "patch", "issue": None, "abba": False, **job}
     path = queue_path("pending") / f"{ts}_{job['slug']}.json"
     path.write_text(json.dumps(job, indent=2))
     return path
 
 
 def cmd_add(args: argparse.Namespace) -> int:
-    path = enqueue({"slug": args.slug, "ref": args.ref, "abba": args.abba})
+    path = enqueue({"slug": args.slug, "ref": args.ref, "mode": args.mode, "abba": args.abba})
     print(f"queued {path.relative_to(REPO_ROOT)}")
     return 0
 
@@ -157,7 +162,8 @@ def process(job_path: Path) -> dict[str, Any]:
     worktree = REPO_ROOT / "worktrees" / name
     branch = f"lever/{slug}-{ts}"
     ref = job.get("ref") or "main"
-    result: dict[str, Any] = {"slug": slug, "ref": ref, "issue": job.get("issue"), "branch": branch,
+    mode = job.get("mode") or "patch"
+    result: dict[str, Any] = {"slug": slug, "ref": ref, "mode": mode, "issue": job.get("issue"), "branch": branch,
                               "worktree": str(worktree), "report": str(report_dir)}
     gate_cfg: dict[str, Any] = {}
 
@@ -167,16 +173,25 @@ def process(job_path: Path) -> dict[str, Any]:
             if ref != "main":
                 refspecs.append(f"+refs/heads/{ref}:refs/remotes/origin/{ref}")
             run_step("fetch", ["git", "fetch", "origin", *refspecs], log_f, REPO_ROOT)
-            patch = read_candidate_file(ref, slug, "lever.patch")
-            if patch is None:
-                raise StepFailed("find-patch", 1)
             gate_json = read_candidate_file(ref, slug, "gate.json")
             gate_cfg = json.loads(gate_json) if gate_json else {}
-            (report_dir / "lever.patch").write_text(patch)
-            baseline_build, result["base_sha"] = ensure_baseline(log_f)
-            run_step("worktree", ["git", "worktree", "add", "-b", branch, str(worktree), result["base_sha"]], log_f, REPO_ROOT)
-            run_step("apply", ["git", "apply", "--index", str(report_dir / "lever.patch")], log_f, worktree)
-            run_step("commit", ["git", "commit", "--no-verify", "-m", f"lever: apply {slug}"], log_f, worktree)
+            if mode == "merge":
+                if ref == "main":
+                    raise StepFailed("merge-needs-ref", 1)
+                baseline_build, result["base_sha"] = ensure_baseline(log_f)
+                ref_sha = git_out("rev-parse", f"origin/{ref}")
+                # The A/B must compare main against main plus upstream, not against an older main.
+                run_step("contains-main", ["git", "merge-base", "--is-ancestor", result["base_sha"], ref_sha], log_f, REPO_ROOT)
+                run_step("worktree", ["git", "worktree", "add", "-b", branch, str(worktree), ref_sha], log_f, REPO_ROOT)
+            else:
+                patch = read_candidate_file(ref, slug, "lever.patch")
+                if patch is None:
+                    raise StepFailed("find-patch", 1)
+                (report_dir / "lever.patch").write_text(patch)
+                baseline_build, result["base_sha"] = ensure_baseline(log_f)
+                run_step("worktree", ["git", "worktree", "add", "-b", branch, str(worktree), result["base_sha"]], log_f, REPO_ROOT)
+                run_step("apply", ["git", "apply", "--index", str(report_dir / "lever.patch")], log_f, worktree)
+                run_step("commit", ["git", "commit", "--no-verify", "-m", f"lever: apply {slug}"], log_f, worktree)
             result["candidate_sha"] = git_out("rev-parse", "HEAD", cwd=worktree)
             run_step("configure", ["cmake", "-B", "build_hip", "-S", ".", *CMAKE_ARGS], log_f, worktree)
             run_step("build", ["ninja", "-C", "build_hip"], log_f, worktree)
@@ -203,7 +218,8 @@ def process(job_path: Path) -> dict[str, Any]:
     lines = [
         f"# {slug}: {result['verdict']}",
         "",
-        f"- Base (origin/main): `{result.get('base_sha', '?')}`, patch from `origin/{ref}`",
+        f"- Base (origin/main): `{result.get('base_sha', '?')}`, "
+        + (f"merge branch `origin/{ref}` itself" if mode == "merge" else f"patch from `origin/{ref}`"),
         f"- Candidate: `{result.get('candidate_sha', '?')}` on branch `{branch}`",
         f"- Worktree: `{worktree}`",
         f"- Engine flags: {gate_cfg or 'none'}",
@@ -276,6 +292,8 @@ def main() -> int:
     p_add.add_argument("slug")
     p_add.add_argument("--ref", default="main", help="branch on origin holding candidates/<slug>/ (default: main)")
     p_add.add_argument("--abba", action="store_true", help="A,B,B,A gate instead of A,B")
+    p_add.add_argument("--mode", choices=["patch", "merge"], default="patch",
+                       help="merge: test origin/<ref> itself (upstream sync, must contain origin/main)")
     sub.add_parser("list")
     p_run = sub.add_parser("run")
     p_run.add_argument("--daemon", action="store_true", help="keep polling for new jobs")

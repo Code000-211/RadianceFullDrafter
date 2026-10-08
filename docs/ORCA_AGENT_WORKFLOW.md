@@ -47,6 +47,7 @@ der den Hebel begründet für aussichtslos hält.
 | Label | Gesetzt von | Bedeutung |
 |---|---|---|
 | `research:new-lever` | research, audit, Leon | Idee, wartet auf den Planer |
+| `upstream:sync` | `upstream_sync.py` | Codeberg-main zusammenführen; läuft durch plan → code → review → Gate (`docs/UPSTREAM.md`) |
 | `source:research`, `source:audit` | research, audit | Herkunft der Idee |
 | `plan:ready` | plan | Plan steht (neuester Kommentar mit `<!-- radiance-plan -->`) |
 | `tier:light`, `tier:medium`, `tier:heavy` | plan | Schwierigkeit; bestimmt das Modell für code und review |

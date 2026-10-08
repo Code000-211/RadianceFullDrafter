@@ -61,7 +61,7 @@ PLAN_MARKER = "<!-- radiance-plan -->"
 REVIEW_MARKER = "<!-- radiance-review -->"
 HANDOFF_MARKER = "<!-- radiance-handoff -->"
 QA_MARKER = "<!-- radiance-qa -->"
-META_RE = re.compile(r"^candidate:\s*[A-Za-z0-9_.-]+\s*$(?:\s*^ref:\s*\S+\s*$)?", re.MULTILINE)
+META_RE = re.compile(r"^candidate:\s*[A-Za-z0-9_.-]+\s*$(?:\s*^ref:\s*\S+\s*$)?(?:\s*^mode:\s*merge\s*$)?", re.MULTILINE)
 
 ROLES = ("plan", "code", "review", "research", "audit", "upstream")
 ISSUE_ROLES = ("plan", "code", "review")
@@ -74,6 +74,7 @@ TIER_DE = {"light": "leicht", "medium": "mittel", "heavy": "schwer", "fallback":
 
 WORKFLOW_LABELS = {
     "research:new-lever": ("5319e7", "Idee für einen Hebel; wartet auf den Planer"),
+    "upstream:sync": ("0e8a16", "Codeberg-main zusammenführen; Planer, Code, Review, Gate wie ein Hebel"),
     "plan:ready": ("0052cc", "Implementierungsplan steht; wartet auf den Code-Agent"),
     "plan:needs-revision": ("c5def5", "Plan passt nicht zum Code oder Gate; zurück zum Planer"),
     "plan:rejected": ("cccccc", "Planer hat die Idee begründet verworfen"),
@@ -93,7 +94,7 @@ DOWNSTREAM = {"needs-code-review", "changes-requested", "plan:needs-revision"} |
 DEAD = {"status:blocked", "status:gate-passed", "plan:rejected"}
 
 KIND_DE = {
-    "plan/new": "neue Idee planen",
+    "plan/new": "neue Idee oder Upstream-Sync planen",
     "plan/revise": "Plan überarbeiten",
     "code/changes": "Review-Änderungen umsetzen",
     "code/gate-fix": "Gate-Fehlschlag beheben",
@@ -158,7 +159,7 @@ def kind_of(role: str, labels: set[str], has_gate_result: Callable[[], bool]) ->
     if role == "plan":
         if "plan:needs-revision" in labels:
             return "revise"
-        if "research:new-lever" in labels and not labels & ({"plan:ready"} | DOWNSTREAM):
+        if labels & {"research:new-lever", "upstream:sync"} and not labels & ({"plan:ready"} | DOWNSTREAM):
             return "new"
     elif role == "code":
         if "changes-requested" in labels:

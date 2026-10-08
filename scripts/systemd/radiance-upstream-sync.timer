@@ -1,0 +1,10 @@
+[Unit]
+Description=Check Codeberg main for new commits every 6 hours
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=6h
+Unit=radiance-upstream-sync.service
+
+[Install]
+WantedBy=timers.target

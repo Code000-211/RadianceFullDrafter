@@ -99,3 +99,30 @@ Worktree. Die Frage muss deshalb für sich verständlich sein: was der Plan sagt
 vorfindest, welche Optionen du siehst. Der Befehl wartet bis zu 4 Minuten; kommt bis dahin keine
 Antwort, mit dem ausgegebenen `orca_agent.py answer <id>` weiter warten. Höchstens 3 Fragen pro Lauf.
 Frage und Antwort landen im Issue und stehen beim nächsten Lauf im Übergabe-Block.
+
+## Upstream-Sync (Label `upstream:sync`)
+
+Statt eines Hebel-Pakets ist der Merge-Branch selbst der Kandidat (`docs/UPSTREAM.md`):
+
+```bash
+git fetch origin upstream/main
+git merge --no-ff <upstream-SHA aus dem Plan> -m "upstream: merge <kurz-SHA>"
+# Konflikte nach den Konfliktregeln des Plans lösen, dann git add + git commit
+git revert --no-edit <sha>     # je ausgeschlossenem Commit; Commit-Text um diese Zeile ergänzen:
+                               # Upstream-Excluded: <sha> <Grund>
+```
+
+- Nie rebasen, nie squashen: Die Upstream-Commits müssen Vorfahren des Branches bleiben.
+- Bei einem Gate-Fix oder Review-Änderungen auf dem bestehenden Sync-Branch weiterarbeiten. Ist
+  `origin/main` inzwischen weiter, zuerst `git merge origin/main` (die Queue verlangt, dass der
+  Branch `origin/main` enthält).
+- Gate-Fix: aus dem Bericht (Metrik, `isa_diff.json`) und `git log` den verantwortlichen
+  Upstream-Commit bestimmen, ausschließen und im Kommentar begründen. Ist die Ursache nicht
+  eindeutig: `ask` an den Planer oder `plan:needs-revision`.
+- Prüfungen: Build und `ctest --test-dir build_hip -LE gpu`; `lever_review.py claims` entfällt.
+- Übergabe wie in Abschnitt 5, aber mit diesem Block:
+  ```
+  candidate: upstream-sync
+  ref: <branch>
+  mode: merge
+  ```

@@ -13,6 +13,7 @@ Details stehen in genau einem Dokument je Thema:
 | Gate: was gemessen wird, Schwellen, Kalibrierung | `docs/GATE.md` |
 | Arbeitsablauf der Agents (Start, Modelle, Rückfragen), Hebel-Pakete, Issue-Labels | `docs/ORCA_AGENT_WORKFLOW.md` |
 | Rollen-Prompts der Agents | `docs/agents/<rolle>.md` |
+| Upstream übernehmen (PR-Bewertung, Sync von Codeberg-main, eigenes Kernel-Plugin) | `docs/UPSTREAM.md` |
 | Engine-Architektur | `spec.md`, Quellcode |
 | Geschichte (frühere Optimierungen, Postmortems, Hebel-Katalog) | `docs/history/` |
 

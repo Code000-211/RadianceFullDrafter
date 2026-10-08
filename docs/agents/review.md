@@ -69,3 +69,16 @@ Ist unklar, ob eine Abweichung vom Plan gewollt ist, frag den Planer, statt zu r
 Rundenlimit: Steht der Zähler „Review-Runden mit Änderungswünschen“ in der Kopfzeile schon auf dem
 Maximum, gibt es keine weitere Änderungsrunde. Dann Freigabe, wenn nichts Blockierendes bleibt,
 sonst `status:blocked` mit Begründung.
+
+## Upstream-Sync (Label `upstream:sync`)
+
+Statt der Hebel-Punkte 6 und 7 prüfen:
+
+- Der Branch enthält genau den Upstream-Stand aus dem Plan (`git merge-base --is-ancestor <sha> HEAD`)
+  und `origin/main`; es wurde nichts gesquasht oder rebased.
+- Jede Konfliktlösung folgt der Regel des Plans. Für Kernel auf unserem Pfad: `git diff
+  origin/main...HEAD -- <datei>` darf unsere Fassung nur um die geplanten Fixes ändern.
+- Jeder Ausschluss ist ein Revert mit Zeile `Upstream-Excluded: <sha> <Grund>`, und es gibt keine
+  Ausschlüsse, die nicht im Plan oder in einem begründeten Gate-Fix stehen.
+- Die Dateien unter „Semantik ohne Konflikt“ aus dem Plan sind tatsächlich angepasst, wo nötig.
+- Übergabe-Block mit `mode: merge`.

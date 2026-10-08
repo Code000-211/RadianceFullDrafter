@@ -49,6 +49,9 @@ class TestSelection(unittest.TestCase):
         self.assertIsNone(self.kind("plan", "research:new-lever", "plan:ready"))
         self.assertIsNone(self.kind("plan", "research:new-lever", "status:needs-review"))  # legacy issue
         self.assertIsNone(self.kind("plan", "research:new-lever", "plan:rejected"))
+        self.assertEqual(self.kind("plan", "upstream:sync"), "new")
+        self.assertIsNone(self.kind("plan", "upstream:sync", "plan:ready"))
+        self.assertEqual(self.kind("code", "upstream:sync", "plan:ready", "tier:heavy"), "implement")
 
     def test_code_priorities_and_exclusions(self) -> None:
         self.assertEqual(self.kind("code", "plan:ready", "tier:light"), "implement")
