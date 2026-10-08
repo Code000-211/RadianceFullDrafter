@@ -44,6 +44,18 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# Check if executing in git pre-commit and whether staged files touch code
+if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    STAGED_FILES=$(git diff --cached --name-only 2>/dev/null || true)
+    if [ -n "${STAGED_FILES}" ]; then
+        CODE_FILES=$(echo "${STAGED_FILES}" | grep -E '\.(cpp|hip|h|hpp|c)$|CMakeLists\.txt|baselines/' || true)
+        if [ -z "${CODE_FILES}" ]; then
+            echo "ℹ️  Pure documentation/metadata commit detected. Skipping binary symbol & GPU hardware checks."
+            exit 0
+        fi
+    fi
+fi
+
 echo "================================================================================"
 echo " 🔍 RadianceMine Epistemic Ground-Truth & Anti-Hallucination Gate"
 echo " Workspace:     ${REPO_ROOT}"

@@ -197,6 +197,24 @@ Following the forensic findings of `HOW_HALLUCINATIONS_CORRUPTED_THE_WORKTREE_AN
 
 ---
 
+## Rule 6: Empirical Skepticism & Mandatory Fact-Checking (Anti-Sycophancy Law)
+
+1. **User & Peer Input is a Hypothesis, Not Dogma**:
+   - The user and peer agents are collaborative partners, NOT infallible oracles.
+   - When the user proposes an idea, hypothesis, or parameter (e.g., PCIe bandwidth, kernel fusion strategy, speculative depth, or ISA instructions), all agents MUST treat it as a testable hypothesis rather than an unchallengeable absolute command.
+2. **Authority & Duty to Research the Internet**:
+   - All agents (Claude, AGY, subagents) are explicitly authorized and required to search the internet, academic literature (alphaXiv/arXiv), open-source repositories (GitHub), and official vendor manuals (AMD RDNA4 ISA, ROCm docs) to independently verify claims.
+3. **Duty to Respectfully Challenge False Assumptions**:
+   - If an agent discovers that an instruction, user premise, or peer proposal contradicts physical hardware reality (e.g. assuming PCIe 5.0 on a PCIe 4.0 slot, or claiming Wave64 on RDNA4), the agent **MUST NOT blindly comply or act sycophantically**.
+   - The agent MUST challenge the assumption, cite the official documentation or empirical measurements, explain the risks, and propose the technically sound alternative.
+4. **Automated Regression Review Lifecycle**:
+   - Whenever an optimization lever or candidate fails `scripts/gate_check.sh` (or causes a performance drop in single-stream decode, concurrency, or prefill):
+     * The lever is NEVER silently discarded or pushed with relaxed thresholds.
+     * The automated system MUST post the exact failure diagnostic and benchmark diff to the corresponding GitHub Issue.
+     * The issue MUST be labeled `status:needs-review` and `regression:detected` and routed back to the Research Agent (Claude) for forensic root-cause analysis and architectural revision.
+
+---
+
 ## Enforcement & Penalties
 
 Any automated agent or developer violating this Constitution will have their branch quarantined immediately:

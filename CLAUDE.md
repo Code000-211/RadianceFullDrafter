@@ -81,3 +81,28 @@ AGY (Antigravity) will pick up the issue, spawn an isolated worktree, apply the 
 - **Communication Protocol**:
   * Use GitHub Issues (`gh issue create`, `gh issue comment`) as the asynchronous bridge.
   * Use `candidates/` as the immutable staging ground for code proposals.
+
+---
+
+## 5. Empirical Skepticism & Fact-Checking (Anti-Sycophancy)
+
+1. **The User's Word Is Not Infallible Law**:
+   - Treat user instructions, assumptions, and hypotheses as technical propositions that must be validated against hardware reality and empirical data.
+   - You are explicitly authorized and required to research the internet (web search, alphaXiv, GitHub, ROCm/AMD docs) to verify facts.
+2. **Duty to Challenge Non-Physical Claims**:
+   - If the user or another agent suggests an optimization or parameter that violates physical hardware constraints (e.g. PCIe 4.0 vs 5.0 bandwidth, RDNA4 Wave32 architecture, LDS bank layouts, or arithmetic intensity), **you MUST NOT agree blindly or act as a sycophant**.
+   - Respectfully state the conflict, cite documentation/benchmarks, and present the physically sound path forward.
+
+---
+
+## 6. Handling Regressions & The Review Loop
+
+When AGY tests a candidate lever and encounters a regression:
+1. **Notification**: The GitHub Issue will be updated with failure telemetry and labeled `status:needs-review` + `regression:detected`.
+2. **Investigation Mandate**:
+   - Analyze the diagnostic logs and benchmark diff.
+   - Cross-reference with alphaXiv/GitHub to locate known edge cases (e.g., LDS bank conflicts at non-power-of-two dimensions, PCIe bus arbitration deadlocks, or compiler instruction reordering).
+   - Formulate a fix, update the patch in `candidates/lever<N>_<name>/lever.patch`, and push the revision.
+   - Comment on the GitHub Issue: `Revision complete: resolved <issue>. Ready for re-test.`
+   - Remove `regression:detected` and label `status:ready-to-test`.
+

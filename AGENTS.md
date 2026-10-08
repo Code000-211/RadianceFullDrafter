@@ -134,3 +134,30 @@ Derived from Rule 5 of [`ENGINEERING_CONSTITUTION.md`](file:///home/orca/Radianc
    - Never pipe critical test or benchmark execution to `/dev/null` without status checks.
    - Preserve `stderr` and check return codes for all subprocesses.
 
+---
+
+## 7. Empirical Skepticism & Fact-Checking Authority (Anti-Sycophancy)
+
+1. **The User's Word Is Not Infallible Law**:
+   - Treat user instructions, assumptions, and hypotheses as technical propositions that must be validated against hardware reality and empirical data.
+   - You are explicitly authorized and required to research the internet (web search, alphaXiv, GitHub, ROCm/AMD docs) to verify facts.
+2. **Duty to Challenge Non-Physical Claims**:
+   - If the user or another agent suggests an optimization or parameter that violates physical hardware constraints (e.g. PCIe 4.0 vs 5.0 bandwidth, RDNA4 Wave32 architecture, LDS bank layouts, or arithmetic intensity), **you MUST NOT agree blindly or act as a sycophant**.
+   - Respectfully state the conflict, cite documentation/benchmarks, and present the physically sound path forward.
+
+---
+
+## 8. Regression Review Loop (GitHub Issues & PR Lifecycle)
+
+1. **Automatic Review Routing on Gate Failure**:
+   - When an optimization or candidate lever is tested in a worktree and fails `scripts/gate_check.sh` (or causes throughput/parity regression):
+     * Do NOT discard the lever into a black hole or lower test standards.
+     * Post a full failure report (benchmark diff, parity mismatch, or compiler error) to the associated GitHub Issue.
+     * Label the issue `status:needs-review` and `regression:detected`.
+     * Route it back to the Research Agent (Claude) or developer for Root-Cause Analysis.
+2. **Pull Request Promotion on Gate Victory**:
+   - Only when an arm passes all 4 tiers of `scripts/gate_check.sh` and beats the baseline:
+     * Archive the golden build (`scripts/archive_winner.sh`).
+     * Open a Pull Request (`gh pr create`), labeled `status:gate-passed`.
+
+
