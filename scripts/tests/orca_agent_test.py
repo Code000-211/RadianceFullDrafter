@@ -194,8 +194,9 @@ class TestLimitsAndLocks(StateTestCase):
         self.assertEqual(oa.free_slots(2), 1)
 
     def test_backend_problems(self) -> None:
-        self.assertIn("kein Modellname", oa.backend_problem(self.cfg, "gemini"))
         cfg = copy.deepcopy(self.cfg)
+        cfg["backends"]["gemini"]["model"] = None
+        self.assertIn("kein Modellname", oa.backend_problem(cfg, "gemini"))
         cfg["backends"]["glm"]["key_file"] = str(Path(self.tmp.name) / "missing")
         with mock.patch.object(oa.shutil, "which", return_value="/usr/bin/claude"):
             self.assertIn("Schlüsseldatei", oa.backend_problem(cfg, "glm"))
