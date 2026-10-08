@@ -717,7 +717,7 @@ TEST(parity_renders_with_its_differences) {
     const std::string md = render_markdown(rep);
     CHECK(md.find("## Parity against base.json") != std::string::npos);
     CHECK(md.find("**DIFFERS**: 0 of 3 requests") != std::string::npos);
-    CHECK(md.find("| categories code | 1 | 1 | 1 | 3 / 3 |") != std::string::npos);
+    CHECK(md.find("| categories code | 1 | 1 | 0 | 1 | 3 / 3 |") != std::string::npos);
 }
 
 /* ------------------------------------------------------------------ report */

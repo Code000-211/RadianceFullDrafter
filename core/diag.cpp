@@ -251,12 +251,16 @@ json phase_report(const PhaseInput& in) {
      * means the phase measured a cache hit, and the driver says so. */
     req["cached_prompt_tokens"] = cached;
     {
-        json outs = json::array(), drafts = json::array();
+        json outs = json::array(), drafts = json::array(), prompts = json::array();
         for (const RequestTiming& r : in.requests) {
             outs.push_back(r.output);
             drafts.push_back(json::array({ r.drafted, r.accepted }));
+            prompts.push_back(r.prompt);
         }
         req["outputs"] = outs;
+        /* Prompt tokens a request, so a difference can be read against what its prefill took:
+         * a path that only long prompts take shows only in long prompts. */
+        req["prompt_tokens"] = prompts;
         /* [proposed, accepted] a request: the unit the acceptance comparison pairs on. */
         req["drafts"] = drafts;
     }
@@ -585,7 +589,9 @@ int compare_outputs(const json& now, const json& base, json* out, std::string* w
                     }
                     size_t i = 0;
                     while (i < ta.size() && i < tb.size() && ta[i] == tb[i]) ++i;
+                    const json pt = ra[r]["requests"].value("prompt_tokens", json::array());
                     differing.push_back({ { "point", point }, { "run", (int64_t)r + 1 }, { "request", (int64_t)k + 1 },
+                                          { "prompt_tokens", k < pt.size() ? pt[k] : json(nullptr) },
                                           { "first_different_token", (int64_t)i },
                                           { "tokens", (int64_t)ta.size() }, { "tokens_baseline", (int64_t)tb.size() } });
                 }
@@ -885,10 +891,11 @@ std::string render_markdown(const json& rep) {
              num(p.value("compared", json())) + " requests produced identical tokens.\n\n";
         const json& d = p.value("differing", json::array());
         if (!d.empty()) {
-            m += "| Point | Run | Request | First different token | Tokens (now / baseline) |\n|---|---|---|---|---|\n";
+            m += "| Point | Run | Request | Prompt tokens | First different token | Tokens (now / baseline) |\n|---|---|---|---|---|---|\n";
             for (const auto& x : d)
                 m += "| " + x["point"].get<std::string>() + " | " + num(x["run"]) + " | " + num(x["request"]) + " | " +
-                     num(x["first_different_token"]) + " | " + num(x["tokens"]) + " / " + num(x["tokens_baseline"]) + " |\n";
+                     num(x.value("prompt_tokens", json())) + " | " + num(x["first_different_token"]) + " | " +
+                     num(x["tokens"]) + " / " + num(x["tokens_baseline"]) + " |\n";
             m += "\n";
         }
         const json acc = p.value("acceptance", json::array());
