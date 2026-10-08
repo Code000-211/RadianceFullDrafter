@@ -10,7 +10,7 @@
 
 As an agent operating inside `RadianceMine`, your primary mission is to advance the performance and capabilities of the Radiance engine on AMD RDNA4 (gfx1201) hardware **without inducing regressions**.
 
-The repository baseline is **Opt 146** (`1a4455d26871100a6a97e1dd3b5c83d4431764b6`). Any step that degrades single-stream decode below 210.3 tok/s, concurrency below 448 tok/s, prefill below 9,331 tok/s, or breaks greedy bit-exact parity is an automatic failure.
+The repository baseline is **Opt 146** (`1a4455d26871100a6a97e1dd3b5c83d4431764b6`). Any step that degrades decode, C8 concurrency or 64k prefill versus `baselines/baseline_opt146.json` beyond the gate slack, or breaks greedy bit-exact parity, is an automatic failure. All thresholds live in `baselines/gate_thresholds.json`.
 
 ---
 
@@ -32,7 +32,7 @@ Forensic analysis proved that previous 60% performance crashes were caused by co
 3. `GPU_KEEP_ALIVE=1` or `gpu_sentinel`: Background polling daemons launch periodic GPU pulse kernels that inject PCIe contention and command-queue stalls during benchmarks.
 
 ### ⛔ Prohibited Action 4: Merging Without Passing the Master Gate
-No code may be promoted to candidate status or merged into `main` without a clean pass of `scripts/gate_check.sh`:
+No code may be promoted to candidate status or merged into `main` without a clean pass of `scripts/gate_check.sh`. The gate is fail-closed: a tier that cannot run (no server, no candidate benchmark JSON) fails it, and `DRY_RUN=1` never passes. All thresholds and seals come from `baselines/gate_thresholds.json`:
 - **Tier 0**: Epistemic Ground-Truth & Anti-Hallucination Gate (`scripts/check_epistemic_invariants.py --strict`)
   * Strict binary symbol grounding (`nm -D` & `.so` check)
   * Zero tolerance for silent test skips (`if (!sel(...)) return;`) or placebo assertions
@@ -41,15 +41,11 @@ No code may be promoted to candidate status or merged into `main` without a clea
   * Transparent logging (zero masked `stderr` or unverified exit codes)
 - **Tier 1**: Parity & Speed Floor (`scripts/parity_check.py --suite full`)
   * Greedy bit-exact tokens (0 divergence)
-  * Code TPS $\ge 230.0$
-  * Reasoning TPS $\ge 240.0$
-  * Math TPS $\ge 210.0$
+  * Code, reasoning and math decode floors (`tier1` in `gate_thresholds.json`)
 - **Tier 2**: BetterBench Composite Gate (`scripts/check_composite_gate.py`)
-  * Composite Score $\ge 631.3$
-  * C1 decode $\ge 210.3$ tok/s
-  * C8 concurrency $\ge 448.2$ tok/s
-  * 64k prefill $\ge 9,331.8$ tok/s
-  * C1 P99 $\le 4.5\,\text{ms}$, C8 P99 $\le 15.0\,\text{ms}$, TTFT $\le 100.0\,\text{ms}$
+  * Requires the candidate's benchmark results (`--bench-json`)
+  * Composite score, C1 decode, C8 concurrency and 64k prefill must not degrade versus the baseline beyond `tier2.slack_pct` (baseline composite as computed by the script: 673.7)
+  * C1/C8 ITL P99 and TTFT P50 must meet `tier2.latency_targets_ms` or not degrade versus the baseline
 - **Tier 3**: RDNA4 ISA & Hardware Invariants (`scripts/verify_rdna4_invariants.sh`)
   * VGPRs $\le 84$ (optimal) / $\le 96$ (strict ceiling)
   * Zero LDS 32-bank conflicts
@@ -188,8 +184,8 @@ Derived from Rule 5 of [`ENGINEERING_CONSTITUTION.md`](file:///home/orca/Radianc
    - Tests must never mask errors with silent early returns (`if (!sel(...)) return;`).
    - Every test must execute physical assertions against engine functions, not local arithmetic tautologies.
 4. **Absolute Immutability of Test Tolerances & Speed Floors**:
-   - Never alter `--token-tolerance` (strictly 0) or reduce speed thresholds (`--min-code-tps >= 230`, `--min-reasoning-tps >= 240`, `--min-math-tps >= 210`).
-   - Baselines (`golden_parity_reference.json`, `baseline_opt146.json`) are cryptographically sealed with SHA-256.
+   - Never change `baselines/gate_thresholds.json`, the baselines or their SHA-256 seals on your own. The pre-commit hook blocks such commits unless `RADIANCE_GATE_CHANGE=1` is set, which only the human owner decides.
+   - `scripts/gate_check.sh` must not pass `--token-tolerance` or `--min-*-tps` overrides.
 5. **Hardware State & Clock Transparency**:
    - Always verify that GPU memory clocks are not throttled at 96 MHz (DPM 0) before running benchmarks.
    - Run warmup passes to elevate clocks to DPM 5 (1258 MHz).

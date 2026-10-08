@@ -3,14 +3,10 @@
 
 Evaluates BetterBench benchmark runs against the certified baseline (Opt 146).
 Enforces:
-  1. Composite Score Non-Degradation: candidate.total_score >= baseline.total_score (631.3 pts)
-  2. C1 Decode Throughput: candidate.decode_med_tps >= baseline.decode_med_tps (205.2 t/s)
-  3. C8 Concurrency Throughput: candidate.concurrency_tps >= baseline.concurrency_tps (448.2 t/s)
-  4. 64k Cold Prefill Throughput: candidate.prefill_med_tps >= baseline.prefill_med_tps (9,331.8 t/s)
-  5. Latency Guardrails:
-     - C1 Decode P99 target <= 4.5 ms (no degradation vs baseline 8.72 ms)
-     - C8 Decode P99 target <= 15.0 ms
-     - Single-Stream TTFT target <= 100.0 ms
+  1. Composite score, C1 decode, C8 concurrency and 64k prefill do not degrade versus the
+     baseline beyond the per-metric slack.
+  2. Latency guardrails: C1/C8 ITL P99 and TTFT P50 meet their target or do not degrade.
+Slack and targets come from baselines/gate_thresholds.json.
 """
 
 from __future__ import annotations
@@ -22,10 +18,13 @@ import sys
 from pathlib import Path
 from typing import Any
 
-# Latency guardrail targets
-TARGET_C1_P99_MS = 4.5
-TARGET_C8_P99_MS = 15.0
-TARGET_TTFT_MS = 100.0
+import gate_thresholds
+
+_TIER2 = gate_thresholds.load()["tier2"]
+SLACK_PCT = _TIER2["slack_pct"]
+TARGET_C1_P99_MS = _TIER2["latency_targets_ms"]["c1_itl_p99"]
+TARGET_C8_P99_MS = _TIER2["latency_targets_ms"]["c8_itl_p99"]
+TARGET_TTFT_MS = _TIER2["latency_targets_ms"]["ttft_p50"]
 
 
 def load_json(p: Path) -> dict[str, Any]:
@@ -160,12 +159,6 @@ def main() -> int:
         help="Path to baseline BetterBench results.json (default: baselines/baseline_opt146.json)",
     )
     parser.add_argument(
-        "--allow-slack-pct",
-        type=float,
-        default=0.0,
-        help="Allowed slack percentage for non-degradation checks (default: 0.0% strict)",
-    )
-    parser.add_argument(
         "--json-out",
         type=Path,
         default=None,
@@ -204,8 +197,8 @@ def main() -> int:
     score_b = m_base["total_score"]
     score_c = m_cand["total_score"]
     d_score = ((score_c - score_b) / score_b) * 100.0 if score_b else 0.0
-    st_score = "🚀 GAIN" if d_score >= 0.5 else ("❌ REGRESS" if d_score < -args.allow_slack_pct else "✓ PASS")
-    if d_score < -args.allow_slack_pct:
+    st_score = "🚀 GAIN" if d_score >= 0.5 else ("❌ REGRESS" if d_score < -SLACK_PCT["composite"] else "✓ PASS")
+    if d_score < -SLACK_PCT["composite"]:
         violations.append(f"Composite Score degraded: {score_c:.1f} vs baseline {score_b:.1f} ({d_score:+.2f}%)")
     print(f"| {'COMPOSITE SCORE':<26} | {score_b:>10.1f} pts | {score_c:>10.1f} pts | {d_score:>+8.1f} % | {st_score:<12} |")
     print(sep)
@@ -214,8 +207,8 @@ def main() -> int:
     dec_b = m_base["decode_med_tps"]
     dec_c = m_cand["decode_med_tps"]
     d_dec = ((dec_c - dec_b) / dec_b) * 100.0 if dec_b else 0.0
-    st_dec = "🚀 GAIN" if d_dec >= 1.0 else ("❌ REGRESS" if d_dec < -args.allow_slack_pct else "✓ PASS")
-    if d_dec < -args.allow_slack_pct:
+    st_dec = "🚀 GAIN" if d_dec >= 1.0 else ("❌ REGRESS" if d_dec < -SLACK_PCT["decode"] else "✓ PASS")
+    if d_dec < -SLACK_PCT["decode"]:
         violations.append(f"C1 Decode Throughput degraded: {dec_c:.1f} vs baseline {dec_b:.1f} t/s ({d_dec:+.2f}%)")
     print(f"| • {'C1 Combined Decode':<24} | {dec_b:>10.1f} t/s | {dec_c:>10.1f} t/s | {d_dec:>+8.1f} % | {st_dec:<12} |")
 
@@ -223,7 +216,7 @@ def main() -> int:
     c8_b = m_base["concurrency_tps"]
     c8_c = m_cand["concurrency_tps"]
     d_c8 = ((c8_c - c8_b) / c8_b) * 100.0 if c8_b else 0.0
-    c8_slack = max(args.allow_slack_pct, 2.0)
+    c8_slack = SLACK_PCT["concurrency"]
     st_c8 = "🚀 GAIN" if d_c8 >= 1.0 else ("❌ REGRESS" if d_c8 < -c8_slack else "✓ PASS")
     if d_c8 < -c8_slack:
         violations.append(f"C8 Concurrency degraded: {c8_c:.1f} vs baseline {c8_b:.1f} t/s ({d_c8:+.2f}%)")
@@ -233,8 +226,8 @@ def main() -> int:
     pf_b = m_base["prefill_med_tps"]
     pf_c = m_cand["prefill_med_tps"]
     d_pf = ((pf_c - pf_b) / pf_b) * 100.0 if pf_b else 0.0
-    st_pf = "🚀 GAIN" if d_pf >= 1.0 else ("❌ REGRESS" if d_pf < -args.allow_slack_pct else "✓ PASS")
-    if d_pf < -args.allow_slack_pct:
+    st_pf = "🚀 GAIN" if d_pf >= 1.0 else ("❌ REGRESS" if d_pf < -SLACK_PCT["prefill"] else "✓ PASS")
+    if d_pf < -SLACK_PCT["prefill"]:
         violations.append(f"Cold 64k Prefill degraded: {pf_c:.1f} vs baseline {pf_b:.1f} t/s ({d_pf:+.2f}%)")
     print(f"| • {'Cold 64k Prefill':<24} | {pf_b:>10.1f} t/s | {pf_c:>10.1f} t/s | {d_pf:>+8.1f} % | {st_pf:<12} |")
     print(sep)

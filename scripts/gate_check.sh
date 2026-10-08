@@ -8,6 +8,9 @@
 #   - Tier 1: Parity Check Gate (scripts/parity_check.py --suite full)
 #   - Tier 2: BetterBench Composite Gate (scripts/check_composite_gate.py)
 #   - Tier 3: RDNA4 ISA & Hardware Invariants (scripts/verify_rdna4_invariants.sh)
+#
+# Fail-closed: a tier that cannot run fails the gate. DRY_RUN never certifies.
+# Thresholds come only from baselines/gate_thresholds.json.
 # ==============================================================================
 set -euo pipefail
 
@@ -62,12 +65,19 @@ while [[ $# -gt 0 ]]; do
 done
 
 echo "================================================================================"
-echo " 🛡️  RadianceMine 3-Tier Master Push & Merge Gate"
+echo " 🛡️  RadianceMine 4-Tier Master Push & Merge Gate"
 echo " Workspace:     ${REPO_ROOT}"
 echo " Baseline:      Opt 146 (1a4455d26871100a6a97e1dd3b5c83d4431764b6)"
 echo " Evaluation:    Tier '${TARGET_TIER}'"
 echo " Endpoint:      ${ENDPOINT}"
 echo "================================================================================"
+
+if [ "${DRY_RUN:-0}" = "1" ]; then
+    echo "❌ DRY_RUN=1: the gate measures nothing in a dry run and cannot certify anything." >&2
+    exit 10
+fi
+
+TIERS_RUN=()
 
 # ==============================================================================
 # Pre-Flight Gate: Environment Sanitation & Forensic Invariants
@@ -117,6 +127,7 @@ run_tier0() {
     python3 "${SCRIPT_DIR}/check_epistemic_invariants.py" \
         --strict \
         --endpoint "${ENDPOINT}"
+    TIERS_RUN+=(0)
 }
 
 # ==============================================================================
@@ -130,30 +141,17 @@ run_tier1() {
     
     TIER1_JSON="${REPO_ROOT}/baselines/tier1_gate_results.json"
     
-    # Check if server is running before attempting query
     if ! curl -s --max-time 3 "${ENDPOINT}/models" >/dev/null 2>&1; then
-        echo "⚠️  Inference server not running at ${ENDPOINT}."
-        echo "   Starting temporary check or skipping live query if dry-run requested."
-        echo "   To verify live Tier 1 gate, start engine: scripts/start_engine.sh"
-        # If dry-run verification
-        if [ "${DRY_RUN:-0}" = "1" ]; then
-            echo "   [DRY-RUN] Simulating Tier 1 test verification..."
-            return 0
-        else
-            echo "❌ ERROR: Cannot execute Tier 1 without running server. Start engine or use DRY_RUN=1." >&2
-            return 2
-        fi
+        echo "❌ FAIL: Tier 1 needs a running inference server at ${ENDPOINT}; none answered." >&2
+        return 2
     fi
 
     python3 "${SCRIPT_DIR}/parity_check.py" \
         --endpoint "${ENDPOINT}" \
         --model "${MODEL}" \
         --suite full \
-        --token-tolerance 0 \
-        --min-code-tps 230.0 \
-        --min-reasoning-tps 210.0 \
-        --min-math-tps 210.0 \
         --json-out "${TIER1_JSON}"
+    TIERS_RUN+=(1)
 }
 
 # ==============================================================================
@@ -165,18 +163,17 @@ run_tier2() {
     echo " Executing Tier 2: BetterBench Composite Score Gate"
     echo "================================================================================"
     
-    # Locate candidate results.json if not explicitly provided
     if [ -z "${CANDIDATE_JSON}" ] || [ ! -f "${CANDIDATE_JSON}" ]; then
-        LATEST_RUN=$(find "${REPO_ROOT}/benchmarks/runs" -maxdepth 2 -name "results.json" 2>/dev/null | sort | tail -n 1 || true)
-        if [ -n "${LATEST_RUN}" ] && [ -f "${LATEST_RUN}" ]; then
-            CANDIDATE_JSON="${LATEST_RUN}"
-        else
-            echo "ℹ️  No candidate benchmark run found. Evaluating baseline self-consistency..."
-            CANDIDATE_JSON="${BASELINE_JSON}"
-        fi
+        echo "❌ FAIL: Tier 2 needs the candidate's benchmark results via --bench-json (got '${CANDIDATE_JSON}')." >&2
+        return 2
+    fi
+    if [ "$(realpath "${CANDIDATE_JSON}")" = "$(realpath "${BASELINE_JSON}")" ]; then
+        echo "❌ FAIL: Tier 2 candidate results are the baseline file itself." >&2
+        return 2
     fi
 
     python3 "${SCRIPT_DIR}/check_composite_gate.py" "${CANDIDATE_JSON}" "${BASELINE_JSON}"
+    TIERS_RUN+=(2)
 }
 
 # ==============================================================================
@@ -189,6 +186,7 @@ run_tier3() {
     echo "================================================================================"
     
     bash "${SCRIPT_DIR}/verify_rdna4_invariants.sh" "${BUILD_DIR}"
+    TIERS_RUN+=(3)
 }
 
 # ==============================================================================
@@ -215,13 +213,7 @@ case "${TARGET_TIER}" in
         # Tier 2 (BetterBench Composite Score Gate)
         # Tier 3 (RDNA4 Hardware & ISA Compliance Gate)
         run_tier0
-        if curl -s --max-time 2 "${ENDPOINT}/models" >/dev/null 2>&1 || [ "${DRY_RUN:-0}" = "1" ]; then
-            run_tier1
-        else
-            echo ""
-            echo "ℹ️  Tier 1 skipped: server not currently running at ${ENDPOINT}."
-            echo "   (To run live Tier 1 parity check, launch: scripts/start_engine.sh)"
-        fi
+        run_tier1
         run_tier2
         run_tier3
         ;;
@@ -233,6 +225,10 @@ esac
 
 echo ""
 echo "================================================================================"
-echo " 🏆 ALL SPECIFIED QUALITY GATES PASSED! CODE CERTIFIED FOR PROMOTION."
+if [ "${TARGET_TIER}" = "all" ]; then
+    echo " 🏆 ALL 4 TIERS PASSED (ran: ${TIERS_RUN[*]}). CODE CERTIFIED FOR PROMOTION."
+else
+    echo " ✓ Tier(s) ${TIERS_RUN[*]} passed. Partial run, not a certification."
+fi
 echo "================================================================================"
 exit 0

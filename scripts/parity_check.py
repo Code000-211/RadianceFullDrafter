@@ -10,9 +10,8 @@ count drift is detected, preventing wasted benchmark runs on defective builds.
 
 Tier 1 Gate Invariants:
   1. Token Exactness: 0 token discrepancy against certified reference vectors.
-  2. Code Decode Speed: >= 230.0 tok/s on code_is_prime.
-  3. Reasoning Decode Speed: >= 240.0 tok/s on reasoning_probability.
-  4. Math Decode Speed: >= 210.0 tok/s on math_linear_eq.
+  2. Code, reasoning and math decode speed floors.
+Tolerance and floors default to baselines/gate_thresholds.json.
 """
 
 from __future__ import annotations
@@ -30,6 +29,8 @@ import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+import gate_thresholds
 
 # ==============================================================================
 # Built-in Default Golden References (Qwen3.8 / Qwen4Exp Baseline)
@@ -371,6 +372,7 @@ def load_goldens(custom_path: Path | None) -> list[GoldenPrompt]:
 
 
 def main() -> int:
+    tier1 = gate_thresholds.load()["tier1"]
     parser = argparse.ArgumentParser(
         description="Strict Greedy Parity Pre-Benchmark Gate for RadianceMine",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -400,26 +402,26 @@ def main() -> int:
     parser.add_argument(
         "--token-tolerance",
         type=int,
-        default=0,
+        default=tier1["token_tolerance"],
         help="Maximum allowed token count discrepancy for passing (0 = strict exact)",
     )
     parser.add_argument(
         "--min-code-tps",
         type=float,
-        default=float(os.getenv("MIN_CODE_TPS", "230.0")),
-        help="Minimum required decode speed (t/s) on code_is_prime to pass parity gate (default: 230.0)",
+        default=tier1["min_code_tps"],
+        help="Minimum required decode speed (t/s) on code prompts",
     )
     parser.add_argument(
         "--min-reasoning-tps",
         type=float,
-        default=float(os.getenv("MIN_REASONING_TPS", "210.0")),
-        help="Minimum required decode speed (t/s) on reasoning_probability to pass parity gate (default: 210.0)",
+        default=tier1["min_reasoning_tps"],
+        help="Minimum required decode speed (t/s) on reasoning prompts",
     )
     parser.add_argument(
         "--min-math-tps",
         type=float,
-        default=float(os.getenv("MIN_MATH_TPS", "210.0")),
-        help="Minimum required decode speed (t/s) on math_linear_eq to pass parity gate (default: 210.0)",
+        default=tier1["min_math_tps"],
+        help="Minimum required decode speed (t/s) on math prompts",
     )
     parser.add_argument(
         "--fail-fast",
@@ -456,6 +458,11 @@ def main() -> int:
     )
 
     args = parser.parse_args()
+    print(
+        f"Thresholds from {gate_thresholds.THRESHOLDS_FILE.name} unless overridden: "
+        f"tolerance={args.token_tolerance}, code>={args.min_code_tps}, "
+        f"reasoning>={args.min_reasoning_tps}, math>={args.min_math_tps}"
+    )
 
     # Pre-flight Connectivity Verification
     health_url = f"{args.endpoint.rstrip('/')}/models"

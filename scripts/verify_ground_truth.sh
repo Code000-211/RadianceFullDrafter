@@ -49,7 +49,16 @@ done
 if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     STAGED_FILES=$(git diff --cached --name-only 2>/dev/null || true)
     if [ -n "${STAGED_FILES}" ]; then
-        CODE_FILES=$(echo "${STAGED_FILES}" | grep -E '\.(cpp|hip|h|hpp|c)$|CMakeLists\.txt|baselines/' || true)
+        # Baselines, seals and thresholds only change with an explicit human decision.
+        GATE_FILES=$(echo "${STAGED_FILES}" | grep -E '^baselines/' || true)
+        if [ -n "${GATE_FILES}" ] && [ "${RADIANCE_GATE_CHANGE:-0}" != "1" ]; then
+            echo "❌ This commit changes gate baselines or thresholds:" >&2
+            echo "${GATE_FILES}" | sed 's/^/     /' >&2
+            git diff --cached --stat -- baselines/ >&2
+            echo "   Re-run with RADIANCE_GATE_CHANGE=1 git commit ... if this is intended." >&2
+            exit 1
+        fi
+        CODE_FILES=$(echo "${STAGED_FILES}" | grep -E '\.(cpp|hip|h|hpp|c|py|sh)$|CMakeLists\.txt|^baselines/|^scripts/' || true)
         if [ -z "${CODE_FILES}" ]; then
             echo "ℹ️  Pure documentation/metadata commit detected. Skipping binary symbol & GPU hardware checks."
             exit 0

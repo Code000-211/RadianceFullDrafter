@@ -29,16 +29,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 
-# ==============================================================================
-# Cryptographic Seals & Golden Thresholds (Inviolable Laws)
-# ==============================================================================
-SEAL_GOLDEN_PARITY_SHA256 = "75e83c3da2aa5db53e6b659068289b16e92da26fc08a4358b27aa7a10ea8c7df"
-SEAL_BASELINE_OPT146_SHA256 = "34b3a48652a408e103a36c29352dab0e43030fd038d21112f74c58a07539d772"
-
-MIN_CODE_TPS_FLOOR = 230.0
-MIN_REASONING_TPS_FLOOR = 210.0
-MIN_MATH_TPS_FLOOR = 210.0
-MAX_TOKEN_TOLERANCE = 0
+import gate_thresholds
 
 
 @dataclass
@@ -280,80 +271,47 @@ def check_invariant_3_immutability_lock(repo_root: Path) -> InvariantResult:
     warnings: list[str] = []
     passed = True
 
-    # 1. Verify Cryptographic SHA-256 Seals on Baselines
-    golden_ref_file = repo_root / "baselines" / "golden_parity_reference.json"
-    baseline_opt146_file = repo_root / "baselines" / "baseline_opt146.json"
+    # 1. Verify SHA-256 seals on baselines (seals live in baselines/gate_thresholds.json;
+    #    changing either side is blocked by the pre-commit hook without RADIANCE_GATE_CHANGE=1)
+    try:
+        thresholds = gate_thresholds.load()
+    except (OSError, ValueError) as e:
+        return InvariantResult(3, "Threshold & Tolerance Immutability Lock", False, [f"❌ Cannot read {gate_thresholds.THRESHOLDS_FILE}: {e}"])
 
-    for path, expected_hash, label in [
-        (golden_ref_file, SEAL_GOLDEN_PARITY_SHA256, "Golden Parity Reference"),
-        (baseline_opt146_file, SEAL_BASELINE_OPT146_SHA256, "Opt 146 Baseline Reference"),
-    ]:
+    for name, expected_hash in thresholds["seals_sha256"].items():
+        path = repo_root / "baselines" / name
         if not path.exists():
             passed = False
             details.append(f"❌ MISSING BASELINE: Required reference file not found at {path}")
             continue
-
-        with open(path, "rb") as f:
-            actual_hash = hashlib.sha256(f.read()).hexdigest()
-
+        actual_hash = hashlib.sha256(path.read_bytes()).hexdigest()
         if actual_hash != expected_hash:
             passed = False
             details.append(
-                f"❌ CRYPTOGRAPHIC SEAL BROKEN: {label} ({path.name})\n"
+                f"❌ SEAL BROKEN: {name}\n"
                 f"   Expected SHA-256: {expected_hash}\n"
-                f"   Actual SHA-256:   {actual_hash}\n"
-                f"   Modifying golden references to mask regressions violates Law 3 of the Engineering Constitution!"
+                f"   Actual SHA-256:   {actual_hash}"
             )
         else:
-            details.append(f"✓ {label} SHA-256 seal intact: {actual_hash[:16]}...")
+            details.append(f"✓ {name} SHA-256 seal intact: {actual_hash[:16]}...")
 
-    # 2. Verify parity_check.py thresholds and token tolerance
+    # 2. parity_check.py must take tolerance and floors from the thresholds file
     parity_check_py = repo_root / "scripts" / "parity_check.py"
-    if parity_check_py.exists():
-        with open(parity_check_py, "r", encoding="utf-8") as f:
-            content = f.read()
+    parity_src = parity_check_py.read_text(encoding="utf-8") if parity_check_py.exists() else ""
+    for key in ("token_tolerance", "min_code_tps", "min_reasoning_tps", "min_math_tps"):
+        if f'default=tier1["{key}"]' not in parity_src:
+            passed = False
+            details.append(f"❌ scripts/parity_check.py does not default {key} to gate_thresholds.json")
 
-        # Check default token_tolerance == 0
-        m_tol = re.search(r'--token-tolerance["\'],\s*type=int,\s*default=(\d+)', content)
-        if m_tol:
-            val = int(m_tol.group(1))
-            if val != 0:
-                passed = False
-                details.append(f"❌ TOLERANCE RELAXATION: scripts/parity_check.py default token-tolerance is {val} (must be 0)!")
-            else:
-                details.append("✓ scripts/parity_check.py token-tolerance strictly locked to 0.")
-        else:
-            warnings.append("Could not statically verify token-tolerance default in scripts/parity_check.py.")
-
-        # Check min speed defaults
-        speed_checks = [
-            (r'--min-code-tps["\'].*?default=float\(os\.getenv\(["\']MIN_CODE_TPS["\'],\s*["\']([\d\.]+)["\']', MIN_CODE_TPS_FLOOR, "Code TPS"),
-            (r'--min-reasoning-tps["\'].*?default=float\(os\.getenv\(["\']MIN_REASONING_TPS["\'],\s*["\']([\d\.]+)["\']', MIN_REASONING_TPS_FLOOR, "Reasoning TPS"),
-            (r'--min-math-tps["\'].*?default=float\(os\.getenv\(["\']MIN_MATH_TPS["\'],\s*["\']([\d\.]+)["\']', MIN_MATH_TPS_FLOOR, "Math TPS"),
-        ]
-        for pattern, floor, name in speed_checks:
-            m_spd = re.search(pattern, content, re.DOTALL)
-            if m_spd:
-                val = float(m_spd.group(1))
-                if val < floor:
-                    passed = False
-                    details.append(f"❌ THRESHOLD LOWERED: {name} default in parity_check.py is {val} t/s (minimum floor: {floor} t/s)!")
-                else:
-                    details.append(f"✓ {name} floor locked: {val:.1f} >= {floor:.1f} t/s.")
-
-    # 3. Verify gate_check.sh calls parity_check.py with token-tolerance 0 and unlowered floors
+    # 3. gate_check.sh must not override tolerance or floors on the command line
     gate_check_sh = repo_root / "scripts" / "gate_check.sh"
-    if gate_check_sh.exists():
-        with open(gate_check_sh, "r", encoding="utf-8") as f:
-            sh_content = f.read()
-
-        if "--token-tolerance 0" not in sh_content and "--token-tolerance" in sh_content:
-            m_tol_sh = re.search(r'--token-tolerance\s+(\d+)', sh_content)
-            if m_tol_sh and int(m_tol_sh.group(1)) > 0:
-                passed = False
-                details.append(f"❌ GATE CHECK COMPROMISED: scripts/gate_check.sh passes --token-tolerance {m_tol_sh.group(1)}!")
-        else:
-            details.append("✓ scripts/gate_check.sh enforces --token-tolerance 0.")
+    gate_src = gate_check_sh.read_text(encoding="utf-8") if gate_check_sh.exists() else ""
+    overrides = re.findall(r"--(?:token-tolerance|min-[a-z]+-tps)\b", gate_src)
+    if overrides:
+        passed = False
+        details.append(f"❌ scripts/gate_check.sh overrides thresholds: {sorted(set(overrides))}")
+    else:
+        details.append("✓ Gate thresholds come only from baselines/gate_thresholds.json.")
 
     return InvariantResult(3, "Threshold & Tolerance Immutability Lock", passed, details, warnings)
 

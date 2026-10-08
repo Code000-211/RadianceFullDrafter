@@ -35,6 +35,11 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+if [ "${DRY_RUN}" = "1" ] && [ -n "${ISSUE_NUM}" ]; then
+    echo "ℹ️  Dry run: issue #${ISSUE_NUM} will not be touched."
+    ISSUE_NUM=""
+fi
+
 if [ -z "${CANDIDATE_NAME}" ]; then
     echo "❌ ERROR: Candidate name or directory is required." >&2
     echo "Usage: $0 <candidate_folder_or_slug> [--issue <gh_issue_number>] [--dry-run]" >&2
@@ -137,6 +142,12 @@ if [ ! -f "${WORKTREE_DIR}/build_hip/build.ninja" ]; then
         -DRAD_BUILD_TESTS=ON
 fi
 ninja -C "${WORKTREE_DIR}/build_hip" -j32 radiance arch_test || ninja -C "${WORKTREE_DIR}/build_hip" -j32
+
+if [ "${DRY_RUN}" = "1" ]; then
+    echo ""
+    echo "✓ Dry run: patch applied and build finished. Engine swap and Master Gate not executed."
+    exit 0
+fi
 
 # Step 4: Hot-Swap Dual-GPU Engine to Candidate Binary
 if [ "${DRY_RUN}" != "1" ]; then
