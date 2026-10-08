@@ -1,0 +1,19 @@
+{
+  "lsp": {
+    "disabledServers": ["cpp"],
+    "servers": {
+      "cpp-hip": {
+        "name": "clangd (C++/HIP, ROCm)",
+        "extensions": [".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".cu", ".cuh", ".hip"],
+        "command": "/home/orca/.local/bin/clangd",
+        "args": [
+          "--compile-commands-dir=/home/orca/RadianceMine",
+          "--query-driver=/opt/rocm/llvm/bin/clang++,/opt/rocm/bin/hipcc,/usr/bin/c++",
+          "--background-index",
+          "-j=4"
+        ],
+        "rootMarkers": ["CMakeLists.txt", ".clangd", "compile_commands.json"]
+      }
+    }
+  }
+}
