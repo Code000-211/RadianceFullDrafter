@@ -71,9 +71,8 @@ Korrektheitsbefund.
 **Warum „die Antwort ist noch richtig“ nicht reicht.** Ein Modell beantwortet einfache Prompts
 auch mit einem echten Rechenfehler oft richtig, etwa einer falschen Skalierung in einem selten
 gerouteten Experten oder einem Fehler erst ab 16k Kontext. Richtige Antworten sind deshalb nur
-eine grobe Zusatzprüfung. Der Schutz ist die Deklaration mit Beleg, und bis das Gate ein
-abgestuftes Maß hat (KL gegen die Baseline, `docs/DIAGNOSE.md`), entscheidet Leon über jede
-deklarierte Abweichung anhand des Paritätsberichts (erste abweichende Stelle je Request,
+eine grobe Zusatzprüfung. Der Schutz ist die Deklaration mit Beleg; über jede deklarierte
+Abweichung entscheidet Leon anhand des Paritätsberichts (erste abweichende Stelle je Request,
 `radiance --diagnose --diagnose-baseline`).
 
 ## 4. Laufzeit-Umgebung
