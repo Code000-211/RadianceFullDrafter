@@ -1,0 +1,22 @@
+# Agent dispatcher tick: starts role agents (plan, code, review, research, audit, upstream) in
+# fresh worktrees, each in an Orca terminal; see docs/ORCA_AGENT_WORKFLOW.md.
+# Deterministic, no LLM call itself. Needs gh auth and the Orca runtime for user orca.
+#
+# Install (as root in CT 107):
+#   cp /home/orca/RadianceMine/scripts/systemd/radiance-agent-tick.{service,timer} /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now radiance-agent-tick.timer
+[Unit]
+Description=RadianceMine agent dispatcher tick
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=orca
+Group=orca
+WorkingDirectory=/home/orca/RadianceMine
+ExecStart=/usr/bin/python3 -u /home/orca/RadianceMine/scripts/orca_agent.py tick
+# With launcher "detached" the agent runs outlive this oneshot unit.
+KillMode=process
+StandardOutput=journal
+StandardError=journal

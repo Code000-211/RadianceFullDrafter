@@ -1,0 +1,10 @@
+[Unit]
+Description=Run the RadianceMine agent dispatcher every 3 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=3min
+Unit=radiance-agent-tick.service
+
+[Install]
+WantedBy=timers.target

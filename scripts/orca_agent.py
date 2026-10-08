@@ -1,17 +1,32 @@
 #!/usr/bin/env python3
-"""orca_agent.py — role dispatch for the Orca automations of RadianceMine.
+"""orca_agent.py — deterministic dispatcher for the RadianceMine agent roles.
 
-Every Orca automation calls this script twice: as its precheck and as its agent command.
+Orca automations only take a prompt and a provider; they cannot pick a model per run. So a
+systemd timer runs `tick`, which decides everything without an LLM, and Orca only hosts the
+worktree and the terminal the agent runs in (visible in the Orca sidebar and dashboard).
 
-    orca_agent.py check <role>   exit 0 and print the work item when a slot is free and there is work,
-                                 1 = nothing to do, 2 = check failed (Orca starts no agent)
-    orca_agent.py run <role>     inside the automation's worktree: take a slot and the work item, pick
-                                 the model, start the agent CLI, verify the label handoff afterwards
-    orca_agent.py labels         create the workflow labels on GitHub (gate labels via gh_bridge)
-    orca_agent.py status         slots, cooldowns, last runs
+    orca_agent.py tick                 timer entry: clean up old agent worktrees, then for every role
+                                       with work and a free slot create a worktree and start `run` in an
+                                       Orca terminal (launcher "orca") or as a detached process
+    orca_agent.py run <role> [--issue N]
+                                       inside an agent worktree: take a slot and the issue, build the
+                                       role's worktree setup, start ONE fresh agent session with the
+                                       model for its tier, verify the label handoff afterwards
+    orca_agent.py ask <frage> [--wait S]
+                                       for code/review agents: blocking question to the planner; a fresh
+                                       planner session answers with only the plan and the question as
+                                       context; question and answer go to the issue
+    orca_agent.py answer <id> [--wait S]  keep waiting for an answer that was still open
+    orca_agent.py check <role>         would `tick` start this role now? (diagnostics; exit 0/1/2)
+    orca_agent.py labels               create the workflow labels on GitHub (gate labels via gh_bridge)
+    orca_agent.py status               slots, backends, last runs, open questions
 
-Roles: plan, code, review, research, audit, upstream (prompts in docs/agents/<role>.md).
-Models, tiers and limits: scripts/agents/models.json. Workflow: docs/ORCA_AGENT_WORKFLOW.md.
+Roles: plan, code, review, research, audit, upstream; prompts in docs/agents/<role>.md.
+Models, tiers, limits, launcher: scripts/agents/models.json. Workflow: docs/ORCA_AGENT_WORKFLOW.md.
+
+Every run is a new CLI process without resume flags, i.e. a new session. Agents do not read the
+whole issue: `run` puts a brief with only what the role needs (idea, latest plan, latest review
+or gate report, answers to questions) into the prompt.
 
 Locks are flock()ed files in the state directory, so a crashed agent frees its slot and its
 issue. Round counters come from GitHub (gate results, written by gh_bridge only) and from this
@@ -40,11 +55,22 @@ PRIMARY = Path(os.environ.get("RADIANCE_PRIMARY", Path(__file__).resolve().paren
 CONFIG = PRIMARY / "scripts" / "agents" / "models.json"
 PROMPTS = PRIMARY / "docs" / "agents"
 STATE = Path(os.environ.get("RADIANCE_AGENT_STATE", Path.home() / ".local" / "state" / "radiance-agents"))
+
 RESULT_MARKER = "<!-- radiance-gate-result -->"
+PLAN_MARKER = "<!-- radiance-plan -->"
+REVIEW_MARKER = "<!-- radiance-review -->"
+HANDOFF_MARKER = "<!-- radiance-handoff -->"
+QA_MARKER = "<!-- radiance-qa -->"
+META_RE = re.compile(r"^candidate:\s*[A-Za-z0-9_.-]+\s*$(?:\s*^ref:\s*\S+\s*$)?", re.MULTILINE)
 
 ROLES = ("plan", "code", "review", "research", "audit", "upstream")
-TIERS = ("light", "medium", "heavy")
-TIER_DE = {"light": "leicht", "medium": "mittel", "heavy": "schwer"}
+ISSUE_ROLES = ("plan", "code", "review")
+BUILD_ROLES = ("code", "review", "audit")
+TICK_ORDER = ("review", "code", "plan", "upstream", "audit", "research")  # finish work before starting new
+ASK_ROLES = ("code", "review")
+TIERS = ("light", "medium", "heavy", "fallback")
+PLANNER_TIERS = TIERS[:3]
+TIER_DE = {"light": "leicht", "medium": "mittel", "heavy": "schwer", "fallback": "Fallback"}
 
 WORKFLOW_LABELS = {
     "research:new-lever": ("5319e7", "Idee für einen Hebel; wartet auf den Planer"),
@@ -76,7 +102,7 @@ KIND_DE = {
 }
 
 
-# ---------------------------------------------------------------- configuration, GitHub
+# ---------------------------------------------------------------- configuration, GitHub, git
 
 def load_config(path: Path = CONFIG) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
@@ -96,8 +122,9 @@ def open_issues() -> list[dict[str, Any]]:
 
 
 def issue_view(number: int) -> dict[str, Any]:
-    data = json.loads(gh("issue", "view", str(number), "--repo", REPO, "--json", "number,title,state,labels,comments"))
-    return {"number": data["number"], "title": data["title"], "state": data["state"],
+    data = json.loads(gh("issue", "view", str(number), "--repo", REPO, "--json",
+                         "number,title,state,body,labels,comments"))
+    return {"number": data["number"], "title": data["title"], "state": data["state"], "body": data.get("body") or "",
             "labels": {l["name"] for l in data["labels"]},
             "comments": [c.get("body") or "" for c in data.get("comments", [])]}
 
@@ -106,9 +133,20 @@ def gh_comments(number: int) -> list[str]:
     return issue_view(number)["comments"]
 
 
+def comment(number: int, body: str) -> None:
+    gh("issue", "comment", str(number), "--repo", REPO, "--body", body)
+
+
 def block_issue(number: int, reason: str) -> None:
-    gh("issue", "comment", str(number), "--repo", REPO, "--body", f"Automatisch gesperrt: {reason}\n\n— orca_agent.py")
+    comment(number, f"Automatisch gesperrt: {reason}\n\n— orca_agent.py")
     gh("issue", "edit", str(number), "--repo", REPO, "--add-label", "status:blocked")
+
+
+def git(*args: str, cwd: Path | None = None) -> str:
+    proc = subprocess.run(["git", *args], cwd=str(cwd) if cwd else None, capture_output=True, text=True, check=False)
+    if proc.returncode != 0:
+        raise RuntimeError(f"git {' '.join(args[:2])} failed: {proc.stderr.strip()}")
+    return proc.stdout.strip()
 
 
 # ---------------------------------------------------------------- selection (pure)
@@ -152,11 +190,11 @@ def gate_failures(comments: list[str]) -> int:
     return sum(1 for c in comments if RESULT_MARKER in c and "### Gate bestanden" not in c)
 
 
-def pick_tier(labels: set[str], failures: int, offset: int = 0) -> tuple[str, int]:
+def pick_tier(labels: set[str], failures: int, offset: int = 0, max_tier: str = "fallback") -> tuple[str, int]:
     """Planner's tier (default medium), one step up per failed round, plus the role offset."""
-    set_tiers = [TIERS.index(l[5:]) for l in labels if l.startswith("tier:") and l[5:] in TIERS]
+    set_tiers = [PLANNER_TIERS.index(l[5:]) for l in labels if l.startswith("tier:") and l[5:] in PLANNER_TIERS]
     base = max(set_tiers) if set_tiers else 1
-    return TIERS[min(len(TIERS) - 1, base + failures + offset)], base
+    return TIERS[min(TIERS.index(max_tier), base + failures + offset)], base
 
 
 def outcome(role: str, before: set[str], after: set[str], state: str) -> str | None:
@@ -166,7 +204,8 @@ def outcome(role: str, before: set[str], after: set[str], state: str) -> str | N
     if role == "plan":
         if state == "CLOSED" or "plan:rejected" in after:
             return "rejected"
-        if "plan:ready" in after and "plan:needs-revision" not in after and not after.isdisjoint(set(f"tier:{t}" for t in TIERS)):
+        if "plan:ready" in after and "plan:needs-revision" not in after and \
+                not after.isdisjoint(f"tier:{t}" for t in PLANNER_TIERS):
             return "planned"
     elif role == "code":
         if "plan:needs-revision" in after - before:
@@ -183,7 +222,57 @@ def outcome(role: str, before: set[str], after: set[str], state: str) -> str | N
     return None
 
 
-# ---------------------------------------------------------------- local state: locks, ledger, cooldowns
+# ---------------------------------------------------------------- brief: only what the role needs
+
+def clip(text: str | None, limit: int) -> str | None:
+    if text is None or len(text) <= limit:
+        return text
+    return text[:limit] + "\n\n_(gekürzt; vollständig im Issue)_"
+
+
+def latest(comments: list[str], marker: str) -> str | None:
+    return next((c for c in reversed(comments) if marker in c), None)
+
+
+def since_latest_plan(comments: list[str]) -> list[str]:
+    idx = max((i for i, c in enumerate(comments) if PLAN_MARKER in c), default=-1)
+    return comments[idx + 1:]
+
+
+def build_brief(role: str, kind: str, view: dict[str, Any]) -> str:
+    comments = view["comments"]
+    recent = since_latest_plan(comments)
+    plan = latest(comments, PLAN_MARKER)
+    sections: list[tuple[str, str | None]] = [("Idee (Issue-Text)", clip(view["body"], 4000))]
+    if role == "plan":
+        if kind == "revise":
+            sections += [("Bisheriger Plan", plan),
+                         ("Seit dem Plan (Grund der Überarbeitung, Review, Gate)",
+                          clip("\n\n---\n\n".join(recent), 12000) if recent else None)]
+    else:
+        sections.append(("Plan", plan))
+        if role == "code" and kind == "changes":
+            sections.append(("Review-Befunde", latest(recent, REVIEW_MARKER)))
+        if role == "code" and kind == "gate-fix":
+            sections.append(("Gate-Bericht", clip(latest(comments, RESULT_MARKER), 8000)))
+        if kind in ("changes", "gate-fix", "review"):
+            sections.append(("Letzte Übergabe des Code-Agents", latest(recent, HANDOFF_MARKER)))
+        if role == "review":
+            sections.append(("Vorige Review-Runde", latest(recent, REVIEW_MARKER)))
+        qa = [c for c in recent if QA_MARKER in c]
+        sections.append(("Rückfragen und Antworten", "\n\n---\n\n".join(qa) if qa else None))
+    meta = [m.group(0) for c in comments for m in META_RE.finditer(c)]
+    if meta and role != "plan":
+        sections.append(("Aktueller Kandidat (neuester Block)", f"```\n{meta[-1]}\n```"))
+    out = ["# Übergabe", "",
+           "Das ist alles, was du aus dem Issue brauchst. Lies das ganze Issue nur, wenn hier etwas fehlt.", ""]
+    for title, text in sections:
+        if text:
+            out += [f"## {title}", "", text.strip(), ""]
+    return "\n".join(out)
+
+
+# ---------------------------------------------------------------- local state: locks, ledger, reservations
 
 def state_dir() -> Path:
     STATE.mkdir(parents=True, exist_ok=True)
@@ -220,8 +309,25 @@ def free_slots(max_parallel: int) -> int:
     return sum(1 for i in range(max_parallel) if not is_locked(state_dir() / f"slot-{i}.lock"))
 
 
-def issue_lock_path(number: int) -> Path:
-    return state_dir() / f"issue-{number}.lock"
+def work_lock_path(role: str, issue: int | None) -> Path:
+    """Issue roles lock the issue; research, audit and upstream run one at a time."""
+    return state_dir() / (f"issue-{issue}.lock" if issue else f"role-{role}.lock")
+
+
+RESERVATION_TTL = 20 * 60  # a started run takes its lock long before this
+
+
+def reservation_path(role: str, issue: int | None) -> Path:
+    return state_dir() / (f"reserved-issue-{issue}" if issue else f"reserved-role-{role}")
+
+
+def reserved(role: str, issue: int | None) -> bool:
+    p = reservation_path(role, issue)
+    return p.is_file() and time.time() - p.stat().st_mtime < RESERVATION_TTL
+
+
+def active_reservations() -> int:
+    return sum(1 for p in state_dir().glob("reserved-*") if time.time() - p.stat().st_mtime < RESERVATION_TTL)
 
 
 def ledger(number: int | None = None) -> list[dict[str, Any]]:
@@ -263,49 +369,67 @@ def backend_problem(cfg: dict[str, Any], name: str) -> str | None:
 
 # ---------------------------------------------------------------- per-role decisions
 
-def backend_for(cfg: dict[str, Any], role: str, labels: set[str], failures: int) -> tuple[str, str | None]:
+def backend_options(cfg: dict[str, Any], role: str, labels: set[str], failures: int) -> list[tuple[str, str | None]]:
+    """(backend, tier) in order of preference. A tiered role whose backend is unavailable moves up,
+    but never into the fallback tier just because a cheaper backend is missing or rate limited."""
     rc = cfg["roles"][role]
-    if rc.get("tiered"):
-        tier, _ = pick_tier(labels, failures, rc.get("tier_offset", 0))
-        return cfg["tiers"][tier], tier
-    return rc["backend"], None
+    if not rc.get("tiered"):
+        return [(rc["backend"], None)]
+    max_tier = rc.get("max_tier", "fallback")
+    tier, _ = pick_tier(labels, failures, rc.get("tier_offset", 0), max_tier)
+    options = [(cfg["tiers"][tier], tier)]
+    if tier != "fallback":
+        for t in TIERS[TIERS.index(tier) + 1:TIERS.index(max_tier) + 1]:
+            if t != "fallback" or cfg["limits"].get("availability_fallback", False):
+                options.append((cfg["tiers"][t], t))
+    return options
 
 
 def code_failures(comments: list[str], rows: list[dict[str, Any]]) -> int:
     return gate_failures(comments) + count(rows, "review", "changes-requested") + count(rows, "code", None)
 
 
-def find_work(cfg: dict[str, Any], role: str, verbose: bool = True) -> dict[str, Any] | None:
-    lim = cfg["limits"]
-    if role in ("research", "audit"):
-        ideas = [i for i in open_issues() if "research:new-lever" in i["labels"] and not i["labels"] & DEAD]
-        if len(ideas) >= lim["max_open_ideas"]:
-            if verbose:
-                print(f"{len(ideas)} offene Ideen >= {lim['max_open_ideas']}: erst abarbeiten", file=sys.stderr)
-            return None
-        stamp = state_dir() / f"last-{role}"
-        if stamp.is_file() and time.time() - stamp.stat().st_mtime < lim["interval_hours"][role] * 3600:
-            return None
-        backend = cfg["roles"][role]["backend"]
+def choose_backend(cfg: dict[str, Any], options: list[tuple[str, str | None]], log: Callable[[str], None]) -> tuple[str, str | None] | None:
+    problems = []
+    for backend, tier in options:
         problem = backend_problem(cfg, backend)
-        if problem:
-            if verbose:
-                print(problem, file=sys.stderr)
+        if problem is None:
+            return backend, tier
+        problems.append(problem)
+    log("; ".join(problems))
+    return None
+
+
+def find_work(cfg: dict[str, Any], role: str, verbose: bool = True, only_issue: int | None = None) -> dict[str, Any] | None:
+    lim = cfg["limits"]
+
+    def log(msg: str) -> None:
+        if verbose:
+            print(f"[{role}] {msg}", file=sys.stderr)
+
+    if role in ("research", "audit", "upstream"):
+        if is_locked(work_lock_path(role, None)) or (only_issue is None and reserved(role, None)):
             return None
-        return {"role": role, "issue": None, "title": f"{role}-Lauf", "kind": role, "backend": backend, "tier": None}
-    if role == "upstream":
-        state = json.loads((PRIMARY / "telemetry" / "upstream_review.json").read_text())
-        for e in sorted(state["prs"].values(), key=lambda e: -(e.get("useful") or 0)):
-            if e.get("open") and not e.get("done") and not e.get("assessment") and (e.get("useful") or 1.0) >= 0.5:
-                backend = cfg["roles"]["upstream"]["backend"]
-                problem = backend_problem(cfg, backend)
-                if problem:
-                    if verbose:
-                        print(problem, file=sys.stderr)
-                    return None
-                return {"role": role, "issue": None, "title": f"upstream PR #{e['pr_id']} {e['title']}",
-                        "kind": "upstream", "backend": backend, "tier": None}
-        return None
+        title = f"{role}-Lauf"
+        if role in ("research", "audit"):
+            ideas = [i for i in open_issues() if "research:new-lever" in i["labels"] and not i["labels"] & DEAD]
+            if len(ideas) >= lim["max_open_ideas"]:
+                log(f"{len(ideas)} offene Ideen >= {lim['max_open_ideas']}: erst abarbeiten")
+                return None
+            stamp = state_dir() / f"last-{role}"
+            if stamp.is_file() and time.time() - stamp.stat().st_mtime < lim["interval_hours"][role] * 3600:
+                return None
+        else:
+            state = json.loads((PRIMARY / "telemetry" / "upstream_review.json").read_text())
+            todo = [e for e in state["prs"].values() if e.get("open") and not e.get("done")
+                    and not e.get("assessment") and (e.get("useful") or 1.0) >= 0.5]
+            if not todo:
+                return None
+            title = f"Upstream-PRs ohne Bewertung: {len(todo)}"
+        chosen = choose_backend(cfg, backend_options(cfg, role, set(), 0), log)
+        if chosen is None:
+            return None
+        return {"role": role, "issue": None, "title": title, "kind": role, "backend": chosen[0], "tier": None}
 
     cache: dict[int, list[str]] = {}
 
@@ -314,20 +438,20 @@ def find_work(cfg: dict[str, Any], role: str, verbose: bool = True) -> dict[str,
             cache[n] = gh_comments(n)
         return cache[n]
 
-    for issue, kind in work_items(role, open_issues(), comments_of):
+    issues = open_issues()
+    if only_issue is not None:
+        issues = [i for i in issues if i["number"] == only_issue]
+    for issue, kind in work_items(role, issues, comments_of):
         n = issue["number"]
-        if is_locked(issue_lock_path(n)):
+        if is_locked(work_lock_path(role, n)) or (only_issue is None and reserved(role, n)):
             continue
         rows = ledger(n)
         failures = code_failures(comments_of(n), rows) if role in ("code", "review") else 0
-        backend, tier = backend_for(cfg, role, issue["labels"], failures)
-        problem = backend_problem(cfg, backend)
-        if problem:
-            if verbose:
-                print(f"#{n} übersprungen: {problem}", file=sys.stderr)
+        chosen = choose_backend(cfg, backend_options(cfg, role, issue["labels"], failures), lambda m: log(f"#{n}: {m}"))
+        if chosen is None:
             continue
-        return {"role": role, "issue": n, "title": issue["title"], "kind": kind, "backend": backend,
-                "tier": tier, "failures": failures, "labels": sorted(issue["labels"])}
+        return {"role": role, "issue": n, "title": issue["title"], "kind": kind, "backend": chosen[0],
+                "tier": chosen[1], "failures": failures, "labels": sorted(issue["labels"])}
     return None
 
 
@@ -344,13 +468,13 @@ def limit_violation(cfg: dict[str, Any], item: dict[str, Any], rows: list[dict[s
 
 # ---------------------------------------------------------------- agent launch
 
-def build_prompt(cfg: dict[str, Any], item: dict[str, Any], rows: list[dict[str, Any]], worktree: Path, branch: str) -> str:
+def build_prompt(cfg: dict[str, Any], item: dict[str, Any], rows: list[dict[str, Any]], worktree: Path, branch: str,
+                 brief: str = "") -> str:
     b = cfg["backends"][item["backend"]]
     lim = cfg["limits"]
     lines = ["# Auftrag", "", f"Rolle: **{item['role']}**"]
     if item["issue"]:
-        lines += [f"Issue: #{item['issue']} „{item['title']}“ ({KIND_DE[item['role'] + '/' + item['kind']]})",
-                  f"Issue vollständig lesen: `gh issue view {item['issue']} --repo {REPO} --comments`"]
+        lines.append(f"Issue: #{item['issue']} „{item['title']}“ ({KIND_DE[item['role'] + '/' + item['kind']]})")
     else:
         lines.append(f"Aufgabe: {item['title']}")
     tier_note = ""
@@ -362,30 +486,40 @@ def build_prompt(cfg: dict[str, Any], item: dict[str, Any], rows: list[dict[str,
     if item["issue"]:
         lines.append(f"Zähler: Review-Runden mit Änderungswünschen {count(rows, 'review', 'changes-requested')}/"
                      f"{lim['max_review_rounds']}, Plan-Fassungen {count(rows, 'plan', 'planned')}/"
-                     f"{1 + lim['max_plan_revisions']}, Gate-Fehlschläge siehe Issue (max. 3)")
+                     f"{1 + lim['max_plan_revisions']}, Gate-Fehlschläge siehe Übergabe (max. 3)")
+    if item["role"] in ASK_ROLES:
+        lines.append(f"Rückfragen an den Planer: `python3 {PRIMARY}/scripts/orca_agent.py ask \"<frage>\"` "
+                     f"(höchstens {lim['max_questions']} pro Lauf, siehe Rollen-Prompt)")
     lines += [f"Jeden Kommentar beenden mit: `— Agent {item['role']} · {b['model']}`", "",
               "Lies zuerst `AGENTS.md` und `docs/ORCA_AGENT_WORKFLOW.md`.", "", "---", ""]
-    return "\n".join(lines) + (PROMPTS / f"{item['role']}.md").read_text(encoding="utf-8")
+    text = "\n".join(lines) + (PROMPTS / f"{item['role']}.md").read_text(encoding="utf-8")
+    return text + ("\n\n---\n\n" + brief if brief else "")
 
 
-def agent_command(b: dict[str, Any], prompt: str) -> list[str]:
+def agent_command(b: dict[str, Any], prompt: str, read_only: bool = False) -> list[str]:
     if b["cli"] == "claude":
-        return ["claude", "-p", prompt, "--model", b["model"], "--dangerously-skip-permissions",
-                "--output-format", "stream-json", "--verbose"]
+        cmd = ["claude", "-p", prompt, "--model", b["model"], "--dangerously-skip-permissions",
+               "--output-format", "stream-json", "--verbose"]
+        return cmd + (["--disallowedTools", "Edit", "Write", "NotebookEdit"] if read_only else [])
     if b["cli"] == "agy":
         return ["agy", "-p", prompt, "--model", b["model"], "--dangerously-skip-permissions"]
     raise ValueError(f"unbekannte CLI {b['cli']}")
 
 
-def agent_env(b: dict[str, Any]) -> dict[str, str]:
+def agent_env(b: dict[str, Any], extra: dict[str, str] | None = None) -> dict[str, str]:
     env = dict(os.environ)
     # An inherited endpoint or token must never reroute an "Opus" run to another provider.
     for k in ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL",
               "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL"):
         env.pop(k, None)
+    if b["cli"] == "claude":
+        # `orca_agent.py ask` blocks up to a few minutes; the default shell timeout is 2 min.
+        env.setdefault("BASH_DEFAULT_TIMEOUT_MS", "300000")
+        env.setdefault("BASH_MAX_TIMEOUT_MS", "600000")
     env.update(b.get("env", {}))
     if b.get("key_file"):
         env[b["key_env"]] = Path(b["key_file"]).expanduser().read_text(encoding="utf-8").strip()
+    env.update(extra or {})
     return env
 
 
@@ -422,16 +556,33 @@ def show_stream_line(line: str) -> None:
         print(f"\n[Ergebnis: {'Fehler' if ev.get('is_error') else 'ok'}] {str(ev.get('result', ''))[:2000]}")
 
 
-def launch(b: dict[str, Any], prompt: str, timeout_min: int, log_path: Path) -> tuple[int, bool]:
-    proc = subprocess.Popen(agent_command(b, prompt), env=agent_env(b), stdout=subprocess.PIPE,
+def final_text(cli: str, lines: list[str]) -> str:
+    if cli == "claude":
+        for line in reversed(lines):
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if ev.get("type") == "result":
+                return str(ev.get("result", ""))
+        return ""
+    return "".join(lines)[-8000:]
+
+
+def launch(b: dict[str, Any], prompt: str, timeout_min: float, log_path: Path,
+           extra_env: dict[str, str] | None = None, read_only: bool = False) -> tuple[int, bool, str]:
+    """One fresh agent session; returns (exit code, hit a usage limit, final text)."""
+    proc = subprocess.Popen(agent_command(b, prompt, read_only), env=agent_env(b, extra_env), stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, text=True, start_new_session=True)
     timer = threading.Timer(timeout_min * 60, lambda: os.killpg(proc.pid, signal.SIGTERM))
     timer.start()
     limited = False
+    lines: list[str] = []
     try:
         with open(log_path, "w", encoding="utf-8") as log:
             for line in proc.stdout:
                 log.write(line)
+                lines.append(line)
                 limited |= is_limit_message(b["cli"], line)
                 if b["cli"] == "claude":
                     show_stream_line(line)
@@ -440,50 +591,46 @@ def launch(b: dict[str, Any], prompt: str, timeout_min: int, log_path: Path) -> 
         rc = proc.wait()
     finally:
         timer.cancel()
-    return rc, limited and rc != 0
+    return rc, limited and rc != 0, final_text(b["cli"], lines)
 
 
-def git_out(*args: str) -> str:
-    return subprocess.run(["git", *args], capture_output=True, text=True, check=True).stdout.strip()
+def set_cooldown(cfg: dict[str, Any], backend: str) -> None:
+    (state_dir() / f"cooldown-{backend}").write_text(str(time.time() + cfg["limits"]["cooldown_min"] * 60))
 
 
-# ---------------------------------------------------------------- commands
-
-def cmd_check(cfg: dict[str, Any], role: str) -> int:
-    if free_slots(cfg["limits"]["max_parallel"]) == 0:
-        print("alle Agent-Slots belegt", file=sys.stderr)
-        return 1
-    item = find_work(cfg, role)
-    if item is None:
-        return 1
-    print(f"#{item['issue']} {item['title']}" if item["issue"] else item["title"])
-    return 0
+def log_file(name: str) -> Path:
+    logs = state_dir() / "logs"
+    logs.mkdir(exist_ok=True)
+    return logs / f"{time.strftime('%Y%m%d_%H%M%S')}_{name}.log"
 
 
-def cmd_run(cfg: dict[str, Any], role: str) -> int:
-    worktree = Path(git_out("rev-parse", "--show-toplevel")).resolve()
+# ---------------------------------------------------------------- run: one agent session in a worktree
+
+def cmd_run(cfg: dict[str, Any], role: str, only_issue: int | None) -> int:
+    worktree = Path(git("rev-parse", "--show-toplevel")).resolve()
     if worktree == PRIMARY.resolve():
-        print(f"Agents laufen nicht im Primary-Checkout {PRIMARY}; Orca-Worktree oder scripts/create_worktree.sh", file=sys.stderr)
+        print(f"Agents laufen nicht im Primary-Checkout {PRIMARY}; `orca_agent.py tick` legt Worktrees an", file=sys.stderr)
         return 2
     slot = acquire_slot(cfg["limits"]["max_parallel"])
     if slot is None:
         print("alle Agent-Slots belegt; nichts gestartet")
         return 0
+    reservation_path(role, only_issue).unlink(missing_ok=True)
     item = None
-    issue_fd = None
-    for _ in range(3):  # another run may take the issue between find_work and the lock
-        item = find_work(cfg, role)
-        if item is None or item["issue"] is None:
+    for _ in range(3):  # another run may take the work between find_work and the lock
+        item = find_work(cfg, role, only_issue=only_issue)
+        if item is None:
             break
-        issue_fd = try_lock(issue_lock_path(item["issue"]))
-        if issue_fd is not None:
+        work_fd = try_lock(work_lock_path(role, item["issue"]))
+        if work_fd is not None:
             break
         item = None
     if item is None:
-        print("keine Arbeit für", role)
+        print("keine Arbeit für", role, f"#{only_issue}" if only_issue else "")
         return 0
     n = item["issue"]
     rows = ledger(n) if n else []
+    brief = ""
     if n:
         reason = limit_violation(cfg, item, rows)
         if reason:
@@ -491,24 +638,34 @@ def cmd_run(cfg: dict[str, Any], role: str) -> int:
             record({"time": time.time(), "role": role, "issue": n, "kind": item["kind"], "outcome": "limit", "reason": reason})
             print(f"#{n} gesperrt: {reason}")
             return 0
-        before = set(item["labels"])
+        view = issue_view(n)
+        before = view["labels"]
+        brief = build_brief(role, item["kind"], view)
     elif role in ("research", "audit"):
         (state_dir() / f"last-{role}").touch()
 
+    if role in BUILD_ROLES:
+        print("Worktree-Build (scripts/orca_setup.sh) …", flush=True)
+        setup = subprocess.run(["bash", str(worktree / "scripts" / "orca_setup.sh")], cwd=str(worktree), check=False)
+        if setup.returncode != 0:
+            print(f"Worktree-Build fehlgeschlagen (exit {setup.returncode}); kein Agent gestartet", file=sys.stderr)
+            record({"time": time.time(), "role": role, "issue": n, "kind": item["kind"], "outcome": "setup-failed"})
+            return 1
+
     b = cfg["backends"][item["backend"]]
-    logs = state_dir() / "logs"
-    logs.mkdir(exist_ok=True)
-    log_path = logs / f"{time.strftime('%Y%m%d_%H%M%S')}_{role}_{n or item['kind']}.log"
+    log_path = log_file(f"{role}_{n or item['kind']}")
+    run_id = log_path.stem
     print(f"Rolle {role} · {item['title']} · {item['backend']} ({b['model']}) · Log {log_path}", flush=True)
     t0 = time.time()
-    rc, limited = launch(b, build_prompt(cfg, item, rows, worktree, git_out("branch", "--show-current")),
-                         cfg["roles"][role]["timeout_min"], log_path)
+    rc, limited, _ = launch(b, build_prompt(cfg, item, rows, worktree, git("branch", "--show-current"), brief),
+                            cfg["roles"][role]["timeout_min"], log_path,
+                            {"RADIANCE_AGENT_ROLE": role, "RADIANCE_AGENT_ISSUE": str(n or ""), "RADIANCE_AGENT_RUN": run_id})
     row = {"time": t0, "seconds": round(time.time() - t0), "role": role, "issue": n, "kind": item["kind"],
-           "backend": item["backend"], "model": b["model"], "tier": item.get("tier"), "rc": rc, "log": str(log_path)}
+           "backend": item["backend"], "model": b["model"], "tier": item.get("tier"), "rc": rc, "log": str(log_path),
+           "run": run_id, "worktree": str(worktree)}
     if limited:
-        until = time.time() + cfg["limits"]["cooldown_min"] * 60
-        (state_dir() / f"cooldown-{item['backend']}").write_text(str(until))
-        if not n:
+        set_cooldown(cfg, item["backend"])
+        if role in ("research", "audit"):
             (state_dir() / f"last-{role}").unlink(missing_ok=True)
         record({**row, "rate_limited": True, "outcome": None})
         print(f"Nutzungslimit bei {item['backend']}: Pause {cfg['limits']['cooldown_min']} min, Lauf zählt nicht")
@@ -522,14 +679,225 @@ def cmd_run(cfg: dict[str, Any], role: str) -> int:
     record({**row, "outcome": result})
     if result is None:
         left = cfg["limits"]["max_no_handoff"] - count(ledger(n), role, None)
-        gh("issue", "comment", str(n), "--repo", REPO, "--body",
-           f"Agent-Lauf ({role}, {b['model']}, {'Zeitlimit' if rc == -signal.SIGTERM else f'exit {rc}'}) "
-           f"endete ohne gültige Label-Übergabe. "
-           f"Log auf dem Server: `{log_path}`. Weitere Versuche dieser Rolle: {max(left, 0)}.\n\n— orca_agent.py")
+        how = "Zeitlimit" if rc == -signal.SIGTERM else f"exit {rc}"
+        comment(n, f"Agent-Lauf ({role}, {b['model']}, {how}) endete ohne gültige Label-Übergabe. "
+                   f"Log auf dem Server: `{log_path}`. Weitere Versuche dieser Rolle: {max(left, 0)}.\n\n— orca_agent.py")
         if left <= 0:
             block_issue(n, f"{cfg['limits']['max_no_handoff']} Läufe der Rolle {role} ohne gültige Übergabe")
         return 1
     print(f"#{n}: {result}")
+    return 0
+
+
+# ---------------------------------------------------------------- ask: blocking question to the planner
+
+def question_path(qid: str) -> Path:
+    qdir = state_dir() / "questions"
+    qdir.mkdir(exist_ok=True)
+    return qdir / f"{qid}.json"
+
+
+def write_json(path: Path, data: dict[str, Any]) -> None:
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+    tmp.replace(path)
+
+
+def wait_answer(qid: str, wait_s: float) -> int:
+    path = question_path(qid)
+    deadline = time.time() + wait_s
+    while True:
+        q = json.loads(path.read_text(encoding="utf-8"))
+        if q["status"] in ("answered", "failed"):
+            print(q["answer"])
+            return 0
+        if time.time() >= deadline:
+            print(f"Antwort steht noch aus. Weiter warten mit: python3 {PRIMARY}/scripts/orca_agent.py answer {qid}")
+            return 3
+        time.sleep(5)
+
+
+def cmd_ask(cfg: dict[str, Any], question: str, wait_s: float) -> int:
+    role = os.environ.get("RADIANCE_AGENT_ROLE", "")
+    issue = os.environ.get("RADIANCE_AGENT_ISSUE", "")
+    run_id = os.environ.get("RADIANCE_AGENT_RUN", "")
+    if role not in ASK_ROLES or not issue:
+        print("ask ist nur aus einem code- oder review-Lauf heraus möglich", file=sys.stderr)
+        return 2
+    asked = [p for p in (state_dir() / "questions").glob("*.json")
+             if json.loads(p.read_text(encoding="utf-8")).get("run") == run_id] if (state_dir() / "questions").is_dir() else []
+    if len(asked) >= cfg["limits"]["max_questions"]:
+        print(f"Fragelimit ({cfg['limits']['max_questions']} pro Lauf) erreicht. Nach Plan entscheiden oder "
+              "bei echtem Widerspruch plan:needs-revision setzen.")
+        return 1
+    qid = f"{issue}-{time.strftime('%Y%m%d%H%M%S')}"
+    write_json(question_path(qid), {"id": qid, "issue": int(issue), "role": role, "run": run_id, "question": question,
+                                    "cwd": os.getcwd(), "status": "open", "asked": time.time()})
+    with open(log_file(f"answer_{qid}"), "w", encoding="utf-8") as out:
+        subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "_answer", qid], cwd=os.getcwd(),
+                         stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
+    print(f"Frage {qid} an den Planer gestellt; warte bis {int(wait_s)} s …", flush=True)
+    return wait_answer(qid, wait_s)
+
+
+def cmd_answer_worker(cfg: dict[str, Any], qid: str) -> int:
+    path = question_path(qid)
+    q = json.loads(path.read_text(encoding="utf-8"))
+    backend = cfg["roles"]["answer"]["backend"]
+    problem = backend_problem(cfg, backend)
+    if problem:
+        q.update(status="failed", answer=f"Planer nicht erreichbar ({problem}). Nach Plan entscheiden; bei echtem "
+                                          "Widerspruch zum Code plan:needs-revision setzen.")
+        write_json(path, q)
+        return 1
+    b = cfg["backends"][backend]
+    view = issue_view(q["issue"])
+    qa = [c for c in since_latest_plan(view["comments"]) if QA_MARKER in c]
+    context = [f"# Rückfrage zu Issue #{q['issue']} „{view['title']}“", "",
+               f"Gestellt vom Agent `{q['role']}` im Worktree `{q['cwd']}` (dein Arbeitsverzeichnis).", "",
+               "## Frage", "", q["question"], "", "## Plan", "", latest(view["comments"], PLAN_MARKER) or "(kein Plan)"]
+    if qa:
+        context += ["", "## Frühere Rückfragen zu diesem Plan", "", "\n\n---\n\n".join(qa)]
+    prompt = (PROMPTS / "answer.md").read_text(encoding="utf-8") + "\n\n---\n\n" + "\n".join(context)
+    log_path = log_file(f"answer-session_{qid}")
+    t0 = time.time()
+    rc, limited, text = launch(b, prompt, cfg["roles"]["answer"]["timeout_min"], log_path, read_only=True)
+    record({"time": t0, "seconds": round(time.time() - t0), "role": "answer", "issue": q["issue"], "backend": backend,
+            "model": b["model"], "rc": rc, "log": str(log_path), "outcome": "answered" if rc == 0 and text else None,
+            "rate_limited": limited})
+    if limited:
+        set_cooldown(cfg, backend)
+    if rc != 0 or not text.strip():
+        q.update(status="failed", answer=f"Keine Antwort vom Planer (exit {rc}). Nach Plan entscheiden; bei echtem "
+                                          "Widerspruch plan:needs-revision setzen.")
+        write_json(path, q)
+        return 1
+    q.update(status="answered", answer=text.strip(), answered=time.time())
+    write_json(path, q)
+    comment(q["issue"], f"{QA_MARKER}\n**Rückfrage ({q['role']}):** {q['question']}\n\n"
+                        f"**Antwort (Planer · {b['model']}):**\n\n{text.strip()}\n\n— orca_agent.py")
+    return 0
+
+
+# ---------------------------------------------------------------- tick: start agents, clean up worktrees
+
+def orca(cfg: dict[str, Any], *args: str) -> str:
+    proc = subprocess.run([cfg["orca"]["cli"], *args, "--json"], capture_output=True, text=True, check=False, timeout=120)
+    if proc.returncode != 0:
+        raise RuntimeError(f"{cfg['orca']['cli']} {' '.join(args[:2])} failed: {(proc.stderr or proc.stdout).strip()}")
+    return proc.stdout
+
+
+def worktree_records() -> dict[str, Any]:
+    path = state_dir() / "worktrees.json"
+    return json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+
+
+def start_agent(cfg: dict[str, Any], item: dict[str, Any]) -> Path:
+    role, n = item["role"], item["issue"]
+    name = f"agent-{role}-{n or 'x'}-{time.strftime('%m%d-%H%M%S')}"
+    wt = PRIMARY / "worktrees" / name
+    git("-C", str(PRIMARY), "worktree", "add", "-b", f"agent/{name}", str(wt), "origin/main")
+    cmd = f"python3 {PRIMARY / 'scripts' / 'orca_agent.py'} run {role}" + (f" --issue {n}" if n else "")
+    try:
+        if cfg["orca"]["launcher"] == "orca":
+            title = f"{role} #{n}" if n else role
+            orca(cfg, "terminal", "create", "--worktree", f"path:{wt}", "--title", title, "--command", cmd)
+        else:
+            with open(log_file(f"detached_{name}"), "w", encoding="utf-8") as out:
+                subprocess.Popen(cmd.split(), cwd=str(wt), stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
+    except (RuntimeError, OSError):
+        remove_worktree(cfg, wt, name)
+        raise
+    reservation_path(role, n).touch()
+    recs = worktree_records()
+    recs[name] = {"path": str(wt), "branch": f"agent/{name}", "created": time.time(), "role": role, "issue": n}
+    write_json(state_dir() / "worktrees.json", recs)
+    return wt
+
+
+def remove_worktree(cfg: dict[str, Any], wt: Path, name: str) -> None:
+    if cfg["orca"]["launcher"] == "orca":
+        try:
+            orca(cfg, "worktree", "rm", "--worktree", f"path:{wt}", "--force")
+        except RuntimeError as e:
+            print(f"orca worktree rm {name}: {e}; entferne mit git", file=sys.stderr)
+    if wt.exists():
+        git("-C", str(PRIMARY), "worktree", "remove", "--force", str(wt))
+    git("-C", str(PRIMARY), "worktree", "prune")
+    if subprocess.run(["git", "-C", str(PRIMARY), "show-ref", "--verify", "--quiet", f"refs/heads/agent/{name}"]).returncode == 0:
+        git("-C", str(PRIMARY), "branch", "-D", f"agent/{name}")
+
+
+def cleanup_worktrees(cfg: dict[str, Any]) -> None:
+    """Removes agent worktrees older than keep_hours whose run is over and that hold no unpushed work."""
+    recs = worktree_records()
+    keep = cfg["orca"]["keep_worktree_hours"] * 3600
+    for name, rec in list(recs.items()):
+        wt = Path(rec["path"])
+        if time.time() - rec["created"] < keep or is_locked(work_lock_path(rec["role"], rec.get("issue"))):
+            continue
+        if wt.exists():
+            dirty = git("status", "--porcelain", cwd=wt)
+            unpushed = git("log", "--oneline", "HEAD", "--not", "--remotes", cwd=wt)
+            if dirty or unpushed:
+                if not rec.get("kept"):
+                    print(f"{name}: ungesicherte Änderungen, bleibt liegen ({wt})", file=sys.stderr)
+                    rec["kept"] = True
+                continue
+        remove_worktree(cfg, wt, name)
+        del recs[name]
+    write_json(state_dir() / "worktrees.json", recs)
+
+
+def cmd_tick(cfg: dict[str, Any]) -> int:
+    tick_fd = try_lock(state_dir() / "tick.lock")
+    if tick_fd is None:
+        print("anderer tick läuft")
+        return 0
+    try:
+        return tick(cfg)
+    finally:
+        os.close(tick_fd)
+
+
+def tick(cfg: dict[str, Any]) -> int:
+    if cfg["orca"]["launcher"] == "orca":
+        orca(cfg, "status")
+    cleanup_worktrees(cfg)
+    free = free_slots(cfg["limits"]["max_parallel"]) - active_reservations()
+    if free <= 0:
+        return 0
+    git("-C", str(PRIMARY), "fetch", "--quiet", "origin", "main")
+    failed = []
+    for role in TICK_ORDER:
+        try:
+            while free > 0:
+                item = find_work(cfg, role)
+                if item is None:
+                    break
+                wt = start_agent(cfg, item)
+                print(f"gestartet: {role} {('#' + str(item['issue'])) if item['issue'] else ''} · {item['backend']} · {wt}")
+                free -= 1
+                if item["issue"] is None:
+                    break
+        except (RuntimeError, OSError, ValueError, KeyError, subprocess.SubprocessError) as e:
+            # One broken role (e.g. missing upstream state) must not stop the others; the exit code still fails.
+            print(f"[{role}] fehlgeschlagen: {e}", file=sys.stderr)
+            failed.append(role)
+    return 2 if failed else 0
+
+
+# ---------------------------------------------------------------- small commands
+
+def cmd_check(cfg: dict[str, Any], role: str) -> int:
+    if free_slots(cfg["limits"]["max_parallel"]) - active_reservations() <= 0:
+        print("alle Agent-Slots belegt", file=sys.stderr)
+        return 1
+    item = find_work(cfg, role)
+    if item is None:
+        return 1
+    print(f"#{item['issue']} {item['title']} · {item['backend']}" if item["issue"] else f"{item['title']} · {item['backend']}")
     return 0
 
 
@@ -547,28 +915,55 @@ def cmd_labels() -> int:
 
 def cmd_status(cfg: dict[str, Any]) -> int:
     lim = cfg["limits"]
-    print(f"Slots frei: {free_slots(lim['max_parallel'])}/{lim['max_parallel']}  (State: {STATE})")
+    print(f"Slots frei: {free_slots(lim['max_parallel'])}/{lim['max_parallel']}, reserviert: {active_reservations()}"
+          f"  (State: {STATE})")
     for name in cfg["backends"]:
         print(f"  {name:13s} {backend_problem(cfg, name) or 'bereit'}")
     for r in ledger()[-15:]:
         when = time.strftime("%m-%d %H:%M", time.localtime(r["time"]))
         print(f"  {when} {r['role']:8s} #{r.get('issue') or '-':<5} {r.get('model', ''):14s} {r.get('outcome')}")
+    qdir = state_dir() / "questions"
+    for p in sorted(qdir.glob("*.json")) if qdir.is_dir() else []:
+        q = json.loads(p.read_text(encoding="utf-8"))
+        if q["status"] == "open":
+            print(f"  offene Frage {q['id']} ({q['role']}): {q['question'][:80]}")
     return 0
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("command", choices=["check", "run", "labels", "status"])
-    ap.add_argument("role", nargs="?", choices=ROLES)
+    sub = ap.add_subparsers(dest="command", required=True)
+    sub.add_parser("tick")
+    p = sub.add_parser("run")
+    p.add_argument("role", choices=ROLES)
+    p.add_argument("--issue", type=int)
+    p = sub.add_parser("check")
+    p.add_argument("role", choices=ROLES)
+    p = sub.add_parser("ask")
+    p.add_argument("question")
+    p.add_argument("--wait", type=float, default=240)
+    p = sub.add_parser("answer")
+    p.add_argument("id")
+    p.add_argument("--wait", type=float, default=240)
+    p = sub.add_parser("_answer")
+    p.add_argument("id")
+    sub.add_parser("labels")
+    sub.add_parser("status")
     args = ap.parse_args()
-    if args.command in ("check", "run") and not args.role:
-        ap.error("check und run brauchen eine Rolle")
     try:
         cfg = load_config()
+        if args.command == "tick":
+            return cmd_tick(cfg)
+        if args.command == "run":
+            return cmd_run(cfg, args.role, args.issue)
         if args.command == "check":
             return cmd_check(cfg, args.role)
-        if args.command == "run":
-            return cmd_run(cfg, args.role)
+        if args.command == "ask":
+            return cmd_ask(cfg, args.question, args.wait)
+        if args.command == "answer":
+            return wait_answer(args.id, args.wait)
+        if args.command == "_answer":
+            return cmd_answer_worker(cfg, args.id)
         if args.command == "labels":
             return cmd_labels()
         return cmd_status(cfg)

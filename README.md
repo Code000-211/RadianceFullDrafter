@@ -15,7 +15,7 @@ Agent audit (Coverage-Karte des Codes) ──┼─► Issue research:new-lever
 Leon ────────────────────────────────────┘          │
                                            Agent plan (Opus): verwerfen oder Plan + tier:*
                                                     │ plan:ready
-                                           Agent code (Modell nach tier) ◄──┐ changes-requested
+                                           Agent code (Gemini/GLM, tier) ◄──┐ changes-requested
                                                     │ needs-code-review     │
                                            Agent review (eine Stufe höher) ─┘
                                                     │ status:ready-to-test
@@ -26,7 +26,8 @@ Leon ─────────────────────────
                                               └─► FAIL: status:needs-review ──► Agent code (Gate-Fix)
 ```
 
-Die Agents sind Orca-Automationen; `scripts/orca_agent.py` wählt Arbeit, Modell und Slot.
+Ein systemd-Timer (`scripts/orca_agent.py tick`) wählt Arbeit, Modell und Slot und startet jeden Agent
+in einem eigenen Worktree in Orca; Opus plant, Gemini und GLM setzen um.
 
 ## Dokumente
 
@@ -59,5 +60,6 @@ bash scripts/measure_hardware.sh                   # Bandbreiten neu messen
 |---|---|
 | `radiance-upstream-watcher` | Codeberg-PRs abfragen, `REVIEW.md` pflegen |
 | `radiance-lever-queue` | GitHub-Issues `status:ready-to-test` bauen, gaten, Ergebnis zurückmelden |
+| `radiance-agent-tick` (Timer, alle 3 min) | Agents starten: Arbeit, Modell und Slot wählen, Worktree + Orca-Terminal |
 
-Unit-Dateien: `scripts/systemd/`. Orca-Automationen: siehe `docs/ORCA_AGENT_WORKFLOW.md`.
+Unit-Dateien: `scripts/systemd/` (Queue, Upstream-Watcher, Agent-Tick). Agents: siehe `docs/ORCA_AGENT_WORKFLOW.md`.

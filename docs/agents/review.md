@@ -6,8 +6,8 @@ GPUs für alle; ein Fehler, den du hier findest, ist billiger.
 
 ## 1. Lesen
 
-- Issue mit allen Kommentaren: neuester Plan (`<!-- radiance-plan -->`), Übergabe-Kommentar des
-  Code-Agents, frühere Review-Runden, Gate-Berichte.
+- Übergabe-Block am Ende dieses Prompts: Plan, Übergabe des Code-Agents, vorige Review-Runde,
+  Antworten des Planers. Das ganze Issue nur lesen, wenn dort etwas fehlt.
 - Branch aus dem letzten `ref:`-Block:
   ```bash
   git fetch origin <ref> && git reset --hard origin/<ref>
@@ -50,8 +50,10 @@ Build oder Test rot, Regelverstoß) oder **Hinweis**. Nur blockierende Befunde r
 
 ## 3. Entscheiden
 
-Kommentar „Review Runde <n>: Freigabe“ oder „Review Runde <n>: Änderungen nötig“, mit Befunden
-als Liste (`datei:zeile`, was, warum, was stattdessen) und den Ergebniszeilen deiner Prüfungen.
+Kommentar, beginnend mit `<!-- radiance-review -->`, dann „Review Runde <n>: Freigabe“ oder
+„Review Runde <n>: Änderungen nötig“, mit Befunden als Liste (`datei:zeile`, was, warum, was
+stattdessen) und den Ergebniszeilen deiner Prüfungen. Der Code-Agent sieht in der nächsten Runde
+nur diesen Kommentar und den Plan; jeder Befund muss für sich verständlich sein.
 
 | Ergebnis | Labels |
 |---|---|
@@ -59,6 +61,10 @@ als Liste (`datei:zeile`, was, warum, was stattdessen) und den Ergebniszeilen de
 | Änderungen | `gh issue edit <nr> --add-label changes-requested --remove-label needs-code-review` |
 | Plan selbst falsch | `gh issue edit <nr> --add-label plan:needs-revision --remove-label needs-code-review` |
 | aussichtslos | `gh issue edit <nr> --add-label status:blocked` (mit Begründung) |
+
+Ist unklar, ob eine Abweichung vom Plan gewollt ist, frag den Planer, statt zu raten:
+`python3 /home/orca/RadianceMine/scripts/orca_agent.py ask "<frage>"` (Regeln wie in
+`docs/agents/code.md`, Abschnitt „Rückfragen“).
 
 Rundenlimit: Steht der Zähler „Review-Runden mit Änderungswünschen“ in der Kopfzeile schon auf dem
 Maximum, gibt es keine weitere Änderungsrunde. Dann Freigabe, wenn nichts Blockierendes bleibt,

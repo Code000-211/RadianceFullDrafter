@@ -1,5 +1,5 @@
 {
-  "_doc": "Modell- und Grenzen-Konfiguration für scripts/orca_agent.py. Siehe docs/ORCA_AGENT_WORKFLOW.md.",
+  "_doc": "Modelle, Stufen, Grenzen und Launcher für scripts/orca_agent.py. Siehe docs/ORCA_AGENT_WORKFLOW.md. Nur Leon ändert die Zuordnung.",
   "backends": {
     "opus": {
       "cli": "claude",
@@ -25,29 +25,38 @@
     "gemini-pro": {
       "cli": "agy",
       "model": null,
-      "_todo": "Exakten Namen aus `agy models` eintragen. alphaXiv ist in Antigravity angemeldet."
+      "_todo": "Exakten Namen aus `agy models` eintragen; ohne Pro-Zugang hier denselben Namen wie gemini-flash. alphaXiv ist in Antigravity angemeldet."
     }
   },
   "tiers": {
     "light": "gemini-flash",
-    "medium": "glm",
-    "heavy": "opus"
+    "medium": "gemini-pro",
+    "heavy": "glm",
+    "fallback": "opus"
   },
   "roles": {
     "plan":     {"backend": "opus",       "timeout_min": 60},
-    "code":     {"tiered": true,          "timeout_min": 120},
-    "review":   {"tiered": true, "tier_offset": 1, "timeout_min": 60},
+    "answer":   {"backend": "opus",       "timeout_min": 8},
+    "code":     {"tiered": true, "max_tier": "fallback", "timeout_min": 120},
+    "review":   {"tiered": true, "tier_offset": 1, "max_tier": "heavy", "timeout_min": 60},
     "research": {"backend": "gemini-pro", "timeout_min": 60},
-    "audit":    {"backend": "opus",       "timeout_min": 90},
-    "upstream": {"backend": "glm",        "timeout_min": 45}
+    "audit":    {"backend": "glm",        "timeout_min": 90},
+    "upstream": {"backend": "gemini-pro", "timeout_min": 45}
   },
   "limits": {
     "max_parallel": 5,
     "max_review_rounds": 2,
     "max_plan_revisions": 2,
     "max_no_handoff": 2,
+    "max_questions": 3,
     "max_open_ideas": 8,
     "interval_hours": {"research": 24, "audit": 12},
-    "cooldown_min": 60
+    "cooldown_min": 60,
+    "availability_fallback": false
+  },
+  "orca": {
+    "cli": "orca-ide",
+    "launcher": "orca",
+    "keep_worktree_hours": 12
   }
 }

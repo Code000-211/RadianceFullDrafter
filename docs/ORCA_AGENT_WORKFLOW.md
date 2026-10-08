@@ -1,15 +1,16 @@
 # Orca-Agent-Workflow für RadianceMine
 
-Diese Datei ist die Arbeitsanweisung für Agents, die von Orca-Automationen gestartet werden.
-Sie gilt zusammen mit `AGENTS.md`. Die Rollen-Prompts stehen in `docs/agents/<rolle>.md`;
-`scripts/orca_agent.py` wählt Arbeit, Modell und Slot und prüft die Übergabe.
+Diese Datei ist die Arbeitsanweisung für die Agents von RadianceMine. Sie gilt zusammen mit
+`AGENTS.md`. Die Rollen-Prompts stehen in `docs/agents/<rolle>.md`; `scripts/orca_agent.py`
+wählt Arbeit, Modell und Slot, startet jeden Agent in einem eigenen Worktree in Orca und prüft
+die Übergabe.
 
 ## Wer entscheidet was
 
 | Aufgabe | Wer | Wie |
 |---|---|---|
 | Ideen finden | Agents `research` (extern) und `audit` (eigener Code) | Issue mit `research:new-lever` |
-| Idee annehmen oder verwerfen, Implementierungsplan, Stufe | Agent `plan` (stärkstes Modell) | Plan-Kommentar, `plan:ready` + `tier:*` |
+| Idee annehmen oder verwerfen, Implementierungsplan, Stufe, Rückfragen beantworten | Agent `plan` (Opus, als einzige Rolle) | Plan-Kommentar, `plan:ready` + `tier:*` |
 | Patch schreiben, Gate-Fehlschlag beheben | Agent `code` (Modell nach Stufe) | Branch + `candidate:`/`ref:`-Block, `needs-code-review` |
 | Patch freigeben | Agent `review` (eine Stufe über `code`) | `status:ready-to-test` oder `changes-requested` |
 | Upstream-PR bewerten | Agent `upstream` | `watch_upstream.py --assess` |
@@ -126,62 +127,109 @@ Engine-Block und die A/B-Tabelle (Delta gegen Toleranz). Das vollständige Log l
 `build`, `gate`) und bei welcher Metrik; `isa_diff.json` zeigt Kernel mit mehr VGPRs oder
 neuen Spills.
 
-## Orca-Automationen
+## Start der Agents
 
-Es gibt keinen eigenen Dispatcher-Dienst: Jede Rolle ist eine Orca-Automation mit neuem Worktree
-pro Lauf (Basis `origin/main`, Setup baut `build_hip`). Orca startet den Agent nur, wenn der
-Precheck Arbeit findet; `orca_agent.py` sucht dabei auch die Arbeit aus, wählt das Modell und
-belegt einen der Slots.
+Orca-Automationen nehmen nur einen Prompt und einen Provider; ein Modell pro Lauf oder einen
+eigenen Befehl kennen sie nicht. Deshalb entscheidet ein deterministischer Tick ohne LLM, und Orca
+stellt Worktree und Terminal, in dem der Agent sichtbar läuft:
 
-| Automation | Precheck | Agent-Befehl | Intervall (Vorschlag) |
-|---|---|---|---|
-| Radiance: Plan | `python3 /home/orca/RadianceMine/scripts/orca_agent.py check plan` | `python3 /home/orca/RadianceMine/scripts/orca_agent.py run plan` | 15 min |
-| Radiance: Code | `… check code` | `… run code` | 10 min |
-| Radiance: Review | `… check review` | `… run review` | 10 min |
-| Radiance: Research | `… check research` | `… run research` | 1 h (läuft höchstens alle 24 h) |
-| Radiance: Audit | `… check audit` | `… run audit` | 1 h (läuft höchstens alle 12 h) |
-| Radiance: Upstream | `… check upstream` | `… run upstream` | 1 h |
+```
+systemd-Timer (alle 3 min) ─► orca_agent.py tick
+    ├─ alte Agent-Worktrees ohne ungesicherte Arbeit entfernen (nach 12 h)
+    └─ je Rolle mit Arbeit und freiem Slot:
+         git worktree add worktrees/agent-<rolle>-<issue>-<zeit> (Branch agent/…, Basis origin/main)
+         orca-ide terminal create --worktree path:<wt> --command "orca_agent.py run <rolle> --issue <nr>"
+                └─► run: Slot + Issue sperren, Worktree bauen (code/review/audit),
+                         EINE frische Agent-Session mit dem Modell der Stufe, Übergabe prüfen
+```
 
-Code und Review dürfen mehrfach parallel laufen; dieselbe Automation nimmt nie dasselbe Issue
-zweimal (Sperre pro Issue). Precheck: Exit 0 = Arbeit und freier Slot, 1 = nichts zu tun, 2 =
-Precheck kaputt.
+Reihenfolge im Tick: review, code, plan, upstream, audit, research (laufende Arbeit vor neuer).
+Installation: `scripts/systemd/radiance-agent-tick.{service,timer}`. Ohne Orca-Runtime:
+`"launcher": "detached"` in `scripts/agents/models.json`, dann laufen die Agents als
+Hintergrundprozesse (Log unter `~/.local/state/radiance-agents/logs/`).
 
-Ohne Orca (Test oder Notbetrieb): `bash scripts/create_worktree.sh <name>`, im Worktree
-`python3 /home/orca/RadianceMine/scripts/orca_agent.py run <rolle>`.
+Diagnose: `python3 scripts/orca_agent.py check <rolle>` zeigt, was der Tick jetzt starten würde;
+`python3 scripts/orca_agent.py status` zeigt Slots, gesperrte Backends, letzte Läufe, offene Fragen.
+
+## Kontext: frische Session, nur das Nötige
+
+- Jeder Lauf ist ein neuer CLI-Prozess ohne Resume, also eine neue Session. Nichts wird zwischen
+  Läufen im Modellkontext mitgenommen.
+- Agents lesen nicht das ganze Issue. `run` hängt an den Rollen-Prompt einen Übergabe-Block mit
+  genau dem, was die Rolle braucht:
+
+| Rolle / Arbeit | Übergabe-Block |
+|---|---|
+| plan, neue Idee | Issue-Text |
+| plan, Überarbeitung | Issue-Text, letzter Plan, alles seit dem letzten Plan |
+| code, implementieren | Issue-Text, neuester Plan, Antworten auf Rückfragen |
+| code, Review-Änderungen | dazu letzter Review-Kommentar und letzte eigene Übergabe |
+| code, Gate-Fix | dazu letzter Gate-Bericht und letzte eigene Übergabe |
+| review | Issue-Text, Plan, Übergabe des Code-Agents, vorige Review-Runde, Antworten |
+
+- Dafür beginnen die Kommentare mit Markierungen: `<!-- radiance-plan -->` (Planer),
+  `<!-- radiance-handoff -->` (Code), `<!-- radiance-review -->` (Review),
+  `<!-- radiance-qa -->` (Rückfrage, schreibt `orca_agent.py`), `<!-- radiance-gate-result -->`
+  (Queue). Was ohne Markierung im Issue steht, sieht kein Agent automatisch.
+
+## Rückfragen
+
+Code- und Review-Agents fragen den Planer, statt zu raten:
+
+```bash
+python3 /home/orca/RadianceMine/scripts/orca_agent.py ask "<frage>"
+```
+
+Der Befehl startet eine frische Opus-Session, die nur den Plan, frühere Rückfragen und die Frage
+sieht und den Worktree des Fragenden lesen, aber nicht ändern darf. Die Antwort kommt als Ausgabe
+des Befehls zurück (Wartezeit bis 4 min, danach `orca_agent.py answer <id>`), der fragende Agent
+arbeitet in derselben Session weiter. Frage und Antwort landen im Issue und stehen beim nächsten
+Lauf im Übergabe-Block. Beginnt die Antwort mit `PLAN-FEHLER:`, setzt der Fragende
+`plan:needs-revision`.
+
+Orcas eigene Orchestration (`orca orchestration ask`) schickt Fragen an einen Coordinator, der
+selbst ein Agent sein müsste, und ist experimentell. `ask` erreicht dasselbe ohne dauerhaft
+laufenden Coordinator.
 
 ## Modelle
 
-`scripts/agents/models.json` (nur Leon ändert die Zuordnung):
+`scripts/agents/models.json` (nur Leon ändert die Zuordnung). Opus nur für das Planen; alles
+andere läuft auf Gemini und GLM, Opus springt bei Code erst nach mehreren Fehlschlägen ein:
+
+| Stufe | Backend |
+|---|---|
+| light | Gemini Flash (agy) |
+| medium | Gemini Pro (agy) |
+| heavy | GLM 5.3 (claude über Z.ai) |
+| fallback | Opus |
 
 | Rolle | Modell |
 |---|---|
-| plan | Opus (immer) |
-| code | nach `tier:`: light → Gemini Flash (agy), medium → GLM (claude über Z.ai), heavy → Opus |
-| review | eine Stufe über dem Code-Agent, höchstens heavy |
-| research | Gemini Pro über agy (dort ist alphaXiv angemeldet) |
-| audit | Opus |
-| upstream | GLM |
+| plan, Antworten auf Rückfragen | Opus |
+| code | nach `tier:` des Planers, nach jedem Fehlschlag eine Stufe höher, zuletzt Opus |
+| review | eine Stufe über dem Code-Agent, höchstens GLM |
+| research, upstream | Gemini Pro (alphaXiv ist in Antigravity angemeldet) |
+| audit | GLM |
 
-Nach jedem Fehlschlag eines Issues (Gate-Lauf ohne PASS, Review mit Änderungswünschen, Lauf ohne
-Übergabe) laufen code und review eine Stufe höher. GLM bekommt `ANTHROPIC_BASE_URL` und den
-Schlüssel aus `~/.config/zai/api_key` nur im eigenen Prozess; für Opus-Läufe entfernt
-`orca_agent.py` diese Variablen ausdrücklich. Ein Backend ohne Modellname, CLI oder Schlüssel ist
-gesperrt; der Precheck sagt dann auf stderr, warum nichts startet.
+Fehlschlag eines Issues: Gate-Lauf ohne PASS, Review mit Änderungswünschen, Lauf ohne Übergabe.
+Ist ein Backend gesperrt (kein Modellname, keine CLI, kein Schlüssel, Nutzungslimit), weicht
+die Rolle auf die nächsthöhere Stufe aus, aber nie deswegen auf Opus
+(`"availability_fallback": false`). GLM bekommt `ANTHROPIC_BASE_URL` und den Schlüssel aus
+`~/.config/zai/api_key` nur im eigenen Prozess; für Opus-Läufe entfernt `orca_agent.py` diese
+Variablen ausdrücklich.
 
 ## Grenzen
 
 | Grenze | Wert | Durchgesetzt von |
 |---|---|---|
-| Agents gleichzeitig | 5 | Slots (`flock`) in `~/.local/state/radiance-agents/` |
+| Agents gleichzeitig | 5 (Rückfrage-Sessions zählen nicht) | Slots (`flock`) in `~/.local/state/radiance-agents/` |
 | Review-Runden mit Änderungswünschen | 2, danach Freigabe oder `status:blocked` | review-Prompt, `orca_agent.py` |
 | Plan-Überarbeitungen | 2 | `orca_agent.py` |
 | Läufe einer Rolle ohne gültige Übergabe | 2 | `orca_agent.py` |
+| Rückfragen pro Lauf | 3 | `orca_agent.py ask` |
 | Gate-Läufe ohne PASS | 3 | `gh_bridge.py` |
 | offene, unerledigte Ideen | 8; darüber legen research und audit nichts an | `orca_agent.py` |
-| Laufzeit pro Agent | je Rolle 45–120 min | `orca_agent.py` (beendet die Prozessgruppe) |
+| Laufzeit pro Agent | je Rolle 45–120 min, Antwort 8 min | `orca_agent.py` (beendet die Prozessgruppe) |
 | Nutzungslimit eines Anbieters | 60 min Pause für dieses Backend, Lauf zählt nicht | `orca_agent.py` |
-
-Zustand ansehen: `python3 scripts/orca_agent.py status` (freie Slots, gesperrte Backends, letzte
-Läufe). Logs je Lauf: `~/.local/state/radiance-agents/logs/`.
 
 Kommentare in Issues schreiben die Agents auf Deutsch.

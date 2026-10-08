@@ -74,25 +74,69 @@ class TestSelection(unittest.TestCase):
 
 
 class TestTiers(unittest.TestCase):
-    def test_default_escalation_and_cap(self) -> None:
+    def test_default_escalation_and_caps(self) -> None:
         self.assertEqual(oa.pick_tier(set(), 0)[0], "medium")
         self.assertEqual(oa.pick_tier({"tier:light"}, 0)[0], "light")
         self.assertEqual(oa.pick_tier({"tier:light"}, 1)[0], "medium")
         self.assertEqual(oa.pick_tier({"tier:light"}, 0, offset=1)[0], "medium")
-        self.assertEqual(oa.pick_tier({"tier:medium"}, 5)[0], "heavy")
+        self.assertEqual(oa.pick_tier({"tier:heavy"}, 1)[0], "fallback")
+        self.assertEqual(oa.pick_tier({"tier:medium"}, 5, max_tier="heavy")[0], "heavy")
         self.assertEqual(oa.pick_tier({"tier:light", "tier:heavy"}, 0)[0], "heavy")
+        self.assertEqual(oa.pick_tier({"tier:fallback"}, 0)[0], "medium")  # planner cannot pick Opus
 
     def test_failures_count_gate_reviews_and_missing_handoffs(self) -> None:
         rows = [{"role": "review", "outcome": "changes-requested"}, {"role": "code", "outcome": None},
                 {"role": "code", "outcome": None, "rate_limited": True}, {"role": "code", "outcome": "submitted"}]
         self.assertEqual(oa.code_failures([GATE_FAIL, GATE_PASS, "text"], rows), 3)
 
-    def test_backend_per_role(self) -> None:
+    def test_opus_only_for_planning_and_as_last_code_step(self) -> None:
         cfg = oa.load_config()
-        self.assertEqual(oa.backend_for(cfg, "plan", {"tier:light"}, 0), ("opus", None))
-        self.assertEqual(oa.backend_for(cfg, "code", {"tier:light"}, 0), ("gemini-flash", "light"))
-        self.assertEqual(oa.backend_for(cfg, "review", {"tier:light"}, 0), ("glm", "medium"))
-        self.assertEqual(oa.backend_for(cfg, "review", {"tier:medium"}, 1), ("opus", "heavy"))
+        first = lambda role, labels, f: oa.backend_options(cfg, role, labels, f)[0]
+        self.assertEqual(first("plan", {"tier:light"}, 0), ("opus", None))
+        self.assertEqual(cfg["roles"]["answer"]["backend"], "opus")
+        self.assertEqual(first("code", {"tier:light"}, 0), ("gemini-flash", "light"))
+        self.assertEqual(first("code", {"tier:medium"}, 0), ("gemini-pro", "medium"))
+        self.assertEqual(first("code", {"tier:heavy"}, 0), ("glm", "heavy"))
+        self.assertEqual(first("code", {"tier:heavy"}, 1), ("opus", "fallback"))
+        self.assertEqual(first("review", {"tier:light"}, 0), ("gemini-pro", "medium"))
+        self.assertEqual(first("review", {"tier:heavy"}, 3), ("glm", "heavy"))
+        for role in ("research", "audit", "upstream"):
+            self.assertNotEqual(first(role, set(), 0)[0], "opus")
+
+    def test_unavailable_backend_moves_up_but_not_to_opus(self) -> None:
+        cfg = oa.load_config()
+        self.assertEqual(oa.backend_options(cfg, "code", {"tier:light"}, 0),
+                         [("gemini-flash", "light"), ("gemini-pro", "medium"), ("glm", "heavy")])
+        cfg["limits"]["availability_fallback"] = True
+        self.assertEqual(oa.backend_options(cfg, "code", {"tier:heavy"}, 0)[-1], ("opus", "fallback"))
+        picked = oa.choose_backend(cfg, [("gemini-flash", "light"), ("glm", "heavy")], lambda m: None)
+        with mock.patch.object(oa, "backend_problem", side_effect=lambda c, n: None if n == "glm" else "gesperrt"):
+            picked = oa.choose_backend(cfg, [("gemini-flash", "light"), ("glm", "heavy")], lambda m: None)
+        self.assertEqual(picked, ("glm", "heavy"))
+
+
+class TestBrief(unittest.TestCase):
+    VIEW = {"title": "t", "body": "Idee: X fusionieren", "comments": [
+        oa.PLAN_MARKER + " alter Plan", "Plauderei", oa.RESULT_MARKER + "\n### Gate nicht bestanden: alt",
+        oa.PLAN_MARKER + " neuer Plan", oa.HANDOFF_MARKER + " Übergabe 1\ncandidate: x\nref: agent/a",
+        oa.REVIEW_MARKER + " Befund A", oa.QA_MARKER + " Frage/Antwort", "unwichtig"]}
+
+    def test_code_changes_gets_only_what_it_needs(self) -> None:
+        brief = oa.build_brief("code", "changes", self.VIEW)
+        for needed in ("Idee: X", "neuer Plan", "Befund A", "Frage/Antwort", "Übergabe 1", "ref: agent/a"):
+            self.assertIn(needed, brief)
+        for noise in ("alter Plan", "Plauderei", "unwichtig", "Gate nicht bestanden"):
+            self.assertNotIn(noise, brief)
+
+    def test_gate_fix_gets_gate_report(self) -> None:
+        self.assertIn("Gate nicht bestanden", oa.build_brief("code", "gate-fix", self.VIEW))
+
+    def test_revision_gets_everything_since_the_plan(self) -> None:
+        brief = oa.build_brief("plan", "revise", self.VIEW)
+        self.assertIn("neuer Plan", brief)
+        self.assertIn("Befund A", brief)
+        self.assertIn("unwichtig", brief)
+        self.assertNotIn("alter Plan", brief)
 
 
 class TestOutcome(unittest.TestCase):
@@ -172,9 +216,12 @@ class TestLaunchHelpers(StateTestCase):
             item = {"role": role, "issue": 7 if role in ("plan", "code", "review") else None, "title": "x",
                     "kind": {"plan": "new", "code": "implement", "review": "review"}.get(role, role),
                     "backend": "opus", "tier": "medium" if role == "code" else None, "failures": 0}
-            text = oa.build_prompt(self.cfg, item, [], Path("/wt"), "b")
+            text = oa.build_prompt(self.cfg, item, [], Path("/wt"), "b", "# Übergabe\nX")
             self.assertIn(f"Rolle: **{role}**", text)
             self.assertIn("# Rolle:", text)
+            self.assertTrue(text.endswith("# Übergabe\nX"))
+            self.assertEqual("orca_agent.py ask" in text, role in oa.ASK_ROLES)
+        self.assertTrue((oa.PROMPTS / "answer.md").is_file())
 
 
 class TestRun(StateTestCase):
@@ -184,14 +231,18 @@ class TestRun(StateTestCase):
         labels = {"plan:ready", "tier:light", "needs-code-review"}
         calls: list[tuple] = []
         patches = [
-            mock.patch.object(oa, "git_out", side_effect=lambda *a: "/wt" if a[0] == "rev-parse" else "lever-x"),
+            mock.patch.object(oa, "git", side_effect=lambda *a, **k: "/wt" if a[0] == "rev-parse" else "lever-x"),
             mock.patch.object(oa, "open_issues", return_value=[issue(12, *labels)]),
             mock.patch.object(oa, "gh_comments", return_value=[]),
-            mock.patch.object(oa, "issue_view", return_value={"labels": labels_after, "state": "OPEN", "comments": []}),
+            mock.patch.object(oa, "issue_view", side_effect=[
+                {"labels": labels, "state": "OPEN", "comments": [], "body": "b", "title": "t"},
+                {"labels": labels_after, "state": "OPEN", "comments": [], "body": "b", "title": "t"}]),
             mock.patch.object(oa, "gh", side_effect=lambda *a: calls.append(a) or ""),
-            mock.patch.object(oa, "launch", return_value=(0, False)),
+            mock.patch.object(oa, "launch", return_value=(0, False, "")),
             mock.patch.object(oa.shutil, "which", return_value="/usr/bin/claude"),
             mock.patch.object(oa, "cooling_until", return_value=0.0),
+            mock.patch.object(oa.subprocess, "run", side_effect=lambda cmd, **k: calls.append(("setup", *cmd)) or
+                              mock.Mock(returncode=0)),
         ]
         cfg = copy.deepcopy(self.cfg)
         key = Path(self.tmp.name) / "zai"
@@ -200,20 +251,81 @@ class TestRun(StateTestCase):
         for p in patches:
             p.start()
             self.addCleanup(p.stop)
-        rc = oa.cmd_run(cfg, "review")
+        cfg["backends"]["gemini-pro"]["model"] = "gemini-x"
+        rc = oa.cmd_run(cfg, "review", 12)
         return rc, calls, oa.ledger(12)
 
     def test_approval_is_recorded(self) -> None:
         rc, calls, rows = self.run_review({"plan:ready", "tier:light", "status:ready-to-test"})
         self.assertEqual(rc, 0)
-        self.assertEqual(calls, [])
-        self.assertEqual((rows[-1]["outcome"], rows[-1]["backend"], rows[-1]["tier"]), ("approved", "glm", "medium"))
+        self.assertEqual(calls, [("setup", "bash", "/wt/scripts/orca_setup.sh")])
+        self.assertEqual((rows[-1]["outcome"], rows[-1]["backend"], rows[-1]["tier"]), ("approved", "gemini-pro", "medium"))
 
     def test_missing_handoff_is_reported(self) -> None:
         rc, calls, rows = self.run_review({"plan:ready", "tier:light", "needs-code-review"})
         self.assertEqual(rc, 1)
         self.assertIsNone(rows[-1]["outcome"])
         self.assertTrue(any(c[:2] == ("issue", "comment") and "ohne gültige Label-Übergabe" in c[-1] for c in calls))
+
+
+class TestAsk(StateTestCase):
+    def test_question_is_answered_by_a_fresh_planner_session(self) -> None:
+        env = {"RADIANCE_AGENT_ROLE": "code", "RADIANCE_AGENT_ISSUE": "12", "RADIANCE_AGENT_RUN": "r1"}
+        posted: list[tuple] = []
+        view = {"title": "t", "body": "", "labels": set(), "state": "OPEN",
+                "comments": [oa.PLAN_MARKER + " Plan: Schritt 2 ändert foo()"]}
+        with mock.patch.dict(os.environ, env), \
+                mock.patch.object(oa.subprocess, "Popen") as popen, \
+                mock.patch.object(oa, "wait_answer", return_value=0):
+            self.assertEqual(oa.cmd_ask(self.cfg, "Gilt Schritt 2 auch für bar()?", 1), 0)
+        qid = popen.call_args[0][0][-1]
+        prompts = []
+        with mock.patch.object(oa, "issue_view", return_value=view), \
+                mock.patch.object(oa, "backend_problem", return_value=None), \
+                mock.patch.object(oa, "comment", side_effect=lambda n, b: posted.append((n, b))), \
+                mock.patch.object(oa, "launch", side_effect=lambda b, p, *a, **k: prompts.append((b, p, k)) or (0, False, "Nur foo().")):
+            self.assertEqual(oa.cmd_answer_worker(self.cfg, qid), 0)
+        backend, prompt, kwargs = prompts[0]
+        self.assertEqual(backend["model"], "opus")
+        self.assertTrue(kwargs["read_only"])
+        self.assertIn("Schritt 2 ändert foo()", prompt)
+        self.assertIn("Gilt Schritt 2 auch für bar()?", prompt)
+        self.assertEqual(posted[0][0], 12)
+        self.assertIn(oa.QA_MARKER, posted[0][1])
+        q = json.loads(oa.question_path(qid).read_text())
+        self.assertEqual((q["status"], q["answer"]), ("answered", "Nur foo()."))
+        self.assertEqual(oa.wait_answer(qid, 0), 0)
+
+    def test_question_limit_and_roles(self) -> None:
+        with mock.patch.dict(os.environ, {"RADIANCE_AGENT_ROLE": "plan", "RADIANCE_AGENT_ISSUE": "1"}):
+            self.assertEqual(oa.cmd_ask(self.cfg, "?", 0), 2)
+        env = {"RADIANCE_AGENT_ROLE": "review", "RADIANCE_AGENT_ISSUE": "3", "RADIANCE_AGENT_RUN": "r2"}
+        with mock.patch.dict(os.environ, env), mock.patch.object(oa.subprocess, "Popen"), \
+                mock.patch.object(oa, "wait_answer", return_value=0), mock.patch.object(oa.time, "strftime", side_effect=["a", "b", "c", "d"] + ["x"] * 10):
+            for _ in range(self.cfg["limits"]["max_questions"]):
+                self.assertEqual(oa.cmd_ask(self.cfg, "?", 0), 0)
+            self.assertEqual(oa.cmd_ask(self.cfg, "?", 0), 1)
+
+
+class TestTick(StateTestCase):
+    def test_reservation_prevents_double_start(self) -> None:
+        cfg = copy.deepcopy(self.cfg)
+        cfg["orca"]["launcher"] = "detached"
+        cfg["backends"]["gemini-flash"]["model"] = "flash-x"
+        started = []
+        orig = oa.find_work
+        with mock.patch.object(oa, "git", return_value=""), \
+                mock.patch.object(oa, "open_issues", return_value=[issue(4, "plan:ready", "tier:light")]), \
+                mock.patch.object(oa, "gh_comments", return_value=[]), \
+                mock.patch.object(oa.shutil, "which", return_value="/usr/bin/x"), \
+                mock.patch.object(oa.subprocess, "Popen", side_effect=lambda *a, **k: started.append(a[0])), \
+                mock.patch.object(oa, "find_work", side_effect=lambda c, r, **k: orig(c, r, **k) if r == "code" else None):
+            self.assertEqual(oa.cmd_tick(cfg), 0)
+            self.assertEqual(oa.cmd_tick(cfg), 0)
+        self.assertEqual(len(started), 1)
+        self.assertEqual(started[0][-2:], ["--issue", "4"])
+        self.assertTrue(oa.reserved("code", 4))
+        self.assertEqual(len(oa.worktree_records()), 1)
 
 
 if __name__ == "__main__":
