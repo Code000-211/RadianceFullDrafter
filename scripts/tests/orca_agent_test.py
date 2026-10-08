@@ -341,5 +341,37 @@ class TestTick(StateTestCase):
         self.assertEqual(len(oa.worktree_records()), 1)
 
 
+class TestOrcaWorktrees(StateTestCase):
+    def test_orca_creates_the_worktree_and_removes_it_by_id(self) -> None:
+        wt = Path(self.tmp.name) / "workspaces" / "agent-code-4"
+        wt.mkdir(parents=True)
+        wid = f"2a02::{wt}"
+        calls: list[tuple] = []
+
+        def orca(cfg, *args):
+            calls.append(args)
+            if args[:2] == ("worktree", "create"):  # nesting as reported by orca-ide 1.4.192, wrapped once more
+                return json.dumps({"ok": True, "result": {"worktree": {"id": wid, "path": str(wt), "branch": "x"}}})
+            return json.dumps({"ok": True})
+
+        cfg = copy.deepcopy(self.cfg)
+        with mock.patch.object(oa, "orca", side_effect=orca), \
+                mock.patch.object(oa, "git", side_effect=lambda *a, **k: "OoguroRyuuya/agent-code-4" if a[:2] == ("rev-parse", "--abbrev-ref") else ""), \
+                mock.patch.object(oa.subprocess, "run", return_value=mock.Mock(returncode=1)):
+            path = oa.start_agent(cfg, {"role": "code", "issue": 4})
+            self.assertEqual(path, wt)
+            self.assertIn(("terminal", "create", "--worktree", f"id:{wid}", "--title", "code #4", "--command",
+                           f"python3 {oa.PRIMARY / 'scripts' / 'orca_agent.py'} run code --issue 4"), calls)
+            rec = next(iter(oa.worktree_records().values()))
+            self.assertEqual((rec["orca_id"], rec["branch"]), (wid, "OoguroRyuuya/agent-code-4"))
+            oa.remove_worktree(cfg, rec, "agent-code-4")
+            self.assertIn(("worktree", "rm", "--worktree", f"id:{wid}", "--force"), calls)
+
+    def test_missing_id_is_an_error(self) -> None:
+        with mock.patch.object(oa, "orca", return_value=json.dumps({"ok": True, "result": {}})):
+            with self.assertRaises(RuntimeError):
+                oa.create_worktree(self.cfg, "x")
+
+
 if __name__ == "__main__":
     unittest.main()

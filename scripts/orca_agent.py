@@ -821,40 +821,74 @@ def worktree_records() -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
 
 
+def find_worktree(obj: Any) -> tuple[str, str] | None:
+    """(id, path) from `orca worktree create --json`, searched rather than indexed: the CLI's
+    envelope is not documented, only that the worktree object carries `id` and `path`."""
+    if isinstance(obj, dict):
+        if isinstance(obj.get("id"), str) and isinstance(obj.get("path"), str):
+            return obj["id"], obj["path"]
+        obj = list(obj.values())
+    if isinstance(obj, list):
+        for v in obj:
+            found = find_worktree(v)
+            if found:
+                return found
+    return None
+
+
+def create_worktree(cfg: dict[str, Any], name: str) -> dict[str, Any]:
+    """Launcher "orca": Orca creates the worktree (base ref origin/main from its repo settings), so
+    it shows in Orca's sidebar and its terminal can be adopted by a client that connects later; a
+    headless orca-serve keeps terminals in the background either way. Otherwise plain git."""
+    if cfg["orca"]["launcher"] == "orca":
+        out = json.loads(orca(cfg, "worktree", "create", "--repo", cfg["orca"]["repo"], "--name", name,
+                              "--setup", "skip", "--no-parent"))
+        found = find_worktree(out)
+        if found is None or not Path(found[1]).is_dir():
+            raise RuntimeError(f"orca worktree create {name}: no worktree id/path in {json.dumps(out)[:300]}")
+        branch = git("rev-parse", "--abbrev-ref", "HEAD", cwd=Path(found[1]))
+        return {"path": found[1], "orca_id": found[0], "branch": branch}
+    wt = PRIMARY / "worktrees" / name
+    git("-C", str(PRIMARY), "worktree", "add", "-b", f"agent/{name}", str(wt), "origin/main")
+    return {"path": str(wt), "branch": f"agent/{name}"}
+
+
 def start_agent(cfg: dict[str, Any], item: dict[str, Any]) -> Path:
     role, n = item["role"], item["issue"]
     name = f"agent-{role}-{n or 'x'}-{time.strftime('%m%d-%H%M%S')}"
-    wt = PRIMARY / "worktrees" / name
-    git("-C", str(PRIMARY), "worktree", "add", "-b", f"agent/{name}", str(wt), "origin/main")
+    rec = create_worktree(cfg, name)
+    wt = Path(rec["path"])
     cmd = f"python3 {PRIMARY / 'scripts' / 'orca_agent.py'} run {role}" + (f" --issue {n}" if n else "")
     try:
         if cfg["orca"]["launcher"] == "orca":
             title = f"{role} #{n}" if n else role
-            orca(cfg, "terminal", "create", "--worktree", f"path:{wt}", "--title", title, "--command", cmd)
+            orca(cfg, "terminal", "create", "--worktree", f"id:{rec['orca_id']}", "--title", title, "--command", cmd)
         else:
             with open(log_file(f"detached_{name}"), "w", encoding="utf-8") as out:
                 subprocess.Popen(cmd.split(), cwd=str(wt), stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
     except (RuntimeError, OSError):
-        remove_worktree(cfg, wt, name)
+        remove_worktree(cfg, rec, name)
         raise
     reservation_path(role, n).touch()
     recs = worktree_records()
-    recs[name] = {"path": str(wt), "branch": f"agent/{name}", "created": time.time(), "role": role, "issue": n}
+    recs[name] = {**rec, "created": time.time(), "role": role, "issue": n}
     write_json(state_dir() / "worktrees.json", recs)
     return wt
 
 
-def remove_worktree(cfg: dict[str, Any], wt: Path, name: str) -> None:
-    if cfg["orca"]["launcher"] == "orca":
+def remove_worktree(cfg: dict[str, Any], rec: dict[str, Any], name: str) -> None:
+    wt = Path(rec["path"])
+    if rec.get("orca_id"):
         try:
-            orca(cfg, "worktree", "rm", "--worktree", f"path:{wt}", "--force")
+            orca(cfg, "worktree", "rm", "--worktree", f"id:{rec['orca_id']}", "--force")
         except RuntimeError as e:
             print(f"orca worktree rm {name}: {e}; entferne mit git", file=sys.stderr)
     if wt.exists():
         git("-C", str(PRIMARY), "worktree", "remove", "--force", str(wt))
     git("-C", str(PRIMARY), "worktree", "prune")
-    if subprocess.run(["git", "-C", str(PRIMARY), "show-ref", "--verify", "--quiet", f"refs/heads/agent/{name}"]).returncode == 0:
-        git("-C", str(PRIMARY), "branch", "-D", f"agent/{name}")
+    branch = rec.get("branch") or f"agent/{name}"
+    if subprocess.run(["git", "-C", str(PRIMARY), "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"]).returncode == 0:
+        git("-C", str(PRIMARY), "branch", "-D", branch)
 
 
 def cleanup_worktrees(cfg: dict[str, Any]) -> None:
@@ -873,7 +907,7 @@ def cleanup_worktrees(cfg: dict[str, Any]) -> None:
                     print(f"{name}: ungesicherte Änderungen, bleibt liegen ({wt})", file=sys.stderr)
                     rec["kept"] = True
                 continue
-        remove_worktree(cfg, wt, name)
+        remove_worktree(cfg, rec, name)
         del recs[name]
     write_json(state_dir() / "worktrees.json", recs)
 

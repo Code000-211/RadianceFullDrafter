@@ -138,13 +138,17 @@ stellt Worktree und Terminal, in dem der Agent sichtbar läuft:
 systemd-Timer (alle 3 min) ─► orca_agent.py tick
     ├─ alte Agent-Worktrees ohne ungesicherte Arbeit entfernen (nach 12 h)
     └─ je Rolle mit Arbeit und freiem Slot:
-         git worktree add worktrees/agent-<rolle>-<issue>-<zeit> (Branch agent/…, Basis origin/main)
-         orca-ide terminal create --worktree path:<wt> --command "orca_agent.py run <rolle> --issue <nr>"
+         orca-ide worktree create --repo <id> --name agent-<rolle>-<issue>-<zeit> --setup skip
+             (Basis origin/main laut Orca-Repo-Einstellung; erscheint in Orcas Seitenleiste)
+         orca-ide terminal create --worktree id:<wt> --command "orca_agent.py run <rolle> --issue <nr>"
                 └─► run: Slot + Issue sperren, Worktree bauen (code/review/audit),
                          EINE frische Agent-Session mit dem Modell der Stufe, Übergabe prüfen
 ```
 
 Reihenfolge im Tick: review, code, plan, upstream, audit, research (laufende Arbeit vor neuer).
+Auf epyc läuft Orca ohne Fenster (`orca-serve` unter xvfb); Terminals laufen dann im Hintergrund
+und werden erst sichtbar, wenn ein Orca-Client verbunden ist (`orca-ide terminal focus`). Das Log
+jedes Laufs liegt unabhängig davon unter `~/.local/state/radiance-agents/logs/`.
 Installation: `scripts/systemd/radiance-agent-tick.{service,timer}`. Ohne Orca-Runtime:
 `"launcher": "detached"` in `scripts/agents/models.json`, dann laufen die Agents als
 Hintergrundprozesse (Log unter `~/.local/state/radiance-agents/logs/`).
