@@ -32,6 +32,15 @@ BASELINE_OPT146 = """
 - Master Gate: Parity tolerance strictly 0 (greedy exactness).
 """
 
+OPENWIKI_GROUNDING_MANDATE = """
+=== Mandatory Ground-Truth First (Zero-Blind-Exploration Law) ===
+- You are STRICTLY PROHIBITED from blind directory searches, random multi-file greps, or dumping full source files into context memory.
+- Before reading code or formulating architecture proposals, execute:
+    python3 scripts/locate_code.py "<task_or_query>"
+  or query OpenWiki directly via `openwiki_search` / `openwiki_read`.
+- Every architectural claim, kernel modification, or candidate diff must cite verified OpenWiki claims (repo://path#L...).
+"""
+
 def generate_research_prompt(goal: str, suggestion: str = "", lever_slug: str = "") -> str:
     prompt = f"""# Mandate: Research & Optimization Blueprint
 
@@ -46,15 +55,17 @@ def generate_research_prompt(goal: str, suggestion: str = "", lever_slug: str = 
 """
     prompt += HARDWARE_TRUTH_CARD
     prompt += BASELINE_OPT146
+    prompt += OPENWIKI_GROUNDING_MANDATE
     prompt += f"""
 ## Strict Output Contract (Zero Trunk Modification)
-1. Research papers on alphaXiv and kernels on GitHub (vLLM, SGLang, FlashAttention-3, DeepSeek, AsmEvo, CUTLASS).
-2. Package your candidate lever strictly inside:
+1. Ground in OpenWiki first (`python3 scripts/locate_code.py "<query>"`).
+2. Research papers on alphaXiv and kernels on GitHub (vLLM, SGLang, FlashAttention-3, DeepSeek, AsmEvo, CUTLASS).
+3. Package your candidate lever strictly inside:
    `candidates/{lever_slug or 'lever<N>_<slug>'}/`
-   - `README.md`: Equations, roofline analysis, RDNA4 Wave32 mapping, expected gain.
+   - `README.md`: Equations, roofline analysis, RDNA4 Wave32 mapping, expected gain, OpenWiki references.
    - `lever.patch`: Clean git patch against baseline (Opt 146).
    - `src/`: (Optional) Standalone modified kernel/header files.
-3. Submit a GitHub Issue labeled `research:new-lever`:
+4. Submit a GitHub Issue labeled `research:new-lever`:
    `gh issue create --title "Candidate Lever: <Name>" --label "research:new-lever" --body "..."`
 """
     return prompt.strip()
@@ -71,8 +82,10 @@ Base: `main` (Opt 146 golden baseline)
 
 {HARDWARE_TRUTH_CARD}
 {BASELINE_OPT146}
+{OPENWIKI_GROUNDING_MANDATE}
 
 ## Execution Steps
+0. Ground in OpenWiki: `python3 scripts/locate_code.py "Implementing {lever_slug}"`.
 1. Navigate to worktree `{worktree_path}`.
 2. Apply patch: `git apply ../../candidates/{lever_slug}/lever.patch`.
 3. Compile: `ninja -C build_hip arch_test`.

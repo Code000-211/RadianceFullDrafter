@@ -72,6 +72,7 @@ releases/golden_builds/*.tmp
 benchmarks/runs/*
 !benchmarks/runs/.gitkeep
 telemetry/*.json
+telemetry/*.pid
 !telemetry/.gitkeep
 baselines/*_results.json
 tmp/

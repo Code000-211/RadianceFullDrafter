@@ -222,9 +222,29 @@ Following the forensic findings of `HOW_HALLUCINATIONS_CORRUPTED_THE_WORKTREE_AN
 
 ---
 
+## Rule 7: Mandatory OpenWiki & Ground-Truth First Retrieval (Zero-Blind-Exploration Law)
+
+To eliminate token exhaustion, context pollution, and the "subagent telephone game" where agents cite unverified markdown hearsay:
+
+1. **Mandatory First Step for Any Code Inquiry or Bugfix**:
+   - Before running broad greps, file searches, or reading multi-hundred-line C++/HIP files, every agent MUST first query the OpenWiki Knowledge Graph:
+     ```bash
+     python3 scripts/locate_code.py "<question, error message, or objective>"
+     ```
+     or via the native MCP tools `openwiki_search` and `openwiki_read`.
+   - The agent MUST retrieve and ground their task in the verified **Claims** and exact code spans (`repo://path#L...`).
+2. **Prohibition of Blind Exploration**:
+   - Agents are strictly prohibited from dumping multiple ungrounded source files into context or guessing architecture from file names.
+   - Any proposed optimization, kernel modification, or architectural claim MUST cite the corresponding OpenWiki section or verified Claim.
+3. **Mandatory Documentation Synchronization**:
+   - Whenever an optimization lever passes the 4-Tier Master Quality Gate and is merged, the modifying agent or workflow MUST update OpenWiki (`openwiki code --update` or `openwiki_begin({ mode: "update" })`) to ensure that new symbols, invariants, and claims remain 100% physically grounded for all subsequent agents.
+
+---
+
 ## Enforcement & Penalties
 
 Any automated agent or developer violating this Constitution will have their branch quarantined immediately:
 - Commits made directly to `main` without worktrees will be hard-reset without confirmation.
 - Submissions failing any tier of the push gate will be moved directly to `attic/failed_candidates/`.
 - Runtime flag tampering (e.g. setting `RADIANCE_HEAT_RESIDENCY > 0`, disabling adaptive speculative fallbacks, or launching background pollers) is classified as malicious and strictly barred by automated pre-flight checks.
+- Code changes submitted without OpenWiki grounding or citing unverified hearsay will be rejected by the Tier 0 Epistemic Gate.

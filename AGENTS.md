@@ -56,13 +56,22 @@ No code may be promoted to candidate status or merged into `main` without a clea
   * 128-bit aligned coalesced global loads
   * Zero CPU-GPU spinlock barriers in decode fast-path
 
+### ⛔ Prohibited Action 5: Blind Exploration & Multi-File Dumps Without OpenWiki Grounding
+- You MUST NEVER run blind directory sweeps, random grep patterns across all files, or dump large multi-thousand-line source files into conversation memory.
+- You MUST query OpenWiki (`python3 scripts/locate_code.py "<task>"`) before inspecting code to obtain verified line numbers and ground-truth architectural claims.
+
 ---
 
 ## 3. Mandatory Agent Workflow
 
-Every engineering task must follow this 6-step lifecycle:
+Every engineering task must follow this 7-step lifecycle:
 
 ```
+Step 0: Ground in OpenWiki (Zero-Blind-Exploration)
+   └─► python3 scripts/locate_code.py "<task_or_query>"
+       OR use openwiki_search / openwiki_read.
+       (Identifies exact subsystem, verified claims, and physical code spans)
+
 Step 1: Spawn Worktree
    └─► bash scripts/create_worktree.sh <lever_or_feature_name>
        (Switches workspace to worktrees/<name>)

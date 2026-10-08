@@ -3,12 +3,13 @@
 # verify_ground_truth.sh — Physical Verification & Epistemic Integrity Gate
 # ==============================================================================
 # Master ground-truth verification script for RadianceMine.
-# Enforces the 5 physical ground-truth invariants:
+# Enforces the 6 physical ground-truth invariants:
 #   1. Binary Symbol Physical Grounding (nm -D & .so check)
 #   2. Test Integrity & Anti-Silent-Skip Policy
 #   3. Threshold & Tolerance Immutability Lock (SHA-256 baseline seal)
 #   4. Hardware Clock & DPM State Pre-Flight Check
 #   5. Context-Mode Transparency & Exit Code Integrity
+#   6. OpenWiki Knowledge Graph & Claims Integrity (Zero-Blind-Exploration Law)
 # ==============================================================================
 set -euo pipefail
 
@@ -103,6 +104,6 @@ fi
 
 echo ""
 echo "================================================================================"
-echo " 🏆 GROUND TRUTH VERIFICATION COMPLETE: ALL 5 INVARIANTS SATISFIED."
+echo " 🏆 GROUND TRUTH VERIFICATION COMPLETE: ALL 6 INVARIANTS SATISFIED."
 echo "================================================================================"
 exit 0

@@ -3,13 +3,14 @@
 
 Automated enforcement tool for the RadianceMine physical verification system.
 Translates lessons from HOW_HALLUCINATIONS_CORRUPTED_THE_WORKTREE_AND_CONTEXT_MODE_POSTMORTEM.md
-into five strictly enforced invariants:
+into six strictly enforced invariants:
 
   Invariant 1: Binary Symbol Physical Grounding (nm -D & .so inspection)
   Invariant 2: Test Integrity & Anti-Silent-Skip Checker
   Invariant 3: Threshold & Tolerance Immutability Lock (Cryptographic Seal)
   Invariant 4: Hardware Clock & DPM Pre-Flight Verification
   Invariant 5: Context-Mode Transparency Guard (No stderr/exit-code masking)
+  Invariant 6: OpenWiki Knowledge Graph & Claims Integrity (Zero-Blind-Exploration Law)
 """
 
 from __future__ import annotations
@@ -507,6 +508,90 @@ def check_invariant_5_transparency_guard(repo_root: Path) -> InvariantResult:
     return InvariantResult(5, "Context-Mode Transparency Guard", passed, details, warnings)
 
 
+def check_invariant_6_openwiki_integrity(repo_root: Path) -> InvariantResult:
+    """Invariant 6: OpenWiki Knowledge Graph & Claims Integrity (Zero-Blind-Exploration Law).
+
+    Verifies that:
+      1. openwiki/ directory and canonical architecture pages exist.
+      2. openwiki/.claims/ contains cryptographic atomic claims.
+      3. scripts/locate_code.py exists and is functional.
+      4. Governance documents (ENGINEERING_CONSTITUTION.md & AGENTS.md) mandate OpenWiki grounding.
+    """
+    passed = True
+    details: list[str] = []
+    warnings: list[str] = []
+
+    openwiki_dir = repo_root / "openwiki"
+    if not openwiki_dir.is_dir():
+        passed = False
+        details.append(f"❌ openwiki/ directory missing at {openwiki_dir}")
+        return InvariantResult(6, "OpenWiki Knowledge & Claims Integrity", passed, details, warnings)
+
+    # Check canonical architecture pages
+    canonical_pages = [
+        "quickstart.md",
+        "architecture/engine_runtime.md",
+        "architecture/gemm_and_kernels.md",
+        "architecture/p2p_interconnect.md",
+        "architecture/speculative_mtp.md",
+        "governance/quality_gates.md",
+        "pipeline/upstream_watcher.md",
+    ]
+    missing_pages = []
+    for page in canonical_pages:
+        page_path = openwiki_dir / page
+        if not page_path.is_file():
+            missing_pages.append(page)
+
+    if missing_pages:
+        passed = False
+        details.append(f"❌ Missing canonical OpenWiki pages: {', '.join(missing_pages)}")
+    else:
+        details.append(f"✓ All {len(canonical_pages)} canonical OpenWiki architecture pages verified.")
+
+    # Check claims directory and files
+    claims_dir = openwiki_dir / ".claims"
+    if not claims_dir.is_dir():
+        passed = False
+        details.append("❌ openwiki/.claims/ directory missing")
+    else:
+        claim_files = list(claims_dir.rglob("*.json"))
+        if not claim_files:
+            passed = False
+            details.append("❌ No claim files found in openwiki/.claims/")
+        else:
+            details.append(f"✓ {len(claim_files)} atomic claim definitions verified across openwiki/.claims/.")
+
+    # Check scripts/locate_code.py
+    locator_path = repo_root / "scripts" / "locate_code.py"
+    if not locator_path.is_file():
+        passed = False
+        details.append(f"❌ Fast code locator missing at {locator_path}")
+    else:
+        details.append("✓ Fast code locator verified (scripts/locate_code.py).")
+
+    # Check constitution and agent rules
+    constitution_path = repo_root / "ENGINEERING_CONSTITUTION.md"
+    if constitution_path.is_file():
+        const_text = constitution_path.read_text(encoding="utf-8", errors="replace")
+        if "Rule 7" not in const_text or "Mandatory OpenWiki" not in const_text:
+            passed = False
+            details.append("❌ ENGINEERING_CONSTITUTION.md missing Rule 7 (Mandatory OpenWiki).")
+        else:
+            details.append("✓ ENGINEERING_CONSTITUTION.md Rule 7 (Mandatory OpenWiki) verified.")
+
+    agents_path = repo_root / "AGENTS.md"
+    if agents_path.is_file():
+        agents_text = agents_path.read_text(encoding="utf-8", errors="replace")
+        if "Prohibited Action 5" not in agents_text or "locate_code.py" not in agents_text:
+            passed = False
+            details.append("❌ AGENTS.md missing Prohibited Action 5 or locate_code.py workflow.")
+        else:
+            details.append("✓ AGENTS.md Prohibited Action 5 & Step 0 OpenWiki workflow verified.")
+
+    return InvariantResult(6, "OpenWiki Knowledge & Claims Integrity", passed, details, warnings)
+
+
 # ==============================================================================
 # Master Invariant Execution Orchestrator
 # ==============================================================================
@@ -542,6 +627,10 @@ def run_all_invariants(
     res5 = check_invariant_5_transparency_guard(repo_root)
     results.append(res5)
 
+    # Run Invariant 6
+    res6 = check_invariant_6_openwiki_integrity(repo_root)
+    results.append(res6)
+
     print("\n" + "=" * 80)
     print(f"| {'#':<3} | {'Invariant Name':<45} | {'Result':<12} |")
     print(f"|{'-'*5}|{'-'*47}|{'-'*14}|")
@@ -566,7 +655,7 @@ def run_all_invariants(
                 print(f"   ⚠️  {w}")
 
     if failures == 0:
-        print(f"\n{BOLD}{GREEN}🏆 TIER 0 EPISTEMIC GROUND-TRUTH VERIFICATION PASSED (5/5 INVARIANTS CLEAN){RESET}\n")
+        print(f"\n{BOLD}{GREEN}🏆 TIER 0 EPISTEMIC GROUND-TRUTH VERIFICATION PASSED (6/6 INVARIANTS CLEAN){RESET}\n")
         return 0
     else:
         print(f"\n{BOLD}{RED}❌ TIER 0 EPISTEMIC GROUND-TRUTH GATE FAILED: {failures} invariant(s) violated!{RESET}")
@@ -582,9 +671,9 @@ def main() -> int:
     parser.add_argument(
         "--invariant",
         type=int,
-        choices=[1, 2, 3, 4, 5],
+        choices=[1, 2, 3, 4, 5, 6],
         default=None,
-        help="Run only a specific invariant (1-5)",
+        help="Run only a specific invariant (1-6)",
     )
     parser.add_argument(
         "--strict",
@@ -623,6 +712,8 @@ def main() -> int:
             res = check_invariant_4_hardware_clocks(auto_warmup=args.warmup, endpoint=args.endpoint)
         elif args.invariant == 5:
             res = check_invariant_5_transparency_guard(repo_root)
+        elif args.invariant == 6:
+            res = check_invariant_6_openwiki_integrity(repo_root)
         else:
             return 1
 
