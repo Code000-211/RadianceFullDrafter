@@ -757,6 +757,7 @@ struct Config {
     std::vector<int> diagnose_concurrency = { 1, 2, 4, 8 };          /* --diagnose-concurrency */
     std::vector<int> diagnose_prefill = { 1024, 4096, 16384, 65536 }; /* --diagnose-prefill */
     std::string diagnose_corpus;        /* --diagnose-corpus FILE; empty is the built-in one */
+    std::string diagnose_baseline;      /* --diagnose-baseline FILE: an earlier diagnose.json to compare outputs with */
     bool diagnose_mode() const { return !diagnose.empty(); }
 
     /* --mm-max-patches: the most patches one encoder pass carries, which bounds the largest image

@@ -9,11 +9,15 @@
  * strings.
  *
  * NOTHING IS SERVED FROM THE PREFIX CACHE. Every prompt is salted at its head with a tag unique to
- * this process and request (diag::salt_messages), the cache is emptied before every run, and
- * every request's cached-token count is checked afterwards: a run the cache served any of is
- * reported, and the report's verdict says the run is not a measurement. The cache itself stays
- * on, so what it costs a request that misses -- lookups, publishing, checkpoints -- is measured
- * as a server pays it.
+ * the request (diag::salt_messages), the cache is emptied before every run, and every request's
+ * cached-token count is checked afterwards: a run the cache served any of is reported, and the
+ * report's verdict says the run is not a measurement. The cache itself stays on, so what it costs
+ * a request that misses -- lookups, publishing, checkpoints -- is measured as a server pays it.
+ *
+ * PARITY. The tag is a counter, not a clock, so two builds run the same workload on the same
+ * prompts with the same seeds, and every request's tokens are in the report. With
+ * --diagnose-baseline the run compares them with an earlier report token for token
+ * (diag::compare_outputs) and fails on any difference.
  *
  * Points, each run once unmeasured (first launches of a shape record passes and load code) and
  * then --diagnose-runs times, every run from an idle engine:
@@ -46,7 +50,6 @@
 #include <thread>
 #include <vector>
 
-#include <unistd.h>
 
 extern char** environ;
 
@@ -129,15 +132,16 @@ int Engine::run_diagnose() {
         warn("no usable chat template: prompts are raw text, so draft acceptance and tokens a step "
              "are not those of chat traffic");
 
-    /* A tag no earlier process used either: the host and disk tiers of the prefix cache outlive a
-     * restart, and a salt that repeated across runs would let them serve the second run. */
-    const uint64_t nonce = (uint64_t)std::chrono::system_clock::now().time_since_epoch().count() ^
-                           ((uint64_t)getpid() << 32);
+    /* A counter, the same in every process, so a baseline and a candidate see the same prompts. A
+     * disk tier of the prefix cache outlives the process and could serve a second run its first
+     * run's prompts; the cached-token check after every run catches that, and it is warned of. */
+    if (cfg_.prefix_cache_disk_mib > 0)
+        warn("the prefix cache has a disk tier, which outlives this process: a second diagnose run "
+             "would be served from it and its runs refused. Run without --prefix-cache-disk-mib");
     uint64_t salt_n = 0;
     auto render = [&](const json& messages, std::vector<int32_t>* out) -> int {
         char tag[64];
-        std::snprintf(tag, sizeof tag, "diagnose %016llx-%llu", (unsigned long long)nonce,
-                      (unsigned long long)++salt_n);
+        std::snprintf(tag, sizeof tag, "diagnose request %llu", (unsigned long long)++salt_n);
         const json msgs = diag::salt_messages(messages, tag);
         if (use_chat) {
             server::ChatRenderOptions o;
@@ -312,6 +316,12 @@ int Engine::run_diagnose() {
             t.cached = s.n_cached();
             t.drafted = s.n_drafted();
             t.accepted = s.n_draft_accepted();
+            {
+                std::vector<server::SinkToken> toks((size_t)std::max<int64_t>(s.n_produced(), 0) + 1);
+                const size_t got = sinks[i]->read(toks.data(), toks.size());
+                t.output.reserve(got);
+                for (size_t k = 0; k < got; ++k) t.output.push_back(toks[k].token);
+            }
             const server::Finish f = s.finish_reason();
             const bool cancelled_by_us = i < n_early && !late.empty() && f == server::Finish::Cancelled;
             t.ok = f == server::Finish::Length || f == server::Finish::Stop || cancelled_by_us;
@@ -528,6 +538,24 @@ int Engine::run_diagnose() {
     w["reasoning_effort"] = cfg_.reasoning_effort;
     w["runs"] = runs;
     w["tokens"] = dec_tokens;
+    {
+        /* What decides the prompts and the seeds: two reports with the same fingerprint ran the
+         * same requests in the same order. */
+        json fp;
+        json c = json::array();
+        for (const auto& e : corpus) c.push_back({ e.category, e.messages, e.max_tokens });
+        fp["corpus"] = c;
+        fp["tokens"] = dec_tokens;
+        fp["runs"] = runs;
+        fp["concurrency"] = cfg_.diagnose_concurrency;
+        fp["prefill"] = cfg_.diagnose_prefill;
+        fp["max_num_seqs"] = cfg_.max_seqs;
+        fp["context"] = ctx_limit;
+        fp["chat_template"] = use_chat;
+        fp["reasoning_effort"] = cfg_.reasoning_effort;
+        fp["sampling"] = w["sampling"];
+        w["fingerprint"] = diag::workload_fingerprint(fp);
+    }
     rep["workload"] = w;
     json envj;
     envj["variables"] = env_snapshot();
@@ -544,6 +572,28 @@ int Engine::run_diagnose() {
     rep["prefill"] = prefill;
     rep["interference"] = interference;
     rep["not_measured"] = not_measured;
+
+    bool parity_ok = true;
+    if (!cfg_.diagnose_baseline.empty()) {
+        std::ifstream f(cfg_.diagnose_baseline);
+        const json base = json::parse(f, nullptr, /*allow_exceptions=*/false);
+        std::string why;
+        json cmp;
+        if (!f.is_open() || base.is_discarded()) {
+            why = "cannot read " + cfg_.diagnose_baseline + " as JSON";
+        } else if (diag::compare_outputs(rep, base, &cmp, &why) == RAD_OK) {
+            cmp["baseline"] = cfg_.diagnose_baseline;
+            rep["parity"] = cmp;
+            parity_ok = cmp["verdict"] == "identical";
+            RAD_INFO("diagnose: parity %s, %lld of %lld requests identical", cmp["verdict"].get<std::string>().c_str(),
+                     (long long)cmp["identical"].get<int64_t>(), (long long)cmp["compared"].get<int64_t>());
+        }
+        if (!why.empty()) {
+            rep["parity"] = { { "baseline", cfg_.diagnose_baseline }, { "verdict", "not compared: " + why } };
+            parity_ok = false;
+            RAD_ERR("diagnose: %s", why.c_str());
+        }
+    }
 
     const fs::path dir(cfg_.diagnose);
     {
@@ -563,7 +613,7 @@ int Engine::run_diagnose() {
         }
     }
     RAD_INFO("diagnose: report in %s", (dir / "diagnose.md").c_str());
-    return problems.empty() ? RAD_OK : RAD_E_STATE;
+    return problems.empty() && parity_ok ? RAD_OK : RAD_E_STATE;
 }
 
 }  /* namespace rad */

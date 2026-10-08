@@ -1006,6 +1006,7 @@ for a model that takes no images or video.
 | `--diagnose-concurrency LIST` | `1,2,4,8` | stream counts of the concurrency sweep |
 | `--diagnose-prefill LIST` | `1024,4096,16384,65536` | prompt lengths of the prefill sweep |
 | `--diagnose-corpus FILE` | built-in | JSONL of category prompts, one `{"category", "messages" or "prompt", "max_tokens"?}` a line |
+| `--diagnose-baseline FILE` | | an earlier `diagnose.json` of the same workload: compare every request's tokens with it, fail on any difference |
 
 **Diagnostics**
 
@@ -1514,6 +1515,15 @@ the runs beside it.
 the request at its very head, the cache is emptied before every run, and every request's cached
 token count is checked. A run the cache served anything of turns the report's verdict to *not a
 measurement*. The cache stays on, so the cost a request pays for missing it is measured.
+
+**Parity.** The salt is a request counter, not a clock, so two builds run identical prompts with
+identical seeds, and every request's tokens are in the report. Bit-identical logits sample
+identical tokens at any temperature, so `--diagnose-baseline OLD/diagnose.json` turns the whole
+workload -- categories, batched decode, long prefills -- into a parity check: the report lists
+each request whose tokens differ and the first token where they part, and the run exits non-zero.
+The interference point is not compared, because when its streams are cancelled depends on timing.
+Run the baseline twice against itself first: a difference there means a path is not
+deterministic, and that path cannot be held to bit parity.
 
 What it does not measure is listed in the report itself: per-kernel time (that needs dispatch
 timestamps, which are not built yet), the HTTP path and streaming to a client, and placement

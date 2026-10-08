@@ -457,6 +457,106 @@ TEST(corpus_file_refuses_a_bad_line_and_names_it) {
     CHECK(c.empty());   /* a refused file leaves the output alone */
 }
 
+/* ------------------------------------------------------------------ parity */
+
+namespace {
+/* A report with one category, one concurrency point and one prefill point, one run each, whose
+ * requests produced `toks`. */
+json report_with(const std::vector<std::vector<int32_t>>& toks, const std::string& fp = "abc") {
+    PhaseInput in;
+    for (const auto& t : toks) {
+        RequestTiming r;
+        r.output = t;
+        in.requests.push_back(r);
+    }
+    const json run = phase_report(in);
+    json rep;
+    rep["workload"] = { { "fingerprint", fp } };
+    rep["categories"] = json::array({ { { "category", "code" }, { "runs", json::array({ run }) } } });
+    rep["concurrency"] = json::array({ { { "streams", 2 }, { "runs", json::array({ run }) } } });
+    rep["prefill"] = json::array({ { { "requested_tokens", 1024 }, { "runs", json::array({ run }) } } });
+    return rep;
+}
+}  /* namespace */
+
+TEST(phase_report_keeps_every_requests_tokens) {
+    const json r = report_with({ { 1, 2, 3 }, { 4 } });
+    const json& o = r["categories"][0]["runs"][0]["requests"]["outputs"];
+    REQUIRE(o.size() == 2);
+    CHECK(o[0] == json::array({ 1, 2, 3 }));
+    CHECK(o[1] == json::array({ 4 }));
+}
+
+TEST(identical_outputs_are_parity) {
+    json out;
+    std::string why;
+    REQUIRE(compare_outputs(report_with({ { 1, 2, 3 }, { 4, 5 } }), report_with({ { 1, 2, 3 }, { 4, 5 } }), &out, &why) == RAD_OK);
+    CHECK_EQ(out["compared"].get<int64_t>(), (int64_t)6);   /* 2 requests in each of 3 points */
+    CHECK_EQ(out["identical"].get<int64_t>(), (int64_t)6);
+    CHECK(out["differing"].empty());
+    CHECK_EQ(out["verdict"].get<std::string>(), std::string("identical"));
+}
+
+TEST(a_difference_names_the_first_token_that_differs) {
+    json out;
+    std::string why;
+    REQUIRE(compare_outputs(report_with({ { 1, 2, 3 }, { 4, 5, 6, 7 } }), report_with({ { 1, 2, 3 }, { 4, 5, 9 } }), &out, &why) == RAD_OK);
+    CHECK_EQ(out["identical"].get<int64_t>(), (int64_t)3);
+    REQUIRE(out["differing"].size() == 3);
+    const json& d = out["differing"][0];
+    CHECK_EQ(d["point"].get<std::string>(), std::string("categories code"));
+    CHECK_EQ(d["request"].get<int64_t>(), (int64_t)2);
+    CHECK_EQ(d["first_different_token"].get<int64_t>(), (int64_t)2);
+    CHECK_EQ(d["tokens"].get<int64_t>(), (int64_t)4);
+    CHECK_EQ(d["tokens_baseline"].get<int64_t>(), (int64_t)3);
+    CHECK_EQ(out["verdict"].get<std::string>(), std::string("DIFFERS"));
+    /* A request that stopped early is a difference at the shorter one's end. */
+    REQUIRE(compare_outputs(report_with({ { 1, 2 } }), report_with({ { 1, 2, 3 } }), &out, &why) == RAD_OK);
+    CHECK_EQ(out["differing"][0]["first_different_token"].get<int64_t>(), (int64_t)2);
+}
+
+TEST(points_only_one_side_ran_are_missing_not_counted) {
+    json a = report_with({ { 1 } });
+    json b = report_with({ { 1 } });
+    b["prefill"][0]["requested_tokens"] = 65536;   /* the baseline ran another length */
+    json out;
+    std::string why;
+    REQUIRE(compare_outputs(a, b, &out, &why) == RAD_OK);
+    CHECK_EQ(out["compared"].get<int64_t>(), (int64_t)2);
+    CHECK_EQ(out["identical"].get<int64_t>(), (int64_t)2);
+    CHECK_EQ(out["missing"].size(), (size_t)2);
+    CHECK_EQ(out["verdict"].get<std::string>(), std::string("identical where both ran; points missing"));
+}
+
+TEST(different_workloads_are_not_compared) {
+    json out;
+    std::string why;
+    CHECK_EQ(compare_outputs(report_with({ { 1 } }, "abc"), report_with({ { 1 } }, "def"), &out, &why), RAD_E_INVAL);
+    CHECK(why.find("different workloads") != std::string::npos);
+    CHECK_EQ(compare_outputs(report_with({ { 1 } }, ""), report_with({ { 1 } }, ""), &out, &why), RAD_E_INVAL);
+}
+
+TEST(fingerprint_is_stable_and_sensitive) {
+    const json a = { { "tokens", 256 }, { "runs", 3 } };
+    const json b = { { "tokens", 257 }, { "runs", 3 } };
+    CHECK_EQ(workload_fingerprint(a), workload_fingerprint(json::parse(a.dump())));
+    CHECK(workload_fingerprint(a) != workload_fingerprint(b));
+    CHECK_EQ(workload_fingerprint(a).size(), (size_t)16);
+}
+
+TEST(parity_renders_with_its_differences) {
+    json rep = report_with({ { 1, 2, 3 } });
+    json cmp;
+    std::string why;
+    REQUIRE(compare_outputs(rep, report_with({ { 1, 9, 3 } }), &cmp, &why) == RAD_OK);
+    cmp["baseline"] = "base.json";
+    rep["parity"] = cmp;
+    const std::string md = render_markdown(rep);
+    CHECK(md.find("## Parity against base.json") != std::string::npos);
+    CHECK(md.find("**DIFFERS**: 0 of 3 requests") != std::string::npos);
+    CHECK(md.find("| categories code | 1 | 1 | 1 | 3 / 3 |") != std::string::npos);
+}
+
 /* ------------------------------------------------------------------ report */
 
 TEST(markdown_renders_the_sweeps_from_json_alone) {
@@ -498,6 +598,7 @@ TEST(markdown_renders_the_sweeps_from_json_alone) {
     CHECK(md.find("| TTFT of the arriving prompt | 450 ms |") != std::string::npos);
     CHECK(md.find("| Stall ratio (longest / typical) | – |") != std::string::npos);
     CHECK(md.find("## Not measured") != std::string::npos);
+    CHECK(md.find("## Parity") == std::string::npos);   /* no baseline given */
 
     /* And the same text from a report that went through a file. */
     CHECK(render_markdown(json::parse(rep.dump())) == md);

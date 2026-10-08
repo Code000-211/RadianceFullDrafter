@@ -98,6 +98,7 @@ struct RequestTiming {
     int64_t accepted = 0;
     bool    ok = false;           /* finished on length or stop, not on an error or a cancel */
     bool    stopped = false;      /* finished on the model's own end of sequence, not on length */
+    std::vector<int32_t> output;  /* the tokens it produced, for the parity comparison */
 };
 
 enum class PhaseKind { Decode, Prefill };
@@ -133,6 +134,25 @@ json summarize_paths(const std::vector<json>& runs, const std::vector<std::strin
  * between two emissions that overlaps it, against the median gap of the emissions before it. */
 json interference_report(const std::vector<StepRecord>& steps, int64_t from_ns, int64_t to_ns);
 
+/* ------------------------------------------------------------------ parity */
+
+/* WHAT TWO RUNS OF THE SAME WORKLOAD PRODUCED, COMPARED TOKEN FOR TOKEN. With the same prompts and
+ * the same seed per request, a build whose logits are bit-identical samples identical tokens, at
+ * any temperature -- so every request of the categories, the concurrency sweep and the prefill
+ * sweep is a parity check of the paths it ran: long prefills, attention at depth, batched decode.
+ * The interference point is left out: when its running streams are cancelled depends on timing.
+ *
+ * `now` and `base` are whole reports. Points are matched by their key (category, streams,
+ * requested tokens), runs and requests by position. The result counts identical and differing
+ * requests and names, for each difference, the first token where they part; a point or run that
+ * only one side has is listed as missing rather than counted as either. Two reports of different
+ * workloads (workload.fingerprint) are refused with RAD_E_INVAL: their prompts differ. */
+int compare_outputs(const json& now, const json& base, json* out, std::string* why);
+
+/* The part of a report's workload that decides which prompts and seeds it ran: equal fingerprints
+ * mean comparable outputs. */
+std::string workload_fingerprint(const json& workload_params);
+
 /* ------------------------------------------------------------------ workload */
 
 /* ONE PROMPT OF THE CATEGORY WORKLOAD: OpenAI-style chat messages and the category they are
@@ -156,8 +176,9 @@ int load_corpus(const std::string& path, std::vector<CorpusEntry>* out, std::str
 
 /* THE SAME MESSAGES MADE UNIQUE FROM THEIR FIRST CHARACTER. `tag` is put at the head of the first
  * message's content, so no two requests of a run share a prefix longer than the chat template's
- * own opening -- less than one cache block -- and the prefix cache cannot serve one from another
- * however it is configured. The driver also checks that it did not (RequestTiming::cached). */
+ * own opening -- less than one cache block -- and the prefix cache cannot serve one from another.
+ * The tag is deterministic (a request counter), so two builds see the same prompts; a hit from a
+ * cache tier that outlived the process is caught by the driver's check of RequestTiming::cached. */
 json salt_messages(const json& messages, const std::string& tag);
 
 

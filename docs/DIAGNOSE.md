@@ -91,6 +91,17 @@ Für die BetterBench-Kategorien mit denselben Prompts: deren Korpus einmal als J
 (`{"category", "messages"}` pro Zeile) und mit `--diagnose-corpus` übergeben. Gewichtung und Score
 bleiben außerhalb der Engine (`scripts/bench_metrics.py`), sie lesen `diagnose.json`.
 
+## Parität über die ganze Last
+
+Das Salz ist ein Zähler, kein Zeitstempel: Zwei Builds bekommen dieselben Prompts und dieselben
+Seeds, und jeder Request schreibt seine Tokens in den Bericht. Bitgleiche Logits ergeben bei jeder
+Temperatur dieselben Tokens. `--diagnose-baseline ALT/diagnose.json` vergleicht deshalb Kategorien,
+Concurrency und Prefill Token für Token, nennt je abweichendem Request die erste abweichende Stelle
+und beendet den Lauf mit Fehler. Interferenz wird nicht verglichen (Abbruchzeitpunkt hängt am
+Timing). Vorher die Baseline zweimal gegen sich selbst laufen lassen: Weicht sie dort ab, ist ein
+Pfad nicht deterministisch und taugt nicht für Bitparität. Regel für nicht bitgenaue Hebel:
+`AGENTS.md` §3, Numerik.
+
 ## Messregeln, die der Bericht einhält
 
 - Kernel-Zeit ist echt, Lücken sind eine Obergrenze, solange Messung sie erzeugen kann.

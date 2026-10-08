@@ -218,6 +218,8 @@ static const Flag g_flags[] = {
     { "--diagnose-corpus",    "FILE",   "JSONL of category prompts, one {\"category\", \"messages\" or \"prompt\",\n"
     "                                    \"max_tokens\"?} a line; default: a built-in set of code, reasoning,\n"
     "                                    prose, json, file_edit and summarization prompts" },
+    { "--diagnose-baseline",  "FILE",   "an earlier diagnose.json of the same workload: compare every request's\n"
+    "                                    tokens with it and fail the run on any difference (parity)" },
 
     { "--debug-graph",        nullptr,  "print the entire declared graph and exit-quality detail" },
     { "--debug-selection",    nullptr,  "print the selection table" },
@@ -749,6 +751,7 @@ int config_parse(int argc, char** argv, Config* c) {
             if (!parse_int_list(a.c_str(), v, 16, 1 << 24, &c->diagnose_prefill)) return RAD_E_INVAL;
         }
         else if (S("--diagnose-corpus"))       { if (!(v = need(i))) return RAD_E_INVAL; c->diagnose_corpus = v; }
+        else if (S("--diagnose-baseline"))     { if (!(v = need(i))) return RAD_E_INVAL; c->diagnose_baseline = v; }
         else if (S("--debug-graph"))           { c->debug_graph = true; c->debug_selection = true; }
         else if (S("--debug-selection"))       c->debug_selection = true;
         else if (S("--debug-placement"))       c->debug_placement = true;
@@ -832,8 +835,9 @@ int config_parse(int argc, char** argv, Config* c) {
 
     /* ONE MODE A RUN. Each replaces serving with its own driver, so two given together would have
      * to pick one silently; --debug-graph returns before either runs. */
-    if (!c->diagnose_mode() && !c->diagnose_corpus.empty()) {
-        RAD_ERR("--diagnose-corpus is the --diagnose workload; give --diagnose DIR as well");
+    if (!c->diagnose_mode() && (!c->diagnose_corpus.empty() || !c->diagnose_baseline.empty())) {
+        RAD_ERR("--diagnose-corpus and --diagnose-baseline belong to the --diagnose workload; give "
+                "--diagnose DIR as well");
         return RAD_E_INVAL;
     }
     if (c->diagnose_mode() && (c->kld() || c->debug_graph)) {

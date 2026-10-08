@@ -171,6 +171,11 @@ json phase_report(const PhaseInput& in) {
     /* Prompt tokens the prefix cache served. The workload is salted so this is 0; anything else
      * means the phase measured a cache hit, and the driver says so. */
     req["cached_prompt_tokens"] = cached;
+    {
+        json outs = json::array();
+        for (const RequestTiming& r : in.requests) outs.push_back(r.output);
+        req["outputs"] = outs;
+    }
     /* TTFT FROM ADMISSION, and the queue wait beside it: the first is the engine's latency, the
      * second is how long the scheduler kept the request waiting, and a client sees their sum. */
     req["ttft_ms"] = to_json(quantiles(ttft_ms));
@@ -336,6 +341,98 @@ json interference_report(const std::vector<StepRecord>& steps, int64_t from_ns, 
     j["longest_gap_ms"] = worst >= 0 ? json(round3(worst)) : json(nullptr);
     j["stall_ratio"] = b.n && b.p50 > 0 && worst >= 0 ? json(round3(worst / b.p50)) : json(nullptr);
     return j;
+}
+
+/* ================================================================== parity */
+
+std::string workload_fingerprint(const json& p) {
+    /* FNV-1a over the canonical dump: stable across builds, and the parameters are few. */
+    const std::string d = p.dump();
+    uint64_t h = 1469598103934665603ull;
+    for (unsigned char c : d) { h ^= c; h *= 1099511628211ull; }
+    char b[24];
+    std::snprintf(b, sizeof b, "%016llx", (unsigned long long)h);
+    return b;
+}
+
+int compare_outputs(const json& now, const json& base, json* out, std::string* why) {
+    auto fp = [](const json& r) {
+        return r.contains("workload") ? r["workload"].value("fingerprint", std::string()) : std::string();
+    };
+    if (fp(now).empty() || fp(now) != fp(base)) {
+        *why = "the two reports ran different workloads (workload.fingerprint " + fp(now) + " against " +
+               fp(base) + "), so their prompts differ and their outputs cannot be compared";
+        return RAD_E_INVAL;
+    }
+    struct Section { const char* name; const char* key; };
+    static const Section kSections[] = { { "categories", "category" }, { "concurrency", "streams" },
+                                         { "prefill", "requested_tokens" } };
+    int64_t compared = 0, identical = 0;
+    json differing = json::array(), missing = json::array();
+    for (const Section& sec : kSections) {
+        const json empty = json::array();
+        const json& a = now.contains(sec.name) ? now[sec.name] : empty;
+        const json& b = base.contains(sec.name) ? base[sec.name] : empty;
+        auto find = [&](const json& list, const json& key) -> const json* {
+            for (const json& p : list)
+                if (p.contains(sec.key) && p[sec.key] == key) return &p;
+            return nullptr;
+        };
+        for (const json& pa : a) {
+            const json& key = pa[sec.key];
+            const std::string point = std::string(sec.name) + " " + (key.is_string() ? key.get<std::string>() : key.dump());
+            const json* pb = find(b, key);
+            if (!pb) {
+                missing.push_back(point + ": not in the baseline");
+                continue;
+            }
+            const json& ra = pa.value("runs", json::array());
+            const json& rb = (*pb).value("runs", json::array());
+            for (size_t r = 0; r < std::max(ra.size(), rb.size()); ++r) {
+                if (r >= ra.size() || r >= rb.size()) {
+                    missing.push_back(point + " run " + std::to_string(r + 1) + ": only one side has it");
+                    continue;
+                }
+                const json& oa = ra[r]["requests"].value("outputs", json::array());
+                const json& ob = rb[r]["requests"].value("outputs", json::array());
+                for (size_t k = 0; k < std::max(oa.size(), ob.size()); ++k) {
+                    if (k >= oa.size() || k >= ob.size()) {
+                        missing.push_back(point + " run " + std::to_string(r + 1) + " request " +
+                                          std::to_string(k + 1) + ": only one side has it");
+                        continue;
+                    }
+                    ++compared;
+                    const json& ta = oa[k];
+                    const json& tb = ob[k];
+                    if (ta == tb) {
+                        ++identical;
+                        continue;
+                    }
+                    size_t i = 0;
+                    while (i < ta.size() && i < tb.size() && ta[i] == tb[i]) ++i;
+                    differing.push_back({ { "point", point }, { "run", (int64_t)r + 1 }, { "request", (int64_t)k + 1 },
+                                          { "first_different_token", (int64_t)i },
+                                          { "tokens", (int64_t)ta.size() }, { "tokens_baseline", (int64_t)tb.size() } });
+                }
+            }
+        }
+        for (const json& pb : b)
+            if (!find(a, pb[sec.key]))
+                missing.push_back(std::string(sec.name) + " " +
+                                  (pb[sec.key].is_string() ? pb[sec.key].get<std::string>() : pb[sec.key].dump()) +
+                                  ": only in the baseline");
+    }
+    json j;
+    j["compared"] = compared;
+    j["identical"] = identical;
+    j["differing"] = differing;
+    j["missing"] = missing;
+    j["verdict"] = compared == 0           ? "nothing compared"
+                 : !differing.empty()      ? "DIFFERS"
+                 : !missing.empty()        ? "identical where both ran; points missing"
+                                           : "identical";
+    *out = j;
+    return RAD_OK;
 }
 
 /* ================================================================== workload */
@@ -558,8 +655,8 @@ std::string render_markdown(const json& rep) {
              "| Category | Runs | Stream tok/s | ms/step | Tok/step | Draft acceptance | TTFT ms | 1% low tok/s | Ended on EOS |\n"
              "|---|---|---|---|---|---|---|---|---|\n";
         for (const auto& c : rep["categories"]) {
-            const json& s = c["summary"];
-            m += "| " + c["category"].get<std::string>() + " | " + num(s["runs"]) + " | " +
+            const json s = c.value("summary", json::object());
+            m += "| " + c.value("category", std::string("?")) + " | " + num(s.value("runs", json())) + " | " +
                  cell(s, "requests.stream_tok_s.p50") + " | " + cell(s, "counters.ms_per_decode_step") + " | " +
                  cell(s, "steps.decode_tok_per_step") + " | " + cell(s, "counters.draft_acceptance") + " | " +
                  cell(s, "requests.ttft_ms.p50") + " | " + cell(s, "steps.tok_s_1pct_low") + " | " +
@@ -572,8 +669,8 @@ std::string render_markdown(const json& rep) {
              "| Streams | Runs | Aggregate tok/s | Per stream tok/s | ms/step | Tok/step | Draft acceptance | "
              "Emission p50 ms | Emission p99/p50 | 1% low tok/s |\n|---|---|---|---|---|---|---|---|---|---|\n";
         for (const auto& c : rep["concurrency"]) {
-            const json& s = c["summary"];
-            m += "| " + num(c["streams"]) + " | " + num(s["runs"]) + " | " + cell(s, "requests.aggregate_tok_s") +
+            const json s = c.value("summary", json::object());
+            m += "| " + num(c.value("streams", json())) + " | " + num(s.value("runs", json())) + " | " + cell(s, "requests.aggregate_tok_s") +
                  " | " + cell(s, "requests.stream_tok_s.p50") + " | " + cell(s, "counters.ms_per_decode_step") +
                  " | " + cell(s, "steps.decode_tok_per_step") + " | " + cell(s, "counters.draft_acceptance") +
                  " | " + cell(s, "steps.emission_interval_ms.p50") + " | " +
@@ -586,8 +683,8 @@ std::string render_markdown(const json& rep) {
              "| Prompt tokens | Runs | TTFT ms | Prefill tok/s | Chunk ms p50 | Decode ms/step at depth | "
              "Decode tok/s at depth |\n|---|---|---|---|---|---|---|\n";
         for (const auto& c : rep["prefill"]) {
-            const json& s = c["summary"];
-            m += "| " + num(c["prompt_tokens"]) + " | " + num(s["runs"]) + " | " + cell(s, "requests.ttft_ms.p50") +
+            const json s = c.value("summary", json::object());
+            m += "| " + num(c.value("prompt_tokens", json())) + " | " + num(s.value("runs", json())) + " | " + cell(s, "requests.ttft_ms.p50") +
                  " | " + cell(s, "requests.prefill_tok_s.p50") + " | " + cell(s, "steps.prefill_chunk_ms.p50") +
                  " | " + cell(s, "counters.ms_per_decode_step") + " | " + cell(s, "requests.stream_tok_s.p50") + " |\n";
         }
@@ -595,14 +692,30 @@ std::string render_markdown(const json& rep) {
     }
     if (rep.contains("interference") && rep["interference"].is_object()) {
         const json& i = rep["interference"];
-        const json& s = i["summary"];
-        m += "## A prompt arriving into running streams\n\n" + num(i["streams"]) + " streams decoding, then one prompt of " +
-             num(i["prompt_tokens"]) + " tokens.\n\n| Measure | Value |\n|---|---|\n";
+        const json s = i.value("summary", json::object());
+        m += "## A prompt arriving into running streams\n\n" + num(i.value("streams", json())) + " streams decoding, then one prompt of " +
+             num(i.value("prompt_tokens", json())) + " tokens.\n\n| Measure | Value |\n|---|---|\n";
         m += "| TTFT of the arriving prompt | " + cell(s, "arrival_ttft_ms") + " ms |\n";
         m += "| Its TTFT on an idle engine (prefill sweep) | " + num(i.value("idle_ttft_ms", json())) + " ms |\n";
         m += "| Typical emission gap before it | " + cell(s, "interference.typical_gap_ms") + " ms |\n";
         m += "| Longest emission gap while it prefilled | " + cell(s, "interference.longest_gap_ms") + " ms |\n";
         m += "| Stall ratio (longest / typical) | " + cell(s, "interference.stall_ratio") + " |\n\n";
+    }
+    if (rep.contains("parity") && rep["parity"].is_object()) {
+        const json& p = rep["parity"];
+        m += "## Parity against " + p.value("baseline", std::string("the baseline")) + "\n\n**" +
+             p.value("verdict", std::string()) + "**: " + num(p.value("identical", json())) + " of " +
+             num(p.value("compared", json())) + " requests produced identical tokens.\n\n";
+        const json& d = p.value("differing", json::array());
+        if (!d.empty()) {
+            m += "| Point | Run | Request | First different token | Tokens (now / baseline) |\n|---|---|---|---|---|\n";
+            for (const auto& x : d)
+                m += "| " + x["point"].get<std::string>() + " | " + num(x["run"]) + " | " + num(x["request"]) + " | " +
+                     num(x["first_different_token"]) + " | " + num(x["tokens"]) + " / " + num(x["tokens_baseline"]) + " |\n";
+            m += "\n";
+        }
+        for (const auto& x : p.value("missing", json::array())) m += "- missing: " + x.get<std::string>() + "\n";
+        if (!p.value("missing", json::array()).empty()) m += "\n";
     }
     if (rep.contains("not_measured")) {
         m += "## Not measured\n\n";

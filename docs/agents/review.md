@@ -32,7 +32,10 @@ Dann den Diff gegen diese Liste:
 2. **Korrektheit.** Indexrechnung, Grenzen, Reste bei nicht teilbaren Größen, Races,
    Synchronisation, beide TP-Ränge symmetrisch, Fehlerpfade.
 3. **Numerik und Parität.** Rechenreihenfolge, Akkumulationstyp, FP8-/INT-Konvertierung, Rundung.
-   Passt das zu dem, was der Plan über Parität sagt?
+   Stimmt die Zeile `numerik:` des Plans mit dem Diff überein (`AGENTS.md` §3, Numerik)? Ändert
+   der Diff eine Reihenfolge, obwohl der Plan `bitgenau` sagt, ist das blockierend. Bei
+   `verlustfrei-nicht-bitgenau`: hält jeder Beleg (Akkumulator, Zwischenformate gleich oder
+   genauer)? Jede Verringerung von Genauigkeit ist blockierend.
 4. **RDNA4.** `docs/RDNA4_ISA_ENGINEERING_RULES.md`: VGPR-Granularität, keine Waterfall-Schleifen,
    VOPD-Regeln. Wave32.
 5. **Hardware.** Keine Peer-Reads auf dem Hot Path, keine Annahme von PCIe 5.0

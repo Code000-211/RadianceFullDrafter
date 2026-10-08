@@ -51,6 +51,31 @@ Baseline im selben Lauf; siehe `docs/GATE.md`.
 - Hebel hinter Flags/Umgebungsvariablen brauchen `candidates/<slug>/gate.json`, sonst misst das
   Gate sie nicht.
 
+### Numerik: verlustfrei, bitgenau als Normalfall
+
+Wir quantisieren nichts neu. Jeder Hebel ist verlustfrei, und es gibt drei Fälle:
+
+| Fall | Beispiele | Erlaubt? |
+|---|---|---|
+| **Bitgenau** | Scheduling, Overlap, Speicherlayout, Launch-Overhead, eine Fusion, die Reihenfolge und Zwischenformate beibehält | ja; Parität mit Toleranz 0 |
+| **Verlustfrei, nicht bitgenau** | andere Summationsreihenfolge, Split-K, andere Kachelung oder Reduktionsbaum, Fusion, bei der sich Reihenfolge ändert, Zwischenformate aber gleich oder genauer bleiben | ja, **nur deklariert** (unten) |
+| **Verlustbehaftet** | geringere Genauigkeit in Gewichten, Aktivierungen, Akkumulatoren oder KV-Cache; Näherungsfunktionen; übersprungene oder abgeschnittene Rechnung; geänderte Quantisierung oder Container | nein |
+
+**Deklaration.** Ein Hebel, der Ergebnisse nicht bitgenau lässt, sagt das im Plan (Abschnitt
+„Numerik und Parität“, Zeile `numerik: verlustfrei-nicht-bitgenau`) und in `gate.json`
+(`"numerics": "reordered"`), mit: welche Op, was sich an der Reihenfolge ändert, und der Beleg
+aus dem Code, dass Akkumulatortyp und jedes Zwischenformat gleich oder genauer bleiben. Review
+prüft genau diesen Beleg. Eine Paritätsabweichung ohne Deklaration ist ein FAIL und ein
+Korrektheitsbefund.
+
+**Warum „die Antwort ist noch richtig“ nicht reicht.** Ein Modell beantwortet einfache Prompts
+auch mit einem echten Rechenfehler oft richtig, etwa einer falschen Skalierung in einem selten
+gerouteten Experten oder einem Fehler erst ab 16k Kontext. Richtige Antworten sind deshalb nur
+eine grobe Zusatzprüfung. Der Schutz ist die Deklaration mit Beleg, und bis das Gate ein
+abgestuftes Maß hat (KL gegen die Baseline, `docs/DIAGNOSE.md`), entscheidet Leon über jede
+deklarierte Abweichung anhand des Paritätsberichts (erste abweichende Stelle je Request,
+`radiance --diagnose --diagnose-baseline`).
+
 ## 4. Laufzeit-Umgebung
 
 Verboten beim Benchmarken und im Gate:

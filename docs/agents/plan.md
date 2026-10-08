@@ -87,9 +87,13 @@ neuer Plan (kein Diff zum alten) und oben ein Satz, was sich geändert hat und w
 **Schritte.** Nummeriert, jeder klein und für sich baubar. Je Schritt: was genau, und woran der
 Code-Agent erkennt, dass er fertig ist.
 
-**Numerik und Parität.** Ändert sich Rechenreihenfolge, Akkumulation, Rundung oder ein
-Quantisierungsformat? Bit-exakt erwartet oder nur innerhalb der Gate-Toleranz? Was würde ein
-Paritätsfehler im Gate-Bericht zeigen?
+**Numerik und Parität.** Genau eine Zeile `numerik: bitgenau` oder
+`numerik: verlustfrei-nicht-bitgenau` (`AGENTS.md` §3, Numerik). Verlustbehaftete Änderungen
+(geringere Genauigkeit, Näherung, übersprungene Rechnung, andere Quantisierung) werden nicht
+geplant. Bei `verlustfrei-nicht-bitgenau`: welche Op, was sich an der Reihenfolge ändert, und
+`datei:zeile`-Belege, dass Akkumulatortyp und jedes Zwischenformat gleich oder genauer bleiben;
+dazu `"numerics": "reordered"` in `candidates/<slug>/gate.json`. Bei `bitgenau`: warum keine
+Reihenfolge sich ändert.
 
 **ISA-Budget.** Für geänderte Kernel: VGPR-Obergrenze nach `docs/RDNA4_ISA_ENGINEERING_RULES.md`
 (Granularität 24, Belegungsstufen), keine neuen Spills, keine Waterfall-Schleifen.

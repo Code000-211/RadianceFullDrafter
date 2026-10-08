@@ -166,7 +166,7 @@ TEST(the_diagnose_mode_takes_its_workload_and_refuses_what_it_cannot_run) {
     Config c;
     CHECK_EQ(parse({ "--diagnose", "/out", "--diagnose-tokens", "128", "--diagnose-runs", "5",
                      "--diagnose-concurrency", "1,16,3", "--diagnose-prefill", "512,32768",
-                     "--diagnose-corpus", "/c.jsonl" }, &c), RAD_OK);
+                     "--diagnose-corpus", "/c.jsonl", "--diagnose-baseline", "/b.json" }, &c), RAD_OK);
     CHECK(c.diagnose_mode());
     CHECK_EQ(c.diagnose, std::string("/out"));
     CHECK_EQ(c.diagnose_tokens, 128);
@@ -174,6 +174,7 @@ TEST(the_diagnose_mode_takes_its_workload_and_refuses_what_it_cannot_run) {
     CHECK(c.diagnose_concurrency == std::vector<int>({ 1, 16, 3 }));   /* in the order given */
     CHECK(c.diagnose_prefill == std::vector<int>({ 512, 32768 }));
     CHECK_EQ(c.diagnose_corpus, std::string("/c.jsonl"));
+    CHECK_EQ(c.diagnose_baseline, std::string("/b.json"));
 
     Config f;
     CHECK_EQ(parse({ "--diagnose" }, &f), RAD_E_INVAL);
@@ -186,6 +187,8 @@ TEST(the_diagnose_mode_takes_its_workload_and_refuses_what_it_cannot_run) {
     CHECK_EQ(parse({ "--diagnose", "/o", "--diagnose-prefill", "" }, &f), RAD_E_INVAL);
     Config g;   /* fresh: a Config the calls above parsed into already carries --diagnose */
     CHECK_EQ(parse({ "--diagnose-corpus", "/c.jsonl" }, &g), RAD_E_INVAL);          /* no --diagnose */
+    Config h;
+    CHECK_EQ(parse({ "--diagnose-baseline", "/b.json" }, &h), RAD_E_INVAL);
     CHECK_EQ(parse({ "--diagnose", "/o", "--kld-ref", "/r", "--kld-out", "/x" }, &f), RAD_E_INVAL);
     CHECK_EQ(parse({ "--diagnose", "/o", "--debug-graph" }, &f), RAD_E_INVAL);
 }
@@ -865,7 +868,7 @@ TEST(usage_names_every_flag_it_documents) {
     CHECK(text.find("--kld-record") != std::string::npos);
     CHECK(text.find("--kld-ref") != std::string::npos);
     for (const char* f : { "--diagnose", "--diagnose-tokens", "--diagnose-runs", "--diagnose-concurrency",
-                           "--diagnose-prefill", "--diagnose-corpus" })
+                           "--diagnose-prefill", "--diagnose-corpus", "--diagnose-baseline" })
         CHECK(text.find(f) != std::string::npos);
     for (const char* f : { "--default-max-tokens", "--max-tokens-cap", "--presence-penalty",
                            "--dry-sequence-breakers", "--chat-template-kwargs",
