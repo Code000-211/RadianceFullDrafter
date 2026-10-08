@@ -19,8 +19,8 @@
     },
     "gemini": {
       "cli": "agy",
-      "model": null,
-      "_todo": "Exakten Namen von Gemini Flash 3.8 aus `agy models` eintragen; null = Backend gesperrt. Gemini Pro (3.1) bewusst nicht. Bei Gemini 4 nur diesen Namen tauschen. alphaXiv ist in Antigravity angemeldet."
+      "model": "gemini-3.8-flash-high",
+      "_doc": "Aus `agy models` (2026-10-08): gemini-3.8-flash-high/-medium/-low; Gemini Pro (3.1) bewusst nicht. Bei Gemini 4 nur diesen Namen tauschen. alphaXiv ist in Antigravity angemeldet."
     }
   },
   "tiers": {

@@ -1,7 +1,7 @@
 # Upstream Codeberg watcher: Jev usefulness triage into candidates/upstream/REVIEW.md.
 # It only reads Codeberg + TypeSafe and writes two local files; no GitHub access needed.
 #
-# Install (as root in CT 107):
+# Install (as root in CT 105, e.g. from the Proxmox host: pct exec 105 -- bash):
 #   cp /home/orca/RadianceMine/scripts/systemd/radiance-upstream-watcher.service /etc/systemd/system/
 #   systemctl daemon-reload && systemctl enable --now radiance-upstream-watcher
 [Unit]

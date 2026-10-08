@@ -2,7 +2,7 @@
 # fresh worktrees, each in an Orca terminal; see docs/ORCA_AGENT_WORKFLOW.md.
 # Deterministic, no LLM call itself. Needs gh auth and the Orca runtime for user orca.
 #
-# Install (as root in CT 107):
+# Install (as root in CT 105, e.g. from the Proxmox host: pct exec 105 -- bash):
 #   cp /home/orca/RadianceMine/scripts/systemd/radiance-agent-tick.{service,timer} /etc/systemd/system/
 #   systemctl daemon-reload && systemctl enable --now radiance-agent-tick.timer
 [Unit]

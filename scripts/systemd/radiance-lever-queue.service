@@ -1,7 +1,7 @@
 # Lever test queue: runs queued candidates one at a time (build + gate_check.sh).
 # Queue a lever with: python3 scripts/lever_queue.py add <slug>
 #
-# Install (as root in CT 107):
+# Install (as root in CT 105, e.g. from the Proxmox host: pct exec 105 -- bash):
 #   cp /home/orca/RadianceMine/scripts/systemd/radiance-lever-queue.service /etc/systemd/system/
 #   systemctl daemon-reload && systemctl enable --now radiance-lever-queue
 [Unit]

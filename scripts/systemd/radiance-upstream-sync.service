@@ -2,7 +2,7 @@
 # `upstream:sync` issue for the agent pipeline. It never merges; see docs/UPSTREAM.md.
 # Needs network to Codeberg and gh/git push credentials of user orca (unlike the PR watcher).
 #
-# Install (as root in CT 107):
+# Install (as root in CT 105, e.g. from the Proxmox host: pct exec 105 -- bash):
 #   cp /home/orca/RadianceMine/scripts/systemd/radiance-upstream-sync.{service,timer} /etc/systemd/system/
 #   systemctl daemon-reload && systemctl enable --now radiance-upstream-sync.timer
 [Unit]
