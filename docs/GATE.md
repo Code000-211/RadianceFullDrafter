@@ -28,8 +28,9 @@ Ein Lauf dauert mit A/B etwa 10 Minuten.
 Ergebnisse: `<out>/ab/report.md` (Tabelle), `<out>/ab/summary.json` (alle Blöcke mit
 Binary-SHA256, Startzeit, MCLK-Anteil, Parität, Metriken), `<out>/isa_diff.json`.
 
-Exit-Codes von `ab_gate.py`: 0 PASS, 2 Regression oder Parität, 3 Setup-Fehler/Inconclusive
-(z. B. GPUs belegt, Engine startet nicht, Baseline verfehlt selbst die Parität → Goldens veraltet).
+Exit-Codes von `ab_gate.py`: 0 PASS; 2 Kandidat scheitert (Parität, Speed, oder seine Engine
+startet nicht — der Bericht enthält dann das Ende des Engine-Logs); 3 Setup-Fehler/Inconclusive
+(GPUs belegt, Baseline-Engine startet nicht, Baseline verfehlt selbst die Parität → Goldens veraltet).
 
 ## Einstellungen
 

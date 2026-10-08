@@ -33,6 +33,7 @@ import argparse
 import fcntl
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -48,6 +49,14 @@ REPORTS_DIR = REPO_ROOT / "reports"
 RELEASES_DIR = REPO_ROOT / "releases"
 LOCK_FILE = QUEUE_DIR / "runner.lock"
 BASELINE_WT = REPO_ROOT / "worktrees" / "_baseline"
+ROCM = os.environ.get("ROCM_PATH", "/opt/rocm")
+# The systemd unit starts with a bare environment; cmake's HIP detection needs these.
+BUILD_ENV = {
+    **os.environ,
+    "ROCM_PATH": ROCM,
+    "HIP_PATH": os.environ.get("HIP_PATH", ROCM),
+    "PATH": f"{ROCM}/bin:{ROCM}/llvm/bin:{os.environ.get('PATH', '/usr/bin:/bin')}",
+}
 CMAKE_ARGS = ["-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release", "-DRAD_WITH_HIP=ON", "-DRAD_GPU_TARGETS=gfx1201", "-DRAD_BUILD_TESTS=ON"]
 
 
@@ -92,7 +101,7 @@ def cmd_list(_: argparse.Namespace) -> int:
 def run_step(step: str, cmd: list[str], log_f, cwd: Path) -> None:
     log_f.write(f"\n=== {time.strftime('%H:%M:%S')} {step}: {' '.join(cmd)}\n")
     log_f.flush()
-    proc = subprocess.run(cmd, cwd=str(cwd), stdout=log_f, stderr=subprocess.STDOUT, check=False)
+    proc = subprocess.run(cmd, cwd=str(cwd), stdout=log_f, stderr=subprocess.STDOUT, env=BUILD_ENV, check=False)
     log_f.write(f"=== {step} exit {proc.returncode}\n")
     log_f.flush()
     if proc.returncode != 0:
@@ -154,8 +163,10 @@ def process(job_path: Path) -> dict[str, Any]:
 
     with (report_dir / "run.log").open("w") as log_f:
         try:
-            run_step("fetch", ["git", "fetch", "origin", "+refs/heads/main:refs/remotes/origin/main",
-                               f"+refs/heads/{ref}:refs/remotes/origin/{ref}"], log_f, REPO_ROOT)
+            refspecs = ["+refs/heads/main:refs/remotes/origin/main"]
+            if ref != "main":
+                refspecs.append(f"+refs/heads/{ref}:refs/remotes/origin/{ref}")
+            run_step("fetch", ["git", "fetch", "origin", *refspecs], log_f, REPO_ROOT)
             patch = read_candidate_file(ref, slug, "lever.patch")
             if patch is None:
                 raise StepFailed("find-patch", 1)

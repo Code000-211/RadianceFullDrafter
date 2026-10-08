@@ -21,7 +21,8 @@ Verdict per metric: candidate mean vs baseline mean must not be worse than
 tier2.slack_pct. In "abba" mode the A/A spread is checked against the slack as well;
 a spread larger than the slack makes the result inconclusive, which fails the gate.
 
-Exit codes: 0 pass, 2 parity or speed regression, 3 setup error / inconclusive.
+Exit codes: 0 pass, 2 candidate fails (parity, speed, or its engine does not start),
+3 setup error (GPUs busy, baseline engine does not start) / inconclusive.
 """
 
 from __future__ import annotations
@@ -82,6 +83,13 @@ def radiance_processes() -> list[tuple[int, str, int]]:
         except (OSError, ProcessLookupError):
             continue
     return out
+
+
+def tail(path: Path, lines: int) -> str:
+    try:
+        return "\n".join(path.read_text(errors="replace").splitlines()[-lines:])
+    except OSError:
+        return "(no log)"
 
 
 def endpoint_up(port: int) -> bool:
@@ -345,17 +353,22 @@ def main() -> int:
 
     order = ["baseline", "candidate"] if mode == "ab" else ["baseline", "candidate", "candidate", "baseline"]
     blocks: list[dict[str, Any]] = []
-    try:
-        for i, role in enumerate(order, start=1):
-            build = args.baseline_build if role == "baseline" else args.candidate_build
-            engine = Engine(build, cfg["port"], args.out / f"block{i}_{role}.log",
-                            args.candidate_arg if role == "candidate" else [],
-                            cand_env if role == "candidate" else {})
+    for i, role in enumerate(order, start=1):
+        build = args.baseline_build if role == "baseline" else args.candidate_build
+        engine = Engine(build, cfg["port"], args.out / f"block{i}_{role}.log",
+                        args.candidate_arg if role == "candidate" else [],
+                        cand_env if role == "candidate" else {})
+        try:
             blocks.append(run_block(f"block{i}", role, engine, cfg, args.out))
-    except SetupError as e:
-        log(f"❌ setup error: {e}")
-        (args.out / "summary.json").write_text(json.dumps({"verdict": "SETUP_ERROR", "error": str(e), "blocks": blocks}, indent=2))
-        return 3
+        except SetupError as e:
+            # A candidate that cannot start or serve is the candidate's failure; a baseline
+            # that cannot is a problem of the test setup.
+            verdict, rc = (f"FAIL (candidate engine: {e})", 2) if role == "candidate" else (f"SETUP_ERROR (baseline engine: {e})", 3)
+            log(f"❌ {verdict}")
+            (args.out / "summary.json").write_text(json.dumps({"verdict": verdict, "blocks": blocks}, indent=2))
+            (args.out / "report.md").write_text(
+                f"# A/B Gate: {verdict}\n\nEngine log: `{engine.log_path}`\n\n```\n{tail(engine.log_path, 25)}\n```\n")
+            return rc
 
     comparison = compare(blocks, cfg["slack_pct"])
     baseline_parity_ok = all(b["parity"]["passed"] for b in blocks if b["role"] == "baseline")
