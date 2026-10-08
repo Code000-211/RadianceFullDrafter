@@ -40,9 +40,13 @@ Dann den Diff gegen diese Liste:
 6. **Gate misst den Hebel.** Liegt der Hebel hinter Flag oder Umgebungsvariable, steht genau das in
    `gate.json`? Ist `lever.patch` aus `git diff` erzeugt und deckt den ganzen Code-Diff ab?
 7. **Belege.** README ohne erfundene Messwerte; Wirkungen als Erwartung.
-8. **Verbotene Dateien.** Nichts unter `baselines/`, keine Gate-Skripte (`gate_check.sh`,
+8. **Regeln der Engine** (`AGENTS.md` §5): Benennung `<family>_<op>_<geometrie>` und Ablehnung
+   falscher Geometrie im Einstiegspunkt, keine geänderten Op-Schemas, neue Ops mit `libref`-Zeile
+   oder `replaces`, Fehler als `RAD_E_*`-Werte, keine Allokation oder Synchronisation auf dem
+   Step-Pfad, Host-Backend baut weiter ohne ROCm. Ein Verstoß ist blockierend.
+9. **Verbotene Dateien.** Nichts unter `baselines/`, keine Gate-Skripte (`gate_check.sh`,
    `ab_gate.py`, `parity_check.py`, `gate_thresholds.py`).
-9. **Übergabe.** Letzter `candidate:`/`ref:`-Block zeigt auf genau den geprüften Branch.
+10. **Übergabe.** Letzter `candidate:`/`ref:`-Block zeigt auf genau den geprüften Branch.
 
 Jeder Befund ist **blockierend** (falsches Ergebnis, Paritätsrisiko, Gate misst den Hebel nicht,
 Build oder Test rot, Regelverstoß) oder **Hinweis**. Nur blockierende Befunde rechtfertigen

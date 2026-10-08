@@ -1,6 +1,6 @@
 """Tests for scripts/upstream_sync.py (analysis on throwaway repos) and the merge-mode metadata.
 
-Run: python3 -m unittest tests/upstream_sync_test.py
+Run: python3 -m unittest scripts/tests/upstream_sync_test.py
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
+SCRIPTS_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(SCRIPTS_DIR))
 spec = importlib.util.spec_from_file_location("upstream_sync", SCRIPTS_DIR / "upstream_sync.py")
 us = importlib.util.module_from_spec(spec)

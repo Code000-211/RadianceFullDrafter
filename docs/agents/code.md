@@ -39,6 +39,8 @@ Issue liest du nur, wenn dort etwas fehlt.
 - Nicht anfassen: `baselines/`, `scripts/gate_check.sh`, `scripts/ab_gate.py`,
   `scripts/parity_check.py`, `scripts/gate_thresholds.py`.
 - Keine GPU-Nutzung: keine Engine starten, keine Tests mit Label `gpu`, kein Profiler.
+- Die Regeln der Engine (`AGENTS.md` §5) gelten für jede Zeile Engine-Code, auch wenn der Plan sie
+  nicht wiederholt. Verlangt der Plan einen Verstoß: `ask` oder `plan:needs-revision`.
 
 ## 3. Paket bauen
 

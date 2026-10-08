@@ -10,8 +10,9 @@ import unittest
 from pathlib import Path
 
 # Load parity_check module dynamically from scripts/
-SCRIPTS_DIR = Path(__file__).resolve().parent.parent.parent.parent / "scripts"
+SCRIPTS_DIR = Path(__file__).resolve().parent.parent
 PARITY_SCRIPT = SCRIPTS_DIR / "parity_check.py"
+sys.path.insert(0, str(SCRIPTS_DIR))  # parity_check imports gate_thresholds from scripts/
 
 spec = importlib.util.spec_from_file_location("parity_check", PARITY_SCRIPT)
 if spec is None or spec.loader is None:

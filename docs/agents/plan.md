@@ -25,7 +25,11 @@ nicht deine Überlegungen. Alles, was er wissen muss, steht im Plan selbst.
    Eine Idee, deren erwartete Wirkung im Rauschen liegt, kann das Gate nicht bestätigen.
 4. Den betroffenen Code selbst lesen (`rg`, clangd). Jede Stelle im Plan muss es geben, mit
    `datei:zeile` aus dem aktuellen `origin/main`.
-5. Laufzeit-Verbote aus `AGENTS.md` §4 gelten auch für Hebel (z. B. kein
+5. Die Regeln der Engine (`AGENTS.md` §5) gelten für jeden Plan: Benennung nach
+   `libr4d/README.md`, keine geänderten Op-Schemas, neue Ops nur mit `libref`-Zeile oder
+   `replaces`-Hook, modellspezifische Kernel in unserem Plugin statt in `libr4d/`. Ein Plan, der
+   dagegen verstoßen müsste, wird umgeplant oder verworfen, nicht mit Ausnahme versehen.
+6. Laufzeit-Verbote aus `AGENTS.md` §4 gelten auch für Hebel (z. B. kein
    `RADIANCE_HEAT_RESIDENCY > 0`, kein statisches `NUM_SPECULATIVE_TOKENS > 3`).
 
 ## 2. Verwerfen

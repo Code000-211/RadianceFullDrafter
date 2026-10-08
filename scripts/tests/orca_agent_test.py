@@ -1,6 +1,6 @@
 """Tests for scripts/orca_agent.py: selection, tiers, handoff, limits, slots, one simulated run.
 
-Run: python3 -m unittest tests/orca_agent_test.py
+Run: python3 -m unittest scripts/tests/orca_agent_test.py
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
+SCRIPTS_DIR = Path(__file__).resolve().parent.parent
 spec = importlib.util.spec_from_file_location("orca_agent", SCRIPTS_DIR / "orca_agent.py")
 oa = importlib.util.module_from_spec(spec)
 sys.modules["orca_agent"] = oa

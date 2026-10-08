@@ -64,6 +64,41 @@ Chat-Template und Reasoning-Parser.
 
 <!-- OPENWIKI:START -->
 
+## 5. Die Regeln der Engine sind bindend
+
+Die Radiance-Engine bringt ihre eigenen Verträge mit. Sie gelten für jede Änderung an Engine-Code
+(`abi/`, `core/`, `arch/`, `libr4d/`, `libref/`, `libquant/`, `libavx/`, `tools/`, `tests/`, eigene
+Plugins) ohne Ausnahme; bisher haben wir sie nicht durchgehend eingehalten. Quellen, in dieser
+Rangfolge:
+
+| Quelle | Inhalt |
+|---|---|
+| `spec.md` | Design und Verträge; laut `docs/IMPLEMENTATION.md` bindend |
+| `docs/IMPLEMENTATION.md` | Konventionen: Host-Backend baut und testet ohne ROCm, Fehler sind Werte, nichts Unimplementiertes meldet Erfolg, keine Allokation und Synchronisation auf dem Step-Pfad, keine HIP-Stream-APIs in Plugins außer `hipLaunchKernel` |
+| `docs/PLUGIN.md` | Plugin-Verträge: Kernel sagt, was er bedienen kann; Constraints, Priorität, Hierarchie; optionale Hooks |
+| `docs/OPS.md` | Die konventionelle Op-Liste (`libref`); eine neue Op hat keinen Fallback und kein Orakel |
+| `libr4d/README.md` | Benennung `<family>_<op>_<geometrie>`; ein Einstiegspunkt lehnt eine falsche Geometrie ab, statt zu rechnen |
+| `libr4d/isa/README.md`, `docs/TOOLS.md` | Wie gemessen wird (`trace.sh`, `tsum.sh`, `gaps.sh`, `rad-kbench`, `rad-tune`) und wie die Zahlen zu lesen sind |
+| Kommentare im Code, die einen Vertrag nennen | z. B. `libr4d/r4d_rows.cpp` („ORDER IS priority“), `core/plugin/loader.cpp` (Hierarchie) |
+
+Daraus folgt insbesondere:
+
+- **Upstream-Bibliotheken nicht für unser Modell umschreiben.** Modellspezifische Kernel kommen in
+  unser eigenes Plugin und werden über die Hierarchie ausgewählt (`docs/UPSTREAM.md`).
+- **Op-Schemas nicht ändern.** Wer andere Parameter braucht, braucht eine eigene Op; eine Op
+  außerhalb von `docs/OPS.md` braucht eine `libref`-Zeile oder einen `replaces`-Hook, damit
+  `rad-kbench` und das Orakel sie prüfen können (`spec.md` §17).
+- **Kein Python in Engine, Engine-Werkzeugen, Build oder CTest.** Unsere Python-Werkzeuge (Gate,
+  Queue, Agents) liegen in `scripts/` und ihre Tests in `scripts/tests/`, nie in `tests/`.
+- **Messen mit den Werkzeugen der Engine** und nach ihren Lesehinweisen: In einem Trace ist
+  Kernel-Zeit echt, Leerlauf eine Obergrenze (`libr4d/isa/trace.sh`).
+- **`--debug-accept-reference-kernels`** nie beim Benchmarken oder im Gate.
+
+Widerspricht eine Regel dieser Datei einer Regel der Engine, gilt die Regel der Engine. Ausnahmen
+sind nur §3 (Gate) und §4 (Laufzeit-Verbote), die für unseren Betrieb gelten. Jeden solchen
+Widerspruch im Issue benennen; die Entscheidung trifft Leon. Bestehende Verstöße sind Funde: Das
+Audit meldet sie als `audit:bug`, ein Hebel behebt sie nicht nebenbei.
+
 ## OpenWiki
 
 This repository has a generated `openwiki/` evidence index. It is optional just-in-time context, not required startup reading.

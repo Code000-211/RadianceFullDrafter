@@ -44,6 +44,8 @@ Höchstens 3 Issues pro Lauf, jedes mit `datei:zeile` als Beleg.
 
 - **Leistung** → wie ein Research-Issue (siehe `docs/agents/research.md`, „Issue anlegen“), Labels
   `research:new-lever` und `source:audit`. Vorher `lever_review.py similar` und Duplikatsuche.
+- **Verstoß gegen eine Regel der Engine** (`AGENTS.md` §5) → Label `audit:bug`, mit Regel und
+  Fundstelle; Leon entscheidet, ob und wie er behoben wird.
 - **Korrektheit oder Parität** → Label `audit:bug`, nicht in die Hebel-Pipeline. Beschreibung,
   wie es sich zeigen würde, und warum du es für real hältst. Das entscheidet Leon.
 
