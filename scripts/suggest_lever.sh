@@ -26,9 +26,23 @@ if ! command -v gh >/dev/null 2>&1; then
     exit 1
 fi
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TRIAGE_INFO=""
+if [ -f "${SCRIPT_DIR}/typesafe_triage.py" ]; then
+    echo "🧠 Running TypeSafe AI (Jev System One) pre-evaluation..."
+    TRIAGE_INFO=$(python3 "${SCRIPT_DIR}/typesafe_triage.py" triage-suggestion "${TITLE} ${DETAILS}" 2>/dev/null || true)
+fi
+
 BODY=$(cat << EOF
 ## User Proposal & Hypothesis
 ${DETAILS:-$TITLE}
+
+---
+
+## 🧠 TypeSafe AI (Jev System One) Pre-Evaluation
+\`\`\`
+${TRIAGE_INFO:-'(TypeSafe evaluation skipped)'}
+\`\`\`
 
 ---
 

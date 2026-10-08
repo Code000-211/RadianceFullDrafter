@@ -162,6 +162,13 @@ else
     # Extract last 40 lines of gate log for diagnostic report
     FAILURE_SNIPPET=$(tail -n 40 "${GATE_LOG}")
     
+    # Run TypeSafe AI (Jev System One) Root-Cause Classification
+    JEV_CLASSIFICATION=""
+    if [ -f "${SCRIPT_DIR}/typesafe_triage.py" ]; then
+        echo "🧠 Classifying regression root cause with TypeSafe AI (Jev)..."
+        JEV_CLASSIFICATION=$(python3 "${SCRIPT_DIR}/typesafe_triage.py" classify-regression "${GATE_LOG}" 2>/dev/null || true)
+    fi
+    
     # Write local REGRESSION_REPORT.md
     REPORT_FILE="${WORKTREE_DIR}/REGRESSION_REPORT.md"
     cat > "${REPORT_FILE}" << EOF
@@ -170,6 +177,11 @@ else
 **Exit Code**: ${GATE_RC}  
 **Candidate Directory**: \`${CANDIDATE_DIR}\`  
 **Worktree**: \`${WORKTREE_DIR}\`  
+
+## 🧠 TypeSafe AI (Jev) Classification
+\`\`\`
+${JEV_CLASSIFICATION:-'(Classification unavailable)'}
+\`\`\`
 
 ## Failure Diagnostic
 \`\`\`

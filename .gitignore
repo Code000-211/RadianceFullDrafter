@@ -78,3 +78,8 @@ tmp/
 .env
 .env.local
 local_config.sh
+
+# TypeSafe & API Keys
+.typesafe*
+*api_key*
+*.key
