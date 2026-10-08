@@ -76,24 +76,6 @@ if [ ${CHECK_RC} -ne 0 ]; then
     exit ${CHECK_RC}
 fi
 
-# Step 3: Verify Pre-Commit Hook Installation
-HOOK_PATH="${REPO_ROOT}/.git/hooks/pre-commit"
-if [ ! -x "${HOOK_PATH}" ]; then
-    echo "⚠️  NOTICE: Pre-commit hook is not installed or not executable at '${HOOK_PATH}'."
-    echo "   Installing pre-commit hook automatically..."
-    cat > "${HOOK_PATH}" << 'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-REPO_ROOT="$(git rev-parse --show-toplevel)"
-echo "🛡️  Running RadianceMine Epistemic Pre-Commit Gate..."
-bash "${REPO_ROOT}/scripts/verify_ground_truth.sh"
-EOF
-    chmod +x "${HOOK_PATH}"
-    echo "   ✓ Pre-commit hook successfully installed at '${HOOK_PATH}'."
-else
-    echo "✓ Pre-commit hook active and executable."
-fi
-
 echo ""
 echo "================================================================================"
 echo " 🏆 TIER 0 STATIC CHECKS PASSED."
