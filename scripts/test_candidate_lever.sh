@@ -114,16 +114,18 @@ fi
 # Step 3: Compile Worktree Binaries
 echo ""
 echo "🔨 [Step 3/5] Building binaries in worktree..."
-if [ -f "${WORKTREE_DIR}/build_hip/build.ninja" ]; then
-    ninja -C "${WORKTREE_DIR}/build_hip" -j32 radiance arch_test || ninja -C "${WORKTREE_DIR}/build_hip" -j32
-else
+export ROCM_PATH="${ROCM_PATH:-/opt/rocm}"
+export HIP_PATH="${HIP_PATH:-/opt/rocm}"
+export PATH="${ROCM_PATH}/bin:${ROCM_PATH}/llvm/bin:${PATH}"
+
+if [ ! -f "${WORKTREE_DIR}/build_hip/build.ninja" ]; then
     cmake -B "${WORKTREE_DIR}/build_hip" -S "${WORKTREE_DIR}" -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
         -DRAD_WITH_HIP=ON \
         -DRAD_GPU_TARGETS=gfx1201 \
         -DRAD_BUILD_TESTS=ON
-    ninja -C "${WORKTREE_DIR}/build_hip" -j32 radiance arch_test || ninja -C "${WORKTREE_DIR}/build_hip" -j32
 fi
+ninja -C "${WORKTREE_DIR}/build_hip" -j32 radiance arch_test || ninja -C "${WORKTREE_DIR}/build_hip" -j32
 
 # Step 4: Hot-Swap Dual-GPU Engine to Candidate Binary
 if [ "${DRY_RUN}" != "1" ]; then
