@@ -36,8 +36,12 @@ echo "==========================================================================
 
 # Check if worktree directory already exists
 if [ -d "${WORKTREE_DIR}" ]; then
-    echo "⚠️  Worktree directory '${WORKTREE_DIR}' already exists."
-    echo "   To switch to it: cd ${WORKTREE_DIR}"
+    echo "ℹ️  Worktree directory '${WORKTREE_DIR}' already exists."
+    echo "   Cleaning and resetting worktree state to pristine '${BASE_BRANCH}'..."
+    git -C "${WORKTREE_DIR}" checkout -f "${BASE_BRANCH}" 2>/dev/null || git -C "${WORKTREE_DIR}" checkout -f -B "${BRANCH_NAME}" "${BASE_BRANCH}"
+    git -C "${WORKTREE_DIR}" reset --hard "${BASE_BRANCH}" 2>/dev/null || true
+    git -C "${WORKTREE_DIR}" clean -fd 2>/dev/null || true
+    echo "✓ Worktree cleaned and synchronized with '${BASE_BRANCH}'."
     exit 0
 fi
 

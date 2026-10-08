@@ -113,7 +113,7 @@ fi
 
 # Step 3: Compile Worktree Binaries
 echo ""
-echo "🔨 [Step 3/4] Building binaries in worktree..."
+echo "🔨 [Step 3/5] Building binaries in worktree..."
 if [ -f "${WORKTREE_DIR}/build_hip/build.ninja" ]; then
     ninja -C "${WORKTREE_DIR}/build_hip" -j32 arch_test || ninja -C "${WORKTREE_DIR}/build_hip" -j32
 else
@@ -121,9 +121,26 @@ else
     ninja -C "${WORKTREE_DIR}/build_hip" -j32 arch_test || ninja -C "${WORKTREE_DIR}/build_hip" -j32
 fi
 
-# Step 4: Execute 4-Tier Master Gate
+# Step 4: Hot-Swap Dual-GPU Engine to Candidate Binary
+if [ "${DRY_RUN}" != "1" ]; then
+    echo ""
+    echo "🔄 [Step 4/5] Hot-swapping engine on dual GPUs to worktree candidate..."
+    if ! bash "${SCRIPT_DIR}/engine_manager.sh" restart --build-dir "${WORKTREE_DIR}/build_hip"; then
+        echo "❌ FATAL: Candidate engine failed to start on dual GPUs!" >&2
+        echo "Restoring golden baseline engine..."
+        bash "${SCRIPT_DIR}/engine_manager.sh" restore-golden || true
+        FAIL_MSG="Candidate engine crashed on startup. See /tmp/radiance_engine.log."
+        if [ -n "${ISSUE_NUM}" ] && command -v gh >/dev/null 2>&1; then
+            gh issue comment "${ISSUE_NUM}" --body "### ❌ Startup Crash on Dual GPUs\n\n${FAIL_MSG}"
+            gh issue edit "${ISSUE_NUM}" --add-label "status:needs-review,regression:detected" --remove-label "status:in-progress"
+        fi
+        exit 3
+    fi
+fi
+
+# Step 5: Execute 4-Tier Master Gate on physical GPUs
 echo ""
-echo "🛡️  [Step 4/4] Executing 4-Tier Master Quality Gate on physical GPUs..."
+echo "🛡️  [Step 5/5] Executing 4-Tier Master Quality Gate on physical GPUs..."
 GATE_LOG="${WORKTREE_DIR}/gate_execution.log"
 set +e
 DRY_RUN="${DRY_RUN}" bash "${SCRIPT_DIR}/gate_check.sh" --build-dir "${WORKTREE_DIR}/build_hip" 2>&1 | tee "${GATE_LOG}"
@@ -156,8 +173,14 @@ else
     echo ""
     echo "================================================================================"
     echo " ⚠️  GATE REGRESSION DETECTED: ${CANDIDATE_SLUG} failed gate check (code ${GATE_RC})"
-    echo " Routing failure telemetry to Review Loop..."
+    echo " Restoring Golden Baseline engine and routing failure to Review Loop..."
     echo "================================================================================"
+    
+    # Immediately restore golden baseline engine so the system remains healthy
+    if [ "${DRY_RUN}" != "1" ]; then
+        echo "🔄 Restoring golden baseline engine..."
+        bash "${SCRIPT_DIR}/engine_manager.sh" restore-golden || true
+    fi
     
     # Extract last 40 lines of gate log for diagnostic report
     FAILURE_SNIPPET=$(tail -n 40 "${GATE_LOG}")

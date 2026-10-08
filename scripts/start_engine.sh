@@ -8,15 +8,32 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd -P)"
 
-BIN_PATH="${REPO_ROOT}/build_hip/bin/radiance"
-export RADIANCE_HOME="${REPO_ROOT}/build_hip/radiance_home"
-
-MODEL_PATH="${1:-/root/models/qwen3.8-next-flash-fp8-iq4r-moe/qwen3.8-next-flash-fp8-iq4r-moe.rad}"
-if [ $# -gt 0 ]; then shift; fi
-
+BUILD_DIR="${BUILD_DIR:-${REPO_ROOT}/build_hip}"
 PORT="${PORT:-8000}"
 TP="${TP:-2}"
 TP_WIRE="${TP_WIRE:-wht6}"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --build-dir)
+            BUILD_DIR="$2"
+            shift 2
+            ;;
+        --port)
+            PORT="$2"
+            shift 2
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+BIN_PATH="${BUILD_DIR}/bin/radiance"
+export RADIANCE_HOME="${BUILD_DIR}/radiance_home"
+
+MODEL_PATH="${1:-/root/models/qwen3.8-next-flash-fp8-iq4r-moe/qwen3.8-next-flash-fp8-iq4r-moe.rad}"
+if [ $# -gt 0 ]; then shift; fi
 
 # Runtime environment invariants
 export RADIANCE_RIDGEFILL="${RADIANCE_RIDGEFILL:-speed}"
