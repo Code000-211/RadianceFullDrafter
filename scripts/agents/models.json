@@ -17,20 +17,15 @@
       "key_file": "~/.config/zai/api_key",
       "key_env": "ANTHROPIC_AUTH_TOKEN"
     },
-    "gemini-flash": {
+    "gemini": {
       "cli": "agy",
       "model": null,
-      "_todo": "Exakten Namen aus `agy models` eintragen (Gemini Flash 3.8). null = Backend gesperrt."
-    },
-    "gemini-pro": {
-      "cli": "agy",
-      "model": null,
-      "_todo": "Exakten Namen aus `agy models` eintragen; ohne Pro-Zugang hier denselben Namen wie gemini-flash. alphaXiv ist in Antigravity angemeldet."
+      "_todo": "Exakten Namen von Gemini Flash 3.8 aus `agy models` eintragen; null = Backend gesperrt. Gemini Pro (3.1) bewusst nicht. Bei Gemini 4 nur diesen Namen tauschen. alphaXiv ist in Antigravity angemeldet."
     }
   },
   "tiers": {
-    "light": "gemini-flash",
-    "medium": "gemini-pro",
+    "light": "gemini",
+    "medium": "gemini",
     "heavy": "glm",
     "fallback": "opus"
   },
@@ -39,9 +34,9 @@
     "answer":   {"backend": "opus",       "timeout_min": 8},
     "code":     {"tiered": true, "max_tier": "fallback", "timeout_min": 120},
     "review":   {"tiered": true, "tier_offset": 1, "max_tier": "heavy", "timeout_min": 60},
-    "research": {"backend": "gemini-pro", "timeout_min": 60},
+    "research": {"backend": "gemini",     "timeout_min": 60},
     "audit":    {"backend": "glm",        "timeout_min": 90},
-    "upstream": {"backend": "gemini-pro", "timeout_min": 45}
+    "upstream": {"backend": "gemini",     "timeout_min": 45}
   },
   "limits": {
     "max_parallel": 5,

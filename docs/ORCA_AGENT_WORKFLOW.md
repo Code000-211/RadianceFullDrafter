@@ -198,18 +198,24 @@ andere läuft auf Gemini und GLM, Opus springt bei Code erst nach mehreren Fehls
 
 | Stufe | Backend |
 |---|---|
-| light | Gemini Flash (agy) |
-| medium | Gemini Pro (agy) |
+| light | Gemini Flash 3.8 (agy) |
+| medium | Gemini Flash 3.8 (agy); eigene Stufe für ein späteres Gemini 4 |
 | heavy | GLM 5.3 (claude über Z.ai) |
 | fallback | Opus |
 
 | Rolle | Modell |
 |---|---|
 | plan, Antworten auf Rückfragen | Opus |
-| code | nach `tier:` des Planers, nach jedem Fehlschlag eine Stufe höher, zuletzt Opus |
-| review | eine Stufe über dem Code-Agent, höchstens GLM |
-| research, upstream | Gemini Pro (alphaXiv ist in Antigravity angemeldet) |
+| code | nach `tier:` des Planers; nach jedem Fehlschlag das nächststärkere Modell (Gemini → GLM → Opus) |
+| review | das nächststärkere Modell über dem Code-Agent, höchstens GLM |
+| research, upstream | Gemini Flash 3.8 (alphaXiv ist in Antigravity angemeldet) |
 | audit | GLM |
+
+Ein Eskalationsschritt wechselt immer das Modell: Stufen mit demselben Backend wie die Stufe
+darunter werden übersprungen. Deshalb geht `light` nach einem Fehlschlag direkt auf GLM, und das
+Review läuft nie auf dem Modell des Code-Agents (außer bei GLM-Code, wo GLM die Obergrenze ist).
+Gemini Pro (3.1) wird bewusst nicht genutzt; bei Gemini 4 nur den Modellnamen im Backend `gemini`
+tauschen oder ein eigenes Backend für `medium` eintragen.
 
 Fehlschlag eines Issues: Gate-Lauf ohne PASS, Review mit Änderungswünschen, Lauf ohne Übergabe.
 Ist ein Backend gesperrt (kein Modellname, keine CLI, kein Schlüssel, Nutzungslimit), weicht

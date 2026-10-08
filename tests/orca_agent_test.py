@@ -74,15 +74,26 @@ class TestSelection(unittest.TestCase):
 
 
 class TestTiers(unittest.TestCase):
-    def test_default_escalation_and_caps(self) -> None:
-        self.assertEqual(oa.pick_tier(set(), 0)[0], "medium")
-        self.assertEqual(oa.pick_tier({"tier:light"}, 0)[0], "light")
-        self.assertEqual(oa.pick_tier({"tier:light"}, 1)[0], "medium")
-        self.assertEqual(oa.pick_tier({"tier:light"}, 0, offset=1)[0], "medium")
-        self.assertEqual(oa.pick_tier({"tier:heavy"}, 1)[0], "fallback")
-        self.assertEqual(oa.pick_tier({"tier:medium"}, 5, max_tier="heavy")[0], "heavy")
-        self.assertEqual(oa.pick_tier({"tier:light", "tier:heavy"}, 0)[0], "heavy")
-        self.assertEqual(oa.pick_tier({"tier:fallback"}, 0)[0], "medium")  # planner cannot pick Opus
+    DISTINCT = {"light": "a", "medium": "b", "heavy": "c", "fallback": "d"}
+    SHARED = {"light": "gemini", "medium": "gemini", "heavy": "glm", "fallback": "opus"}
+
+    def test_escalation_with_distinct_backends(self) -> None:
+        t = lambda labels, steps=0, max_tier="fallback": oa.pick_tier(self.DISTINCT, labels, steps, max_tier)[0]
+        self.assertEqual(t(set()), "medium")
+        self.assertEqual(t({"tier:light"}), "light")
+        self.assertEqual(t({"tier:light"}, 1), "medium")
+        self.assertEqual(t({"tier:heavy"}, 1), "fallback")
+        self.assertEqual(t({"tier:medium"}, 5, "heavy"), "heavy")
+        self.assertEqual(t({"tier:light", "tier:heavy"}), "heavy")
+        self.assertEqual(t({"tier:fallback"}), "medium")  # planner cannot pick Opus
+
+    def test_each_step_changes_the_model(self) -> None:
+        t = lambda labels, steps=0, max_tier="fallback": oa.pick_tier(self.SHARED, labels, steps, max_tier)[0]
+        self.assertEqual(t({"tier:light"}), "light")
+        self.assertEqual(t({"tier:light"}, 1), "heavy")      # not medium: same Gemini model
+        self.assertEqual(t({"tier:light"}, 2), "fallback")
+        self.assertEqual(t({"tier:medium"}, 1), "heavy")
+        self.assertEqual(t({"tier:heavy"}, 1, "heavy"), "heavy")
 
     def test_failures_count_gate_reviews_and_missing_handoffs(self) -> None:
         rows = [{"role": "review", "outcome": "changes-requested"}, {"role": "code", "outcome": None},
@@ -94,24 +105,23 @@ class TestTiers(unittest.TestCase):
         first = lambda role, labels, f: oa.backend_options(cfg, role, labels, f)[0]
         self.assertEqual(first("plan", {"tier:light"}, 0), ("opus", None))
         self.assertEqual(cfg["roles"]["answer"]["backend"], "opus")
-        self.assertEqual(first("code", {"tier:light"}, 0), ("gemini-flash", "light"))
-        self.assertEqual(first("code", {"tier:medium"}, 0), ("gemini-pro", "medium"))
+        self.assertEqual(first("code", {"tier:light"}, 0), ("gemini", "light"))
+        self.assertEqual(first("code", {"tier:medium"}, 0), ("gemini", "medium"))
+        self.assertEqual(first("code", {"tier:light"}, 1), ("glm", "heavy"))
         self.assertEqual(first("code", {"tier:heavy"}, 0), ("glm", "heavy"))
         self.assertEqual(first("code", {"tier:heavy"}, 1), ("opus", "fallback"))
-        self.assertEqual(first("review", {"tier:light"}, 0), ("gemini-pro", "medium"))
+        self.assertEqual(first("review", {"tier:light"}, 0), ("glm", "heavy"))    # never the coder's model
         self.assertEqual(first("review", {"tier:heavy"}, 3), ("glm", "heavy"))
         for role in ("research", "audit", "upstream"):
             self.assertNotEqual(first(role, set(), 0)[0], "opus")
 
     def test_unavailable_backend_moves_up_but_not_to_opus(self) -> None:
         cfg = oa.load_config()
-        self.assertEqual(oa.backend_options(cfg, "code", {"tier:light"}, 0),
-                         [("gemini-flash", "light"), ("gemini-pro", "medium"), ("glm", "heavy")])
+        self.assertEqual(oa.backend_options(cfg, "code", {"tier:light"}, 0), [("gemini", "light"), ("glm", "heavy")])
         cfg["limits"]["availability_fallback"] = True
         self.assertEqual(oa.backend_options(cfg, "code", {"tier:heavy"}, 0)[-1], ("opus", "fallback"))
-        picked = oa.choose_backend(cfg, [("gemini-flash", "light"), ("glm", "heavy")], lambda m: None)
         with mock.patch.object(oa, "backend_problem", side_effect=lambda c, n: None if n == "glm" else "gesperrt"):
-            picked = oa.choose_backend(cfg, [("gemini-flash", "light"), ("glm", "heavy")], lambda m: None)
+            picked = oa.choose_backend(cfg, [("gemini", "light"), ("glm", "heavy")], lambda m: None)
         self.assertEqual(picked, ("glm", "heavy"))
 
 
@@ -181,7 +191,7 @@ class TestLimitsAndLocks(StateTestCase):
         self.assertEqual(oa.free_slots(2), 1)
 
     def test_backend_problems(self) -> None:
-        self.assertIn("kein Modellname", oa.backend_problem(self.cfg, "gemini-flash"))
+        self.assertIn("kein Modellname", oa.backend_problem(self.cfg, "gemini"))
         cfg = copy.deepcopy(self.cfg)
         cfg["backends"]["glm"]["key_file"] = str(Path(self.tmp.name) / "missing")
         with mock.patch.object(oa.shutil, "which", return_value="/usr/bin/claude"):
@@ -251,7 +261,6 @@ class TestRun(StateTestCase):
         for p in patches:
             p.start()
             self.addCleanup(p.stop)
-        cfg["backends"]["gemini-pro"]["model"] = "gemini-x"
         rc = oa.cmd_run(cfg, "review", 12)
         return rc, calls, oa.ledger(12)
 
@@ -259,7 +268,7 @@ class TestRun(StateTestCase):
         rc, calls, rows = self.run_review({"plan:ready", "tier:light", "status:ready-to-test"})
         self.assertEqual(rc, 0)
         self.assertEqual(calls, [("setup", "bash", "/wt/scripts/orca_setup.sh")])
-        self.assertEqual((rows[-1]["outcome"], rows[-1]["backend"], rows[-1]["tier"]), ("approved", "gemini-pro", "medium"))
+        self.assertEqual((rows[-1]["outcome"], rows[-1]["backend"], rows[-1]["tier"]), ("approved", "glm", "heavy"))
 
     def test_missing_handoff_is_reported(self) -> None:
         rc, calls, rows = self.run_review({"plan:ready", "tier:light", "needs-code-review"})
@@ -311,7 +320,7 @@ class TestTick(StateTestCase):
     def test_reservation_prevents_double_start(self) -> None:
         cfg = copy.deepcopy(self.cfg)
         cfg["orca"]["launcher"] = "detached"
-        cfg["backends"]["gemini-flash"]["model"] = "flash-x"
+        cfg["backends"]["gemini"]["model"] = "flash-x"
         started = []
         orig = oa.find_work
         with mock.patch.object(oa, "git", return_value=""), \

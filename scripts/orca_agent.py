@@ -190,11 +190,20 @@ def gate_failures(comments: list[str]) -> int:
     return sum(1 for c in comments if RESULT_MARKER in c and "### Gate bestanden" not in c)
 
 
-def pick_tier(labels: set[str], failures: int, offset: int = 0, max_tier: str = "fallback") -> tuple[str, int]:
-    """Planner's tier (default medium), one step up per failed round, plus the role offset."""
+def pick_tier(tier_backends: dict[str, str], labels: set[str], steps: int = 0,
+              max_tier: str = "fallback") -> tuple[str, list[str]]:
+    """Planner's tier (default medium), then one step up per failed round and per role offset.
+    A step always changes the backend: tiers that map to the same backend as the tier below are
+    skipped, so escalating from Gemini means GLM, and review never runs on the coder's model
+    unless the role's max_tier forces it. Returns the tier and the remaining ladder above it."""
     set_tiers = [PLANNER_TIERS.index(l[5:]) for l in labels if l.startswith("tier:") and l[5:] in PLANNER_TIERS]
-    base = max(set_tiers) if set_tiers else 1
-    return TIERS[min(TIERS.index(max_tier), base + failures + offset)], base
+    base = TIERS[max(set_tiers) if set_tiers else 1]
+    ladder: list[str] = []
+    for t in TIERS[TIERS.index(base):TIERS.index(max_tier) + 1]:
+        if not ladder or tier_backends[t] != tier_backends[ladder[-1]]:
+            ladder.append(t)
+    i = min(steps, len(ladder) - 1)
+    return ladder[i], ladder[i + 1:]
 
 
 def outcome(role: str, before: set[str], after: set[str], state: str) -> str | None:
@@ -375,13 +384,11 @@ def backend_options(cfg: dict[str, Any], role: str, labels: set[str], failures: 
     rc = cfg["roles"][role]
     if not rc.get("tiered"):
         return [(rc["backend"], None)]
-    max_tier = rc.get("max_tier", "fallback")
-    tier, _ = pick_tier(labels, failures, rc.get("tier_offset", 0), max_tier)
+    tier, higher = pick_tier(cfg["tiers"], labels, failures + rc.get("tier_offset", 0), rc.get("max_tier", "fallback"))
     options = [(cfg["tiers"][tier], tier)]
-    if tier != "fallback":
-        for t in TIERS[TIERS.index(tier) + 1:TIERS.index(max_tier) + 1]:
-            if t != "fallback" or cfg["limits"].get("availability_fallback", False):
-                options.append((cfg["tiers"][t], t))
+    for t in higher:
+        if t != "fallback" or cfg["limits"].get("availability_fallback", False):
+            options.append((cfg["tiers"][t], t))
     return options
 
 

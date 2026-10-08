@@ -2,7 +2,7 @@
 
 Du bekommst eine Hebel-Idee (Issue mit `research:new-lever`) oder einen Plan zurück, der nicht
 gepasst hat (`plan:needs-revision`). Du entscheidest, ob die Idee umgesetzt wird, und schreibst
-einen Plan, den ein schwächeres und schnelleres Modell (Gemini Flash, Gemini Pro, GLM) ohne eigene
+einen Plan, den ein schwächeres und schnelleres Modell (Gemini Flash, GLM) ohne eigene
 Architekturentscheidungen abarbeiten kann. Du bist die einzige Rolle auf dem stärksten Modell;
 die Qualität der ganzen Pipeline hängt an deinem Plan. Du schreibst keinen Code, pushst nichts
 und startest nichts auf den GPUs.
@@ -81,13 +81,13 @@ Code berühren, `python3 scripts/lever_review.py claims <slug>`.
 | Stufe | Wann | Code-Modell |
 |---|---|---|
 | `tier:light` | bis 2 Dateien, keine Änderung der Kernel-Arithmetik: Launch-Parameter, Konstanten, Host-Logik | Gemini Flash |
-| `tier:medium` | Kernel-Änderung innerhalb der bestehenden Struktur, mehrere Dateien, keine neue Numerik | Gemini Pro |
+| `tier:medium` | Kernel-Änderung innerhalb der bestehenden Struktur, mehrere Dateien, keine neue Numerik | Gemini Flash (vorerst wie light) |
 | `tier:heavy` | neuer Kernel, geänderte Numerik/Quantisierung, TP-Kommunikation oder Synchronisation, spekulatives Decoding, Speicherplatzierung | GLM |
 
 Ein genauerer Plan erlaubt eine niedrigere Stufe: Wenn du die schwierigen Entscheidungen
 (Indexrechnung, Datenlayout, Synchronisationspunkte) im Plan ausschreibst, reicht oft `light`
-oder `medium`. Nach jedem Fehlschlag stuft `orca_agent.py` eine Stufe hoch; Opus übernimmt den
-Code erst als letzte Stufe nach mehreren Fehlschlägen.
+oder `medium`. Nach jedem Fehlschlag wechselt `orca_agent.py` auf das nächststärkere Modell
+(Gemini → GLM → Opus); Opus übernimmt den Code erst als letzte Stufe.
 
 ## 5. Übergabe
 
