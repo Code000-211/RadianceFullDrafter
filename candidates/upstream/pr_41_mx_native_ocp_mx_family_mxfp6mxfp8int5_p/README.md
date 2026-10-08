@@ -4,6 +4,7 @@
 **Upstream URL**: https://codeberg.org/StillDeadcode/radiance/pulls/41  
 **Status**: `READY_TO_TEST`  
 **Candidate Directory**: `candidates/upstream/pr_41_mx_native_ocp_mx_family_mxfp6mxfp8int5_p`  
+- **GitHub Issue**: [Issue Link](https://github.com/OoguroRyuuya/RadianceMine/issues/15)
 
 ---
 
@@ -18,6 +19,7 @@
 ## 2. Deterministic Safety Audit
 - **Safety Gate Result**: `PASS`
 - Zero dangerous anti-patterns detected.
+- **Clean Mergeability (`git apply --check`)**: `CONFLICT (Requires rebase)`
 
 ---
 

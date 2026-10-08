@@ -1,0 +1,229 @@
+From 791dc3912bb3606ae7fe21fa012e5f8a8070149a Mon Sep 17 00:00:00 2001
+From: redxherring <redxherring@noreply.codeberg.org>
+Date: Wed, 7 Oct 2026 17:44:46 -0400
+Subject: [PATCH 1/2] serve: --model takes an HF repo id, fetched to
+ $RADIANCE_HOME/hf via hfget.sh
+
+A non-path owner/name is downloaded before bring-up and the model path
+rewritten to the cached dir, so a new user points --model at a repo link
+instead of a pre-fetched checkpoint. hfget.sh now keys its re-run skip on
+lfs.oid (sha256) for LFS files and size for the rest, recorded in a
+.hfget-manifest, so a same-size weight update is caught and re-fetched
+while a warm cache stays a no-rehash no-op.
+---
+ core/hf_model.cpp | 80 +++++++++++++++++++++++++++++++++++++++++++++++
+ core/main.cpp     |  2 ++
+ core/rad_core.h   |  1 +
+ scripts/hfget.sh  | 31 ++++++++++++------
+ 4 files changed, 104 insertions(+), 10 deletions(-)
+ create mode 100644 core/hf_model.cpp
+
+diff --git a/core/hf_model.cpp b/core/hf_model.cpp
+new file mode 100644
+index 0000000..a7780b2
+--- /dev/null
++++ b/core/hf_model.cpp
+@@ -0,0 +1,80 @@
++/* hf_model.cpp -- resolve a --model that is an HF repo id into a local cache dir.
++ *
++ * The entry point (main.cpp) stays thin: it calls rad::resolve_hf_model() once, between
++ * config_parse and Engine construction, and the rest of bring-up sees a plain directory.
++ * The fetching itself is scripts/hfget.sh (curl + jq, no Python), run as a child process.
++ */
++#include "engine.h"
++
++#include <cstdlib>
++#include <cstdio>
++#include <filesystem>
++#include <string>
++#include <unistd.h>
++#include <sys/wait.h>
++
++namespace rad {
++
++/* "owner/name" that is not a local path: exactly one slash, no shell-fodder, not a known file. */
++static bool is_hf_repo_id(const std::string& s) {
++    if (std::filesystem::exists(s)) return false;   /* a real existing local path always wins */
++    if (s.empty() || s.front() == '/') return false;
++    if (s.find_first_of("\\:*?\"<>|") != std::string::npos) return false;
++    size_t slash = s.find('/');
++    if (slash == std::string::npos || s.find('/', slash + 1) != std::string::npos) return false;
++    std::string owner = s.substr(0, slash);
++    std::string name  = s.substr(slash + 1);
++    if (owner.empty() || name.empty()) return false;
++    if (owner == ".." || name == "..") return false;
++    static const std::string kFileSuffixes[] = {".rad", ".safetensors", ".gguf", "index.json"};
++    for (const auto& suf : kFileSuffixes)
++        if (name.size() >= suf.size() && name.compare(name.size() - suf.size(), suf.size(), suf) == 0)
++            return false;
++    return true;
++}
++
++/* hfget.sh: $RADIANCE_HFGET, then <exe_dir>/../scripts/, then ./scripts/. */
++static std::string find_hfget() {
++    if (const char* e = std::getenv("RADIANCE_HFGET"))
++        if (*e && std::filesystem::exists(e)) return e;
++    char buf[4096];
++    ssize_t n = readlink("/proc/self/exe", buf, sizeof buf - 1);
++    if (n > 0) {
++        buf[n] = '\0';
++        std::string p = (std::filesystem::path(buf).parent_path() / ".." / "scripts" / "hfget.sh").string();
++        if (std::filesystem::exists(p)) return p;
++    }
++    if (std::filesystem::exists("./scripts/hfget.sh")) return "./scripts/hfget.sh";
++    return "";
++}
++
++/* If cfg.model is an HF repo id, fetch it into $RADIANCE_HOME/hf/ via hfget.sh and rewrite the path. */
++bool resolve_hf_model(Config& cfg) {
++    if (!is_hf_repo_id(cfg.model)) return true;
++    std::string script = find_hfget();
++    if (script.empty()) {
++        RAD_ERR("hfget.sh not found -- set RADIANCE_HFGET to its path");
++        return false;
++    }
++    std::string dest = cfg.radiance_home + "/hf/" + cfg.model;
++    std::filesystem::create_directories(dest);
++    fprintf(stderr, "radiance: downloading %s -> %s\n", cfg.model.c_str(), dest.c_str());
++    pid_t pid = fork();
++    if (pid < 0) { perror("fork"); return false; }
++    if (pid == 0) {
++        const char* argv[] = { script.c_str(), cfg.model.c_str(), dest.c_str(), nullptr };
++        execvp(script.c_str(), const_cast<char* const*>(argv));
++        perror("execvp hfget.sh");
++        _exit(127);
++    }
++    int status = 0;
++    waitpid(pid, &status, 0);
++    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
++        RAD_ERR("hfget.sh failed for %s (status %d) -- see output above", cfg.model.c_str(), status);
++        return false;
++    }
++    cfg.model = dest;   /* rewrite to the cached local dir; downstream reads it as a checkpoint dir */
++    return true;
++}
++
++}  /* namespace rad */
+diff --git a/core/main.cpp b/core/main.cpp
+index 5bf0537..7add73e 100644
+--- a/core/main.cpp
++++ b/core/main.cpp
+@@ -9,6 +9,8 @@ int main(int argc, char** argv) {
+     if (s == 1) { rad::config_usage(argv[0]); return 0; }
+     if (s < 0)  { rad::config_usage(argv[0]); return 2; }
+ 
++    if (!rad::resolve_hf_model(cfg)) return 2;   /* --model given as an HF repo id: fetch + rewrite */
++
+     rad::Engine engine(std::move(cfg));
+ 
+     s = engine.start();
+diff --git a/core/rad_core.h b/core/rad_core.h
+index 4cb287a..4b4fba7 100644
+--- a/core/rad_core.h
++++ b/core/rad_core.h
+@@ -921,4 +921,5 @@ struct Config {
+ namespace rad {
+ int  config_parse(int argc, char** argv, Config* c);
+ void config_usage(const char* argv0);
++bool resolve_hf_model(Config& c);   /* --model given as an HF repo id: fetch into the cache, rewrite c.model */
+ }
+diff --git a/scripts/hfget.sh b/scripts/hfget.sh
+index 74c4d3c..dd2927c 100755
+--- a/scripts/hfget.sh
++++ b/scripts/hfget.sh
+@@ -20,16 +20,25 @@
+ # saturate the link and more only makes the destination seek.
+ set -e
+ 
+-# ---- child mode: one file, named by "<size><tab><path>" in $1, everything else inherited -------
++# ---- child mode: one file, named by "<oid><tab><size><tab><path>" in $1, everything else inherited
+ # sh cannot export a function, so parallelism is one re-entry of this script per file under
+ # `xargs -P` rather than a worker pool.
+ if [ -n "$HFGET_CHILD" ]; then
+-    size=${1%%	*}; path=${1#*	}
++    oid=${1%%	*}; rest=${1#*	}; size=${rest%%	*}; path=${rest#*	}
++    key=${oid:-$size}                                  # LFS: sha256, non-LFS: size
+     out=$HFGET_DEST/$path
+-    if [ -f "$out" ]; then
+-        cur=$(wc -c < "$out")
+-        if [ "$cur" = "$size" ]; then echo "  = $path"; exit 0; fi
+-        echo "  + $path (resuming at $cur of $size)"
++    man=$HFGET_DEST/.hfget-manifest
++    rec=""; [ -f "$man" ] && rec=$(p="$path" awk -F'\t' '$2==ENVIRON["p"]{print $1; exit}' "$man")
++    if [ -f "$out" ] && [ "$(wc -c < "$out")" = "$size" ]; then
++        if [ -z "$rec" ] || [ "$rec" = "$key" ]; then  # warm: size ok AND content-key matches (or unrecorded)
++            echo "  = $path"
++            printf '%s\t%s\n' "$key" "$path" >> "$HFGET_MAN_OUT"
++            exit 0
++        fi
++        rm -f "$out"                                   # SAME SIZE, NEW CONTENT: resume is size-based and useless -> fresh
++        echo "  ~ $path (same size, new content)"
++    elif [ -f "$out" ]; then
++        echo "  + $path (resuming at $(wc -c < "$out") of $size)"
+     else
+         echo "  > $path"
+     fi
+@@ -44,6 +53,7 @@ if [ -n "$HFGET_CHILD" ]; then
+     fi
+     got=$(wc -c < "$out")
+     [ "$got" = "$size" ] || { echo "hfget: $path is $got bytes, listing says $size" >&2; exit 1; }
++    printf '%s\t%s\n' "$key" "$path" >> "$HFGET_MAN_OUT"
+     exit 0
+ fi
+ 
+@@ -87,12 +97,12 @@ sel='.[] | select(.type == "file")'
+ [ "$have_st" -gt 0 ] && sel="$sel"' | select((.path | test("\\.(bin|pth|msgpack|h5|onnx|onnx_data|gguf)$")) | not)'
+ 
+ list=$(mktemp "${TMPDIR:-/tmp}/hfget.XXXXXX")
+-trap 'rm -f "$list"' EXIT INT TERM
+-printf '%s' "$listing" | jq -r "$sel"' | "\(.size)\t\(.path)"' > "$list"
++trap 'rm -f "$list" "$dest/.hfget-manifest.tmp"' EXIT INT TERM
++printf '%s' "$listing" | jq -r "$sel"' | "\(.lfs.oid // "")\t\(.size)\t\(.path)"' > "$list"
+ 
+ n=$(wc -l < "$list")
+ [ "$n" -gt 0 ] || { echo "hfget: the listing has no files" >&2; exit 1; }
+-need=$(awk -F'\t' '{s += $1} END {printf "%.1f", s / 1073741824}' "$list")
++need=$(awk -F'\t' '{s += $2} END {printf "%.1f", s / 1073741824}' "$list")
+ mkdir -p "$dest"
+ free=$(df -BG --output=avail "$dest" | tail -1 | tr -dc '0-9')
+ echo "hfget: $n file(s), $need GiB -> $dest"
+@@ -100,8 +110,9 @@ echo "hfget: $n file(s), $need GiB -> $dest"
+ echo "hfget: $free GiB free on the destination filesystem"
+ awk -v n="$need" -v f="$free" 'BEGIN { if (n > f) { print "hfget: THE DOWNLOAD DOES NOT FIT"; exit 1 } }'
+ 
+-export HFGET_CHILD=1 HFGET_DEST="$dest" HFGET_REPO="$repo" HFGET_REV="$rev"
++export HFGET_CHILD=1 HFGET_DEST="$dest" HFGET_REPO="$repo" HFGET_REV="$rev" HFGET_MAN_OUT="$dest/.hfget-manifest.tmp"
+ self=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
+ tr '\n' '\0' < "$list" | xargs -0 -P "$jobs" -I{} sh "$self" "{}" \
+     || { echo "hfget: incomplete -- re-run to resume" >&2; exit 1; }
++mv "$HFGET_MAN_OUT" "$dest/.hfget-manifest"
+ echo "hfget: complete -- $(du -sh "$dest" | cut -f1) in $dest"
+-- 
+2.55.0
+
+
+From 9efc8e8d04d058c6bd7f3b3e190c9849f79afe52 Mon Sep 17 00:00:00 2001
+From: redxherring <redxherring@noreply.codeberg.org>
+Date: Wed, 7 Oct 2026 19:14:23 -0400
+Subject: [PATCH 2/2] serve: --help notes --model also takes an HF repo id
+
+---
+ core/config.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/core/config.cpp b/core/config.cpp
+index 6997a40..e5b1aee 100644
+--- a/core/config.cpp
++++ b/core/config.cpp
+@@ -39,7 +39,7 @@ static const std::string g_draft_window_help =
+     draft_window_name(kDraftWindowDefault);
+ 
+ static const Flag g_flags[] = {
+-    { "--model",              "PATH",   "the .rad container, or a checkpoint served as it stands" },
++    { "--model",              "PATH|REPO", "the .rad container, a checkpoint served as it stands, or an HF repo id (owner/name) fetched to the cache" },
+     { "--radiance-home",      "DIRS",   "where kernels/, architectures/ and quantizers/ live; several\n"
+                                         "homes separated by ':' are searched in order, the first winning" },
+     { "--kernels",            "LIST",   "kernel plugin hierarchy, comma-separated, first wins" },
+-- 
+2.55.0
+

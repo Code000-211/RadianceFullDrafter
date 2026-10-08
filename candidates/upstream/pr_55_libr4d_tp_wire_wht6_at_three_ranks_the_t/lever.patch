@@ -1,0 +1,1066 @@
+From 4fe1b18db78c3a31ddc4d0e3705d518e1a1b47b3 Mon Sep 17 00:00:00 2001
+From: baKon <mike.ski83@gmail.com>
+Date: Wed, 7 Oct 2026 18:49:08 -0500
+Subject: [PATCH 1/2] libr4d: a three-rank two-shot all-reduce, with shards one
+ word uneven
+
+At three ranks the exact all-reduce was the one-shot at every size: the two-shot required the
+message to shard evenly, and a 2048-wide bf16 row is 256 16-byte words, a multiple of 3 only one
+step in three. Every prefill chunk therefore sent twice its message per rank where the two-shot
+sends 4/3.
+
+The two-shot kernel now splits n16 words into shards of n16/ws, the first n16 % ws one word longer,
+with region B at the longest shard. At 4 and 8 ranks every message the entries accept divides, so
+nothing there changes. ar_twoshot_3rank_exact takes the band above R4D_AR_WIDE_ONESHOT_MAX_ELEMS the
+way the 4- and 8-rank rows do. Its fold is the one-shot's -- fp32, ascending rank order -- so the
+band edge between the two rows changes no bits.
+
+r4d_selftest runs both three-rank rows through a per-element oracle (bf16 and fp32, words % 3 of 0,
+1 and 2, 16 words to the 20971520-element ceiling, in and out of place, back to back on one
+instance).
+---
+ docs/TP3.md                           |   6 ++
+ libr4d/r4d.h                          |  22 ++--
+ libr4d/r4d_ar_entry.hip               |  27 +++++
+ libr4d/r4d_ar_twoshot_Nrank_exact.hip |  92 ++++++++++------
+ libr4d/r4d_plugin.h                   |   1 +
+ libr4d/r4d_rows.cpp                   |  26 ++++-
+ libr4d/r4d_selftest.cpp               | 149 +++++++++++++++++++++++++-
+ 7 files changed, 282 insertions(+), 41 deletions(-)
+
+diff --git a/docs/TP3.md b/docs/TP3.md
+index 3afe9fb..9d9baf1 100644
+--- a/docs/TP3.md
++++ b/docs/TP3.md
+@@ -127,6 +127,12 @@ radiance --model qwen3.8-next-flash-fp8-iq4r-moe.rad --tp 3 --tp-wire exact --ma
+     --num-speculative-tokens 3 --max-num-batched-tokens 2048
+ ```
+ 
++The exact all-reduce at three ranks is the wide family's one-shot up to 1 MiB a message (every
++decode step) and its two-shot above it (every prefill chunk): reduce-scatter + all-gather, which
++sends 4/3 of the message per rank instead of twice it. A message rarely divides into thirds -- a
++2048-wide bf16 row is 256 16-byte words -- so the first `words % 3` shards take one word more.
++Both rows fold in fp32 in ascending rank order, so the band edge between them changes no bits.
++
+ The log says what the geometry did:
+ 
+ ```
+diff --git a/libr4d/r4d.h b/libr4d/r4d.h
+index 148fd8a..ffeac74 100644
+--- a/libr4d/r4d.h
++++ b/libr4d/r4d.h
+@@ -332,7 +332,8 @@ void r4d_ar_gather_2rank(long peer_scratch, long my_scratch, long peer_flags, lo
+ // [block][source rank]; seq_ctrs is 2 * max_blocks words, a handshake and a slot-parity counter
+ // per block of capacity (r4d_ar_seq.h).
+ // Three ranks: the same kernel instantiated at WS=3 (two peers). Nothing in the wide family is
+-// power-of-two; the two-shot cannot serve 3 because it shards the message `world` ways.
++// power-of-two; the two-shot serves 3 too, with shards one word uneven where the message does not
++// divide (r4d_ar_twoshot_3rank_exact, below).
+ void r4d_ar_oneshot_3rank_exact(long peer_scratch0, long peer_scratch1,
+                                 long peer_flags0, long peer_flags1,
+                                 long my_scratch, long my_flags, long seq_ctrs, long slot_stride16,
+@@ -391,14 +392,21 @@ void r4d_ar_gather_hc_write_4rank(long peer_scratch0, long peer_scratch1, long p
+ int  r4d_ar_gather_inv(long inv, long sorted, long T, long stream);
+ void r4d_ar_wide_dims(int* max_blocks, int* nb_design, int* max_peers);
+ 
+-// ---- all-reduce: two-shot, 4 or 8 ranks over P2P -------------------------------------------
++// ---- all-reduce: two-shot, 3, 4 or 8 ranks over P2P ----------------------------------------
+ // Reduce-scatter + all-gather on the same buffer trio and peer-argument order as the wide
+-// one-shot (r4d_ar_twoshot_Nrank_exact.hip): shard s, a contiguous 1/ws of the message, is
+-// reduced by rank s (fp32, ascending rank order), then gathered. Sends 2*(ws-1)/ws*N bytes
+-// per rank in two hops. Covers the sizes where the one-shot's (ws-1)*N send is too heavy.
+-// Regions A and B sit at 0 and shard16, so the slot stride must hold 2*shard16. Above this bound
+-// the caller falls back:
++// one-shot (r4d_ar_twoshot_Nrank_exact.hip): shard s, a contiguous run of the message's 16-byte
++// words, is reduced by rank s (fp32, ascending rank order), then gathered. Sends 2*(ws-1)/ws*N
++// bytes per rank in two hops. Covers the sizes where the one-shot's (ws-1)*N send is too heavy.
++// Shards are as even as the word count allows (the first n16 % ws take one more word), so a
++// message need not divide by the rank count -- at three it almost never does. Regions A and B sit
++// at 0 and the longest shard, so the slot stride must hold twice that. Above this bound the caller
++// falls back:
+ enum { R4D_AR_TWOSHOT_WIDE_MAX_ELEMS = 20971520 };  // a 4096-token hidden-5120 prefill chunk
++void r4d_ar_twoshot_3rank_exact(long peer_scratch0, long peer_scratch1, long peer_flags0,
++                                long peer_flags1, long my_scratch, long my_flags, long seq_ctrs,
++                                long slot_stride16, long inp, long out, long n_elem, long dtype,
++                                long rank, long stream, long nblocks, long nthreads, long drain,
++                                long acq, long pub);
+ void r4d_ar_twoshot_4rank_exact(long peer_scratch0, long peer_scratch1, long peer_scratch2,
+                                 long peer_flags0, long peer_flags1, long peer_flags2,
+                                 long my_scratch, long my_flags, long seq_ctrs,
+diff --git a/libr4d/r4d_ar_entry.hip b/libr4d/r4d_ar_entry.hip
+index ef46937..87c15e8 100644
+--- a/libr4d/r4d_ar_entry.hip
++++ b/libr4d/r4d_ar_entry.hip
+@@ -870,6 +870,33 @@ extern "C" int r4d_rad_ar_oneshot_8rank_exact(const RadArgs* a, RadStream s) {
+  * the thread that already read it, later in its own program order, and no peer reads this rank's
+  * input -- peers read their own scratch. The selector hands the two-shot the messages above the
+  * one-shot's size bound (r4d_rows.cpp, cArTsExact4). */
++/* AT THREE RANKS THE SHARDS ARE UNEVEN, so there is no divisibility to check: a 2048-wide bf16
++ * row is 256 words and a step's message is 256 * rows of them, a multiple of 3 only one step in
++ * three. The kernel gives the first (words % 3) shards one word more, the slot holds two of the
++ * longest, and the fold is the one-shot's -- fp32, ascending rank order -- so the two rows that
++ * share this op produce the same bits and the band edge between them moves nothing a request
++ * could see. */
++extern "C" int r4d_rad_ar_twoshot_3rank_exact(const RadArgs* a, RadStream s) {
++    ArCall c;
++    int rc = ar_setup(a, &c, 1);
++    if (rc != RAD_OK) return rc;
++    if (c.in->world != 3) return RAD_E_SHAPE;
++    if (c.numel > R4D_AR_TWOSHOT_WIDE_MAX_ELEMS) return RAD_E_SHAPE;
++    const long words16 = c.numel * c.in->esize / 16;
++    if (words16 < c.in->world) return RAD_E_SHAPE;
++    const long sh_max = (words16 + c.in->world - 1) / c.in->world;
++    if (2 * sh_max * 16 > c.in->slot_bytes) return RAD_E_SCRATCH;
++    const ArInst* in = c.in;
++    R4D_TRY("ar_twoshot_3rank_exact",
++        r4d_ar_twoshot_3rank_exact(in->peer_scratch[0], in->peer_scratch[1],
++                                   in->peer_flags[0], in->peer_flags[1],
++                                   in->my_scratch, in->my_flags, in->my_seq, in->slot16,
++                                   c.inp, c.out, c.numel, in->dtype, in->rank,
++                                   (long)(uintptr_t)s, c.nblocks, c.nthreads, c.drain, c.acq,
++                                   c.pub));
++    return RAD_OK;
++}
++
+ extern "C" int r4d_rad_ar_twoshot_4rank_exact(const RadArgs* a, RadStream s) {
+     ArCall c;
+     int rc = ar_setup(a, &c, 1);
+diff --git a/libr4d/r4d_ar_twoshot_Nrank_exact.hip b/libr4d/r4d_ar_twoshot_Nrank_exact.hip
+index a45dc81..e5c9002 100644
+--- a/libr4d/r4d_ar_twoshot_Nrank_exact.hip
++++ b/libr4d/r4d_ar_twoshot_Nrank_exact.hip
+@@ -1,13 +1,20 @@
+-// r4d_ar_twoshot_Nrank_exact.hip: r4d_ar_twoshot_4rank_exact and r4d_ar_twoshot_8rank_exact 
+-// reduce-scatter + all-gather at 4 or 8 ranks, exact bf16/fp16/fp32 wire. Per-block pipelined
+-// handshake instead of a grid arrival election. Sends 2*(ws-1)/ws*N bytes per rank in two hops,
+-// so it covers the sizes where the one-shot's (ws-1)*N send is too heavy.
++// r4d_ar_twoshot_Nrank_exact.hip: r4d_ar_twoshot_{3,4,8}rank_exact -- reduce-scatter +
++// all-gather at 3, 4 or 8 ranks, exact bf16/fp16/fp32 wire. Per-block pipelined handshake
++// instead of a grid arrival election. Sends 2*(ws-1)/ws*N bytes per rank in two hops, so it
++// covers the sizes where the one-shot's (ws-1)*N send is too heavy.
+ //
+-// Shard s = contiguous 1/ws of the message, owned by rank s. Phase 1: push my contribution to
+-// each peer-owned shard into the owner's slot[me] region A, flag 2s-1; reduce my shard fp32 in
+-// ascending rank order (own contribution from the input). Phase 2: reduced words go to my out
+-// AND every peer's slot[me] region B, flag 2s; assemble out from region B. Region A at 0, B at
+-// shard16; the slot stride must hold 2*shard16.
++// Shard s = a contiguous run of the message's 16-byte words, owned by rank s. Phase 1: push my
++// contribution to each peer-owned shard into the owner's slot[me] region A, flag 2s-1; reduce my
++// shard fp32 in ascending rank order (own contribution from the input). Phase 2: reduced words go
++// to my out AND every peer's slot[me] region B, flag 2s; assemble out from region B. Region A at
++// 0, B at sh_max; the slot stride must hold 2*sh_max.
++//
++// UNEVEN SHARDS. A message of n16 words splits into base = n16/ws words a shard, and the first
++// n16 % ws shards take one more: shard s starts at s*base + min(s, rem). At 4 and 8 ranks every
++// residual the engine issues divides evenly and this is the plain 1/ws split. At 3 it almost never
++// does -- a 2048-wide bf16 row is 256 words, and 256 * rows is a multiple of 3 only when rows is --
++// so the split has to tolerate it rather than refuse it. The sum per word is the same fp32 fold in
++// ascending rank order whichever rank owns it, so the bits match the one-shot's.
+ //
+ // SHARES the wide family's flag/seq/scratch set: every wide kernel publishes in the 2*seq flag
+ // space (this one adds the 2s-1 half-step) and advances the per-block counter once per AR, so
+@@ -22,7 +29,7 @@ template <typename T, int LANES, int WS>
+ __global__ void r4d_ar_twoshot_wide_exact_kernel(
+     const int4* __restrict__ in4, R4DArWidePeers<int4, WS - 1> peers,
+     const int4* __restrict__ my_base, unsigned int* __restrict__ my_flags,
+-    int4* __restrict__ out4, unsigned int* __restrict__ seq_ctrs, int shard16,
++    int4* __restrict__ out4, unsigned int* __restrict__ seq_ctrs, int n16,
+     int slot_stride16, int rank, int drain, int acq, int pub) {
+   constexpr int NPEERS = WS - 1;
+   const int b = blockIdx.x, nb = gridDim.x, tid = threadIdx.x, nt = blockDim.x;
+@@ -31,11 +38,17 @@ __global__ void r4d_ar_twoshot_wide_exact_kernel(
+   const unsigned int s = s_seq;
+   const int parity = (int)s_slot;
+ 
+-  const int w = (shard16 + nb - 1) / nb;   // block b owns words [w0,w1) of the SHARD space
+-  const int w0 = b * w;
+-  int w1 = w0 + w; if (w1 > shard16) w1 = shard16;
++  // shard s = words [s*base + min(s, rem), +base + (s < rem)); sh_max is the longest one
++  const int base = n16 / WS, rem = n16 % WS;
++  const int sh_max = base + (rem ? 1 : 0);
++#define R4D_TS_OFF(s) ((s) * base + ((s) < rem ? (s) : rem))
++#define R4D_TS_LEN(s) (base + ((s) < rem ? 1 : 0))
+ 
+-  // region A of my slot in every peer's scratch (B sits at +shard16)
++  const int w = (sh_max + nb - 1) / nb;    // block b owns words [w0,w1) of the SHARD space
++  const int w0 = b * w;
++  int w1 = w0 + w; if (w1 > sh_max) w1 = sh_max;
++
++  // region A of my slot in every peer's scratch (B sits at +sh_max)
+   int4* pa[NPEERS];
+ #pragma unroll
+   for (int p = 0; p < NPEERS; ++p)
+@@ -43,9 +56,11 @@ __global__ void r4d_ar_twoshot_wide_exact_kernel(
+ 
+   // ---- phase 1 push: my contribution to each peer-owned shard -> owner's region A
+   for (int p = 0; p < NPEERS; ++p) {
+-    const int4* src = in4 + (size_t)peers.rank[p] * shard16;
++    const int owner = peers.rank[p];
++    const int4* src = in4 + (size_t)R4D_TS_OFF(owner);
+     int4* dst = pa[p];
+-    for (int k = w0 + tid; k < w1; k += nt) dst[k] = src[k];
++    const int lim = w1 < R4D_TS_LEN(owner) ? w1 : R4D_TS_LEN(owner);
++    for (int k = w0 + tid; k < lim; k += nt) dst[k] = src[k];
+   }
+   r4d_ar_handshake<WS>(peers, my_flags, b, rank, 2u * s - 1u, drain, acq, pub);
+ 
+@@ -54,10 +69,11 @@ __global__ void r4d_ar_twoshot_wide_exact_kernel(
+   const int4* src[WS];
+ #pragma unroll
+   for (int r = 0; r < WS; ++r)
+-    src[r] = (r == rank) ? (in4 + (size_t)rank * shard16)
++    src[r] = (r == rank) ? (in4 + (size_t)R4D_TS_OFF(rank))
+                          : (my_base + ((size_t)parity * WS + r) * (size_t)slot_stride16);
+-  int4* my_out = out4 + (size_t)rank * shard16;
+-  for (int k = w0 + tid; k < w1; k += nt) {
++  int4* my_out = out4 + (size_t)R4D_TS_OFF(rank);
++  const int my_lim = w1 < R4D_TS_LEN(rank) ? w1 : R4D_TS_LEN(rank);
++  for (int k = w0 + tid; k < my_lim; k += nt) {
+     float acc[LANES];
+ #pragma unroll
+     for (int j = 0; j < LANES; ++j) acc[j] = 0.0f;
+@@ -74,17 +90,20 @@ __global__ void r4d_ar_twoshot_wide_exact_kernel(
+     for (int j = 0; j < LANES; ++j) r4d_ar_from_f(acc[j], po[j]);
+     my_out[k] = o;
+ #pragma unroll
+-    for (int p = 0; p < NPEERS; ++p) pa[p][shard16 + k] = o;  // region B
++    for (int p = 0; p < NPEERS; ++p) pa[p][sh_max + k] = o;  // region B
+   }
+   r4d_ar_handshake<WS>(peers, my_flags, b, rank, 2u * s, drain, acq, pub);
+ 
+   // ---- assemble: every peer-owned shard from my region B copies
+   for (int p = 0; p < NPEERS; ++p) {
+     const int owner = peers.rank[p];
+-    const int4* srcB = my_base + ((size_t)parity * WS + owner) * (size_t)slot_stride16 + shard16;
+-    int4* dst = out4 + (size_t)owner * shard16;
+-    for (int k = w0 + tid; k < w1; k += nt) dst[k] = srcB[k];
++    const int4* srcB = my_base + ((size_t)parity * WS + owner) * (size_t)slot_stride16 + sh_max;
++    int4* dst = out4 + (size_t)R4D_TS_OFF(owner);
++    const int lim = w1 < R4D_TS_LEN(owner) ? w1 : R4D_TS_LEN(owner);
++    for (int k = w0 + tid; k < lim; k += nt) dst[k] = srcB[k];
+   }
++#undef R4D_TS_OFF
++#undef R4D_TS_LEN
+ }
+ 
+ // --- host side ---
+@@ -107,19 +126,19 @@ static void ar_twoshot_launch(const long* peer_scratch, const long* peer_flags,
+                              std::to_string(R4D_AR_TWOSHOT_WIDE_MAX_ELEMS) +
+                              " elems); use the fallback path");
+   const long n16 = nbytes / 16;
+-  if (n16 % WS != 0)
++  if (n16 < WS)
+     throw std::runtime_error("all_reduce: message (" + std::to_string(n16) +
+-                             " 16B words) does not shard evenly over " + std::to_string(WS) +
+-                             " ranks");
+-  const long shard16 = n16 / WS;
+-  if (2 * shard16 > (long)slot_stride16)
+-    throw std::runtime_error("all_reduce: shard (" + std::to_string(shard16) +
++                             " 16B words) is shorter than one word a rank");
++  // the longest shard (the kernel's uneven split); regions A and B each hold one
++  const long sh_max = (n16 + WS - 1) / WS;
++  if (2 * sh_max > (long)slot_stride16)
++    throw std::runtime_error("all_reduce: shard (" + std::to_string(sh_max) +
+                              " 16B words) needs 2x inside the per-source slot stride (" +
+                              std::to_string(slot_stride16) + ")");
+ 
+   int nb = (int)nblocks;
+   if (nb < 1) nb = R4D_AR_NB_DESIGN;
+-  if (nb > shard16) nb = (int)shard16;
++  if (nb > sh_max) nb = (int)sh_max;
+   if (nb > R4D_AR_WIDE_MAX_BLOCKS) nb = R4D_AR_WIDE_MAX_BLOCKS;
+   int nt = (int)nthreads;
+   if (nt < 64) nt = 64;
+@@ -153,7 +172,7 @@ static void ar_twoshot_launch(const long* peer_scratch, const long* peer_flags,
+ #define R4D_AR_TS_LAUNCH(T, LN)                                                       \
+   r4d_ar_twoshot_wide_exact_kernel<T, LN, WS><<<nb, nt, 0, st>>>(                     \
+       (const int4*)inp, peers, (const int4*)my_scratch, (unsigned int*)my_flags,      \
+-      (int4*)out, (unsigned int*)seq_ctrs, (int)shard16, (int)slot_stride16,          \
++      (int4*)out, (unsigned int*)seq_ctrs, (int)n16, (int)slot_stride16,              \
+       (int)rank, (int)drain, (int)acq, (int)pub)
+   if (dtype == 0) R4D_AR_TS_LAUNCH(__hip_bfloat16, 8);
+   else if (dtype == 1) R4D_AR_TS_LAUNCH(__half, 8);
+@@ -162,6 +181,17 @@ static void ar_twoshot_launch(const long* peer_scratch, const long* peer_flags,
+ #undef R4D_AR_TS_LAUNCH
+ }
+ 
++void r4d_ar_twoshot_3rank_exact(long peer_scratch0, long peer_scratch1, long peer_flags0,
++                                long peer_flags1, long my_scratch, long my_flags, long seq_ctrs,
++                                long slot_stride16, long inp, long out, long n_elem, long dtype,
++                                long rank, long stream, long nblocks, long nthreads, long drain,
++                                long acq, long pub) {
++  const long ps[2] = {peer_scratch0, peer_scratch1};
++  const long pf[2] = {peer_flags0, peer_flags1};
++  ar_twoshot_launch<3>(ps, pf, my_scratch, my_flags, seq_ctrs, slot_stride16, inp, out, n_elem,
++                       dtype, rank, stream, nblocks, nthreads, drain, acq, pub);
++}
++
+ void r4d_ar_twoshot_4rank_exact(long peer_scratch0, long peer_scratch1, long peer_scratch2,
+                                 long peer_flags0, long peer_flags1, long peer_flags2,
+                                 long my_scratch, long my_flags, long seq_ctrs,
+diff --git a/libr4d/r4d_plugin.h b/libr4d/r4d_plugin.h
+index 7e2c7d8..51d7490 100644
+--- a/libr4d/r4d_plugin.h
++++ b/libr4d/r4d_plugin.h
+@@ -185,6 +185,7 @@ int  r4d_rad_ar_oneshot_3rank_exact(const RadArgs*, RadStream);
+ int  r4d_rad_ar_gather_3rank       (const RadArgs*, RadStream);
+ int  r4d_rad_ar_oneshot_4rank_exact(const RadArgs*, RadStream);
+ int  r4d_rad_ar_oneshot_8rank_exact(const RadArgs*, RadStream);
++int  r4d_rad_ar_twoshot_3rank_exact(const RadArgs*, RadStream);
+ int  r4d_rad_ar_twoshot_4rank_exact(const RadArgs*, RadStream);
+ int  r4d_rad_ar_twoshot_8rank_exact(const RadArgs*, RadStream);
+ int  r4d_rad_ar_twoshot_4rank_ti8  (const RadArgs*, RadStream);
+diff --git a/libr4d/r4d_rows.cpp b/libr4d/r4d_rows.cpp
+index f37624e..f372770 100644
+--- a/libr4d/r4d_rows.cpp
++++ b/libr4d/r4d_rows.cpp
+@@ -2668,6 +2668,13 @@ static const RadConstraint cArExact8[] = {
+     C_EQ("world_size", 8), C_EQ("exact", 1), C_IN("dtype", "bf16 fp16 fp32"),
+     C_P2P,
+ };
++/* No DIV: the three-rank two-shot shards unevenly (r4d_rad_ar_twoshot_3rank_exact), so the only
++ * shape it needs is the 16-byte push ar_setup already checks. */
++static const RadConstraint cArTsExact3[] = {
++    C_EQ("world_size", 3), C_EQ("exact", 1), C_IN("dtype", "bf16 fp16 fp32"),
++    C_GE("numel", R4D_AR_WIDE_ONESHOT_MAX_ELEMS + 1), C_LE("numel", R4D_AR_TWOSHOT_WIDE_MAX_ELEMS),
++    C_P2P,
++};
+ static const RadConstraint cArTsExact4[] = {
+     C_EQ("world_size", 4), C_EQ("exact", 1), C_IN("dtype", "bf16 fp16 fp32"),
+     C_DIV("numel", 64), C_GE("numel", R4D_AR_WIDE_ONESHOT_MAX_ELEMS + 1),
+@@ -4345,6 +4352,20 @@ static const RadKernelInfo kKernels[] = {
+ 
+ /* ---------------------------------------------------------------------------- all-reduce ----
+  * The two-shot rows outrank the one-shots, for the reason the constraint block above states. */
++{ "ar_twoshot_3rank_exact", "all_reduce", "ar",
++  "all-reduce (sum), reduce-scatter + all-gather over P2P IPC scratch, per-block pipelined "
++  "handshake",
++  "exactly 3 ranks, all peer-accessible; messages above "
++  R4D_XSTR(R4D_AR_WIDE_ONESHOT_MAX_ELEMS) " elements, two hops; shards as even as the word count "
++  "allows (the first words % 3 take one more); shares the wide family's flag/seq/scratch set; in "
++  "place; cudagraph-safe",
++  "bf16 / fp16 / fp32 payload, fp32 accumulate in ascending rank order, bit-identical across ranks "
++  "and to ar_oneshot_3rank_exact",
++  RAD_DOMAIN_DEVICE, R4D_PRIO_AR_TWOSHOT,
++  ROW(cArTsExact3), ROW(tAr), nullptr,
++  r4d_rad_ar_init, r4d_rad_ar_fini, r4d_rad_ar_twoshot_3rank_exact, nullptr, nullptr, nullptr,
++  r4d_shape_all_reduce },
++
+ { "ar_twoshot_4rank_exact", "all_reduce", "ar",
+   "all-reduce (sum), reduce-scatter + all-gather over P2P IPC scratch, per-block pipelined "
+   "handshake",
+@@ -4435,8 +4456,9 @@ static const RadKernelInfo kKernels[] = {
+   r4d_shape_all_gather },
+ { "ar_oneshot_3rank_exact", "all_reduce", "ar",
+   "all-reduce (sum), one-shot push over P2P IPC scratch, per-block handshake",
+-  "exactly 3 ranks, all peer-accessible; one scratch slot per (parity, source rank); "
+-  "the only wide form at three -- the two-shot shards the message `world` ways; cudagraph-safe",
++  "exactly 3 ranks, all peer-accessible; one scratch slot per (parity, source rank); in place; "
++  "above " R4D_XSTR(R4D_AR_WIDE_ONESHOT_MAX_ELEMS) " elements ar_twoshot_3rank_exact outranks it; "
++  "cudagraph-safe",
+   "bf16 / fp16 / fp32 payload, fp32 accumulate in ascending rank order, bit-identical across ranks",
+   RAD_DOMAIN_DEVICE, R4D_PRIO_AR_ONESHOT,
+   ROW(cArExact3), ROW(tAr), nullptr,
+diff --git a/libr4d/r4d_selftest.cpp b/libr4d/r4d_selftest.cpp
+index 1ed738b..e60ebbb 100644
+--- a/libr4d/r4d_selftest.cpp
++++ b/libr4d/r4d_selftest.cpp
+@@ -10684,6 +10684,148 @@ static void ar_three_rank(const Plugin& pl, const std::vector<int>& devs, const
+     }
+ }
+ 
++/* THE THREE-RANK ALL-REDUCE ROWS, at the sizes the two-shot is selected for and the ones that do
++ * not divide.
++ *
++ * ar_three_rank's input is a constant per rank, which a shard landing at the wrong offset still
++ * sums correctly. This one gives every element its own value, so a word reduced by the wrong
++ * owner, gathered from the wrong slot or dropped at a short shard's end is a wrong number at a
++ * known index. The sizes walk the uneven split: words % 3 of 0, 1 and 2, from a 16-word message
++ * to the row's 20971520-element ceiling, in place (how every block issues it) and once out of
++ * place, back to back on ONE instance so the slot parity and the changing block count are
++ * exercised the way a step's mixed messages exercise them. The oracle is the fold the kernel
++ * claims -- fp32 in ascending rank order, rounded once -- so it is bit for bit, and so it is also
++ * the one-shot's answer: the band edge between the two rows changes no bits. */
++struct ArPattern {
++    const RadKernelInfo* row;
++    int rank, dev;
++    const char* dtype;                 /* "bf16" or "fp32" */
++    std::vector<int64_t> sizes;
++    int out_of_place = -1;             /* index into sizes, or -1 */
++    void* inst = nullptr;
++    int rc_init = RAD_E_STATE, rc_launch = RAD_OK;
++    std::vector<std::vector<float>> out;
++};
++
++static float ar_pattern_value(int rank, int64_t i) {
++    /* Integers up to 254 over 64: exact in bf16 (8 significant bits), and three of them need ten,
++     * so the bf16 sum is rounded and the rounding is checked too. */
++    return (float)((int)((i * 37 + (int64_t)rank * 101) % 509) - 254) / 64.0f;
++}
++
++static void ar_pattern_worker(ArPattern* t) {
++    if (st_set_device(t->dev) != hipSuccess) { t->rc_init = RAD_E_DEVICE; return; }
++    const bool bf = !std::strcmp(t->dtype, "bf16");
++    const int esz = bf ? 2 : 4;
++    int64_t most = 0;
++    for (int64_t n : t->sizes) most = n > most ? n : most;
++    std::vector<RadParam> ps = {
++        PI("world_size", 3), PI("numel", most), PS("dtype", t->dtype), PI("exact", 1),
++    };
++    t->rc_init = t->row->init(ps.data(), (int)ps.size(), t->rank, 3, &t->inst);
++    if (t->rc_init != RAD_OK) return;
++    void* in = nullptr;
++    void* out = nullptr;
++    if (hipMalloc(&in, (size_t)most * esz) != hipSuccess) { t->rc_launch = RAD_E_NOMEM; return; }
++    if (hipMalloc(&out, (size_t)most * esz) != hipSuccess) { t->rc_launch = RAD_E_NOMEM; return; }
++    std::vector<uint8_t> h((size_t)most * esz);
++    for (size_t k = 0; k < t->sizes.size(); ++k) {
++        const int64_t n = t->sizes[k];
++        for (int64_t i = 0; i < n; ++i) {
++            const float v = ar_pattern_value(t->rank, i);
++            if (bf) { const uint16_t b = h_to_bf16(v); std::memcpy(&h[(size_t)i * 2], &b, 2); }
++            else    std::memcpy(&h[(size_t)i * 4], &v, 4);
++        }
++        st_memcpy(in, h.data(), (size_t)n * esz, hipMemcpyHostToDevice);
++        const bool oop = (int)k == t->out_of_place;
++        if (oop) st_memset(out, 0, (size_t)n * esz);
++        const uint32_t dt = bf ? RAD_BF16 : RAD_F32;
++        RadTensor ts[2] = { T(in, dt, { n }), T(out, dt, { n }) };
++        RadArgs a;
++        std::memset(&a, 0, sizeof(a));
++        a.t = ts; a.n_t = oop ? 2 : 1;
++        a.p = ps.data(); a.n_p = (int)ps.size();
++        a.instance = t->inst;
++        a.rank = t->rank;
++        a.world_size = 3;
++        const int rc = t->row->launch(&a, nullptr);
++        st_stream_sync(nullptr);
++        if (rc != RAD_OK && t->rc_launch == RAD_OK) t->rc_launch = rc;
++        st_memcpy(h.data(), oop ? out : in, (size_t)n * esz, hipMemcpyDeviceToHost);
++        std::vector<float> got((size_t)n);
++        for (int64_t i = 0; i < n; ++i) {
++            if (bf) { uint16_t b; std::memcpy(&b, &h[(size_t)i * 2], 2); got[(size_t)i] = h_bf16(b); }
++            else    std::memcpy(&got[(size_t)i], &h[(size_t)i * 4], 4);
++        }
++        t->out.push_back(std::move(got));
++    }
++    st_free(in);
++    st_free(out);
++}
++
++static void ar_three_rank_pattern(const Plugin& pl, const std::vector<int>& devs, const char* name) {
++    const RadKernelInfo* row = find(pl, name);
++    if (!row) { ok(name, false, "row absent"); return; }
++    if (devs.size() < 3) { skip(name, "fewer than three gfx1201 cards"); return; }
++    struct Run { const char* dtype; std::vector<int64_t> sizes; int oop; };
++    const std::vector<Run> runs = {
++        /* bf16, the residual: words = numel / 8. 2048 x 2048 rows is words % 3 == 2, x 2049 is
++         * 0, x 2050 is 1; 128 is 16 words (1), 24008 is 3001 (1); 20971520 the ceiling (1). */
++        { "bf16", { 4194304, 128, 4196352, 24008, 4198400, 20971520, 4194304 }, 2 },
++        /* fp32: words = numel / 4. 8196 -> 2049 (0), 4100 -> 1025 (2), 1048580 -> 262145 (2). */
++        { "fp32", { 8196, 4100, 1048580 }, 0 },
++    };
++    for (const Run& run : runs) {
++        ArPattern t[3];
++        for (int r = 0; r < 3; ++r) {
++            t[r].row = row; t[r].rank = r; t[r].dev = devs[(size_t)r];
++            t[r].dtype = run.dtype; t[r].sizes = run.sizes; t[r].out_of_place = run.oop;
++        }
++        std::thread a(ar_pattern_worker, &t[0]), b(ar_pattern_worker, &t[1]), c(ar_pattern_worker, &t[2]);
++        a.join(); b.join(); c.join();
++        const std::string what = std::string(name) + " " + run.dtype;
++        const bool up = t[0].rc_init == RAD_OK && t[1].rc_init == RAD_OK && t[2].rc_init == RAD_OK;
++        ok((what + " init (peer rendezvous)").c_str(), up,
++           "rc " + std::to_string(t[0].rc_init) + "/" + std::to_string(t[1].rc_init) + "/" +
++               std::to_string(t[2].rc_init));
++        if (!up) return;
++        const bool ran = t[0].rc_launch == RAD_OK && t[1].rc_launch == RAD_OK &&
++                         t[2].rc_launch == RAD_OK;
++        ok((what + " launches").c_str(), ran,
++           "rc " + std::to_string(t[0].rc_launch) + "/" + std::to_string(t[1].rc_launch) + "/" +
++               std::to_string(t[2].rc_launch));
++        if (ran) {
++            const bool bf = !std::strcmp(run.dtype, "bf16");
++            for (size_t k = 0; k < run.sizes.size(); ++k) {
++                const int64_t n = run.sizes[k];
++                int64_t bad = 0, first = -1;
++                for (int64_t i = 0; i < n; ++i) {
++                    float acc = 0.0f;
++                    for (int r = 0; r < 3; ++r) {
++                        const float v = ar_pattern_value(r, i);
++                        acc += bf ? h_bf16(h_to_bf16(v)) : v;
++                    }
++                    const float want = bf ? h_bf16(h_to_bf16(acc)) : acc;
++                    for (int r = 0; r < 3; ++r)
++                        if (t[r].out.size() <= k || t[r].out[k][(size_t)i] != want) {
++                            if (first < 0) first = i;
++                            ++bad;
++                        }
++                }
++                const int64_t words = n * (bf ? 2 : 4) / 16;
++                const std::string label =
++                    what + " numel " + std::to_string(n) + " (" + std::to_string(words) +
++                    " words, % 3 = " + std::to_string(words % 3) +
++                    ((int)k == run.oop ? ", out of place" : ", in place") +
++                    ") == fp32 ascending-rank fold on every rank, bit for bit";
++                ok(label.c_str(), bad == 0,
++                   std::to_string(bad) + " elements wrong, first at " + std::to_string(first));
++            }
++        }
++        if (row->fini) for (int r = 0; r < 3; ++r) if (t[r].inst) row->fini(t[r].inst);
++    }
++}
++
+ static void gather_three_rank(const Plugin& pl, const std::vector<int>& devs, const char* name) {
+     const RadKernelInfo* row = find(pl, name);
+     if (!row) { ok(name, false, "row absent"); return; }
+@@ -12518,7 +12660,7 @@ static void device_phase(const Plugin& pl) {
+     /* Every collective has a host twin (r4d_rows.cpp): the same kernel with its mailbox in pinned
+      * host memory. A case is the pair's, so the twin is held to exactly the original's checks. */
+     for (const char* base : { "ar_oneshot_2rank_exact", "ar_gather_2rank", "ar_oneshot_3rank_exact",
+-                              "ar_gather_3rank" }) {
++                              "ar_twoshot_3rank_exact", "ar_gather_3rank" }) {
+         for (const std::string& n : { std::string(base), std::string(base) + "_host" }) {
+             if (!sel(n.c_str())) continue;
+             const bool three = std::strstr(base, "3rank") != nullptr;
+@@ -12534,8 +12676,13 @@ static void device_phase(const Plugin& pl) {
+              * ar_oneshot_3rank_exact` reproduces one of them alone. */
+             } else if (three && std::strstr(base, "gather")) {
+                 gather_three_rank(pl, devs, n.c_str());
++            } else if (three && std::strstr(base, "twoshot")) {
++                ar_three_rank_pattern(pl, devs, n.c_str());
+             } else {
+                 ar_three_rank(pl, devs, n.c_str());
++                /* The one-shot through the same per-element oracle: both rows of the op agree
++                 * with it, so they agree with each other at every size either could be given. */
++                ar_three_rank_pattern(pl, devs, n.c_str());
+             }
+         }
+     }
+-- 
+2.55.0
+
+
+From 380bb64153b19abf9b92f784502e2208ab861f3a Mon Sep 17 00:00:00 2001
+From: baKon <mike.ski83@gmail.com>
+Date: Wed, 7 Oct 2026 19:10:48 -0500
+Subject: [PATCH 2/2] libr4d: --tp-wire wht6 at three ranks, the tiered-int8
+ wire over the uneven two-shot
+
+--tp 3 --tp-wire wht6 had no kernel: the lossy rows were world_size 2 (rotated 6-bit) and 4
+(tiered int8 over the two-shot). The tiered-int8 two-shot is already written over the world size,
+and what kept it at four was the even split it shards by -- numel % (32 x ws) -- which a 2048-wide
+row (64 groups) meets at three ranks one step in three.
+
+The kernel now splits ng = numel/32 groups as evenly as they divide, the first ng % ws shards one
+group longer, and lays every slot out for the longest shard, so writer and reader agree on one
+number. At four ranks the entry still requires numel % 128 and the split is the even one it was.
+ar_twoshot_3rank_ti8 is the only lossy row at three, so as at four it resolves at every size; a
+message under min_bytes, or not whole groups, goes to the exact one-shot.
+
+r4d_selftest holds it to what a lossy wire can be held to: every rank the same bytes, the declined
+messages the exact fold bit for bit, and the rest within the int8 wire's error of the fp32 sum
+(relative RMS < 1%), over groups % 3 of 0, 1 and 2 with outliers, to the 20971520 ceiling. The
+--tp-wire help, the startup LOSSY warning, README, GUIDE and TP3.md say three ranks.
+---
+ README.md                           |   4 +-
+ core/config.cpp                     |   4 +-
+ core/engine_bringup.cpp             |   2 +-
+ docs/GUIDE.md                       |   5 +-
+ docs/TP3.md                         |   2 +
+ libr4d/r4d.h                        |  13 ++-
+ libr4d/r4d_ar_entry.hip             |  37 ++++++++
+ libr4d/r4d_ar_twoshot_Nrank_ti8.hip |  64 ++++++++++----
+ libr4d/r4d_plugin.h                 |   1 +
+ libr4d/r4d_rows.cpp                 |  17 ++++
+ libr4d/r4d_selftest.cpp             | 125 +++++++++++++++++++++++++++-
+ 11 files changed, 246 insertions(+), 28 deletions(-)
+
+diff --git a/README.md b/README.md
+index 2ad063a..9f21a50 100644
+--- a/README.md
++++ b/README.md
+@@ -100,8 +100,8 @@ At `--tp 4` the gated residual's write carries the exact all-reduce, with the Mo
+ of it, on decode and verify steps; a prefill chunk runs the unfused chain. That chain's exact
+ all-reduce is one-shot up to 1 MiB a message and two-shot above that, which sends half the bytes
+ on a prefill chunk; both produce the same bits. The row above runs exact.
+-`--tp-wire wht6` at four ranks selects a different lossy wire, tiered int8 over the two-shot,
+-above `--tp-wire-min-kb`. Eight ranks have no lossy wire, so `--tp 8 --tp-wire wht6` stops at
++`--tp-wire wht6` at three and four ranks selects a different lossy wire, tiered int8 over the
++two-shot, above `--tp-wire-min-kb`. Eight ranks have no lossy wire, so `--tp 8 --tp-wire wht6` stops at
+ startup naming the all-reduce. Four ranks is a capacity configuration; its per-step rate against
+ `--tp 2` on the same cards has not been measured. The
+ tiering flags are the tp2 recipe carried over. Above two ranks each rank still owns a **slice of
+diff --git a/core/config.cpp b/core/config.cpp
+index 6997a40..4b7be5d 100644
+--- a/core/config.cpp
++++ b/core/config.cpp
+@@ -46,8 +46,8 @@ static const Flag g_flags[] = {
+ 
+     { "--tp",                 "N",      "tensor-parallel ranks" },
+     { "--tp-wire",            "MODE",   "cross-rank all-reduce payload: exact (default) or wht6, a\n"
+-                                        "lossy wire: rotated 6-bit at 2 ranks, tiered int8 at 4,\n"
+-                                        "none at 8" },
++                                        "lossy wire: rotated 6-bit at 2 ranks, tiered int8 at 3\n"
++                                        "and 4, none at 8" },
+     { "--tp-wire-min-kb",     "N",      "smallest all-reduce, in KiB, the lossy wire is used for" },
+     { "--p2p",                "MODE",   "how the collectives reach the other cards: auto (default)\n"
+                                         "asks the driver, on requires peer access and stops without\n"
+diff --git a/core/engine_bringup.cpp b/core/engine_bringup.cpp
+index 10c1caf..d8ae745 100644
+--- a/core/engine_bringup.cpp
++++ b/core/engine_bringup.cpp
+@@ -956,7 +956,7 @@ int Engine::declare() {
+         const int64_t exact_rows = (cfg_.tp_wire_min_kb * 1024 + row_bytes - 1) / row_bytes - 1;
+         RAD_WARN("tp wire: LOSSY (--tp-wire wht6) at %lld KiB a message and above. A cross-rank "
+                  "all-reduce of that size carries a quantised payload instead of bf16 (libr4d's "
+-                 "is Walsh-Hadamard-rotated 6-bit at two ranks and tiered int8 at four), so this "
++                 "is Walsh-Hadamard-rotated 6-bit at two ranks and tiered int8 at three and four), so this "
+                  "process does not compute the same function the exact wire does. Steps of at "
+                  "most %lld rows are exact: single-sequence decode, and a "
+                  "decode step until sequences x (1 + speculative depth) passes that; prefill and "
+diff --git a/docs/GUIDE.md b/docs/GUIDE.md
+index 5d75d9f..275f17d 100644
+--- a/docs/GUIDE.md
++++ b/docs/GUIDE.md
+@@ -791,8 +791,9 @@ which is why it is a named flag and not a heuristic.
+ `--tp-wire-min-kb` is the floor below which messages are still served exactly — 128 KiB leaves
+ single-sequence decode exact and compresses prefill, which is where the win is.
+ 
+-At four ranks `wht6` selects a different lossy wire with the same floor: tiered int8 over a
+-two-shot all-reduce, both hops quantised. Eight ranks have no lossy wire, and `--tp 8 --tp-wire
++At three and four ranks `wht6` selects a different lossy wire with the same floor: tiered int8
++over a two-shot all-reduce, both hops quantised (at three the shards are whole 32-element groups,
++one group uneven where the message does not divide). Eight ranks have no lossy wire, and `--tp 8 --tp-wire
+ wht6` stops at startup naming the all-reduce it found no kernel for. The exact wire at four and
+ eight ranks is one-shot up to 1 MiB a message and two-shot above it, which sends
+ 2·(ranks−1)/ranks of the message per rank instead of (ranks−1) times it; the two produce the same
+diff --git a/docs/TP3.md b/docs/TP3.md
+index 9d9baf1..2f9daa8 100644
+--- a/docs/TP3.md
++++ b/docs/TP3.md
+@@ -132,6 +132,8 @@ decode step) and its two-shot above it (every prefill chunk): reduce-scatter + a
+ sends 4/3 of the message per rank instead of twice it. A message rarely divides into thirds -- a
+ 2048-wide bf16 row is 256 16-byte words -- so the first `words % 3` shards take one word more.
+ Both rows fold in fp32 in ascending rank order, so the band edge between them changes no bits.
++`--tp-wire wht6` at three ranks is the four-rank tiered-int8 wire over the same uneven two-shot,
++above `--tp-wire-min-kb`; under it, the exact one-shot.
+ 
+ The log says what the geometry did:
+ 
+diff --git a/libr4d/r4d.h b/libr4d/r4d.h
+index ffeac74..b497ab0 100644
+--- a/libr4d/r4d.h
++++ b/libr4d/r4d.h
+@@ -422,12 +422,19 @@ void r4d_ar_twoshot_8rank_exact(long peer_scratch0, long peer_scratch1, long pee
+                                 long out, long n_elem, long dtype, long rank, long stream,
+                                 long nblocks, long nthreads, long drain, long acq, long pub);
+ // The tiered int8 wire on both of the two-shot's hops (r4d_ar_twoshot_Nrank_ti8.hip; codec
+-// in r4d_ar_ti8.h), 4 ranks only. The wire: int8 groups of 32 with an fp16 scale and a
++// in r4d_ar_ti8.h), 3 or 4 ranks. The wire: int8 groups of 32 with an fp16 scale and a
+ // per-group record (T1 plain, T2 top-1-exact, T3 wht32) 38 bytes/group, deterministic
+ // tiering, bit-identical across ranks. Same peer-argument order and flag layout as the exact
+ // pair; slot stride in bytes (the wire is not 16B-aligned), holding two wire images; the 
+-// encoder writes its own slot too (no loc_pack). numel must tile 32-elem groups over the ws
+-// shards (numel % 128).
++// encoder writes its own slot too (no loc_pack). numel must be whole 32-elem groups; the
++// groups split over the ranks as evenly as they divide (the first ng % ws shards one group
++// longer) and every slot is laid out for the longest shard. The 4-rank entry still asks for
++// numel % 128, the even split.
++void r4d_ar_twoshot_3rank_ti8(long peer_scratch0, long peer_scratch1, long peer_flags0,
++                              long peer_flags1, long my_scratch, long my_flags, long seq_ctrs,
++                              long slot_stride_bytes, long inp, long out, long n_elem,
++                              long dtype, long rank, long stream, long nblocks,
++                              long nthreads, long drain, long acq, long pub);
+ void r4d_ar_twoshot_4rank_ti8(long peer_scratch0, long peer_scratch1, long peer_scratch2,
+                               long peer_flags0, long peer_flags1, long peer_flags2,
+                               long my_scratch, long my_flags, long seq_ctrs,
+diff --git a/libr4d/r4d_ar_entry.hip b/libr4d/r4d_ar_entry.hip
+index 87c15e8..2e52c93 100644
+--- a/libr4d/r4d_ar_entry.hip
++++ b/libr4d/r4d_ar_entry.hip
+@@ -953,6 +953,43 @@ extern "C" int r4d_rad_ar_twoshot_8rank_exact(const RadArgs* a, RadStream s) {
+  * four-rank crossover has been measured to set another. In place is safe for the exact two-shot's
+  * reason: a thread owns the same 8 elements of a shard in all three phases, reads them from the
+  * input before it writes them, and no peer reads this rank's input. */
++/* The same wire at three ranks, over the uneven two-shot (r4d_ar_twoshot_Nrank_ti8.hip): the only
++ * lossy row at three, so as at four a lossy request resolves it at every size and a message
++ * under `min_bytes` -- or one that is not whole 32-element groups -- goes to the exact one-shot.
++ * A 2048-wide row is 64 groups, so the residual is always whole groups; what it rarely is, is a
++ * multiple of three groups, and the kernel's split does not need it to be. */
++extern "C" int r4d_rad_ar_twoshot_3rank_ti8(const RadArgs* a, RadStream s) {
++    ArCall c;
++    int rc = ar_setup(a, &c, 1);
++    if (rc != RAD_OK) return rc;
++    if (c.in->world != 3) return RAD_E_SHAPE;
++    if (c.in->dtype == 2) return RAD_E_DTYPE;
++
++    int group = 0, group_bytes = 0;
++    r4d_ar_ti8_dims(&group, &group_bytes);
++    if (group <= 0) return RAD_E_DEVICE;
++    const long long floor_b = r4d_pgeti_or(a->p, a->n_p, "min_bytes", R4D_AR_WHT6_MIN_BYTES);
++    const long n_groups = c.numel / group;
++    if ((long long)c.numel * c.in->esize < floor_b || c.numel % group || n_groups < c.in->world)
++        return r4d_rad_ar_oneshot_3rank_exact(a, s);
++    /* The slot holds two wire images of the LONGEST shard. */
++    const long sg = (n_groups + c.in->world - 1) / c.in->world;
++    const long wire = (sg * group_bytes + 15) / 16 * 16;
++    if (2 * wire > c.in->slot_bytes) return RAD_E_SCRATCH;
++    /* nthreads must be a multiple of the encoder's group width -- a throw in the entry point. */
++    if (c.nthreads % 32) return RAD_E_INVAL;
++
++    const ArInst* in = c.in;
++    R4D_TRY("ar_twoshot_3rank_ti8",
++        r4d_ar_twoshot_3rank_ti8(in->peer_scratch[0], in->peer_scratch[1],
++                                 in->peer_flags[0], in->peer_flags[1],
++                                 in->my_scratch, in->my_flags, in->my_seq, in->slot_bytes,
++                                 c.inp, c.out, c.numel, in->dtype, in->rank,
++                                 (long)(uintptr_t)s, c.nblocks, c.nthreads, c.drain, c.acq,
++                                 c.pub));
++    return RAD_OK;
++}
++
+ extern "C" int r4d_rad_ar_twoshot_4rank_ti8(const RadArgs* a, RadStream s) {
+     ArCall c;
+     int rc = ar_setup(a, &c, 1);
+diff --git a/libr4d/r4d_ar_twoshot_Nrank_ti8.hip b/libr4d/r4d_ar_twoshot_Nrank_ti8.hip
+index 783d787..16b1b57 100644
+--- a/libr4d/r4d_ar_twoshot_Nrank_ti8.hip
++++ b/libr4d/r4d_ar_twoshot_Nrank_ti8.hip
+@@ -1,5 +1,5 @@
+-// r4d_ar_twoshot_Nrank_ti8.hip: r4d_ar_twoshot_4rank_ti8 -- reduce-scatter + all-gather with
+-// the tiered-int8 wire on both hops, at 4 ranks. Codec (tiers 1/2/3) from r4d_ar_ti8.h,
++// r4d_ar_twoshot_Nrank_ti8.hip: r4d_ar_twoshot_{3,4}rank_ti8 -- reduce-scatter + all-gather with
++// the tiered-int8 wire on both hops, at 3 or 4 ranks. Codec (tiers 1/2/3) from r4d_ar_ti8.h,
+ // transport from r4d_ar_twoshot_Nrank_exact.hip. The second hop costs 38/64 of its exact 
+ // bytes. Own contribution reads exact from the input at fold time.
+ //
+@@ -10,6 +10,13 @@
+ //
+ // Slot: region A = ti8 wire (38*sg bytes, codes | rec | scales), region B at align16(A end)
+ // a second wire image of the same layout; the stride must hold both.
++//
++// UNEVEN SHARDS, in whole groups (the exact two-shot's rule one level up): ng = numel/32 groups
++// split ng/ws a shard and the first ng % ws take one more, so shard s starts at group
++// s*base + min(s, rem). Every slot is laid out for the LONGEST shard (sg_max), whichever shard it
++// carries, so a writer and a reader never have to agree on anything but sg_max. At 4 ranks the
++// entry still requires numel to tile 32 x 4 and this is the even split it always was; at 3 a
++// 2048-wide row is 64 groups and 64 * rows divides by 3 one step in three.
+ #include "r4d.h"
+ #include "r4d_ar_ti8.h"
+ #include "r4d_ar_wide.h"
+@@ -20,7 +27,7 @@ template <typename T, int WS>
+ __global__ void r4d_ar_twoshot_wide_ti8_kernel(
+     const T* __restrict__ in, R4DArWidePeers<char, WS - 1> peers, char* __restrict__ my_base,
+     unsigned int* __restrict__ my_flags, T* __restrict__ out,
+-    unsigned int* __restrict__ seq_ctrs, int shard_elems, long slot_stride_bytes,
++    unsigned int* __restrict__ seq_ctrs, int n_groups, long slot_stride_bytes,
+     long b_off_bytes, int rank, int drain, int acq, int pub) {
+   constexpr int NPEERS = WS - 1;
+   const int b = blockIdx.x, nb = gridDim.x, tid = threadIdx.x, nt = blockDim.x;
+@@ -29,7 +36,11 @@ __global__ void r4d_ar_twoshot_wide_ti8_kernel(
+   const unsigned int s = s_seq;
+   const int parity = (int)s_slot;
+ 
+-  const int sg = shard_elems / TI8_GROUP;  // groups per shard
++  // shard s = groups [s*gbase + min(s, grem), +gbase + (s < grem)); sg is the longest
++  const int gbase = n_groups / WS, grem = n_groups % WS;
++  const int sg = gbase + (grem ? 1 : 0);
++#define R4D_TI8_OFF(s) ((size_t)((s) * gbase + ((s) < grem ? (s) : grem)) * TI8_GROUP)
++#define R4D_TI8_LEN(s) (gbase + ((s) < grem ? 1 : 0))
+   const int rec_off = TI8_REC_OFF * sg, sc_off = TI8_SC_OFF * sg;  // wire layout: codes | rec | scales
+   const int gpb = (sg + nb - 1) / nb;      // block b owns shard groups [gA, gB)
+   const int gA = b * gpb;
+@@ -43,8 +54,9 @@ __global__ void r4d_ar_twoshot_wide_ti8_kernel(
+   // ---- phase 1: encode my contribution to each peer-owned shard into its owner's
+   // region A. My own shard's contribution stays exact, read from the input at fold time.
+   for (int p = 0; p < NPEERS; ++p) {
+-    const T* src = in + (size_t)peers.rank[p] * shard_elems;
+-    for (int k = 4 * gA + tid; k < 4 * gB; k += nt) {
++    const T* src = in + R4D_TI8_OFF(peers.rank[p]);
++    const int gE = gB < R4D_TI8_LEN(peers.rank[p]) ? gB : R4D_TI8_LEN(peers.rank[p]);
++    for (int k = 4 * gA + tid; k < 4 * gE; k += nt) {
+       const int lig = k & 3;
+       const int g = k >> 2;
+       uint2 codes;
+@@ -63,9 +75,10 @@ __global__ void r4d_ar_twoshot_wide_ti8_kernel(
+   // ---- reduce my shard: own contribution exact from the input, peers decoded from
+   // region A, fp32 fold in ascending rank order; the reduced group is re-encoded and its
+   // wire words go to every peer's region B, the owner keeping their decode.
+-  const T* my_in = in + (size_t)rank * shard_elems;
+-  T* my_out = out + (size_t)rank * shard_elems;
+-  for (int k = 4 * gA + tid; k < 4 * gB; k += nt) {
++  const T* my_in = in + R4D_TI8_OFF(rank);
++  T* my_out = out + R4D_TI8_OFF(rank);
++  const int gM = gB < R4D_TI8_LEN(rank) ? gB : R4D_TI8_LEN(rank);
++  for (int k = 4 * gA + tid; k < 4 * gM; k += nt) {
+     const int lig = k & 3;
+     const int g = k >> 2;
+     float acc[TI8_EPL];
+@@ -111,8 +124,9 @@ __global__ void r4d_ar_twoshot_wide_ti8_kernel(
+     const int owner = peers.rank[p];
+     const char* baseB = my_base +
+         ((size_t)parity * WS + owner) * (size_t)slot_stride_bytes + b_off_bytes;
+-    T* dst = out + (size_t)owner * shard_elems;
+-    for (int k = 4 * gA + tid; k < 4 * gB; k += nt) {
++    T* dst = out + R4D_TI8_OFF(owner);
++    const int gE = gB < R4D_TI8_LEN(owner) ? gB : R4D_TI8_LEN(owner);
++    for (int k = 4 * gA + tid; k < 4 * gE; k += nt) {
+       const int lig = k & 3;
+       const int g = k >> 2;
+       const uint2 c = ((const uint2*)baseB)[k];
+@@ -123,6 +137,8 @@ __global__ void r4d_ar_twoshot_wide_ti8_kernel(
+       ti8_store8(dst + k * TI8_EPL, v);
+     }
+   }
++#undef R4D_TI8_OFF
++#undef R4D_TI8_LEN
+ }
+ 
+ // ---------------------------------------------------------------------------------- host side
+@@ -138,11 +154,13 @@ static void ar_twoshot_ti8_launch(const long* peer_scratch, const long* peer_fla
+                              " out of range for the " + std::to_string(WS) +
+                              " ranks this entry point is compiled for");
+   if (dtype != 0 && dtype != 1) throw std::runtime_error("ti8 ar: only bf16/fp16 payloads");
+-  if (n_elem % ((long)TI8_GROUP * WS) != 0)
+-    throw std::runtime_error("ti8 ar: n_elem must tile " + std::to_string(TI8_GROUP) +
+-                             "-elem groups over " + std::to_string(WS) + " shards");
+-  const int shard_elems = (int)(n_elem / WS);
+-  const int sg = shard_elems / TI8_GROUP;
++  if (n_elem % TI8_GROUP != 0)
++    throw std::runtime_error("ti8 ar: n_elem must be whole " + std::to_string(TI8_GROUP) +
++                             "-elem groups");
++  const long n_groups = n_elem / TI8_GROUP;
++  if (n_groups < WS)
++    throw std::runtime_error("ti8 ar: fewer groups than ranks");
++  const int sg = (int)((n_groups + WS - 1) / WS);  // the longest shard, the slot layout's size
+   const long b_off = ((long)TI8_GROUP_BYTES * sg + 15) / 16 * 16;  // one wire image, 16B-aligned
+   if (2 * b_off > slot_stride_bytes)
+     throw std::runtime_error("ti8 ar: slot stride " + std::to_string(slot_stride_bytes) +
+@@ -194,13 +212,25 @@ static void ar_twoshot_ti8_launch(const long* peer_scratch, const long* peer_fla
+ #define R4D_AR_TS8_LAUNCH(T)                                                            \
+   r4d_ar_twoshot_wide_ti8_kernel<T, WS><<<nb, nt, 0, st>>>(                             \
+       (const T*)inp, peers, (char*)my_scratch, (unsigned int*)my_flags, (T*)out,        \
+-      (unsigned int*)seq_ctrs, shard_elems, (long)slot_stride_bytes, b_off, (int)rank,  \
++      (unsigned int*)seq_ctrs, (int)n_groups, (long)slot_stride_bytes, b_off, (int)rank, \
+       (int)drain, (int)acq, (int)pub)
+   if (dtype == 0) R4D_AR_TS8_LAUNCH(__hip_bfloat16);
+   else R4D_AR_TS8_LAUNCH(__half);
+ #undef R4D_AR_TS8_LAUNCH
+ }
+ 
++void r4d_ar_twoshot_3rank_ti8(long peer_scratch0, long peer_scratch1, long peer_flags0,
++                              long peer_flags1, long my_scratch, long my_flags, long seq_ctrs,
++                              long slot_stride_bytes, long inp, long out, long n_elem,
++                              long dtype, long rank, long stream, long nblocks,
++                              long nthreads, long drain, long acq, long pub) {
++  const long ps[2] = {peer_scratch0, peer_scratch1};
++  const long pf[2] = {peer_flags0, peer_flags1};
++  ar_twoshot_ti8_launch<3>(ps, pf, my_scratch, my_flags, seq_ctrs, slot_stride_bytes, inp,
++                           out, n_elem, dtype, rank, stream, nblocks, nthreads, drain,
++                           acq, pub);
++}
++
+ void r4d_ar_twoshot_4rank_ti8(long peer_scratch0, long peer_scratch1, long peer_scratch2,
+                               long peer_flags0, long peer_flags1, long peer_flags2,
+                               long my_scratch, long my_flags, long seq_ctrs,
+diff --git a/libr4d/r4d_plugin.h b/libr4d/r4d_plugin.h
+index 51d7490..b139a53 100644
+--- a/libr4d/r4d_plugin.h
++++ b/libr4d/r4d_plugin.h
+@@ -188,6 +188,7 @@ int  r4d_rad_ar_oneshot_8rank_exact(const RadArgs*, RadStream);
+ int  r4d_rad_ar_twoshot_3rank_exact(const RadArgs*, RadStream);
+ int  r4d_rad_ar_twoshot_4rank_exact(const RadArgs*, RadStream);
+ int  r4d_rad_ar_twoshot_8rank_exact(const RadArgs*, RadStream);
++int  r4d_rad_ar_twoshot_3rank_ti8  (const RadArgs*, RadStream);
+ int  r4d_rad_ar_twoshot_4rank_ti8  (const RadArgs*, RadStream);
+ /* The fused all-reduce + norm shares the IPC set, so it shares init/fini. */
+ int  r4d_rad_ar_ln_init(const RadParam*, int, int rank, int world, void** out);
+diff --git a/libr4d/r4d_rows.cpp b/libr4d/r4d_rows.cpp
+index f372770..ffbd271 100644
+--- a/libr4d/r4d_rows.cpp
++++ b/libr4d/r4d_rows.cpp
+@@ -2691,6 +2691,11 @@ static const RadConstraint cArWht6[] = {
+     C_EQ("world_size", 2), C_EQ("exact", 0), C_IN("dtype", "bf16 fp16"), C_DIV("numel", 64),
+     C_P2P,
+ };
++/* DIV 32, not 96: the three-rank split is uneven in whole groups (r4d_rad_ar_twoshot_3rank_ti8). */
++static const RadConstraint cArTi8Ts3[] = {
++    C_EQ("world_size", 3), C_EQ("exact", 0), C_IN("dtype", "bf16 fp16"), C_DIV("numel", 32),
++    C_P2P,
++};
+ static const RadConstraint cArTi8Ts4[] = {
+     C_EQ("world_size", 4), C_EQ("exact", 0), C_IN("dtype", "bf16 fp16"), C_DIV("numel", 128),
+     C_P2P,
+@@ -4484,6 +4489,18 @@ static const RadKernelInfo kKernels[] = {
+   r4d_rad_ar_init, r4d_rad_ar_fini, r4d_rad_ar_oneshot_8rank_exact, nullptr, nullptr, nullptr,
+   r4d_shape_all_reduce },
+ 
++{ "ar_twoshot_3rank_ti8", "all_reduce", "ar",
++  "all-reduce (sum), reduce-scatter + all-gather; both hops ride the tiered-int8 wire (double "
++  "quant, the owner storing the decode of its own words) -- lossy",
++  "exactly 3 ranks, all peer-accessible; groups of 32, split over the shards as evenly as they "
++  "divide (the first groups % 3 take one more); under min_bytes the exact one-shot; cudagraph-safe",
++  "bf16 / fp16 payload, int8 + fp16 scale + u32 record per group on the wire, fp32 accumulate in "
++  "ascending rank order, bit-identical across ranks",
++  RAD_DOMAIN_DEVICE, R4D_PRIO_AR_ONESHOT,
++  ROW(cArTi8Ts3), ROW(tAr), nullptr,
++  r4d_rad_ar_init, r4d_rad_ar_fini, r4d_rad_ar_twoshot_3rank_ti8, nullptr, nullptr, nullptr,
++  r4d_shape_all_reduce },
++
+ { "ar_twoshot_4rank_ti8", "all_reduce", "ar",
+   "all-reduce (sum), reduce-scatter + all-gather; both hops ride the tiered-int8 wire (double "
+   "quant, the owner storing the decode of its own words) -- lossy",
+diff --git a/libr4d/r4d_selftest.cpp b/libr4d/r4d_selftest.cpp
+index e60ebbb..2cf5af7 100644
+--- a/libr4d/r4d_selftest.cpp
++++ b/libr4d/r4d_selftest.cpp
+@@ -10826,6 +10826,127 @@ static void ar_three_rank_pattern(const Plugin& pl, const std::vector<int>& devs
+     }
+ }
+ 
++/* THE THREE-RANK TIERED-INT8 WIRE, held to what a lossy wire can be held to.
++ *
++ * Exactly: every rank ends with the same bytes (the owner stores the decode of the words it
++ * published, so the wire is bit-identical across ranks by construction), and a message the wire
++ * declines -- under `min_bytes`, or not whole 32-element groups -- is the exact one-shot's fold,
++ * bit for bit. Statistically: the rest is within a quantisation error of the fp32 sum. The input is
++ * the per-element pattern plus a large outlier every 997 elements on rank 1 (the record's tier 2
++ * keeps a dominant element exact), and the sizes walk groups % 3 of 0, 1 and 2 to the 20971520
++ * ceiling, so a group reduced by the wrong owner or read from the wrong slot is an error of the
++ * order of the values themselves -- a relative RMS near 1, not the few tenths of a percent an int8
++ * wire costs. */
++struct ArTi8 {
++    const RadKernelInfo* row;
++    int rank, dev;
++    std::vector<int64_t> sizes;
++    void* inst = nullptr;
++    int rc_init = RAD_E_STATE, rc_launch = RAD_OK;
++    std::vector<std::vector<uint16_t>> out;
++};
++
++static float ar_ti8_value(int rank, int64_t i) {
++    if (rank == 1 && i % 997 == 13) return 900.0f;   /* exact in bf16 */
++    return ar_pattern_value(rank, i);
++}
++
++static void ar_ti8_worker(ArTi8* t) {
++    if (st_set_device(t->dev) != hipSuccess) { t->rc_init = RAD_E_DEVICE; return; }
++    int64_t most = 0;
++    for (int64_t n : t->sizes) most = n > most ? n : most;
++    std::vector<RadParam> ps = {
++        PI("world_size", 3), PI("numel", most), PS("dtype", "bf16"), PI("exact", 0),
++        PI("min_bytes", 131072),
++    };
++    t->rc_init = t->row->init(ps.data(), (int)ps.size(), t->rank, 3, &t->inst);
++    if (t->rc_init != RAD_OK) return;
++    void* buf = nullptr;
++    if (hipMalloc(&buf, (size_t)most * 2) != hipSuccess) { t->rc_launch = RAD_E_NOMEM; return; }
++    std::vector<uint16_t> h((size_t)most);
++    for (int64_t n : t->sizes) {
++        for (int64_t i = 0; i < n; ++i) h[(size_t)i] = h_to_bf16(ar_ti8_value(t->rank, i));
++        st_memcpy(buf, h.data(), (size_t)n * 2, hipMemcpyHostToDevice);
++        RadTensor ts[1] = { T(buf, RAD_BF16, { n }) };
++        RadArgs a;
++        std::memset(&a, 0, sizeof(a));
++        a.t = ts; a.n_t = 1;
++        a.p = ps.data(); a.n_p = (int)ps.size();
++        a.instance = t->inst;
++        a.rank = t->rank;
++        a.world_size = 3;
++        const int rc = t->row->launch(&a, nullptr);
++        st_stream_sync(nullptr);
++        if (rc != RAD_OK && t->rc_launch == RAD_OK) t->rc_launch = rc;
++        std::vector<uint16_t> got((size_t)n);
++        st_memcpy(got.data(), buf, (size_t)n * 2, hipMemcpyDeviceToHost);
++        t->out.push_back(std::move(got));
++    }
++    st_free(buf);
++}
++
++static void ar_three_rank_ti8(const Plugin& pl, const std::vector<int>& devs, const char* name) {
++    const RadKernelInfo* row = find(pl, name);
++    if (!row) { ok(name, false, "row absent"); return; }
++    if (devs.size() < 3) { skip(name, "fewer than three gfx1201 cards"); return; }
++    /* 32768 is under the 128 KiB floor and 65544 is not whole groups: both exact. The rest are
++     * lossy: 65536 sits ON the floor (2048 groups, % 3 = 2), then 2048 x 2048 / 2049 / 2050 rows
++     * (groups % 3 = 2, 0, 1) and the ceiling (655360 groups, % 3 = 1), and 2048 rows again. */
++    const std::vector<int64_t> sizes = { 4194304, 32768, 65536, 4196352, 65544, 4198400, 20971520,
++                                         4194304 };
++    ArTi8 t[3];
++    for (int r = 0; r < 3; ++r) { t[r].row = row; t[r].rank = r; t[r].dev = devs[(size_t)r]; t[r].sizes = sizes; }
++    std::thread a(ar_ti8_worker, &t[0]), b(ar_ti8_worker, &t[1]), c(ar_ti8_worker, &t[2]);
++    a.join(); b.join(); c.join();
++    const std::string nm(name);
++    const bool up = t[0].rc_init == RAD_OK && t[1].rc_init == RAD_OK && t[2].rc_init == RAD_OK;
++    ok((nm + " init (peer rendezvous)").c_str(), up,
++       "rc " + std::to_string(t[0].rc_init) + "/" + std::to_string(t[1].rc_init) + "/" +
++           std::to_string(t[2].rc_init));
++    if (!up) return;
++    const bool ran = t[0].rc_launch == RAD_OK && t[1].rc_launch == RAD_OK && t[2].rc_launch == RAD_OK;
++    ok((nm + " launches").c_str(), ran,
++       "rc " + std::to_string(t[0].rc_launch) + "/" + std::to_string(t[1].rc_launch) + "/" +
++           std::to_string(t[2].rc_launch));
++    if (ran) {
++        for (size_t k = 0; k < sizes.size(); ++k) {
++            const int64_t n = sizes[k];
++            const bool lossy = n * 2 >= 131072 && n % 32 == 0;
++            int64_t diff_ranks = 0, inexact = 0;
++            double se = 0.0, sx = 0.0, worst = 0.0;
++            for (int64_t i = 0; i < n; ++i) {
++                const uint16_t g0 = t[0].out[k][(size_t)i];
++                if (t[1].out[k][(size_t)i] != g0 || t[2].out[k][(size_t)i] != g0) ++diff_ranks;
++                float acc = 0.0f;
++                for (int r = 0; r < 3; ++r) acc += h_bf16(h_to_bf16(ar_ti8_value(r, i)));
++                const double e = (double)h_bf16(g0) - (double)acc;
++                if (!lossy && g0 != h_to_bf16(acc)) ++inexact;
++                se += e * e; sx += (double)acc * acc;
++                const double rel = std::fabs(e) / (std::fabs((double)acc) + 1.0);
++                if (rel > worst) worst = rel;
++            }
++            const double rrms = sx > 0 ? std::sqrt(se / sx) : 0.0;
++            const std::string what = nm + " numel " + std::to_string(n) + " (" +
++                                     std::to_string(n / 32) + " groups, % 3 = " +
++                                     std::to_string((n / 32) % 3) + ")";
++            ok((what + ": every rank holds the same bytes").c_str(), diff_ranks == 0,
++               std::to_string(diff_ranks) + " elements differ between ranks");
++            if (!lossy) {
++                ok((what + ": declined by the wire, so the exact fold, bit for bit").c_str(),
++                   inexact == 0, std::to_string(inexact) + " elements not the exact fold");
++            } else {
++                char d[160];
++                std::snprintf(d, sizeof(d), "relative RMS %.4f%%, worst |err|/(|sum|+1) %.4f",
++                              rrms * 100.0, worst);
++                std::printf("        %s: %s\n", what.c_str(), d);
++                ok((what + ": within the int8 wire's error of the fp32 sum (relative RMS < 1%)").c_str(),
++                   rrms < 0.01, d);
++            }
++        }
++    }
++    if (row->fini) for (int r = 0; r < 3; ++r) if (t[r].inst) row->fini(t[r].inst);
++}
++
+ static void gather_three_rank(const Plugin& pl, const std::vector<int>& devs, const char* name) {
+     const RadKernelInfo* row = find(pl, name);
+     if (!row) { ok(name, false, "row absent"); return; }
+@@ -12660,7 +12781,7 @@ static void device_phase(const Plugin& pl) {
+     /* Every collective has a host twin (r4d_rows.cpp): the same kernel with its mailbox in pinned
+      * host memory. A case is the pair's, so the twin is held to exactly the original's checks. */
+     for (const char* base : { "ar_oneshot_2rank_exact", "ar_gather_2rank", "ar_oneshot_3rank_exact",
+-                              "ar_twoshot_3rank_exact", "ar_gather_3rank" }) {
++                              "ar_twoshot_3rank_exact", "ar_twoshot_3rank_ti8", "ar_gather_3rank" }) {
+         for (const std::string& n : { std::string(base), std::string(base) + "_host" }) {
+             if (!sel(n.c_str())) continue;
+             const bool three = std::strstr(base, "3rank") != nullptr;
+@@ -12676,6 +12797,8 @@ static void device_phase(const Plugin& pl) {
+              * ar_oneshot_3rank_exact` reproduces one of them alone. */
+             } else if (three && std::strstr(base, "gather")) {
+                 gather_three_rank(pl, devs, n.c_str());
++            } else if (three && std::strstr(base, "ti8")) {
++                ar_three_rank_ti8(pl, devs, n.c_str());
+             } else if (three && std::strstr(base, "twoshot")) {
+                 ar_three_rank_pattern(pl, devs, n.c_str());
+             } else {
+-- 
+2.55.0
+

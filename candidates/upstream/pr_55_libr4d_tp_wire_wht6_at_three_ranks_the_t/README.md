@@ -4,6 +4,7 @@
 **Upstream URL**: https://codeberg.org/StillDeadcode/radiance/pulls/55  
 **Status**: `READY_TO_TEST`  
 **Candidate Directory**: `candidates/upstream/pr_55_libr4d_tp_wire_wht6_at_three_ranks_the_t`  
+- **GitHub Issue**: [Issue Link](https://github.com/OoguroRyuuya/RadianceMine/issues/7)
 
 ---
 
@@ -18,6 +19,7 @@
 ## 2. Deterministic Safety Audit
 - **Safety Gate Result**: `PASS`
 - Zero dangerous anti-patterns detected.
+- **Clean Mergeability (`git apply --check`)**: `CONFLICT (Requires rebase)`
 
 ---
 

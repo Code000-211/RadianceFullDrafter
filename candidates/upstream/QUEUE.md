@@ -1,7 +1,7 @@
 # Upstream Codeberg Evaluation Queue
 
 **Repository**: [StillDeadcode/radiance](https://codeberg.org/StillDeadcode/radiance)  
-**Last Checked**: 2026-10-08 11:09:00  
+**Last Checked**: 2026-10-08 11:15:57  
 **Total Screened PRs**: 30  
 
 ---
@@ -9,16 +9,16 @@
 | PR # | Title | Author | Subsystem | Feas. | ROI | Safety | Status | GitHub Issue | Draft PR | Candidate |
 |------|-------|--------|-----------|-------|-----|--------|--------|--------------|----------|-----------|
 | #56 | scripts/cardclock.py: what hol | @bakon | `tooling` | 2.8 | 0.9 | ✅ | `DOCS_OR_TOOLING` | [#5](https://github.com/OoguroRyuuya/RadianceMine/issues/5) | [#6](https://github.com/OoguroRyuuya/RadianceMine/pull/6) | [Inspect](pr_56_scriptscardclockpy_what_holds_each_cards/README.md) |
-| #55 | libr4d: --tp-wire wht6 at thre | @bakon | `interconnect` | 1.8 | 1.6 | ✅ | `READY_TO_TEST` | - | - | [Inspect](pr_55_libr4d_tp_wire_wht6_at_three_ranks_the_t/README.md) |
-| #54 | libr4d: a three-rank two-shot  | @bakon | `interconnect` | 2.2 | 2.4 | ✅ | `READY_TO_TEST` | - | - | [Inspect](pr_54_libr4d_a_three_rank_two_shot_all_reduce_/README.md) |
-| #52 | engine: a collective with no d | @bakon | `interconnect` | 2.7 | 0.7 | ✅ | `READY_TO_TEST` | - | - | [Inspect](pr_52_engine_a_collective_with_no_device_kerne/README.md) |
-| #51 | serve: --model takes an HF rep | @redxherring | `serving` | 2.2 | 0.2 | ✅ | `SERVING_ENDPOINT` | - | - | [Inspect](pr_51_serve_model_takes_an_hf_repo_id_fetched_/README.md) |
-| #50 | Add LFM2 BF16 and System One t | @zivius | `serving` | 1.6 | 1.4 | ✅ | `SERVING_ENDPOINT` | - | - | [Inspect](pr_50_add_lfm2_bf16_and_system_one_text_and_im/README.md) |
+| #55 | libr4d: --tp-wire wht6 at thre | @bakon | `interconnect` | 1.8 | 1.6 | ✅ | `READY_TO_TEST` | [#7](https://github.com/OoguroRyuuya/RadianceMine/issues/7) | - | [Inspect](pr_55_libr4d_tp_wire_wht6_at_three_ranks_the_t/README.md) |
+| #54 | libr4d: a three-rank two-shot  | @bakon | `interconnect` | 2.2 | 2.4 | ✅ | `READY_TO_TEST` | [#8](https://github.com/OoguroRyuuya/RadianceMine/issues/8) | - | [Inspect](pr_54_libr4d_a_three_rank_two_shot_all_reduce_/README.md) |
+| #52 | engine: a collective with no d | @bakon | `interconnect` | 2.7 | 0.7 | ✅ | `READY_TO_TEST` | [#9](https://github.com/OoguroRyuuya/RadianceMine/issues/9) | - | [Inspect](pr_52_engine_a_collective_with_no_device_kerne/README.md) |
+| #51 | serve: --model takes an HF rep | @redxherring | `serving` | 2.2 | 0.2 | ✅ | `SERVING_ENDPOINT` | [#10](https://github.com/OoguroRyuuya/RadianceMine/issues/10) | - | [Inspect](pr_51_serve_model_takes_an_hf_repo_id_fetched_/README.md) |
+| #50 | Add LFM2 BF16 and System One t | @zivius | `serving` | 1.6 | 1.4 | ✅ | `SERVING_ENDPOINT` | [#11](https://github.com/OoguroRyuuya/RadianceMine/issues/11) | - | [Inspect](pr_50_add_lfm2_bf16_and_system_one_text_and_im/README.md) |
 | #49 | WIP: serve: --model takes an H | @redxherring | `serving` | 2.0 | 0.4 | ✅ | `SERVING_ENDPOINT` | - | - | [Inspect](pr_49_wip_serve_model_takes_an_hf_repo_id_fetc/README.md) |
-| #48 | checkpoint: import an NVFP4 re | @devmilan | `gemm` | 0.8 | 0.6 | ✅ | `REJECTED_UNFEASIBLE` | - | - | [Inspect](pr_48_checkpoint_import_an_nvfp4_release_as_it/README.md) |
-| #45 | serve: /props answers what lla | @bakon | `serving` | 2.8 | 0.1 | ✅ | `SERVING_ENDPOINT` | - | - | [Inspect](pr_45_serve_props_answers_what_llama_server_cl/README.md) |
-| #44 | serve: /v1/models reports what | @bakon | `serving` | 2.3 | 0.3 | ✅ | `SERVING_ENDPOINT` | - | - | [Inspect](pr_44_serve_v1models_reports_what_the_server_r/README.md) |
-| #41 | mx: native OCP-MX family (mxfp | @J-Nova | `gemm` | 1.6 | 1.7 | ✅ | `READY_TO_TEST` | - | - | [Inspect](pr_41_mx_native_ocp_mx_family_mxfp6mxfp8int5_p/README.md) |
+| #48 | checkpoint: import an NVFP4 re | @devmilan | `gemm` | 0.8 | 0.6 | ✅ | `REJECTED_UNFEASIBLE` | [#12](https://github.com/OoguroRyuuya/RadianceMine/issues/12) | - | [Inspect](pr_48_checkpoint_import_an_nvfp4_release_as_it/README.md) |
+| #45 | serve: /props answers what lla | @bakon | `serving` | 2.8 | 0.1 | ✅ | `SERVING_ENDPOINT` | [#13](https://github.com/OoguroRyuuya/RadianceMine/issues/13) | - | [Inspect](pr_45_serve_props_answers_what_llama_server_cl/README.md) |
+| #44 | serve: /v1/models reports what | @bakon | `serving` | 2.3 | 0.3 | ✅ | `SERVING_ENDPOINT` | [#14](https://github.com/OoguroRyuuya/RadianceMine/issues/14) | - | [Inspect](pr_44_serve_v1models_reports_what_the_server_r/README.md) |
+| #41 | mx: native OCP-MX family (mxfp | @J-Nova | `gemm` | 1.6 | 1.7 | ✅ | `READY_TO_TEST` | [#15](https://github.com/OoguroRyuuya/RadianceMine/issues/15) | - | [Inspect](pr_41_mx_native_ocp_mx_family_mxfp6mxfp8int5_p/README.md) |
 | #38 | WIP: serve: --rope-scaling, #3 | @bakon | `general` | 2.0 | 0.5 | ✅ | `QUEUED_LOW_PRIORITY` | - | - | [Inspect](pr_38_wip_serve_rope_scaling_37s_static_yarn_o/README.md) |
 | #37 | Add static YaRN support across | @hazyumps | `general` | 2.7 | 0.8 | ✅ | `QUEUED_LOW_PRIORITY` | - | - | [Inspect](pr_37_add_static_yarn_support_across_qwen_rota/README.md) |
 | #36 | budget: an uneven world's chea | @bakon | `qsa` | 2.4 | 2.4 | ✅ | `READY_TO_TEST` | - | - | [Inspect](pr_36_budget_an_uneven_worlds_cheaper_rank_pag/README.md) |

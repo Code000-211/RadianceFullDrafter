@@ -621,13 +621,15 @@ def check_and_triage_pull_requests(
     create_issues: bool = False,
     create_prs: bool = False,
     filter_pr: int | None = None,
+    include_closed: bool = False,
 ) -> list[dict[str, Any]]:
-    """Polls open PRs, screens them, and updates queue."""
+    """Polls PRs, screens them, and updates queue."""
     seen = load_seen_state()
-    prs_data = http_get_json(f"{API_BASE}/pulls?state=all")
+    state_param = "all" if include_closed else "open"
+    prs_data = http_get_json(f"{API_BASE}/pulls?state={state_param}")
     results = []
 
-    print(f"🔍 Fetched {len(prs_data)} total PRs from {API_BASE}/pulls...")
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 🔍 Fetched {len(prs_data)} {state_param} PRs from {API_BASE}/pulls...", flush=True)
 
     for pr in prs_data:
         pr_id = pr["number"]
@@ -779,24 +781,26 @@ def main() -> int:
     parser.add_argument("--pr", type=int, help="Triage a specific PR number")
     parser.add_argument("--create-issues", action="store_true", help="Create GitHub tracking issues for screened PRs")
     parser.add_argument("--create-prs", action="store_true", help="Create GitHub Draft PRs for clean patches")
+    parser.add_argument("--all", action="store_true", help="Include closed/merged PRs (default: only open PRs)")
 
     args = parser.parse_args()
 
     use_typesafe = not args.no_typesafe
 
     if args.pr:
-        print(f"Targeting single PR #{args.pr}...")
+        print(f"Targeting single PR #{args.pr}...", flush=True)
         check_and_triage_pull_requests(
             use_typesafe=use_typesafe,
             force=args.force,
             create_issues=args.create_issues,
             create_prs=args.create_prs,
             filter_pr=args.pr,
+            include_closed=True,
         )
         return 0
 
     if args.daemon:
-        print(f"🚀 Starting watch_upstream daemon (polling every {args.interval}s)...")
+        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 🚀 Starting watch_upstream daemon (polling every {args.interval}s)...", flush=True)
         while True:
             try:
                 check_and_triage_pull_requests(
@@ -804,11 +808,12 @@ def main() -> int:
                     force=args.force,
                     create_issues=args.create_issues,
                     create_prs=args.create_prs,
+                    include_closed=args.all,
                 )
                 check_recent_commits()
             except (urllib.error.URLError, OSError, RuntimeError) as e:
-                print(f"⚠️ Error during polling cycle: {e}")
-            print(f"Sleeping {args.interval}s...")
+                print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] ⚠️ Error during polling cycle: {e}", flush=True)
+            print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 💤 Sleeping {args.interval}s...", flush=True)
             time.sleep(args.interval)
         return 0
 
@@ -818,6 +823,7 @@ def main() -> int:
         force=args.force,
         create_issues=args.create_issues,
         create_prs=args.create_prs,
+        include_closed=args.all,
     )
     check_recent_commits()
     return 0

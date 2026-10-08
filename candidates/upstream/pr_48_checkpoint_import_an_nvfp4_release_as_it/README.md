@@ -4,6 +4,7 @@
 **Upstream URL**: https://codeberg.org/StillDeadcode/radiance/pulls/48  
 **Status**: `REJECTED_UNFEASIBLE`  
 **Candidate Directory**: `candidates/upstream/pr_48_checkpoint_import_an_nvfp4_release_as_it`  
+- **GitHub Issue**: [Issue Link](https://github.com/OoguroRyuuya/RadianceMine/issues/12)
 
 ---
 
@@ -18,6 +19,7 @@
 ## 2. Deterministic Safety Audit
 - **Safety Gate Result**: `PASS`
 - Zero dangerous anti-patterns detected.
+- **Clean Mergeability (`git apply --check`)**: `CONFLICT (Requires rebase)`
 
 ---
 

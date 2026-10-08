@@ -4,6 +4,7 @@
 **Upstream URL**: https://codeberg.org/StillDeadcode/radiance/pulls/50  
 **Status**: `SERVING_ENDPOINT`  
 **Candidate Directory**: `candidates/upstream/pr_50_add_lfm2_bf16_and_system_one_text_and_im`  
+- **GitHub Issue**: [Issue Link](https://github.com/OoguroRyuuya/RadianceMine/issues/11)
 
 ---
 
@@ -18,6 +19,7 @@
 ## 2. Deterministic Safety Audit
 - **Safety Gate Result**: `PASS`
 - Zero dangerous anti-patterns detected.
+- **Clean Mergeability (`git apply --check`)**: `CONFLICT (Requires rebase)`
 
 ---
 

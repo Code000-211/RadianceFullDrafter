@@ -1,0 +1,700 @@
+From 24fbba36df0105c01c7f53a1fb5def2ae06468e9 Mon Sep 17 00:00:00 2001
+From: baKon <mike.ski83@gmail.com>
+Date: Wed, 7 Oct 2026 13:47:09 -0500
+Subject: [PATCH 1/4] serve: /v1/models reports max_model_len, the context the
+ server runs with
+
+The model list carried only the id, so a client had no way to read the context the server
+was started with and guessed it from the model's name. Carry the field vLLM's model card does:
+the server's max_ctx (--max-model-len, else the container's trained length), on both
+/v1/models and /v1/models/:id, and leave it out when the length is unknown.
+---
+ core/server/oai.cpp    |  3 ++-
+ core/server/oai.h      |  8 +++++++-
+ core/server/server.cpp |  2 +-
+ docs/GUIDE.md          |  2 +-
+ tests/server_test.cpp  | 15 ++++++++++++++-
+ tests/wire_test.cpp    |  8 ++++++++
+ 6 files changed, 33 insertions(+), 5 deletions(-)
+
+diff --git a/core/server/oai.cpp b/core/server/oai.cpp
+index 47e45a2..c0a3205 100644
+--- a/core/server/oai.cpp
++++ b/core/server/oai.cpp
+@@ -2205,12 +2205,13 @@ std::string embeddings_body(const OaiRequest& r, const std::vector<std::vector<f
+     return o.dump();
+ }
+ 
+-std::string models_body(const std::string& model_id, int64_t created) {
++std::string models_body(const std::string& model_id, int64_t created, int64_t max_model_len) {
+     json m;
+     m["id"] = model_id;
+     m["object"] = "model";
+     m["created"] = created;
+     m["owned_by"] = "radiance";
++    if (max_model_len > 0) m["max_model_len"] = max_model_len;
+     json o;
+     o["object"] = "list";
+     o["data"] = json::array({m});
+diff --git a/core/server/oai.h b/core/server/oai.h
+index a5c52e7..3aa5fa6 100644
+--- a/core/server/oai.h
++++ b/core/server/oai.h
+@@ -318,7 +318,13 @@ std::string text_completion_body(const OaiRequest& r, const std::vector<ChoiceOu
+                                  const UsageOut& u, const TimingsOut& t = TimingsOut());
+ std::string embeddings_body(const OaiRequest& r, const std::vector<std::vector<float>>& vecs,
+                             const UsageOut& u);
+-std::string models_body(const std::string& model_id, int64_t created);
++/* `max_model_len` is the context the server was started with (--max-model-len, else the
++ * container's trained length), the field vLLM's model card carries. Clients size their own
++ * context from it -- an agent that compresses its history at the window's edge, a UI that shows
++ * how much is left -- and without it they guess from the model's name, which is wrong whenever the
++ * deployment sets its own length. 0 leaves the field out rather than reporting a length the
++ * server does not know. */
++std::string models_body(const std::string& model_id, int64_t created, int64_t max_model_len = 0);
+ 
+ /* The usage chunk of each endpoint's stream: an SSE event whose choices array is empty and whose
+  * only payload is `usage`. Emitted when the request asked for stream_options.include_usage, ONCE
+diff --git a/core/server/server.cpp b/core/server/server.cpp
+index d289554..21f5f90 100644
+--- a/core/server/server.cpp
++++ b/core/server/server.cpp
+@@ -1153,7 +1153,7 @@ HttpResponse Server::handle_models(const HttpRequest& req) {
+         return error_response(e, req.peer);
+     }
+     metrics_.observe_http(200);
+-    return HttpResponse::json_body(200, models_body(opt_.model_id, started_at_));
++    return HttpResponse::json_body(200, models_body(opt_.model_id, started_at_, opt_.max_ctx));
+ }
+ 
+ HttpResponse Server::handle_metrics(const HttpRequest&) {
+diff --git a/docs/GUIDE.md b/docs/GUIDE.md
+index 5d75d9f..bda0f9e 100644
+--- a/docs/GUIDE.md
++++ b/docs/GUIDE.md
+@@ -1132,7 +1132,7 @@ for a model that takes no images or video.
+ | `POST /v1/chat/completions` | chat, with tools, reasoning and streaming |
+ | `POST /v1/completions` | raw text completion |
+ | `POST /v1/embeddings` | needs a model with an embedding head, else 501 |
+-| `GET /v1/models`, `/v1/models/:id` | what is loaded |
++| `GET /v1/models`, `/v1/models/:id` | what is loaded, with `max_model_len` (the context it serves, as vLLM reports it) |
+ | `GET /health`, `/ping`, `POST /ping` | liveness |
+ | `GET /load` | current load |
+ | `GET /version` | server version |
+diff --git a/tests/server_test.cpp b/tests/server_test.cpp
+index 1f40f37..ea39a51 100644
+--- a/tests/server_test.cpp
++++ b/tests/server_test.cpp
+@@ -343,7 +343,7 @@ struct Fixture {
+     FakeGrammar      gram;
+     std::unique_ptr<Server> srv;
+ 
+-    explicit Fixture(bool with_tools = true) {
++    explicit Fixture(bool with_tools = true, int64_t max_ctx = 0) {
+         Deps d;
+         d.sched = &sched;
+         d.tok = &tok;
+@@ -356,6 +356,7 @@ struct Fixture {
+         o.model_id = "test-model";
+         o.default_max_tokens = 32;
+         o.max_seqs = 4;
++        o.max_ctx = max_ctx;
+         srv.reset(new Server(d, o));
+     }
+ 
+@@ -2521,6 +2522,18 @@ TEST(models_and_health_answer) {
+     CHECK(json::parse(h.body)["status"].get<std::string>() == "ok");
+ }
+ 
++TEST(the_model_entry_carries_the_context_length_the_server_was_started_with) {
++    /* Both routes a client sizes its window from: the list, and the entry it fetches by id. */
++    Fixture f(true, 262144);
++    for (const char* path : {"/v1/models", "/v1/models/test-model"}) {
++        HttpResponse r = f.get(path);
++        CHECK_EQ(r.status, 200);
++        CHECK_EQ(json::parse(r.body)["data"][0].value("max_model_len", (int64_t)0), (int64_t)262144);
++    }
++    Fixture unknown;
++    CHECK(!json::parse(unknown.get("/v1/models").body)["data"][0].contains("max_model_len"));
++}
++
+ TEST(embeddings_without_an_embedder_is_501_not_an_empty_200) {
+     Fixture f;
+     HttpResponse r = f.post("/v1/embeddings", R"({"input":"hi"})");
+diff --git a/tests/wire_test.cpp b/tests/wire_test.cpp
+index 50c8c08..b2cecf0 100644
+--- a/tests/wire_test.cpp
++++ b/tests/wire_test.cpp
+@@ -414,6 +414,14 @@ TEST(the_model_list_is_a_list_of_one_with_the_fields_clients_read) {
+     CHECK_EQ(o["data"][0].value("created", (int64_t)0), (int64_t)1700000000);
+     /* `owned_by` is in the schema and generated clients deserialise it. */
+     CHECK(o["data"][0].contains("owned_by"));
++    /* No length known, none reported: a client falls back to its own default rather than
++     * trusting a made-up one. */
++    CHECK(!o["data"][0].contains("max_model_len"));
++}
++
++TEST(the_model_list_reports_the_context_the_server_runs_with) {
++    const json o = parsed(models_body("q38-flashnext", 1700000000, 262144));
++    CHECK_EQ(o["data"][0].value("max_model_len", (int64_t)0), (int64_t)262144);
+ }
+ 
+ TEST(a_chat_body_carries_usage_and_one_choice_per_completion) {
+-- 
+2.55.0
+
+
+From a8eec8c2ffc285de7d3ca8a34ffb99bf8179ceb2 Mon Sep 17 00:00:00 2001
+From: baKon <mike.ski83@gmail.com>
+Date: Wed, 7 Oct 2026 13:53:19 -0500
+Subject: [PATCH 2/4] serve: /v1/models/:id answers the model object, not a
+ list of one
+
+OpenAI's retrieve returns the entry itself, and its SDK reads `id` off the top level, where
+the list of one this route answered before has none. /v1/models still answers the list.
+---
+ core/server/oai.cpp    | 18 +++++++++++++-----
+ core/server/oai.h      | 24 +++++++++++++++++-------
+ core/server/server.cpp |  6 +++++-
+ docs/GUIDE.md          |  2 +-
+ tests/server_test.cpp  | 17 +++++++++++------
+ tests/wire_test.cpp    | 20 ++++++++++++++++++--
+ 6 files changed, 65 insertions(+), 22 deletions(-)
+
+diff --git a/core/server/oai.cpp b/core/server/oai.cpp
+index c0a3205..75a26e0 100644
+--- a/core/server/oai.cpp
++++ b/core/server/oai.cpp
+@@ -2205,19 +2205,27 @@ std::string embeddings_body(const OaiRequest& r, const std::vector<std::vector<f
+     return o.dump();
+ }
+ 
+-std::string models_body(const std::string& model_id, int64_t created, int64_t max_model_len) {
++static json model_card(const ModelCard& c) {
+     json m;
+-    m["id"] = model_id;
++    m["id"] = c.id;
+     m["object"] = "model";
+-    m["created"] = created;
++    m["created"] = c.created;
+     m["owned_by"] = "radiance";
+-    if (max_model_len > 0) m["max_model_len"] = max_model_len;
++    if (c.max_model_len > 0) m["max_model_len"] = c.max_model_len;
++    return m;
++}
++
++std::string models_body(const ModelCard& c) {
+     json o;
+     o["object"] = "list";
+-    o["data"] = json::array({m});
++    o["data"] = json::array({model_card(c)});
+     return o.dump();
+ }
+ 
++std::string model_body(const ModelCard& c) {
++    return model_card(c).dump();
++}
++
+ /* ================================================================== SSE */
+ 
+ std::string sse_event(const std::string& json_text) {
+diff --git a/core/server/oai.h b/core/server/oai.h
+index 3aa5fa6..0dc2694 100644
+--- a/core/server/oai.h
++++ b/core/server/oai.h
+@@ -318,13 +318,23 @@ std::string text_completion_body(const OaiRequest& r, const std::vector<ChoiceOu
+                                  const UsageOut& u, const TimingsOut& t = TimingsOut());
+ std::string embeddings_body(const OaiRequest& r, const std::vector<std::vector<float>>& vecs,
+                             const UsageOut& u);
+-/* `max_model_len` is the context the server was started with (--max-model-len, else the
+- * container's trained length), the field vLLM's model card carries. Clients size their own
+- * context from it -- an agent that compresses its history at the window's edge, a UI that shows
+- * how much is left -- and without it they guess from the model's name, which is wrong whenever the
+- * deployment sets its own length. 0 leaves the field out rather than reporting a length the
+- * server does not know. */
+-std::string models_body(const std::string& model_id, int64_t created, int64_t max_model_len = 0);
++/* ONE MODEL ENTRY: what /v1/models lists and /v1/models/:id returns on its own. */
++struct ModelCard {
++    std::string id;
++    int64_t     created = 0;
++    /* The context the server was started with (--max-model-len, else the container's trained
++     * length), the field vLLM's model card carries. Clients size their own context from it -- an
++     * agent that compresses its history at the window's edge, a UI that shows how much is left --
++     * and without it they guess from the model's name, which is wrong whenever the deployment sets
++     * its own length. 0 leaves the field out rather than reporting a length the server does not
++     * know. */
++    int64_t     max_model_len = 0;
++};
++/* The list, for GET /v1/models. */
++std::string models_body(const ModelCard& m);
++/* The entry itself, for GET /v1/models/:id: OpenAI's retrieve answers the model object, not a
++ * list of one, and its SDK reads `id` off the top level. */
++std::string model_body(const ModelCard& m);
+ 
+ /* The usage chunk of each endpoint's stream: an SSE event whose choices array is empty and whose
+  * only payload is `usage`. Emitted when the request asked for stream_options.include_usage, ONCE
+diff --git a/core/server/server.cpp b/core/server/server.cpp
+index 21f5f90..f3dfd35 100644
+--- a/core/server/server.cpp
++++ b/core/server/server.cpp
+@@ -1152,8 +1152,12 @@ HttpResponse Server::handle_models(const HttpRequest& req) {
+         e.message = "no such model: " + id;
+         return error_response(e, req.peer);
+     }
++    ModelCard c;
++    c.id = opt_.model_id;
++    c.created = started_at_;
++    c.max_model_len = opt_.max_ctx;
+     metrics_.observe_http(200);
+-    return HttpResponse::json_body(200, models_body(opt_.model_id, started_at_, opt_.max_ctx));
++    return HttpResponse::json_body(200, id.empty() ? models_body(c) : model_body(c));
+ }
+ 
+ HttpResponse Server::handle_metrics(const HttpRequest&) {
+diff --git a/docs/GUIDE.md b/docs/GUIDE.md
+index bda0f9e..cfe41d3 100644
+--- a/docs/GUIDE.md
++++ b/docs/GUIDE.md
+@@ -1132,7 +1132,7 @@ for a model that takes no images or video.
+ | `POST /v1/chat/completions` | chat, with tools, reasoning and streaming |
+ | `POST /v1/completions` | raw text completion |
+ | `POST /v1/embeddings` | needs a model with an embedding head, else 501 |
+-| `GET /v1/models`, `/v1/models/:id` | what is loaded, with `max_model_len` (the context it serves, as vLLM reports it) |
++| `GET /v1/models`, `/v1/models/:id` | what is loaded, with `max_model_len` (the context it serves, as vLLM reports it); `:id` answers the entry itself, as OpenAI's retrieve does |
+ | `GET /health`, `/ping`, `POST /ping` | liveness |
+ | `GET /load` | current load |
+ | `GET /version` | server version |
+diff --git a/tests/server_test.cpp b/tests/server_test.cpp
+index ea39a51..ec06178 100644
+--- a/tests/server_test.cpp
++++ b/tests/server_test.cpp
+@@ -2514,7 +2514,11 @@ TEST(models_and_health_answer) {
+     CHECK_EQ(j["object"].get<std::string>(), std::string("list"));
+     CHECK_EQ(j["data"][0]["id"].get<std::string>(), std::string("test-model"));
+ 
+-    CHECK_EQ(f.get("/v1/models/test-model").status, 200);
++    HttpResponse one = f.get("/v1/models/test-model");
++    CHECK_EQ(one.status, 200);
++    /* The entry itself, the way OpenAI's retrieve answers it. */
++    CHECK_EQ(json::parse(one.body).value("id", std::string()), std::string("test-model"));
++    CHECK_EQ(json::parse(one.body).value("object", std::string()), std::string("model"));
+     CHECK_EQ(f.get("/v1/models/other").status, 404);
+ 
+     HttpResponse h = f.get("/health");
+@@ -2525,11 +2529,12 @@ TEST(models_and_health_answer) {
+ TEST(the_model_entry_carries_the_context_length_the_server_was_started_with) {
+     /* Both routes a client sizes its window from: the list, and the entry it fetches by id. */
+     Fixture f(true, 262144);
+-    for (const char* path : {"/v1/models", "/v1/models/test-model"}) {
+-        HttpResponse r = f.get(path);
+-        CHECK_EQ(r.status, 200);
+-        CHECK_EQ(json::parse(r.body)["data"][0].value("max_model_len", (int64_t)0), (int64_t)262144);
+-    }
++    HttpResponse list = f.get("/v1/models");
++    CHECK_EQ(list.status, 200);
++    CHECK_EQ(json::parse(list.body)["data"][0].value("max_model_len", (int64_t)0), (int64_t)262144);
++    HttpResponse one = f.get("/v1/models/test-model");
++    CHECK_EQ(one.status, 200);
++    CHECK_EQ(json::parse(one.body).value("max_model_len", (int64_t)0), (int64_t)262144);
+     Fixture unknown;
+     CHECK(!json::parse(unknown.get("/v1/models").body)["data"][0].contains("max_model_len"));
+ }
+diff --git a/tests/wire_test.cpp b/tests/wire_test.cpp
+index b2cecf0..68e91fe 100644
+--- a/tests/wire_test.cpp
++++ b/tests/wire_test.cpp
+@@ -404,8 +404,16 @@ json parsed(const std::string& body) {
+ 
+ }  /* namespace */
+ 
++static ModelCard card(const char* id, int64_t created, int64_t max_model_len = 0) {
++    ModelCard c;
++    c.id = id;
++    c.created = created;
++    c.max_model_len = max_model_len;
++    return c;
++}
++
+ TEST(the_model_list_is_a_list_of_one_with_the_fields_clients_read) {
+-    const json o = parsed(models_body("q38-flashnext", 1700000000));
++    const json o = parsed(models_body(card("q38-flashnext", 1700000000)));
+     CHECK_EQ(o.value("object", std::string()), std::string("list"));
+     CHECK(o["data"].is_array());
+     CHECK_EQ(o["data"].size(), 1u);
+@@ -420,10 +428,18 @@ TEST(the_model_list_is_a_list_of_one_with_the_fields_clients_read) {
+ }
+ 
+ TEST(the_model_list_reports_the_context_the_server_runs_with) {
+-    const json o = parsed(models_body("q38-flashnext", 1700000000, 262144));
++    const json o = parsed(models_body(card("q38-flashnext", 1700000000, 262144)));
+     CHECK_EQ(o["data"][0].value("max_model_len", (int64_t)0), (int64_t)262144);
+ }
+ 
++TEST(one_model_is_the_entry_itself_not_a_list_of_one) {
++    const json m = parsed(model_body(card("q38-flashnext", 1700000000, 262144)));
++    CHECK_EQ(m.value("object", std::string()), std::string("model"));
++    CHECK_EQ(m.value("id", std::string()), std::string("q38-flashnext"));
++    CHECK_EQ(m.value("max_model_len", (int64_t)0), (int64_t)262144);
++    CHECK(!m.contains("data"));
++}
++
+ TEST(a_chat_body_carries_usage_and_one_choice_per_completion) {
+     ChoiceOut a;
+     a.index = 0;
+-- 
+2.55.0
+
+
+From 7328fd73419abf4c1a756e7d1f32d8ab08bf89ee Mon Sep 17 00:00:00 2001
+From: baKon <mike.ski83@gmail.com>
+Date: Wed, 7 Oct 2026 13:54:11 -0500
+Subject: [PATCH 3/4] serve: the model entry names the file behind the served
+ name as root
+
+A served name is chosen for clients and says nothing about which container is behind it.
+Report what --model named as `root`, the field vLLM fills with the path it loaded; left out
+when the server has none.
+---
+ core/engine.cpp        | 1 +
+ core/server/oai.cpp    | 1 +
+ core/server/oai.h      | 2 ++
+ core/server/server.cpp | 1 +
+ core/server/server.h   | 4 ++++
+ docs/GUIDE.md          | 2 +-
+ tests/server_test.cpp  | 7 +++++--
+ tests/wire_test.cpp    | 7 +++++++
+ 8 files changed, 22 insertions(+), 3 deletions(-)
+
+diff --git a/core/engine.cpp b/core/engine.cpp
+index b98d4fb..67293bb 100644
+--- a/core/engine.cpp
++++ b/core/engine.cpp
+@@ -2264,6 +2264,7 @@ int Engine::run_server() {
+      * more choices a request; the floor keeps a small batch from refusing what it would queue. */
+     o.max_n    = cfg_.max_n > 0 ? (int)cfg_.max_n : (int)std::max<int64_t>(o.max_n, cfg_.max_seqs);
+     o.max_ctx  = cfg_.max_ctx ? cfg_.max_ctx : meta_.n_ctx_train;
++    o.model_path = cfg_.model;
+     o.default_reasoning_effort = cfg_.reasoning_effort;
+     o.reasoning_effort_map = cfg_.reasoning_effort_map;
+     o.default_thinking_budget = cfg_.thinking_token_budget;
+diff --git a/core/server/oai.cpp b/core/server/oai.cpp
+index 75a26e0..5c6f666 100644
+--- a/core/server/oai.cpp
++++ b/core/server/oai.cpp
+@@ -2212,6 +2212,7 @@ static json model_card(const ModelCard& c) {
+     m["created"] = c.created;
+     m["owned_by"] = "radiance";
+     if (c.max_model_len > 0) m["max_model_len"] = c.max_model_len;
++    if (!c.root.empty()) m["root"] = c.root;
+     return m;
+ }
+ 
+diff --git a/core/server/oai.h b/core/server/oai.h
+index 0dc2694..334661a 100644
+--- a/core/server/oai.h
++++ b/core/server/oai.h
+@@ -329,6 +329,8 @@ struct ModelCard {
+      * its own length. 0 leaves the field out rather than reporting a length the server does not
+      * know. */
+     int64_t     max_model_len = 0;
++    /* What the server loaded (ServerOptions::model_path), vLLM's `root`. Empty leaves it out. */
++    std::string root;
+ };
+ /* The list, for GET /v1/models. */
+ std::string models_body(const ModelCard& m);
+diff --git a/core/server/server.cpp b/core/server/server.cpp
+index f3dfd35..5c190b5 100644
+--- a/core/server/server.cpp
++++ b/core/server/server.cpp
+@@ -1156,6 +1156,7 @@ HttpResponse Server::handle_models(const HttpRequest& req) {
+     c.id = opt_.model_id;
+     c.created = started_at_;
+     c.max_model_len = opt_.max_ctx;
++    c.root = opt_.model_path;
+     metrics_.observe_http(200);
+     return HttpResponse::json_body(200, id.empty() ? models_body(c) : model_body(c));
+ }
+diff --git a/core/server/server.h b/core/server/server.h
+index 782dd10..5336af2 100644
+--- a/core/server/server.h
++++ b/core/server/server.h
+@@ -57,6 +57,10 @@ struct ServerOptions {
+      * /v1/completions answer 501 naming /v1/embeddings, rather than queueing a request the engine
+      * would finish after one step with no text. */
+     bool        embedding_model = false;
++    /* What --model named, reported as the model entry's `root` the way vLLM reports the path it
++     * loaded: a served name chosen for clients says nothing about which file is behind it. Empty
++     * leaves the field out. */
++    std::string model_path;
+     std::string host = "0.0.0.0";
+     int         port = 8000;
+     int         n_threads = 0;
+diff --git a/docs/GUIDE.md b/docs/GUIDE.md
+index cfe41d3..69462c3 100644
+--- a/docs/GUIDE.md
++++ b/docs/GUIDE.md
+@@ -1132,7 +1132,7 @@ for a model that takes no images or video.
+ | `POST /v1/chat/completions` | chat, with tools, reasoning and streaming |
+ | `POST /v1/completions` | raw text completion |
+ | `POST /v1/embeddings` | needs a model with an embedding head, else 501 |
+-| `GET /v1/models`, `/v1/models/:id` | what is loaded, with `max_model_len` (the context it serves, as vLLM reports it); `:id` answers the entry itself, as OpenAI's retrieve does |
++| `GET /v1/models`, `/v1/models/:id` | what is loaded, with `max_model_len` (the context it serves) and `root` (the `--model` path), as vLLM reports them; `:id` answers the entry itself, as OpenAI's retrieve does |
+ | `GET /health`, `/ping`, `POST /ping` | liveness |
+ | `GET /load` | current load |
+ | `GET /version` | server version |
+diff --git a/tests/server_test.cpp b/tests/server_test.cpp
+index ec06178..b16b52a 100644
+--- a/tests/server_test.cpp
++++ b/tests/server_test.cpp
+@@ -343,7 +343,7 @@ struct Fixture {
+     FakeGrammar      gram;
+     std::unique_ptr<Server> srv;
+ 
+-    explicit Fixture(bool with_tools = true, int64_t max_ctx = 0) {
++    explicit Fixture(bool with_tools = true, int64_t max_ctx = 0, const char* model_path = "") {
+         Deps d;
+         d.sched = &sched;
+         d.tok = &tok;
+@@ -357,6 +357,7 @@ struct Fixture {
+         o.default_max_tokens = 32;
+         o.max_seqs = 4;
+         o.max_ctx = max_ctx;
++        o.model_path = model_path;
+         srv.reset(new Server(d, o));
+     }
+ 
+@@ -2528,7 +2529,9 @@ TEST(models_and_health_answer) {
+ 
+ TEST(the_model_entry_carries_the_context_length_the_server_was_started_with) {
+     /* Both routes a client sizes its window from: the list, and the entry it fetches by id. */
+-    Fixture f(true, 262144);
++    Fixture f(true, 262144, "/models/m.rad");
++    CHECK_EQ(json::parse(f.get("/v1/models/test-model").body).value("root", std::string()),
++             std::string("/models/m.rad"));
+     HttpResponse list = f.get("/v1/models");
+     CHECK_EQ(list.status, 200);
+     CHECK_EQ(json::parse(list.body)["data"][0].value("max_model_len", (int64_t)0), (int64_t)262144);
+diff --git a/tests/wire_test.cpp b/tests/wire_test.cpp
+index 68e91fe..c314afd 100644
+--- a/tests/wire_test.cpp
++++ b/tests/wire_test.cpp
+@@ -425,6 +425,13 @@ TEST(the_model_list_is_a_list_of_one_with_the_fields_clients_read) {
+     /* No length known, none reported: a client falls back to its own default rather than
+      * trusting a made-up one. */
+     CHECK(!o["data"][0].contains("max_model_len"));
++    CHECK(!o["data"][0].contains("root"));
++}
++
++TEST(the_model_entry_names_the_file_behind_the_served_name) {
++    ModelCard c = card("q38-flashnext", 1700000000);
++    c.root = "/models/qwen3.8-next-flash-fp8-iq4r-moe.rad";
++    CHECK_EQ(parsed(model_body(c)).value("root", std::string()), c.root);
+ }
+ 
+ TEST(the_model_list_reports_the_context_the_server_runs_with) {
+-- 
+2.55.0
+
+
+From 1d2462654cad2c8cf2e3350224accae6250d8fe4 Mon Sep 17 00:00:00 2001
+From: baKon <mike.ski83@gmail.com>
+Date: Wed, 7 Oct 2026 13:56:00 -0500
+Subject: [PATCH 4/4] serve: the model entry carries the capabilities
+ /server_info reports
+
+OpenAI's model object has no field for what a model can be asked for, so a client learned it
+by sending a request and reading the refusal. The entry it already fetches now carries the same
+capabilities object /server_info does (tools, reasoning, grammar, media, logprobs, the reasoning
+efforts the template takes), built by one Server::capabilities() so the two cannot disagree.
+---
+ core/server/admin.cpp  | 44 ++++++++++++++++++++++++------------------
+ core/server/oai.cpp    |  4 ++++
+ core/server/oai.h      |  5 +++++
+ core/server/server.cpp |  1 +
+ core/server/server.h   |  4 ++++
+ docs/GUIDE.md          |  2 +-
+ tests/server_test.cpp  | 14 ++++++++++++++
+ tests/wire_test.cpp    |  9 +++++++++
+ 8 files changed, 63 insertions(+), 20 deletions(-)
+
+diff --git a/core/server/admin.cpp b/core/server/admin.cpp
+index b1e8a76..c6b8a71 100644
+--- a/core/server/admin.cpp
++++ b/core/server/admin.cpp
+@@ -262,6 +262,30 @@ HttpResponse Server::handle_tokenizer_info(const HttpRequest& req) {
+     return HttpResponse::json_body(200, json_dump(o));
+ }
+ 
++/* ================================================================== capabilities */
++json Server::capabilities() const {
++    json caps;
++    caps["chat"]      = deps_.chat != nullptr;
++    caps["tools"]     = deps_.chat && deps_.chat->supports_tools();
++    caps["reasoning"] = deps_.chat && deps_.chat->supports_reasoning();
++    caps["grammar"]   = deps_.grammar != nullptr;
++    caps["embedding"] = deps_.embed != nullptr;
++    caps["image"]     = deps_.mm && deps_.mm->accepts(MediaKind::Image);
++    caps["video"]     = deps_.mm && deps_.mm->accepts(MediaKind::Video);
++    caps["audio"]     = deps_.mm && deps_.mm->accepts(MediaKind::Audio);
++    caps["logprobs"]  = opt_.supports_logprobs;
++    /* THE EFFORTS A CHAT REQUEST MAY SEND, as probed from the template at startup: null when it
++     * takes any word. "none" and "minimal" are this server's, and turn thinking off. */
++    if (lim_.reasoning_efforts.empty()) {
++        caps["reasoning_efforts"] = nullptr;
++    } else {
++        std::vector<std::string> e = { "none", "minimal" };
++        e.insert(e.end(), lim_.reasoning_efforts.begin(), lim_.reasoning_efforts.end());
++        caps["reasoning_efforts"] = e;
++    }
++    return caps;
++}
++
+ /* ================================================================== /server_info */
+ /* vLLM returns the repr() of its config object, which is a Python string a client can only print.
+  * This returns the same information as JSON, in two halves: what the SERVER decided, which is
+@@ -288,25 +312,7 @@ HttpResponse Server::handle_server_info(const HttpRequest&) {
+     srv["uptime_s"]           = unix_now() - started_at_;
+     srv["in_flight"]          = in_flight_.load(std::memory_order_relaxed);
+ 
+-    json caps;
+-    caps["chat"]      = deps_.chat != nullptr;
+-    caps["tools"]     = deps_.chat && deps_.chat->supports_tools();
+-    caps["reasoning"] = deps_.chat && deps_.chat->supports_reasoning();
+-    caps["grammar"]   = deps_.grammar != nullptr;
+-    caps["embedding"] = deps_.embed != nullptr;
+-    caps["image"]     = deps_.mm && deps_.mm->accepts(MediaKind::Image);
+-    caps["video"]     = deps_.mm && deps_.mm->accepts(MediaKind::Video);
+-    caps["audio"]     = deps_.mm && deps_.mm->accepts(MediaKind::Audio);
+-    caps["logprobs"]  = opt_.supports_logprobs;
+-    /* THE EFFORTS A CHAT REQUEST MAY SEND, as probed from the template at startup: null when it
+-     * takes any word. "none" and "minimal" are this server's, and turn thinking off. */
+-    if (lim_.reasoning_efforts.empty()) {
+-        caps["reasoning_efforts"] = nullptr;
+-    } else {
+-        std::vector<std::string> e = { "none", "minimal" };
+-        e.insert(e.end(), lim_.reasoning_efforts.begin(), lim_.reasoning_efforts.end());
+-        caps["reasoning_efforts"] = e;
+-    }
++    json caps = capabilities();
+ 
+     /* WHAT A REQUEST THAT LEAVES A FIELD OUT GETS, under the request's own spelling of each
+      * field, so a client can read off exactly what leaving one out means on this deployment. */
+diff --git a/core/server/oai.cpp b/core/server/oai.cpp
+index 5c6f666..5fd2196 100644
+--- a/core/server/oai.cpp
++++ b/core/server/oai.cpp
+@@ -2213,6 +2213,10 @@ static json model_card(const ModelCard& c) {
+     m["owned_by"] = "radiance";
+     if (c.max_model_len > 0) m["max_model_len"] = c.max_model_len;
+     if (!c.root.empty()) m["root"] = c.root;
++    if (!c.capabilities.empty()) {
++        json caps = json::parse(c.capabilities, nullptr, false);
++        if (!caps.is_discarded() && caps.is_object()) m["capabilities"] = std::move(caps);
++    }
+     return m;
+ }
+ 
+diff --git a/core/server/oai.h b/core/server/oai.h
+index 334661a..b70a903 100644
+--- a/core/server/oai.h
++++ b/core/server/oai.h
+@@ -331,6 +331,11 @@ struct ModelCard {
+     int64_t     max_model_len = 0;
+     /* What the server loaded (ServerOptions::model_path), vLLM's `root`. Empty leaves it out. */
+     std::string root;
++    /* What the model can be asked for -- tools, reasoning, images -- as /server_info reports it.
++     * There is no field for it in OpenAI's model object, so a client today learns it by sending a
++     * request and reading the refusal; the entry it already fetches can say so up front. A JSON
++     * object as text, spliced in as it is; empty leaves it out. */
++    std::string capabilities;
+ };
+ /* The list, for GET /v1/models. */
+ std::string models_body(const ModelCard& m);
+diff --git a/core/server/server.cpp b/core/server/server.cpp
+index 5c190b5..cfaf576 100644
+--- a/core/server/server.cpp
++++ b/core/server/server.cpp
+@@ -1157,6 +1157,7 @@ HttpResponse Server::handle_models(const HttpRequest& req) {
+     c.created = started_at_;
+     c.max_model_len = opt_.max_ctx;
+     c.root = opt_.model_path;
++    c.capabilities = capabilities().dump();
+     metrics_.observe_http(200);
+     return HttpResponse::json_body(200, id.empty() ? models_body(c) : model_body(c));
+ }
+diff --git a/core/server/server.h b/core/server/server.h
+index 5336af2..0f477d6 100644
+--- a/core/server/server.h
++++ b/core/server/server.h
+@@ -200,6 +200,10 @@ private:
+     HttpResponse handle_detokenize(const HttpRequest& req);
+     HttpResponse handle_tokenizer_info(const HttpRequest& req);
+     HttpResponse handle_server_info(const HttpRequest& req);
++    /* What this deployment can do -- chat, tools, reasoning, grammar, media, logprobs, the
++     * reasoning efforts it takes -- as /server_info's `capabilities` and the model entry both
++     * report it, built in one place so the two cannot disagree. */
++    json capabilities() const;
+     HttpResponse handle_sessions(const HttpRequest& req);
+     HttpResponse handle_reset_prefix_cache(const HttpRequest& req);
+ 
+diff --git a/docs/GUIDE.md b/docs/GUIDE.md
+index 69462c3..f9f1168 100644
+--- a/docs/GUIDE.md
++++ b/docs/GUIDE.md
+@@ -1132,7 +1132,7 @@ for a model that takes no images or video.
+ | `POST /v1/chat/completions` | chat, with tools, reasoning and streaming |
+ | `POST /v1/completions` | raw text completion |
+ | `POST /v1/embeddings` | needs a model with an embedding head, else 501 |
+-| `GET /v1/models`, `/v1/models/:id` | what is loaded, with `max_model_len` (the context it serves) and `root` (the `--model` path), as vLLM reports them; `:id` answers the entry itself, as OpenAI's retrieve does |
++| `GET /v1/models`, `/v1/models/:id` | what is loaded, with `max_model_len` (the context it serves) and `root` (the `--model` path), as vLLM reports them, and `capabilities` (the same object `/server_info` reports); `:id` answers the entry itself, as OpenAI's retrieve does |
+ | `GET /health`, `/ping`, `POST /ping` | liveness |
+ | `GET /load` | current load |
+ | `GET /version` | server version |
+diff --git a/tests/server_test.cpp b/tests/server_test.cpp
+index b16b52a..451d3d4 100644
+--- a/tests/server_test.cpp
++++ b/tests/server_test.cpp
+@@ -2542,6 +2542,20 @@ TEST(the_model_entry_carries_the_context_length_the_server_was_started_with) {
+     CHECK(!json::parse(unknown.get("/v1/models").body)["data"][0].contains("max_model_len"));
+ }
+ 
++TEST(the_model_entry_and_server_info_report_the_same_capabilities) {
++    Fixture f;
++    const json info = json::parse(f.get("/server_info").body)["capabilities"];
++    const json list = json::parse(f.get("/v1/models").body)["data"][0]["capabilities"];
++    const json one  = json::parse(f.get("/v1/models/test-model").body)["capabilities"];
++    CHECK(info.is_object());
++    CHECK(list == info);
++    CHECK(one == info);
++    /* Read per request, not frozen at startup: a template that takes no tools says so. */
++    CHECK(info.value("tools", false));
++    f.tmpl.tools_ok = false;
++    CHECK(!json::parse(f.get("/v1/models").body)["data"][0]["capabilities"].value("tools", true));
++}
++
+ TEST(embeddings_without_an_embedder_is_501_not_an_empty_200) {
+     Fixture f;
+     HttpResponse r = f.post("/v1/embeddings", R"({"input":"hi"})");
+diff --git a/tests/wire_test.cpp b/tests/wire_test.cpp
+index c314afd..50738aa 100644
+--- a/tests/wire_test.cpp
++++ b/tests/wire_test.cpp
+@@ -426,6 +426,15 @@ TEST(the_model_list_is_a_list_of_one_with_the_fields_clients_read) {
+      * trusting a made-up one. */
+     CHECK(!o["data"][0].contains("max_model_len"));
+     CHECK(!o["data"][0].contains("root"));
++    CHECK(!o["data"][0].contains("capabilities"));
++}
++
++TEST(the_model_entry_carries_the_capabilities_it_was_given) {
++    ModelCard c = card("q38-flashnext", 1700000000);
++    c.capabilities = R"({"tools":true,"image":false})";
++    const json m = parsed(model_body(c));
++    CHECK(m["capabilities"].value("tools", false));
++    CHECK(!m["capabilities"].value("image", true));
+ }
+ 
+ TEST(the_model_entry_names_the_file_behind_the_served_name) {
+-- 
+2.55.0
+
