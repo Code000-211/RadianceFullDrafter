@@ -15,7 +15,6 @@ into five strictly enforced invariants:
 from __future__ import annotations
 
 import argparse
-import difflib
 import glob
 import hashlib
 import json
@@ -28,7 +27,6 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
 
 # ==============================================================================
 # Cryptographic Seals & Golden Thresholds (Inviolable Laws)
@@ -79,6 +77,8 @@ def check_invariant_1_symbol_grounding(repo_root: Path, build_dir: Path | None =
 
     if build_dir is None:
         build_dir = repo_root / "build_hip"
+        if not (build_dir / "radiance_home" / "kernels").exists() and (repo_root.parent.parent / "build_hip" / "radiance_home" / "kernels").exists():
+            build_dir = repo_root.parent.parent / "build_hip"
 
     kernel_so_dirs = [
         build_dir / "radiance_home" / "kernels",
@@ -386,7 +386,7 @@ def check_invariant_4_hardware_clocks(auto_warmup: bool = False, endpoint: str =
                 warnings.append(f"Could not read {p}: {e}")
 
     # 2. Alternatively check via rocm-smi if sysfs was not accessible
-    elif os.path.exists("/opt/rocm/bin/rocm-smi") or subprocess.run(["which", "rocm-smi"], capture_output=True).returncode == 0:
+    elif os.path.exists("/opt/rocm/bin/rocm-smi") or subprocess.run(["which", "rocm-smi"], capture_output=True, check=False).returncode == 0:
         rocm_smi_cmd = "/opt/rocm/bin/rocm-smi" if os.path.exists("/opt/rocm/bin/rocm-smi") else "rocm-smi"
         res = subprocess.run([rocm_smi_cmd, "--showclocks"], capture_output=True, text=True, check=False)
         for line in res.stdout.splitlines():
@@ -398,7 +398,6 @@ def check_invariant_4_hardware_clocks(auto_warmup: bool = False, endpoint: str =
     if throttled_cards:
         if auto_warmup:
             details.append("⚡ Throttled GPU detected. Triggering automated warmup pass to elevate DPM clocks...")
-            warmup_ok = False
             try:
                 url = f"{endpoint.rstrip('/')}/chat/completions"
                 payload = {
@@ -415,9 +414,8 @@ def check_invariant_4_hardware_clocks(auto_warmup: bool = False, endpoint: str =
                 )
                 with urllib.request.urlopen(req, timeout=10.0) as resp:
                     if resp.status == 200:
-                        warmup_ok = True
                         details.append("✓ Automated warmup request dispatched successfully.")
-            except Exception as e:
+            except (urllib.error.URLError, OSError, TimeoutError) as e:
                 warnings.append(f"Automated warmup failed: {e}")
 
             time.sleep(1.0)
@@ -476,9 +474,13 @@ def check_invariant_5_transparency_guard(repo_root: Path) -> InvariantResult:
                 clean_line = line.strip()
                 # Check for critical test commands discarding stderr and exit code:
                 # e.g. "python3 ...parity_check... > /dev/null 2>&1" without "|| exit"
-                if ("parity_check" in clean_line or "gate_check" in clean_line) and "> /dev/null 2>&1" in clean_line:
-                    if "|| exit" not in clean_line and "|| return" not in clean_line:
-                        violating_scripts.append((script_path.name, line_idx, clean_line))
+                if (
+                    ("parity_check" in clean_line or "gate_check" in clean_line)
+                    and "> /dev/null 2>&1" in clean_line
+                    and "|| exit" not in clean_line
+                    and "|| return" not in clean_line
+                ):
+                    violating_scripts.append((script_path.name, line_idx, clean_line))
 
         # Check Python scripts for unchecked capture_output
         for script_path in sorted(scripts_dir.glob("*.py")):
@@ -516,7 +518,7 @@ def run_all_invariants(
 ) -> int:
     log_header("RadianceMine Epistemic Invariants & Ground-Truth Verification")
     print(f"Workspace: {repo_root}")
-    print(f"Policy:    Strict Physical Grounding (Anti-Hallucination Law)")
+    print("Policy:    Strict Physical Grounding (Anti-Hallucination Law)")
 
     results: list[InvariantResult] = []
 

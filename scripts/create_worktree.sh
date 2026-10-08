@@ -52,6 +52,12 @@ fi
 
 # Initialize isolated build environment directory
 mkdir -p "${WORKTREE_DIR}/build_hip"
+if [ -d "${REPO_ROOT}/build_hip/radiance_home" ] && [ ! -e "${WORKTREE_DIR}/build_hip/radiance_home" ]; then
+    ln -sf "${REPO_ROOT}/build_hip/radiance_home" "${WORKTREE_DIR}/build_hip/radiance_home"
+fi
+if [ -d "${REPO_ROOT}/build_hip/bin" ] && [ ! -e "${WORKTREE_DIR}/build_hip/bin" ]; then
+    ln -sf "${REPO_ROOT}/build_hip/bin" "${WORKTREE_DIR}/build_hip/bin"
+fi
 
 # Check if corresponding candidate lever exists
 CANDIDATE_PATH="${REPO_ROOT}/candidates/${FEATURE_SLUG}"
