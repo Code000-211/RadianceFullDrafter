@@ -20,7 +20,7 @@ GPUs für alle; ein Fehler, den du hier findest, ist billiger.
 Selbst ausführen, nicht der Ausgabe im Übergabe-Kommentar glauben:
 
 ```bash
-cmake --build build_hip
+cmake --build build_hip -j "$RADIANCE_BUILD_JOBS"
 ctest --test-dir build_hip -LE gpu --output-on-failure
 python3 scripts/lever_review.py claims <slug>
 ```

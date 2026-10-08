@@ -86,7 +86,7 @@ Vor dem Abgeben:
 ```bash
 python3 scripts/lever_review.py similar "<Idee in einem Satz>"   # schon versucht?
 python3 scripts/lever_review.py claims <slug>                    # Belege, Patch, gate.json
-cmake --build build_hip                                          # baut der Patch? (Worktree-Setup hat build_hip schon angelegt)
+cmake --build build_hip -j "$RADIANCE_BUILD_JOBS"                # baut der Patch? (Worktree-Setup hat build_hip schon angelegt)
 ```
 
 `claims` muss `RESULT: OK` liefern. Ein `similar`-Treffer über 0.8 heißt: erst die gefundene

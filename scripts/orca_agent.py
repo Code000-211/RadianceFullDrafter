@@ -636,6 +636,10 @@ def log_file(name: str) -> Path:
 
 def cmd_run(cfg: dict[str, Any], role: str, only_issue: int | None) -> int:
     worktree = Path(git("rev-parse", "--show-toplevel")).resolve()
+    # The whole run (setup build, agent CLI, everything it starts) yields the CPU to the lever
+    # queue, whose engine host threads and gate timings must not compete with agent builds.
+    os.nice(cfg["orca"].get("nice", 10))
+    os.environ.setdefault("RADIANCE_BUILD_JOBS", str(cfg["orca"].get("build_jobs", 8)))
     if worktree == PRIMARY.resolve():
         print(f"Agents laufen nicht im Primary-Checkout {PRIMARY}; `orca_agent.py tick` legt Worktrees an", file=sys.stderr)
         return 2

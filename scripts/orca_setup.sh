@@ -18,5 +18,7 @@ if [ ! -f build_hip/build.ninja ]; then
     cmake -B build_hip -S . -G Ninja \
         -DCMAKE_BUILD_TYPE=Release -DRAD_WITH_HIP=ON -DRAD_GPU_TARGETS=gfx1201 -DRAD_BUILD_TESTS=ON
 fi
-ninja -C build_hip
+# Agents build while the lever queue may be measuring on the same machine: orca_agent.py runs them
+# niced and passes RADIANCE_BUILD_JOBS so a build does not take every core from the gate.
+ninja -C build_hip ${RADIANCE_BUILD_JOBS:+-j "${RADIANCE_BUILD_JOBS}"}
 echo "✓ worktree build ready: ${WT}/build_hip"

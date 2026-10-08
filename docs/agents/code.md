@@ -27,7 +27,7 @@ Issue liest du nur, wenn dort etwas fehlt.
 
 ## 2. Umsetzen
 
-- Schritte des Plans in Reihenfolge. Nach jedem Schritt `cmake --build build_hip`.
+- Schritte des Plans in Reihenfolge. Nach jedem Schritt `cmake --build build_hip -j "$RADIANCE_BUILD_JOBS"`.
 - Ist ein Schritt unklar oder mehrdeutig, frag den Planer, statt zu raten (Abschnitt „Rückfragen“).
 - Stimmt der Plan nicht mit dem Code überein (Stelle fehlt, Annahme falsch, ein Abbruchkriterium
   greift) oder antwortet der Planer mit `PLAN-FEHLER`: nicht improvisieren. Kommentar mit Beleg
@@ -56,7 +56,7 @@ git diff origin/main -- <geänderte Dateien außerhalb candidates/> > candidates
 ## 4. Prüfen
 
 ```bash
-cmake --build build_hip
+cmake --build build_hip -j "$RADIANCE_BUILD_JOBS"
 ctest --test-dir build_hip -LE gpu --output-on-failure
 python3 scripts/lever_review.py claims <slug>          # muss RESULT: OK liefern
 python3 scripts/isa_diff.py /home/orca/RadianceMine/build_hip build_hip   # nur wenn Kernel geändert

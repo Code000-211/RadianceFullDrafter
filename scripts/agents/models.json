@@ -54,6 +54,8 @@
     "cli": "orca-ide",
     "repo": "id:2a029c3f-7bb9-403b-98c8-161f5abc94b6",
     "launcher": "orca",
-    "keep_worktree_hours": 12
+    "keep_worktree_hours": 12,
+    "nice": 10,
+    "build_jobs": 8
   }
 }
