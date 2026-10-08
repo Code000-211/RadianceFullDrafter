@@ -1,0 +1,40 @@
+{
+  "schemaVersion": 1,
+  "pageVersion": "sha256:a142c34eabe0950ec9d3cd4b14bb440cfe6ec61eedab6ef507e92c31dd99ed0d",
+  "claims": [
+    {
+      "id": "claim_286b05a148764abbaa54c3e244895e2d",
+      "statement": "Worktree isolation under Rule 3 guarantees that main remains sealed to the golden baseline while all development occurs in isolated worktrees.",
+      "evidence": [
+        {
+          "resource": "repo://scripts/create_worktree.sh#L1-L40",
+          "version": "repo-lines-v1:sha256:07821c7dd6d2ddd0fdfaef5c7e11bc5c214aa836bb48d2fa4f9c3355ee479105:eyJzZWxlY3RlZExpbmVDb3VudCI6NDAsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjFkOTVmYzA0YTgwYzk1MmY0OWNlNDE4ODYyN2M1M2IwZmJlOGM0NDA0MWI5NTJkNTkyYWNkMWRlOTk4NjE0NjYiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImI0MGJiMjY4MzJlY2YwZjUzYmVlZjUzNDZkZDIzMDEyNjQyZWYxMjZhNGM3NzY0ZWQxNzRkNDgyNzJhNmQ2NjIiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjowLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImUzYjBjNDQyOThmYzFjMTQ5YWZiZjRjODk5NmZiOTI0MjdhZTQxZTQ2NDliOTM0Y2E0OTU5OTFiNzg1MmI4NTUiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImU1OWFmOTdmZTJjMTBlNzViMDUxNGQ2ODYyMGQxZDY1NGM1NTNlNTgwNGFhOWE5M2QxMjgxNTIxMzIzYWE3MTkifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_2e90ff9e7c904999a957e8b638fdf384",
+      "statement": "The 4-Tier Master Quality Gate enforces zero-regression governance across epistemic invariants, token parity, composite score, and RDNA4 ISA compliance.",
+      "evidence": [
+        {
+          "resource": "repo://scripts/gate_check.sh#L1-L35",
+          "version": "repo-lines-v1:sha256:4d632b60208809ce2eecd0c4c4a90e0f20ead5eeb99b3e7f96b37ad57dc3cd66:eyJzZWxlY3RlZExpbmVDb3VudCI6MzUsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjFkOTVmYzA0YTgwYzk1MmY0OWNlNDE4ODYyN2M1M2IwZmJlOGM0NDA0MWI5NTJkNTkyYWNkMWRlOTk4NjE0NjYiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImZhZmYyNGFiNzllNDRjZDE2ZjMyODk3MjM5ZTYwODAxZWUxM2Y3YTljNjIwZjA2MDNmYTU2ZjNkYjcwMjNhOWEiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjowLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImUzYjBjNDQyOThmYzFjMTQ5YWZiZjRjODk5NmZiOTI0MjdhZTQxZTQ2NDliOTM0Y2E0OTU5OTFiNzg1MmI4NTUiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImVhNDNjMWExZDNmNGE4MTljOGRiMTA0NDJjMDMxNWRlODFjYjhlZDNiNmJmMzcxMGNjZDgzNDBkYmMzODQ3MGQifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_943a6bef88b343a29714de65065c1de9",
+      "statement": "The engine lifecycle manager coordinates starting, stopping, and health checking the dual-GPU inference server on port 8000.",
+      "evidence": [
+        {
+          "resource": "repo://scripts/engine_manager.sh#L1-L40",
+          "version": "repo-lines-v1:sha256:32cfd9f0b6edccb254a4a01d5e68f745c1d592357b3a33ec49327a0a8bf09695:eyJzZWxlY3RlZExpbmVDb3VudCI6NDAsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjFkOTVmYzA0YTgwYzk1MmY0OWNlNDE4ODYyN2M1M2IwZmJlOGM0NDA0MWI5NTJkNTkyYWNkMWRlOTk4NjE0NjYiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjZhOTZhYmNmNjAzY2U1NjgzYjhhMTdhNGJkYWNhNzc4NTMxYmNjODNkZDczNmUyYmNiNzlkOGZkYzZlMGMzY2EiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjowLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImUzYjBjNDQyOThmYzFjMTQ5YWZiZjRjODk5NmZiOTI0MjdhZTQxZTQ2NDliOTM0Y2E0OTU5OTFiNzg1MmI4NTUiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6Ijc5M2QzZTc2YjAzNDExMTcxYjczMjQ2YzVjMzFiYzczMmFhNzczZjhlZjU0ZTA0MzZiYmQ1MTJiZTJmYzhlNDgifQ"
+        }
+      ]
+    }
+  ],
+  "verification": {
+    "by": "openwiki/0.6.1",
+    "at": "2026-10-08T09:22:05.134Z"
+  }
+}

@@ -1,0 +1,40 @@
+{
+  "schemaVersion": 1,
+  "pageVersion": "sha256:835a1ac0aa3bfa8397d3376157baf55982026720e001e2c9c4bd00c20d213488",
+  "claims": [
+    {
+      "id": "claim_b3b2c01428644b3c8d122ed5352659e9",
+      "statement": "RadianceMine executes as a single process with dedicated per-rank threads, using unified virtual addressing to eliminate IPC handle marshalling during peer GPU access.",
+      "evidence": [
+        {
+          "resource": "repo://libr4d/r4d_ar_entry.hip#L1-L35",
+          "version": "repo-lines-v1:sha256:3616037ac65f486ad8949b2eb1de8b08b521ac85cf32ad2721369ec304d7f3b7:eyJzZWxlY3RlZExpbmVDb3VudCI6MzUsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjBlYWJlZDAzNDBhOTM5NjI3MjgwZDU5MmFhMmYxMGZmZjY2ZTM5ZmVmYjRkMjRkMWRkZDZhOWMzOTllYWY4OWYiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjgxZWJjZGQzNWI1MmMxMTliN2QwOTMzODljZDdkMDY2ODE0OWJjMzVkZTM3NDBmNmRkOGJjMmE2YjQ3ODIyMjciLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjowLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImUzYjBjNDQyOThmYzFjMTQ5YWZiZjRjODk5NmZiOTI0MjdhZTQxZTQ2NDliOTM0Y2E0OTU5OTFiNzg1MmI4NTUiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjI4NWNmODk0NTZmNzBiY2M1YTBlYTZmMmEwZTBmNzIzZDFiODkxNDljYzNiYTM2NTA2MzYxZWZkYTdkZmU4MDUifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_a69e1a842d7948ad83cd96eaf500710a",
+      "statement": "The two-rank All-Reduce implements a one-shot collective where peer cards stream complementary halves directly into peer reduction buffers.",
+      "evidence": [
+        {
+          "resource": "repo://libr4d/r4d_ar_entry.hip#L35-L65",
+          "version": "repo-lines-v1:sha256:943f2083244921e4a1876dcb8bef19d0be0a446a45f3e8d0e9d589df41422fa4:eyJzZWxlY3RlZExpbmVDb3VudCI6MzEsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjgxZWJjZGQzNWI1MmMxMTliN2QwOTMzODljZDdkMDY2ODE0OWJjMzVkZTM3NDBmNmRkOGJjMmE2YjQ3ODIyMjciLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjlmMzk0ZWMzOTE2NjJhYzI4MTEzYzUwYTc4NTIzMDk2MWJkODFiZTVmYjFmOTlkZTRkNTU5MmI4NGFhZjU5NjkiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjMyODU5MzYyMWI1OGNmYTkwZTM2MmUwOGRmYWQyYTBhNTc3ODIxMjY4Mjg5NDkwM2Q4ZWMxZTllNGE2MmIzOTEiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImUyZDQ4MzY0ODA3NWZlOTllNGZmYzBhMTVlODlkMzkxMTM1NjY3ZDExYzU5YTU0YzFlMWE5MDdkZThlMTIwMGYifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_c5af344909524f2faec4d6ba004bdcc5",
+      "statement": "Per-thread __threadfence_system calls across workgroups saturate the PCIe bus; memory fences must be gated by workgroup leaders with hardware store-drain synchronization.",
+      "evidence": [
+        {
+          "resource": "repo://scripts/eval_patch_safety.py#L36-L55",
+          "version": "repo-lines-v1:sha256:1ef399304f7789eab7cbab658472c33120e76718e3c740a2fe87819ca0ab3a0b:eyJzZWxlY3RlZExpbmVDb3VudCI6MjAsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImJmOTM3MWQ0ZTM3YzRhMjJmMjM2NWM4NTUwODkzOGI2ZDBhZjdjODk2MmZjODQwZWYwMGYwZmUwOTE3Y2NiY2EiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImVmNDJhNWY0ZGYwOTIyMDU3MzRmYWM5YWZhMzk1NmUxMmE5MGYxMTk0MDM4M2RkOTlkNGQ0ZWQ0YWU5MGM2MTciLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjI2MTAyMzU1MTM5MzQ3YjQzNTc0MjM1NTI2ZDAxZmI1ZjRjZTZmZTg2MjEyNTM2ZWU3MGRkYmE2ZTBmNGU3YjAiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImQwYTdkNzZlY2FhOTgxYzAzNzg1ZTcwMGIzNmVlMTU0MDU2OGY4NWVjY2JkNDY2NjZlNzY4ODliNzRjMjFlMjkifQ"
+        }
+      ]
+    }
+  ],
+  "verification": {
+    "by": "openwiki/0.6.1",
+    "at": "2026-10-08T09:22:05.134Z"
+  }
+}

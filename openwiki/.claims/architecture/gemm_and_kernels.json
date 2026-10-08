@@ -1,0 +1,40 @@
+{
+  "schemaVersion": 1,
+  "pageVersion": "sha256:bf7a74daef8c0e82899a8b468f3cba7067575fc67736ab6873ac00d7be043ade",
+  "claims": [
+    {
+      "id": "claim_a62c8f9dfe3145819f47f60592cfc21b",
+      "statement": "RDNA4 gfx1201 allocates Vector General Purpose Registers (VGPRs) in 24-register granularities, creating steep occupancy cliffs at 96, 120, 144, 168, and 192 registers.",
+      "evidence": [
+        {
+          "resource": "repo://scripts/check_isa_compliance.py#L33-L70",
+          "version": "repo-lines-v1:sha256:48fcd230a8dee305667f73dfb04aaec5e975bc20e9c9a0ed536d12ccfcfc10de:eyJzZWxlY3RlZExpbmVDb3VudCI6MzgsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjZkYTFlYWE3ZmFlMDQ1YmE0OTcyYzJiMjEwOGViNTcwNDNiYzM2ZmRhNmJmZGRjZWYyYTJiNGNhMTBmMTRlYjMiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjAxYmE0NzE5YzgwYjZmZTkxMWIwOTFhN2MwNTEyNGI2NGVlZWNlOTY0ZTA5YzA1OGVmOGY5ODA1ZGFjYTU0NmIiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImM0M2E0MmFhMTA3YWZhYzE5NjY2NjRmOTdjNjVmN2M1YjczMmY2Y2RlNTRlODc3NGIzNzFhMTc3YWJhZGM4YjgiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjU5MWIzM2M1MjQzODIwNTQ4NzQzOGRkYmNlZjY1NWQ3MTc2Mjk0MWNiYjk4MWZiMTQyZDgyMmM5ZTM3YmQyYzEifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_ebd9e72e4e2b4e02b32269c1243099b0",
+      "statement": "Tier 3 ISA compliance audits reject kernels that spill to scratch memory or inadvertently cross unapproved VGPR cliff boundaries on hot decode and prefill paths.",
+      "evidence": [
+        {
+          "resource": "repo://scripts/check_isa_compliance.py#L75-L160",
+          "version": "repo-lines-v1:sha256:cf708285d8319f0dfe3260458c9be4a5131575b78a201e72c0ef079a5c3c3c74:eyJzZWxlY3RlZExpbmVDb3VudCI6ODYsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjIzNzIzYWI0Y2FjN2M1NzI1NmQyMzExNWQ3MWNiNDRlMjRmM2YxMmU0ZWZjOWJhMTEzOTJmM2ZiODUzZTQ4MzIiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjEzMmUyYmZkMDhkNmQxNTJkNTA4YWMxYTdkYjk5NjlhZjZhNmU0OTExZGNlNTY4NzZkNjYyNTRmOTI2M2ZiNDUiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImYzZTUzYjI3ZmRiN2EwZjY0YzBjNWNjOTJjNTY1MTFiMTQwODdjYWVlODU3OTNiZDFlZWIyYjU2Y2U4OWRiNTUiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImM0NTlkMzgxZjVlZTVjZjJiOTkzMWE3ZDQ5ZTY1Y2RjZTk5ZmQ0ZDNmYmZkNWQ3NmFjMTM4OWEwZmQzMGViZmEifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_cf76402dc36245c5b13c072d007a1ab7",
+      "statement": "The W4A8 prefill GEMM executes int4-weight and fp8-activation linear projections on gfx1201 using coalesced vector loads and early register reclamation.",
+      "evidence": [
+        {
+          "resource": "repo://libr4d/r4d_gemm_w4a8_prefill.hip#L50-L150",
+          "version": "repo-lines-v1:sha256:b4edc6b01b776df13ef17d304bfb21c7d9b41b0e6a063650a5c73258837b7a77:eyJzZWxlY3RlZExpbmVDb3VudCI6MTAxLCJmaXJzdFNlbGVjdGVkTGluZUhhc2giOiI1NTM5MmM1NmQzODc0NjBjNjI0NWRiZjdhN2EwYTdjZDU1ZDg3NGI5YWQ4YTBmZGI3NmM1OWE3Y2JhOTczNjg0IiwibGFzdFNlbGVjdGVkTGluZUhhc2giOiIwMWJhNDcxOWM4MGI2ZmU5MTFiMDkxYTdjMDUxMjRiNjRlZWVjZTk2NGUwOWMwNThlZjhmOTgwNWRhY2E1NDZiIiwicHJlY2VkaW5nQ29udGV4dExpbmVDb3VudCI6MywicHJlY2VkaW5nQ29udGV4dEhhc2giOiIzOGMwYTNiNzU4NDVjMjJjZDQ5ZjNhNzFlYjkzNzNhNjFmNjY2OTBlYmJmZDc5YmVhMWZkODk1ZDk1N2FlYTFkIiwiZm9sbG93aW5nQ29udGV4dExpbmVDb3VudCI6MywiZm9sbG93aW5nQ29udGV4dEhhc2giOiIwZWI2ZjBkODhkYzAxZTg1NDY3MzMwYzE4NzNiNjlkYjM4OWRlMGQ4NTQ3YjI3ZjIwYjMwZmJmMTkyMmU1ZDFjIn0"
+        }
+      ]
+    }
+  ],
+  "verification": {
+    "by": "openwiki/0.6.1",
+    "at": "2026-10-08T09:22:05.134Z"
+  }
+}

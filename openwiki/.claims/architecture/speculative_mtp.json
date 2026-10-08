@@ -1,0 +1,40 @@
+{
+  "schemaVersion": 1,
+  "pageVersion": "sha256:76db8606f9a0c569a259a6613f0613234f054b1e7b275ef507273d3c03b4cc3f",
+  "claims": [
+    {
+      "id": "claim_ec0427b5441a422f8768b84467a18e67",
+      "statement": "The MTP block evaluates speculative draft tokens through auxiliary linear projections and sparse attention, advancing tokens into the draft window via Engine::issue_serial_drafter.",
+      "evidence": [
+        {
+          "resource": "repo://core/engine_draft.cpp#L147-L210",
+          "version": "repo-lines-v1:sha256:7e7249a976c0d210d6a13a3aaa925de54b6d9e008457feb40522b2a0b3d5a2ab:eyJzZWxlY3RlZExpbmVDb3VudCI6NjQsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjliMTE1ZTA0ZWQ3YzcxY2QyZjRmODEwOWI3MjcxMzU3NWI4NTcwZDE2OWQxOWU4NGU1ZWI1NmZiNmI1MTVlODQiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjkwZWU2MTg5OGMyZjcyNzVlMzU5OGVjZmI1NGJlNDIyYWMwMDg0OGMyODFiZTdhYzVkZTdkOTZmMzVhMjk1NDEiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjU0MDZmNmQ4MDdiMzcxOTlkYWY2OWRmODNlMTcxZTI0MWEyMjE3YWIzZDE2Yzk3MDdhMDAyMDNjOWQwM2RmNWUiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjVmZDE4NDI4MWRmMzAwNGQ0MmYzNGY1MDEwYWRlZDg1ZjI4MjA5NDIyMTNjNWQ3YWU4ZWQzM2MwOWY1ZjI2ZDcifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_09991f15457a4cbdb4b9df053b160704",
+      "statement": "FR-Spec evaluates reduced vocabulary matrices of 52,416 rows instead of 152k rows, reducing draft head weight traffic from 2.54 GB to 67 MiB.",
+      "evidence": [
+        {
+          "resource": "repo://candidates/lever4_fr_spec_draft_head/README.md#L1-L35",
+          "version": "repo-lines-v1:sha256:b8bd273784e95901af711c6c1d5aa3ac0030422185bc51921efa37ef7bd831ff:eyJzZWxlY3RlZExpbmVDb3VudCI6MzUsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjFmODBmZDVhYzQ0MjY2ZGRiZTY4YWI4ZTc3ZjA0MWNjZWJjZDA2ZmI5MjhjYmY2NzhjMDcyOTdjOGRiMTJlNmIiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImJmMmM5MmZiYTgxNzFmNjRlNjRkMGVjMmNiZDg3NWQyYzNmZGYwYTkwYTNhZjdkNTg1MjE2M2M0NTQxZmRkYzAiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjowLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImUzYjBjNDQyOThmYzFjMTQ5YWZiZjRjODk5NmZiOTI0MjdhZTQxZTQ2NDliOTM0Y2E0OTU5OTFiNzg1MmI4NTUiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjAwMWYyZWMxNzU5M2MxMDU0ZWI0NjM2N2Q4NDUzZWYyNGExNzNjZTk2YjcxMTdkOTFmOWE2OGQ0NGZlZjhiMDEifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_b3d68494974541a29e656ec298daa768",
+      "statement": "The scheduler dynamically arbitrates speculative depth between 1 and 5 tokens based on exponential moving averages and streak tracking in suggest_depth.",
+      "evidence": [
+        {
+          "resource": "repo://core/sched/scheduler.h#L60-L95",
+          "version": "repo-lines-v1:sha256:966f9089394122b2aec4585deecb60d18ceb64e1f0ae750bd311ee2d43f92186:eyJzZWxlY3RlZExpbmVDb3VudCI6MzYsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImMzZTgzYTllMzZhNmY2ZTBkYWUyYzg2M2NmZWUyMGMwNzE5ODJhZjk3MmU1MGJhOTk0ZjAxNDY5MWY4N2QyZTMiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjgxZjViYTExZmMxM2U1NTRiMWNlM2YyY2JiN2FlZGM3ZWJkZWFkMTJkMGM4NTY0ZGUxNWYxOWRkMWIwYzk0ZTYiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjU5YWU2MjdlY2M1YzE3YzRhYjhiYTY5YWU3M2NkOTk1ZWY5MTRiOGUzNzU5N2FlNTU0ODAyNDM2NjllYTQxZWYiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImQyNGExMTdlNTNkMTdhN2IxOWQxNzllMmM3YjY0YmIyNjcxNDcxMDIwNGFmODlmNGJmZTVmNWJkMGZjYmYxM2QifQ"
+        }
+      ]
+    }
+  ],
+  "verification": {
+    "by": "openwiki/0.6.1",
+    "at": "2026-10-08T09:22:05.134Z"
+  }
+}

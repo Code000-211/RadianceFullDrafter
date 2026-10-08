@@ -1,0 +1,40 @@
+{
+  "schemaVersion": 1,
+  "pageVersion": "sha256:a91a0d7c173b010f2b7b3564fe81dbbd10e35580d3c51569121ad9c7faf651b2",
+  "claims": [
+    {
+      "id": "claim_948faf8a7be043f9ad1bd1885adf9303",
+      "statement": "The main coordinator thread drives engine execution in Engine::step_loop without issuing blocking hipStreamSynchronize calls during the hot decode path.",
+      "evidence": [
+        {
+          "resource": "repo://core/engine.cpp#L456-L550",
+          "version": "repo-lines-v1:sha256:61248895d08c039c9fdf87d0c9d66b9d6d1c927f504bc91d72c009bc72e84b1d:eyJzZWxlY3RlZExpbmVDb3VudCI6OTUsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImEyMTRlZDFiNzlhNGZhZDQ5N2I0NDdjZDg2ZGFiNTk0ZGYxYTVhZWI0ODRmZWI5ZGVlZDc1MzNlYmU1MDkyZTkiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImIwOTdjODg2MDJiZDk2MDI3OTA0YjdkNjY5MWE5ZmM3Mzc4NzI0M2I2MGUzOGUzYmVmZjg0MTdhZGRkZjZlOGYiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6Ijk3MmY2OTU4ZGZhOTQxZDllYWE2MWJlMDczZWI5ZmQxYWMwNGFiZjdiOWYzMWU3ZDUyZGRhZmU4NjAwYzgwMDIiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjBmZjFkYTY4OGEwODU0NmRmZTFmNDk3M2YxYmRhZTAwNTMzZjVlOTc4MTk3ZTk3YTA2OTlhYTRkM2NhNmZmNjIifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_feebd241864347a8842f67d166d22c17",
+      "statement": "Dedicated per-rank worker threads manage GPU command streams and AQL submissions independently in Engine::rank_loop.",
+      "evidence": [
+        {
+          "resource": "repo://core/engine.cpp#L331-L390",
+          "version": "repo-lines-v1:sha256:fd72e0792bb234962789063c27375b108b2e067ef611dba599b638c66e09e1b4:eyJzZWxlY3RlZExpbmVDb3VudCI6NjAsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQzZjNjOWNiMDY1OGQzYTBlNWU3MTRmZTM1MzgzNDQxODIwNzhkMmZlNjcwNzc3YjAyYzI3ZmIzN2YwY2Y1NWEiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjA2OGZjN2E1NTUyMDNkOGEzZTk3NWY4OTk1YmE5NzEzNzk0MDg1M2E1MGVjMzQyOTg4ZDlmNDlmNGY5ZDFlNmQiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjUzMGM2ZjY0NGQzZjJhYWI5YWYzNTBhNDZjZTVmYWEzMzdkNGYwNGJmYzE3ZDhhNThjNGRhYjk4NTVkZTg4MDQiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImM4M2MxYmE4MTc3MDIxMzQ5Y2U1YWRkNTU1ZjZhMmVjNzcwNDE5ODhiOThlNDgyMWE3YzU5MWMyMDVhMDJkMmUifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_fd827228ad32403584b53b148a83c4a1",
+      "statement": "Speculative draft iterations are dispatched by Engine::issue_serial_drafter and validated against target logits in Engine::finish_serial_drafter.",
+      "evidence": [
+        {
+          "resource": "repo://core/engine_draft.cpp#L147-L330",
+          "version": "repo-lines-v1:sha256:f997949aba5719cd6324eb43262b7fd53e43be99ae52ce96405d8034c49c84b4:eyJzZWxlY3RlZExpbmVDb3VudCI6MTg0LCJmaXJzdFNlbGVjdGVkTGluZUhhc2giOiI5YjExNWUwNGVkN2M3MWNkMmY0ZjgxMDliNzI3MTM1NzViODU3MGQxNjlkMTllODRlNWViNTZmYjZiNTE1ZTg0IiwibGFzdFNlbGVjdGVkTGluZUhhc2giOiI5NzJhNDI5MzgyYjJlMTQ3MThlMGUzN2IwNTcwYThhMTcwMjk5MWZjZDg0OThjZDg0MDYwYThiZjRmMDUwMTdiIiwicHJlY2VkaW5nQ29udGV4dExpbmVDb3VudCI6MywicHJlY2VkaW5nQ29udGV4dEhhc2giOiI1NDA2ZjZkODA3YjM3MTk5ZGFmNjlkZjgzZTE3MWUyNDFhMjIxN2FiM2QxNmM5NzA3YTAwMjAzYzlkMDNkZjVlIiwiZm9sbG93aW5nQ29udGV4dExpbmVDb3VudCI6MywiZm9sbG93aW5nQ29udGV4dEhhc2giOiIyNzMzYTM5NWQ1MDY2ZTcxZTE0MmQyMmY1MTcwMTA1NjgyN2M5MmZkY2NiMGRlZWRkZjA1MTc2MjE4MzI5ODM3In0"
+        }
+      ]
+    }
+  ],
+  "verification": {
+    "by": "openwiki/0.6.1",
+    "at": "2026-10-08T09:22:05.134Z"
+  }
+}

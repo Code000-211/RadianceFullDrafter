@@ -106,3 +106,10 @@ When AGY tests a candidate lever and encounters a regression:
    - Comment on the GitHub Issue: `Revision complete: resolved <issue>. Ready for re-test.`
    - Remove `regression:detected` and label `status:ready-to-test`.
 
+<!-- OPENWIKI:START -->
+
+## OpenWiki
+
+@AGENTS.md
+
+<!-- OPENWIKI:END -->

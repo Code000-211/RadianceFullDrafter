@@ -1,0 +1,54 @@
+{
+  "schemaVersion": 1,
+  "pages": {
+    "/openwiki/architecture/engine_runtime.md": {
+      "pageVersion": "sha256:a91a0d7c173b010f2b7b3564fe81dbbd10e35580d3c51569121ad9c7faf651b2",
+      "completedBy": "antigravity",
+      "completedRunId": "06a5b09d-6672-410b-b0b4-f3adb3ac7372",
+      "gitHead": "7a130ef5c62935f9f3641c5ec5e6131aefd0180b",
+      "sourceFingerprint": "sha256:6c76c4b556fee0fb2a4dbc399daf0a9817ff00e711cfcfb51e10dafa8b77f46b"
+    },
+    "/openwiki/architecture/gemm_and_kernels.md": {
+      "pageVersion": "sha256:bf7a74daef8c0e82899a8b468f3cba7067575fc67736ab6873ac00d7be043ade",
+      "completedBy": "antigravity",
+      "completedRunId": "06a5b09d-6672-410b-b0b4-f3adb3ac7372",
+      "gitHead": "7a130ef5c62935f9f3641c5ec5e6131aefd0180b",
+      "sourceFingerprint": "sha256:6c76c4b556fee0fb2a4dbc399daf0a9817ff00e711cfcfb51e10dafa8b77f46b"
+    },
+    "/openwiki/architecture/p2p_interconnect.md": {
+      "pageVersion": "sha256:835a1ac0aa3bfa8397d3376157baf55982026720e001e2c9c4bd00c20d213488",
+      "completedBy": "antigravity",
+      "completedRunId": "06a5b09d-6672-410b-b0b4-f3adb3ac7372",
+      "gitHead": "7a130ef5c62935f9f3641c5ec5e6131aefd0180b",
+      "sourceFingerprint": "sha256:6c76c4b556fee0fb2a4dbc399daf0a9817ff00e711cfcfb51e10dafa8b77f46b"
+    },
+    "/openwiki/architecture/speculative_mtp.md": {
+      "pageVersion": "sha256:76db8606f9a0c569a259a6613f0613234f054b1e7b275ef507273d3c03b4cc3f",
+      "completedBy": "antigravity",
+      "completedRunId": "06a5b09d-6672-410b-b0b4-f3adb3ac7372",
+      "gitHead": "7a130ef5c62935f9f3641c5ec5e6131aefd0180b",
+      "sourceFingerprint": "sha256:6c76c4b556fee0fb2a4dbc399daf0a9817ff00e711cfcfb51e10dafa8b77f46b"
+    },
+    "/openwiki/governance/quality_gates.md": {
+      "pageVersion": "sha256:b46b4c7c4ad1570848824a4e8c7cfad8c643c43542cb169d223cb38ed20a3fa3",
+      "completedBy": "antigravity",
+      "completedRunId": "06a5b09d-6672-410b-b0b4-f3adb3ac7372",
+      "gitHead": "7a130ef5c62935f9f3641c5ec5e6131aefd0180b",
+      "sourceFingerprint": "sha256:6c76c4b556fee0fb2a4dbc399daf0a9817ff00e711cfcfb51e10dafa8b77f46b"
+    },
+    "/openwiki/pipeline/upstream_watcher.md": {
+      "pageVersion": "sha256:ab8b3d7dc63c27d050ffd277a0719c4876d36976e23e5c185bde65388dc6f675",
+      "completedBy": "antigravity",
+      "completedRunId": "06a5b09d-6672-410b-b0b4-f3adb3ac7372",
+      "gitHead": "7a130ef5c62935f9f3641c5ec5e6131aefd0180b",
+      "sourceFingerprint": "sha256:6c76c4b556fee0fb2a4dbc399daf0a9817ff00e711cfcfb51e10dafa8b77f46b"
+    },
+    "/openwiki/quickstart.md": {
+      "pageVersion": "sha256:a142c34eabe0950ec9d3cd4b14bb440cfe6ec61eedab6ef507e92c31dd99ed0d",
+      "completedBy": "antigravity",
+      "completedRunId": "06a5b09d-6672-410b-b0b4-f3adb3ac7372",
+      "gitHead": "7a130ef5c62935f9f3641c5ec5e6131aefd0180b",
+      "sourceFingerprint": "sha256:6c76c4b556fee0fb2a4dbc399daf0a9817ff00e711cfcfb51e10dafa8b77f46b"
+    }
+  }
+}

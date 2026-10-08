@@ -1,0 +1,40 @@
+{
+  "schemaVersion": 1,
+  "pageVersion": "sha256:ab8b3d7dc63c27d050ffd277a0719c4876d36976e23e5c185bde65388dc6f675",
+  "claims": [
+    {
+      "id": "claim_923b27f61d5f46a3829ec2f254acdb5e",
+      "statement": "The upstream watcher continuously monitors Codeberg REST APIs, using state deduplication in telemetry/upstream_seen.json to eliminate redundant processing.",
+      "evidence": [
+        {
+          "resource": "repo://scripts/watch_upstream.py#L40-L75",
+          "version": "repo-lines-v1:sha256:3110652f78f8c49d698306956bea44cf34c10b68403cfb4545adbb4737657da3:eyJzZWxlY3RlZExpbmVDb3VudCI6MzYsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImZlZWVhNTJkYjkyYjFmYWM2MTA0ZDNhZTU4MDUwYTYxM2U2Mjk5MTNiNzdlNTA5OWVmMTZjMTExYTc3Y2QzOWEiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImNlNzUzMDgzYmFkNDZhMGNjMjlkOTcwMjMyYWYyMGVmYWQ4NWU1NWQ1MDQ1NGJjNWE4MDYwODIwZTE5MTkzNjciLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6Ijk0MDBlNTZlMzIwOGVlNGMwYjA4YjAxMTUxZTI3Y2U2OTZhNmNjODJjYjExZDFiYTg2YjA1NjJiOTdlZWU1NzQiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6Ijc2OTEzMzg3MmI4NzI3NWIzZGJmMTRjMWU2ZTc5MDAxZmRhZDMzMTQ3NTc2M2JkNDg1MGQzY2IyNjk4MDc5NzgifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_5d8bec11092a472c8e267658391dd83e",
+      "statement": "New upstream pull requests are evaluated via TypeSafe AI (Jev System One) for subsystem classification, RDNA4 hardware risk, and expected performance ROI in <100ms.",
+      "evidence": [
+        {
+          "resource": "repo://scripts/watch_upstream.py#L90-L160",
+          "version": "repo-lines-v1:sha256:0edcba673196b51c30ac61c4e7d9f6361c134b779d359e1673c742e5435e66d9:eyJzZWxlY3RlZExpbmVDb3VudCI6NzEsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjAxYmE0NzE5YzgwYjZmZTkxMWIwOTFhN2MwNTEyNGI2NGVlZWNlOTY0ZTA5YzA1OGVmOGY5ODA1ZGFjYTU0NmIiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6Ijg5YmMyZGM5MzE3MzUwNGZmZGY5MmUyM2JmYjBiZjhmNjM5OTg0YzY4YTExZmI1YWQ3Y2MzNWQzZjRlMDM0MzgiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjUwY2RmYzYwNDZmOGRiZWFjMzlkMmRmMWJmZmMwNzU4N2Y2MDc0N2RhNDUzNmUwNzk5NzU5ZDI3MTFhMGY2YTIiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImM1YzAwZDAzMmIxNjA1NjRmYjE5NWIyNzY4YzlhMzliZDQxYmI4ZTExODc2M2FmOTEzN2E0MzUwYmFjNGIyZDYifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_71515c65990e4960be53378b952be57c",
+      "statement": "Qualified upstream PRs automatically generate GitHub tracking issues and isolated Draft Pull Requests with patch safety and mergeability verification.",
+      "evidence": [
+        {
+          "resource": "repo://scripts/watch_upstream.py#L180-L320",
+          "version": "repo-lines-v1:sha256:64d071f228188248457c063818edf03f1942056e0620bade011470f0beb98284:eyJzZWxlY3RlZExpbmVDb3VudCI6MTQxLCJmaXJzdFNlbGVjdGVkTGluZUhhc2giOiI4MDBlNGEwN2IzY2YxNDlhZmU1NDlhMzE2YTM0NGIzMGE1NTZkMTk3YmNhZGEzMDUxNzM3YWEwYjU3MDkyZmQ1IiwibGFzdFNlbGVjdGVkTGluZUhhc2giOiJhZGE1YzY2ZTE3YjE0NTM5NzgzNGI4Yzg1NGRjNDE5M2UyMTI1MTgwYTg5OTZhMTRjMzE4ODMzMjZiMmVmYmNmIiwicHJlY2VkaW5nQ29udGV4dExpbmVDb3VudCI6MywicHJlY2VkaW5nQ29udGV4dEhhc2giOiIyMWM0NTQyNzk0MDgyMGVlNDQ2Y2YzMjNjZGM3NWJkMjZiOTllODI3MTFjYjljZmE4ZmRlMGQxNDFkODZhNDU0IiwiZm9sbG93aW5nQ29udGV4dExpbmVDb3VudCI6MywiZm9sbG93aW5nQ29udGV4dEhhc2giOiI4OTc5NDVkNzJhNWI4N2Y3Zjk1N2VmZGFiOThlNTUzZGQwNGQ5NmNlNzlhMzhlOWExMDg4YzNjYzU0YTNjOTVhIn0"
+        }
+      ]
+    }
+  ],
+  "verification": {
+    "by": "openwiki/0.6.1",
+    "at": "2026-10-08T09:22:05.134Z"
+  }
+}

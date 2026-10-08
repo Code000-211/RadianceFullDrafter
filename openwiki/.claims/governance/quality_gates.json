@@ -1,0 +1,40 @@
+{
+  "schemaVersion": 1,
+  "pageVersion": "sha256:b46b4c7c4ad1570848824a4e8c7cfad8c643c43542cb169d223cb38ed20a3fa3",
+  "claims": [
+    {
+      "id": "claim_7d951a17ef1e403992e07861fa03248d",
+      "statement": "The Tier 0 Epistemic Gate enforces physical binary symbol grounding, detects silent test mocks, and cryptographically validates baseline JSON hashes before benchmarks execute.",
+      "evidence": [
+        {
+          "resource": "repo://scripts/check_epistemic_invariants.py#L30-L120",
+          "version": "repo-lines-v1:sha256:9c44c45f374ce64a4c7a5b4869a7059e9741a890c7e36e4a553fc39b76275f01:eyJzZWxlY3RlZExpbmVDb3VudCI6OTEsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjAxYmE0NzE5YzgwYjZmZTkxMWIwOTFhN2MwNTEyNGI2NGVlZWNlOTY0ZTA5YzA1OGVmOGY5ODA1ZGFjYTU0NmIiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImI1NjljYjA5MjgwZWUwNzgxOTQ1ZTQ4ZDQwNDFiZDJkZmFhZTY5MWFkMmVhYmY1ZDNjYmEwODQ2YzcyMTZjYWEiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImYyYTA0Njg3OGVmMmYxODJhMzVkOTYwODk1MjZlYTZlMjIzNWY5ZjE1OGI2ZTFiZDkwYWY5ZGI5ZmU2ZGU2NTciLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjgzMmE3MTdkYTg2YTJhNmVlYzFhNTc1ZDA0NzA2OWNiODBmMDA0ZDdiZGMwYjQzNDQ5OTg0ZWE5MWRiNDJlNDMifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_b477ff0898e340ccb3c87b254fe3bac2",
+      "statement": "The Tier 1 Parity Gate requires zero token tolerance and enforces strict throughput floors across code, reasoning, and math test suites.",
+      "evidence": [
+        {
+          "resource": "repo://scripts/parity_check.py#L35-L95",
+          "version": "repo-lines-v1:sha256:79055075c5849f8f0ff6e7ded3bac7653d9e8d8b193b9d067906f5fbafb76219:eyJzZWxlY3RlZExpbmVDb3VudCI6NjEsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImYxN2E1OWU4YzY3YzMwNGU0OTdlNDMzNzdiNGIzYTdkNjBjMzM2YmZmODEzN2FkNDViOTM1NGEwZjRmY2JjNGYiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjkzYjliMzdhODFiMzZhYWRhMWZiNDkxNWQ4YTI2ZWU4NDk2MTM5OWFmMWI2OTY0ZDA4OGMyZmQzNzc3NjhjODAiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImNiMzA2YTRhYzEzMzY5MWNmNmQ1MjlmOTVhMjcxMzg4NDMwYjg2NjljMTlkMjkwOGU1NDdiYWU5ZGI0MWYxNjUiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6Ijg2NDQzMGQ5NDNmY2MyOTQ4Y2UxNzRlZWVkM2FhMWMzYzQ0YTcyNDEzYWI5NWZlZjU2NzgxNjRmYWQ2YTVhZWMifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_55971ac65fb847faac93e91b06710ff9",
+      "statement": "No candidate code can be merged into main without passing all four automated tiers of gate_check.sh on physical dual AMD Radeon AI PRO R9700 GPUs.",
+      "evidence": [
+        {
+          "resource": "repo://scripts/gate_check.sh#L1-L40",
+          "version": "repo-lines-v1:sha256:6bd4ddc11da9a011809d2c2d866ccccc12e117b59aa2ff32093c573e28847b61:eyJzZWxlY3RlZExpbmVDb3VudCI6NDAsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjFkOTVmYzA0YTgwYzk1MmY0OWNlNDE4ODYyN2M1M2IwZmJlOGM0NDA0MWI5NTJkNTkyYWNkMWRlOTk4NjE0NjYiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjA2YjFhMGI1ZWRhOTkxMDRiZjdhMjMzMWYzZjY2NTNmMWFkNTg0NmI3NmFlMzRkODQwMjQ0YTRiNTU2ZmM1YTkiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjowLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImUzYjBjNDQyOThmYzFjMTQ5YWZiZjRjODk5NmZiOTI0MjdhZTQxZTQ2NDliOTM0Y2E0OTU5OTFiNzg1MmI4NTUiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjVlNWM0MmZmYWIwYjI0N2Y5MmE4MTI5M2Y2OWEyMGE3ZDQ3OWM4Y2NkMzYyYjdlZmJkMTdlZjQ4ZWE2MzBiZTUifQ"
+        }
+      ]
+    }
+  ],
+  "verification": {
+    "by": "openwiki/0.6.1",
+    "at": "2026-10-08T09:22:05.134Z"
+  }
+}
