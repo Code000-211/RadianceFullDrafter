@@ -150,6 +150,46 @@ TEST(the_kl_mode_records_or_scores_and_says_which_input_it_lacks) {
     CHECK_EQ(parse({ "--kld-ref" }, &f), RAD_E_INVAL);
 }
 
+/* THE DIAGNOSIS MODE: one directory, and lists that are lists. A sweep point named twice would be
+ * measured twice and reported as two rows of one number; a mode combined with another would have
+ * to pick one silently. */
+TEST(the_diagnose_mode_takes_its_workload_and_refuses_what_it_cannot_run) {
+    Config d;
+    CHECK_EQ(parse({}, &d), RAD_OK);
+    CHECK(!d.diagnose_mode());
+    CHECK_EQ(d.diagnose_tokens, 256);
+    CHECK_EQ(d.diagnose_runs, 3);
+    CHECK(d.diagnose_concurrency == std::vector<int>({ 1, 2, 4, 8 }));
+    CHECK(d.diagnose_prefill == std::vector<int>({ 1024, 4096, 16384, 65536 }));
+    CHECK(d.diagnose_corpus.empty());
+
+    Config c;
+    CHECK_EQ(parse({ "--diagnose", "/out", "--diagnose-tokens", "128", "--diagnose-runs", "5",
+                     "--diagnose-concurrency", "1,16,3", "--diagnose-prefill", "512,32768",
+                     "--diagnose-corpus", "/c.jsonl" }, &c), RAD_OK);
+    CHECK(c.diagnose_mode());
+    CHECK_EQ(c.diagnose, std::string("/out"));
+    CHECK_EQ(c.diagnose_tokens, 128);
+    CHECK_EQ(c.diagnose_runs, 5);
+    CHECK(c.diagnose_concurrency == std::vector<int>({ 1, 16, 3 }));   /* in the order given */
+    CHECK(c.diagnose_prefill == std::vector<int>({ 512, 32768 }));
+    CHECK_EQ(c.diagnose_corpus, std::string("/c.jsonl"));
+
+    Config f;
+    CHECK_EQ(parse({ "--diagnose" }, &f), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--diagnose", "/o", "--diagnose-tokens", "1" }, &f), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--diagnose", "/o", "--diagnose-runs", "0" }, &f), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--diagnose", "/o", "--diagnose-concurrency", "1,,2" }, &f), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--diagnose", "/o", "--diagnose-concurrency", "2,2" }, &f), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--diagnose", "/o", "--diagnose-concurrency", "0" }, &f), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--diagnose", "/o", "--diagnose-prefill", "4k" }, &f), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--diagnose", "/o", "--diagnose-prefill", "" }, &f), RAD_E_INVAL);
+    Config g;   /* fresh: a Config the calls above parsed into already carries --diagnose */
+    CHECK_EQ(parse({ "--diagnose-corpus", "/c.jsonl" }, &g), RAD_E_INVAL);          /* no --diagnose */
+    CHECK_EQ(parse({ "--diagnose", "/o", "--kld-ref", "/r", "--kld-out", "/x" }, &f), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--diagnose", "/o", "--debug-graph" }, &f), RAD_E_INVAL);
+}
+
 TEST(the_model_is_required_and_nothing_else_is) {
     Config c;
     Args none{};
@@ -824,6 +864,9 @@ TEST(usage_names_every_flag_it_documents) {
     CHECK(text.find("--ngram-placement") != std::string::npos);
     CHECK(text.find("--kld-record") != std::string::npos);
     CHECK(text.find("--kld-ref") != std::string::npos);
+    for (const char* f : { "--diagnose", "--diagnose-tokens", "--diagnose-runs", "--diagnose-concurrency",
+                           "--diagnose-prefill", "--diagnose-corpus" })
+        CHECK(text.find(f) != std::string::npos);
     for (const char* f : { "--default-max-tokens", "--max-tokens-cap", "--presence-penalty",
                            "--dry-sequence-breakers", "--chat-template-kwargs",
                            "--reasoning-format", "--max-n", "--max-queued-requests",

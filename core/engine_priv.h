@@ -115,4 +115,10 @@ struct TierPump {
  * moment the step loop dumps. */
 void dump_buffers(Ctx& ctx, int step, const char* names, const char* phase = "");
 
+/* The sampler a request that names none is served with: the command line, a generation config
+ * named or placed beside the container, the model's own metadata, in that order (engine.cpp).
+ * The server and the --diagnose workload both start from it. */
+SamplingParams resolve_sampling_defaults(const RadModelMeta& meta, bool container,
+                                         const Config& cfg);
+
 }  /* namespace rad */

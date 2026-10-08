@@ -42,7 +42,7 @@ Fundstellen; die wichtigsten stehen unten.
 
 | # | Baustein | Wo | Host-testbar |
 |---|---|---|---|
-| A | `--diagnose DIR`: eingebaute Last (Chat-Template, feste Seeds, `ignore_eos`), Phasen Aufwärmen → Decode 1 Stream → Decode 8 Streams → langer Prefill → optional Korrektheit; danach Bericht und Ende | `core/engine_diagnose.cpp`, reine Teile in `core/diag.{h,cpp}`, Flag in `core/config.cpp` | ja |
+| A | `--diagnose DIR`: eingebaute Last (Chat-Template, Server-Sampling mit festen Seeds). Messpunkte: Decode nach Kategorie (code, reasoning, prose, json, file_edit, summarization; Korpus eingebaut oder `--diagnose-corpus`), Concurrency-Sweep (`--diagnose-concurrency`, Default 1,2,4,8), Prefill-Sweep mit Decode in der jeweiligen Tiefe (`--diagnose-prefill`, Default 1k–64k), ein Prompt, der in laufende Streams kommt (TTFT unter Last, Stall der laufenden Streams). Jeder Punkt 1× unbewertet, dann `--diagnose-runs`× (Default 3); Median mit Spanne | `core/engine_diagnose.cpp`, reine Teile in `core/diag.{h,cpp}`, Flags in `core/config.cpp` | ja |
 | B | Schritt-Ring: pro Schritt Phase, `n_seq`, `n_tok`, akzeptierte Draft-Tokens, Phasenzeiten, Host-Syncs, Joins, Commit-Zeitstempel. Daraus ms/Schritt, Tokens/Schritt, Annahmequote, langsamste gegen typische Schritte, ITL pro Schritt | `Scheduler::step_finished` (`scheduler.cpp:1674-1712`), vorab angelegter Ring | ja |
 | C | Issue-Census: jede (Op, Band, Domain, `n`) mit Aufrufen pro Schritt und Operandenformen; Export als Datei für `rad-kbench` | `Ctx::issue_body` nach `++n_issues_` (`issue.cpp:817`), Speicher in `bind_*` | ja |
 | D | Zeitmessung pro Dispatch auf jedem N-ten Schritt im Abspiel- und Live-Pfad, Zuordnung zu Op über eine beim Aufzeichnen gespeicherte Record→Op-Tabelle; Auswertung wie `tsum.sh`/`gaps.sh` in C++ (Union-Busy, Lücke vor dem nächsten Kernel, Joins) | `aql.cpp` PlayRun::put/dispatch, Sammler außerhalb des Step-Pfads | Zuordnung ja, Zeit nein |
@@ -62,15 +62,34 @@ Fundstellen; die wichtigsten stehen unten.
 
 ## Reihenfolge
 
-1. **A + B + G** (Grundgerüst, Host-testbar): Flag, Treiber, Schritt-Ring, Bericht, Dashboard.
-   Danach liefert `--diagnose` sofort ms/Schritt, Tokens/Schritt, Annahme, TTFT, ITL-Verteilung,
-   langsamste Schritte, Placement-Zähler pro Phase.
+1. **A + B** (fertig, Host-getestet): Flag, Treiber, Schritt-Ring, Bericht mit Kategorien,
+   Concurrency- und Prefill-Sweep, Interferenz. **1b + G**: Placement-Zähler pro Phase, Dashboard.
 2. **C** (Census) und `rad-kbench --census` mit Vorhersage.
 3. **D + E** (Gerät): Zeitstempel pro Dispatch, Kalibrierung; Prüfung auf epyc durch die Pipeline.
 4. **F** (Korrektheitsfenster) und Kausaltest.
 5. Was-wäre-wenn und Abstand zur Grenze.
 
 Jeder Schritt einzeln baubar, mit Tests im Host-Backend, und einzeln als PR an Upstream denkbar.
+
+## Damit die Messung real ist
+
+| Störgröße | Was der Diagnose-Lauf tut |
+|---|---|
+| Prefix-Cache (VRAM, Host- und Disk-Tier) | Jeder Prompt trägt am Anfang ein Tag, eindeutig pro Prozess und Request (die Tiers überleben einen Neustart, also enthält das Tag Zeit und PID). Cache vor jedem Lauf geleert. Nach jedem Lauf wird `n_cached` jedes Requests geprüft; ein Treffer macht das Urteil „NOT A MEASUREMENT“ und den Exit-Code ungleich 0. Der Cache bleibt an, damit Lookup, Publizieren und Checkpoints wie im Betrieb bezahlt werden. `--no-prefix-cache` geht auch, steht dann als Warnung im Bericht |
+| Erste Ausführung einer Form (Tape-Aufnahme, Code-Objekte laden) | Jeder Messpunkt läuft einmal unbewertet vorher, in derselben Form |
+| `ignore_eos` erzeugt Text nach dem EOS, auf dem der Drafter anders trifft | Kategorien enden auf dem EOS des Modells (Anzahl wird berichtet); nur Concurrency und Prefill nutzen `ignore_eos`, damit alle Streams die ganze Zeit dekodieren |
+| Greedy oder falsches Sampling verfälscht die Annahmequote | Server-Defaults (`generation_config`), feste Seeds pro Request |
+| Reasoning an/aus ändert die Ausgabeverteilung | Deployment-Default (`--reasoning-effort`), im Bericht festgehalten |
+| Decode-Geschwindigkeit hängt von der Kontexttiefe ab | Prefill-Sweep misst Decode in jeder Tiefe |
+| Rauschen von Lauf zu Lauf | `--diagnose-runs`, Median mit Min–Max |
+| Host-Last (Agent-Builds auf epyc!) | Load-Average am Anfang und Ende im Bericht, Warnung bei Last > CPUs/4. Diagnose nur laufen lassen, wenn die Queue die GPUs hat und keine Builds laufen |
+| Dynamische Platzierung driftet mit der Last | Plan-Modus im Bericht; für Vergleiche `--deterministic` oder gleiche Reihenfolge der Punkte. Placement-Zähler pro Phase: Schritt 1b |
+| HTTP, Detokenisierung, SSE | Nicht enthalten (steht im Bericht). Der Abstand zu BetterBench ist genau dieser Anteil |
+| Verbotene Einstellungen (`AGENTS.md` §4) | Warnung im Bericht (`RADIANCE_HEAT_RESIDENCY`, `--profile-ops`) |
+
+Für die BetterBench-Kategorien mit denselben Prompts: deren Korpus einmal als JSONL exportieren
+(`{"category", "messages"}` pro Zeile) und mit `--diagnose-corpus` übergeben. Gewichtung und Score
+bleiben außerhalb der Engine (`scripts/bench_metrics.py`), sie lesen `diagnose.json`.
 
 ## Messregeln, die der Bericht einhält
 

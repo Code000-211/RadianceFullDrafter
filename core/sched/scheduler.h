@@ -21,6 +21,7 @@
 #include "batch.h"
 #include "draft.h"
 #include "metrics.h"
+#include "../diag.h"
 
 #include <chrono>
 #include <memory>
@@ -263,6 +264,15 @@ public:
      * a steady state allocates nothing. */
     void     take_completed(std::vector<uint64_t>* out);
     int      reap(uint64_t id);
+
+    /* ---------------------------------------------------------- the step record (--diagnose)
+     *
+     * One diag::StepRecord per committed step, in a ring sized at init, so a reader can take
+     * every step a phase ran -- its shape and its time -- without a second clock. Both calls take
+     * the lock; `step_records` appends what came after `from` and returns how many of those the
+     * ring overwrote before they were read (diag.h). */
+    uint64_t step_record_count() const;
+    uint64_t step_records(uint64_t from, std::vector<diag::StepRecord>* out) const;
 
     /* ---------------------------------------------------------- the lock, for the engine
      *
@@ -679,6 +689,8 @@ private:
      * nothing adding time to it, and metrics() decays what it reports by this. */
     std::chrono::steady_clock::time_point last_step_at_ = std::chrono::steady_clock::now();
     int64_t step_prefill_tok_ = 0, step_decode_tok_ = 0;
+    /* Sized once at init and written under mu_ in step_finished: a store a step, no allocation. */
+    diag::StepRing step_ring_;
     /* The throughput window (step_finished): each kind's tokens and the wall time the steps
      * covered, both decayed with the same time constant, so their ratio is tokens over time. */
     double  tps_win_prefill_ = 0.0, tps_win_decode_ = 0.0, tps_win_time_ = 0.0;

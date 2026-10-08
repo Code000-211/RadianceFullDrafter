@@ -1627,7 +1627,7 @@ int Engine::serve() {
     for (int i = 0; i < cfg_.tp; ++i) rank_threads_.emplace_back([this, i] { rank_loop(i); });
     std::thread stepper([this] { step_loop(); });
 
-    int s = cfg_.kld() ? run_kld() : run_server();
+    int s = cfg_.diagnose_mode() ? run_diagnose() : cfg_.kld() ? run_kld() : run_server();
 
     /* Stop the step loop before anything the server owns is destroyed: Request::sink is a raw
      * pointer into the server's storage, and a request the scheduler has not finished is a request
@@ -1792,6 +1792,7 @@ std::string Engine::engine_info() const {
 namespace {
 std::atomic<bool> g_signalled{false};
 void on_signal(int) { g_signalled.store(true, std::memory_order_relaxed); }
+}  /* namespace */
 
 /* ================================================================== sampling defaults */
 /* WHAT A REQUEST THAT SENDS NO SAMPLER SETTINGS IS SERVED WITH.
@@ -1867,6 +1868,7 @@ SamplingParams resolve_sampling_defaults(const RadModelMeta& meta, bool containe
     return sp;
 }
 
+namespace {
 /* "presence_penalty 1.5, max_tokens auto, ..." -- every request default and bound the command line
  * moved, under the request's spelling of the field, or "" when it moved none. The four fields
  * resolve_sampling_defaults describes are not repeated. */

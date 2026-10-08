@@ -996,6 +996,17 @@ for a model that takes no images or video.
 | `--kld-corpus FILE` | JSONL, one `{"prompt", "score_from"?, "source"?}` a line; `--kld-record` only |
 | `--kld-out FILE` | the `--kld-ref` report as JSON, and every position's numbers in `FILE.rows` |
 
+**Self-measurement** — instead of serving; see [6.8](#68-measuring-this-engine---diagnose)
+
+| flag | default | |
+|---|---|---|
+| `--diagnose DIR` | | run the built-in workload on this engine and write `DIR/diagnose.json` and `DIR/diagnose.md` |
+| `--diagnose-tokens N` | 256 | tokens a decode stream generates |
+| `--diagnose-runs N` | 3 | measured runs of every point, after one unmeasured |
+| `--diagnose-concurrency LIST` | `1,2,4,8` | stream counts of the concurrency sweep |
+| `--diagnose-prefill LIST` | `1024,4096,16384,65536` | prompt lengths of the prefill sweep |
+| `--diagnose-corpus FILE` | built-in | JSONL of category prompts, one `{"category", "messages" or "prompt", "max_tokens"?}` a line |
+
 **Diagnostics**
 
 | flag | |
@@ -1474,6 +1485,39 @@ a running server and waits for the process to actually go — which matters, bec
 released until it does.
 
 ---
+
+### 6.8 Measuring this engine: `--diagnose`
+
+```sh
+radiance --model m.rad --tp 2 --diagnose /tmp/diag
+```
+
+The engine starts exactly as it would to serve, runs a fixed workload on itself instead of
+listening, writes `diagnose.json` (every run in full) and `diagnose.md` (one table a sweep) and
+exits. Non-zero exit means a request failed or the run is not a measurement (below).
+
+| Point | What runs | What it reports |
+|---|---|---|
+| categories | each corpus prompt, one stream, ending on the model's EOS | stream tok/s, ms a step, tokens a step, draft acceptance, TTFT, by category |
+| concurrency | N streams submitted together, for each N, `ignore_eos` | aggregate and per-stream tok/s, ms a step, tokens a step, emission intervals, jitter, 1% low |
+| prefill | one prompt of each length, then a short decode | TTFT, prefill tok/s, chunk times, decode speed at that depth |
+| interference | up to 4 streams decoding, then one prompt arriving | its TTFT under load beside its idle TTFT, and the longest gap it put into the running streams |
+
+What makes the numbers those of a server and not of a benchmark mode: the chat template and the
+deployment's reasoning default, the server's sampling defaults (with a fixed seed per request),
+drafting and pipelining as configured, the prefix cache on. What makes them repeatable: every
+point is run once unmeasured -- a new batch shape records its passes and loads code on first use --
+then `--diagnose-runs` times from an idle engine, and each cell is the median with the range of
+the runs beside it.
+
+**Nothing is served from the prefix cache.** Every prompt carries a tag unique to the process and
+the request at its very head, the cache is emptied before every run, and every request's cached
+token count is checked. A run the cache served anything of turns the report's verdict to *not a
+measurement*. The cache stays on, so the cost a request pays for missing it is measured.
+
+What it does not measure is listed in the report itself: per-kernel time (that needs dispatch
+timestamps, which are not built yet), the HTTP path and streaming to a client, and placement
+counters. A busy host is reported, because the scheduler plans between steps on the CPU.
 
 ## 7. When something goes wrong
 

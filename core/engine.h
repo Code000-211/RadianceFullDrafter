@@ -350,6 +350,7 @@ private:
      * scoring requests, and every step's scored rows copied to the host and handed to `kld_`.
      * One pinned block a rank, a step's tokens of this rank's logits columns. */
     int  run_kld();
+    int  run_diagnose();   /* --diagnose: core/engine_diagnose.cpp */
     int  score_rows(const RadBatch* b, const StepOut& so);
     std::unique_ptr<Kld> kld_;
     std::vector<float*>  kld_host_;

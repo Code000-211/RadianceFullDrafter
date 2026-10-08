@@ -52,6 +52,9 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
     cfg_ = cfg;
     kv_ = kv;
     pc_ = pc;
+    /* 64 Ki steps is minutes of decode at any step rate this engine reaches, and 3 MiB. A reader
+     * that falls further behind is told how many it lost, not handed the wrong ones. */
+    step_ring_.reset(1u << 16);
 
     /* The engine resolves this once and hands it over, because the prefix cache needs the
      * checkpoint interval out of it before this runs. A caller that passes nothing (the tests)
@@ -1680,6 +1683,17 @@ void Scheduler::step_finished() {
         std::chrono::duration_cast<std::chrono::nanoseconds>(step_end - step_start_).count();
     m_.step_ns += ns;
     if (plan_.phase == RAD_PHASE_DECODE) m_.step_ns_decode += ns;
+    {
+        diag::StepRecord r;
+        r.step = m_.steps;
+        r.phase = plan_.phase;
+        r.n_seq = (int32_t)plan_.e.size();
+        r.prefill_tok = (int32_t)step_prefill_tok_;
+        r.decode_tok = (int32_t)step_decode_tok_;
+        r.ns = ns;
+        r.end_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(step_end.time_since_epoch()).count();
+        step_ring_.push(r);
+    }
 
     const auto   from = step_start_ - last_step_at_ < std::chrono::milliseconds(500)
                             ? last_step_at_ : step_start_;
@@ -1709,6 +1723,16 @@ void Scheduler::step_finished() {
     last_step_at_ = step_end;
     /* So a second call, or one on a loop iteration that ran no step, charges nothing. */
     step_start_ = {};
+}
+
+uint64_t Scheduler::step_record_count() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return step_ring_.count();
+}
+
+uint64_t Scheduler::step_records(uint64_t from, std::vector<diag::StepRecord>* out) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return step_ring_.copy_since(from, out);
 }
 
 /* ------------------------------------------------------------------ the serial drafter */
