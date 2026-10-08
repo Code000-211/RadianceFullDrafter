@@ -115,10 +115,14 @@ fi
 echo ""
 echo "🔨 [Step 3/5] Building binaries in worktree..."
 if [ -f "${WORKTREE_DIR}/build_hip/build.ninja" ]; then
-    ninja -C "${WORKTREE_DIR}/build_hip" -j32 arch_test || ninja -C "${WORKTREE_DIR}/build_hip" -j32
+    ninja -C "${WORKTREE_DIR}/build_hip" -j32 radiance arch_test || ninja -C "${WORKTREE_DIR}/build_hip" -j32
 else
-    cmake -B "${WORKTREE_DIR}/build_hip" -S "${WORKTREE_DIR}" -G Ninja -DRAD_BUILD_HIP=ON
-    ninja -C "${WORKTREE_DIR}/build_hip" -j32 arch_test || ninja -C "${WORKTREE_DIR}/build_hip" -j32
+    cmake -B "${WORKTREE_DIR}/build_hip" -S "${WORKTREE_DIR}" -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DRAD_WITH_HIP=ON \
+        -DRAD_GPU_TARGETS=gfx1201 \
+        -DRAD_BUILD_TESTS=ON
+    ninja -C "${WORKTREE_DIR}/build_hip" -j32 radiance arch_test || ninja -C "${WORKTREE_DIR}/build_hip" -j32
 fi
 
 # Step 4: Hot-Swap Dual-GPU Engine to Candidate Binary
@@ -172,11 +176,16 @@ if [ ${GATE_RC} -eq 0 ]; then
         gh issue comment "${ISSUE_NUM}" --body "### 🏆 Master Quality Gate Passed!\n\nCandidate \`${CANDIDATE_SLUG}\` has passed all 4 tiers of \`scripts/gate_check.sh\`.\n\nOpening Pull Request against \`main\`."
         gh issue edit "${ISSUE_NUM}" --add-label "status:gate-passed" --remove-label "status:in-progress,status:needs-review,regression:detected"
         
-        # Open Pull Request
         PR_URL=$(gh pr create --head "worktree/${CANDIDATE_SLUG}" --base main \
             --title "feat: integrate candidate ${CANDIDATE_SLUG}" \
             --body "Automated PR created by AGY Runner.\n\nCloses #${ISSUE_NUM}.\n\nVerified clean via 4-Tier Master Gate on dual AMD Radeon AI PRO R9700." 2>/dev/null || true)
         echo "✓ Pull Request created: ${PR_URL}"
+    fi
+
+    # Restore golden baseline engine on physical GPUs
+    if [ "${DRY_RUN}" != "1" ]; then
+        echo "🔄 Restoring golden baseline engine..."
+        bash "${SCRIPT_DIR}/engine_manager.sh" restore-golden || true
     fi
     exit 0
 else

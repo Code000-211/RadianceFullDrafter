@@ -55,12 +55,13 @@ else
 fi
 
 # Initialize isolated build environment directory
-mkdir -p "${WORKTREE_DIR}/build_hip"
-if [ -d "${REPO_ROOT}/build_hip/radiance_home" ] && [ ! -e "${WORKTREE_DIR}/build_hip/radiance_home" ]; then
-    ln -sf "${REPO_ROOT}/build_hip/radiance_home" "${WORKTREE_DIR}/build_hip/radiance_home"
+mkdir -p "${WORKTREE_DIR}/build_hip/bin"
+mkdir -p "${WORKTREE_DIR}/build_hip/radiance_home"
+if [ -d "${REPO_ROOT}/build_hip/radiance_home" ]; then
+    cp -rn "${REPO_ROOT}/build_hip/radiance_home/"* "${WORKTREE_DIR}/build_hip/radiance_home/" 2>/dev/null || true
 fi
-if [ -d "${REPO_ROOT}/build_hip/bin" ] && [ ! -e "${WORKTREE_DIR}/build_hip/bin" ]; then
-    ln -sf "${REPO_ROOT}/build_hip/bin" "${WORKTREE_DIR}/build_hip/bin"
+if [ -d "${REPO_ROOT}/build_hip/bin" ]; then
+    cp -rn "${REPO_ROOT}/build_hip/bin/"* "${WORKTREE_DIR}/build_hip/bin/" 2>/dev/null || true
 fi
 
 # Check if corresponding candidate lever exists
