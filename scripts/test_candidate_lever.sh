@@ -70,6 +70,18 @@ if [ -n "${ISSUE_NUM}" ] && command -v gh >/dev/null 2>&1; then
     gh issue comment "${ISSUE_NUM}" --body "🤖 **AGY Runner**: Started isolated worktree testing for \`${CANDIDATE_SLUG}\` on dual AMD Radeon AI PRO R9700 GPUs." 2>/dev/null || true
 fi
 
+# Step 0: Deterministic Patch Safety Check (eval_patch_safety.py)
+echo ""
+echo "🛡️  [Step 0/4] Deterministic Patch Safety Audit (Zero LLM Tokens)..."
+if ! python3 "${SCRIPT_DIR}/eval_patch_safety.py" "${PATCH_FILE}"; then
+    echo "❌ FATAL: Candidate patch failed deterministic safety audit!" >&2
+    if [ -n "${ISSUE_NUM}" ] && command -v gh >/dev/null 2>&1; then
+        gh issue comment "${ISSUE_NUM}" --body "### ❌ Patch Rejected by Deterministic Safety Auditor\n\nAnti-patterns detected in \`${PATCH_FILE}\`. Check worktree logs."
+        gh issue edit "${ISSUE_NUM}" --add-label "status:needs-review,regression:detected" --remove-label "status:in-progress"
+    fi
+    exit 1
+fi
+
 # Step 1: Provision Isolated Worktree
 WORKTREE_DIR="${REPO_ROOT}/worktrees/${CANDIDATE_SLUG}"
 echo ""
