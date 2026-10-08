@@ -1,0 +1,2186 @@
+{
+  "prs": {
+    "56": {
+      "pr_id": 56,
+      "title": "scripts/cardclock.py: what holds each card's clock under load, and which card the TP step waits for",
+      "author": "bakon",
+      "url": "https://github.com/OoguroRyuuya/RadianceMine/pull/6",
+      "updated_at": "2026-10-08T06:58:21+02:00",
+      "status": "DOCS_OR_TOOLING",
+      "github_issue": "https://github.com/OoguroRyuuya/RadianceMine/issues/5",
+      "github_pr": "https://github.com/OoguroRyuuya/RadianceMine/pull/6",
+      "jev": {
+        "subsystem": {
+          "type": "choice",
+          "choice": "tooling",
+          "confidence": 1.0,
+          "probabilities": {
+            "drafter": 0.0,
+            "interconnect": 0.0,
+            "moe": 0.0,
+            "serving": 0.0,
+            "gemm": 0.0,
+            "general": 0.0,
+            "tooling": 1.0,
+            "gdn": 0.0,
+            "qsa": 0.0
+          }
+        },
+        "violates_rdna4_limits": {
+          "type": "noul",
+          "noul": 0.05
+        },
+        "feasibility": {
+          "type": "score",
+          "score": 2.77,
+          "confidence": 0.64,
+          "legend": {
+            "0": "Unfeasible / contradicts hardware laws / CUDA-only",
+            "1": "High risk or complex external dependency",
+            "2": "Moderate feasibility / experimental",
+            "3": "Feasible / standard ROCm HIP implementation",
+            "4": "Immediate high-value quick win"
+          },
+          "probabilities": {
+            "0": 0.01,
+            "1": 0.03,
+            "2": 0.24,
+            "3": 0.62,
+            "4": 0.1
+          }
+        },
+        "performance_roi": {
+          "type": "score",
+          "score": 0.93,
+          "confidence": 0.9,
+          "legend": {
+            "0": "Zero or negative performance impact (docs, tool, placebo)",
+            "1": "Marginal gain (<2%) or monitoring/stability utility",
+            "2": "Solid architectural gain (2-5%)",
+            "3": "High-impact gain (5-15%)",
+            "4": "Breakthrough gain (>15%)"
+          },
+          "probabilities": {
+            "0": 0.1,
+            "1": 0.89,
+            "2": 0.0,
+            "3": 0.01,
+            "4": 0.0
+          }
+        }
+      },
+      "safety": {
+        "passed": true,
+        "violations": []
+      }
+    },
+    "55": {
+      "pr_id": 55,
+      "title": "libr4d: --tp-wire wht6 at three ranks, the tiered-int8 wire over the uneven two-shot (#46)",
+      "author": "bakon",
+      "url": null,
+      "updated_at": "2026-10-08T02:37:39+02:00",
+      "status": "READY_TO_TEST",
+      "github_issue": "https://github.com/OoguroRyuuya/RadianceMine/issues/7",
+      "github_pr": null,
+      "jev": {
+        "subsystem": {
+          "type": "choice",
+          "choice": "interconnect",
+          "confidence": 0.95,
+          "probabilities": {
+            "tooling": 0.0,
+            "drafter": 0.0,
+            "serving": 0.0,
+            "general": 0.03,
+            "moe": 0.0,
+            "gemm": 0.01,
+            "qsa": 0.0,
+            "gdn": 0.0,
+            "interconnect": 0.96
+          }
+        },
+        "violates_rdna4_limits": {
+          "type": "noul",
+          "noul": 0.11
+        },
+        "feasibility": {
+          "type": "score",
+          "score": 1.82,
+          "confidence": 0.0,
+          "legend": {
+            "0": "Unfeasible / contradicts hardware laws / CUDA-only",
+            "1": "High risk or complex external dependency",
+            "2": "Moderate feasibility / experimental",
+            "3": "Feasible / standard ROCm HIP implementation",
+            "4": "Immediate high-value quick win"
+          },
+          "probabilities": {
+            "0": 0.2,
+            "1": 0.2,
+            "2": 0.22,
+            "3": 0.36,
+            "4": 0.02
+          }
+        },
+        "performance_roi": {
+          "type": "score",
+          "score": 1.56,
+          "confidence": 0.0,
+          "legend": {
+            "0": "Zero or negative performance impact (docs, tool, placebo)",
+            "1": "Marginal gain (<2%) or monitoring/stability utility",
+            "2": "Solid architectural gain (2-5%)",
+            "3": "High-impact gain (5-15%)",
+            "4": "Breakthrough gain (>15%)"
+          },
+          "probabilities": {
+            "0": 0.27999999999999997,
+            "1": 0.18,
+            "2": 0.25,
+            "3": 0.27,
+            "4": 0.02
+          }
+        }
+      },
+      "safety": {
+        "passed": true,
+        "violations": []
+      }
+    },
+    "54": {
+      "pr_id": 54,
+      "title": "libr4d: a three-rank two-shot all-reduce, with shards one word uneven",
+      "author": "bakon",
+      "url": null,
+      "updated_at": "2026-10-08T02:37:39+02:00",
+      "status": "READY_TO_TEST",
+      "github_issue": "https://github.com/OoguroRyuuya/RadianceMine/issues/8",
+      "github_pr": null,
+      "jev": {
+        "subsystem": {
+          "type": "choice",
+          "choice": "interconnect",
+          "confidence": 1.0,
+          "probabilities": {
+            "gdn": 0.0,
+            "interconnect": 1.0,
+            "serving": 0.0,
+            "gemm": 0.0,
+            "general": 0.0,
+            "qsa": 0.0,
+            "drafter": 0.0,
+            "tooling": 0.0,
+            "moe": 0.0
+          }
+        },
+        "violates_rdna4_limits": {
+          "type": "noul",
+          "noul": 0.12
+        },
+        "feasibility": {
+          "type": "score",
+          "score": 2.2,
+          "confidence": 0.25,
+          "legend": {
+            "0": "Unfeasible / contradicts hardware laws / CUDA-only",
+            "1": "High risk or complex external dependency",
+            "2": "Moderate feasibility / experimental",
+            "3": "Feasible / standard ROCm HIP implementation",
+            "4": "Immediate high-value quick win"
+          },
+          "probabilities": {
+            "0": 0.12,
+            "1": 0.13,
+            "2": 0.23,
+            "3": 0.47,
+            "4": 0.05
+          }
+        },
+        "performance_roi": {
+          "type": "score",
+          "score": 2.42,
+          "confidence": 0.36,
+          "legend": {
+            "0": "Zero or negative performance impact (docs, tool, placebo)",
+            "1": "Marginal gain (<2%) or monitoring/stability utility",
+            "2": "Solid architectural gain (2-5%)",
+            "3": "High-impact gain (5-15%)",
+            "4": "Breakthrough gain (>15%)"
+          },
+          "probabilities": {
+            "0": 0.1,
+            "1": 0.08,
+            "2": 0.21,
+            "3": 0.51,
+            "4": 0.1
+          }
+        }
+      },
+      "safety": {
+        "passed": true,
+        "violations": []
+      }
+    },
+    "52": {
+      "pr_id": 52,
+      "title": "engine: a collective with no device kernel for a message size refuses at startup (#46)",
+      "author": "bakon",
+      "url": null,
+      "updated_at": "2026-10-08T02:37:39+02:00",
+      "status": "READY_TO_TEST",
+      "github_issue": "https://github.com/OoguroRyuuya/RadianceMine/issues/9",
+      "github_pr": null,
+      "jev": {
+        "subsystem": {
+          "type": "choice",
+          "choice": "interconnect",
+          "confidence": 0.46,
+          "probabilities": {
+            "moe": 0.0,
+            "qsa": 0.0,
+            "general": 0.48,
+            "interconnect": 0.52,
+            "gemm": 0.0,
+            "tooling": 0.0,
+            "drafter": 0.0,
+            "gdn": 0.0,
+            "serving": 0.0
+          }
+        },
+        "violates_rdna4_limits": {
+          "type": "noul",
+          "noul": 0.09
+        },
+        "feasibility": {
+          "type": "score",
+          "score": 2.68,
+          "confidence": 0.55,
+          "legend": {
+            "0": "Unfeasible / contradicts hardware laws / CUDA-only",
+            "1": "High risk or complex external dependency",
+            "2": "Moderate feasibility / experimental",
+            "3": "Feasible / standard ROCm HIP implementation",
+            "4": "Immediate high-value quick win"
+          },
+          "probabilities": {
+            "0": 0.03,
+            "1": 0.09,
+            "2": 0.16,
+            "3": 0.61,
+            "4": 0.11
+          }
+        },
+        "performance_roi": {
+          "type": "score",
+          "score": 0.73,
+          "confidence": 0.74,
+          "legend": {
+            "0": "Zero or negative performance impact (docs, tool, placebo)",
+            "1": "Marginal gain (<2%) or monitoring/stability utility",
+            "2": "Solid architectural gain (2-5%)",
+            "3": "High-impact gain (5-15%)",
+            "4": "Breakthrough gain (>15%)"
+          },
+          "probabilities": {
+            "0": 0.29,
+            "1": 0.7,
+            "2": 0.0,
+            "3": 0.01,
+            "4": 0.0
+          }
+        }
+      },
+      "safety": {
+        "passed": true,
+        "violations": []
+      }
+    },
+    "51": {
+      "pr_id": 51,
+      "title": "serve: --model takes an HF repo id, fetched to $RADIANCE_HOME/hf via hfget.sh",
+      "author": "redxherring",
+      "url": null,
+      "updated_at": "2026-10-08T01:15:22+02:00",
+      "status": "SERVING_ENDPOINT",
+      "github_issue": "https://github.com/OoguroRyuuya/RadianceMine/issues/10",
+      "github_pr": null,
+      "jev": {
+        "subsystem": {
+          "type": "choice",
+          "choice": "serving",
+          "confidence": 1.0,
+          "probabilities": {
+            "interconnect": 0.0,
+            "qsa": 0.0,
+            "drafter": 0.0,
+            "moe": 0.0,
+            "serving": 1.0,
+            "general": 0.0,
+            "gemm": 0.0,
+            "tooling": 0.0,
+            "gdn": 0.0
+          }
+        },
+        "violates_rdna4_limits": {
+          "type": "noul",
+          "noul": 0.07
+        },
+        "feasibility": {
+          "type": "score",
+          "score": 2.21,
+          "confidence": 0.23,
+          "legend": {
+            "0": "Unfeasible / contradicts hardware laws / CUDA-only",
+            "1": "High risk or complex external dependency",
+            "2": "Moderate feasibility / experimental",
+            "3": "Feasible / standard ROCm HIP implementation",
+            "4": "Immediate high-value quick win"
+          },
+          "probabilities": {
+            "0": 0.02,
+            "1": 0.31,
+            "2": 0.18,
+            "3": 0.43,
+            "4": 0.06
+          }
+        },
+        "performance_roi": {
+          "type": "score",
+          "score": 0.19,
+          "confidence": 0.85,
+          "legend": {
+            "0": "Zero or negative performance impact (docs, tool, placebo)",
+            "1": "Marginal gain (<2%) or monitoring/stability utility",
+            "2": "Solid architectural gain (2-5%)",
+            "3": "High-impact gain (5-15%)",
+            "4": "Breakthrough gain (>15%)"
+          },
+          "probabilities": {
+            "0": 0.85,
+            "1": 0.13,
+            "2": 0.01,
+            "3": 0.01,
+            "4": 0.0
+          }
+        }
+      },
+      "safety": {
+        "passed": true,
+        "violations": []
+      }
+    },
+    "50": {
+      "pr_id": 50,
+      "title": "Add LFM2 BF16 and System One text and image decisions",
+      "author": "zivius",
+      "url": null,
+      "updated_at": "2026-10-08T00:40:16+02:00",
+      "status": "SERVING_ENDPOINT",
+      "github_issue": "https://github.com/OoguroRyuuya/RadianceMine/issues/11",
+      "github_pr": null,
+      "jev": {
+        "subsystem": {
+          "type": "choice",
+          "choice": "serving",
+          "confidence": 0.83,
+          "probabilities": {
+            "gdn": 0.02,
+            "drafter": 0.0,
+            "interconnect": 0.0,
+            "general": 0.12,
+            "tooling": 0.0,
+            "serving": 0.85,
+            "gemm": 0.01,
+            "qsa": 0.0,
+            "moe": 0.0
+          }
+        },
+        "violates_rdna4_limits": {
+          "type": "noul",
+          "noul": 0.18
+        },
+        "feasibility": {
+          "type": "score",
+          "score": 1.65,
+          "confidence": 0.33,
+          "legend": {
+            "0": "Unfeasible / contradicts hardware laws / CUDA-only",
+            "1": "High risk or complex external dependency",
+            "2": "Moderate feasibility / experimental",
+            "3": "Feasible / standard ROCm HIP implementation",
+            "4": "Immediate high-value quick win"
+          },
+          "probabilities": {
+            "0": 0.06,
+            "1": 0.44,
+            "2": 0.27,
+            "3": 0.22,
+            "4": 0.01
+          }
+        },
+        "performance_roi": {
+          "type": "score",
+          "score": 1.41,
+          "confidence": 0.0,
+          "legend": {
+            "0": "Zero or negative performance impact (docs, tool, placebo)",
+            "1": "Marginal gain (<2%) or monitoring/stability utility",
+            "2": "Solid architectural gain (2-5%)",
+            "3": "High-impact gain (5-15%)",
+            "4": "Breakthrough gain (>15%)"
+          },
+          "probabilities": {
+            "0": 0.45,
+            "1": 0.11,
+            "2": 0.11,
+            "3": 0.23,
+            "4": 0.1
+          }
+        }
+      },
+      "safety": {
+        "passed": true,
+        "violations": []
+      }
+    },
+    "49": {
+      "pr_id": 49,
+      "title": "WIP: serve: --model takes an HF repo id, fetched to $RADIANCE_HOME/hf via hfget.sh",
+      "author": "redxherring",
+      "url": "https://codeberg.org/StillDeadcode/radiance/pulls/49",
+      "updated_at": "2026-10-08T00:38:24+02:00",
+      "status": "SERVING_ENDPOINT",
+      "jev": {
+        "subsystem": {
+          "type": "choice",
+          "choice": "serving",
+          "confidence": 1.0,
+          "probabilities": {
+            "tooling": 0.0,
+            "interconnect": 0.0,
+            "serving": 1.0,
+            "gemm": 0.0,
+            "general": 0.0,
+            "qsa": 0.0,
+            "drafter": 0.0,
+            "gdn": 0.0,
+            "moe": 0.0
+          }
+        },
+        "violates_rdna4_limits": {
+          "type": "noul",
+          "noul": 0.09
+        },
+        "feasibility": {
+          "type": "score",
+          "score": 1.97,
+          "confidence": 0.16,
+          "legend": {
+            "0": "Unfeasible / contradicts hardware laws / CUDA-only",
+            "1": "High risk or complex external dependency",
+            "2": "Moderate feasibility / experimental",
+            "3": "Feasible / standard ROCm HIP implementation",
+            "4": "Immediate high-value quick win"
+          },
+          "probabilities": {
+            "0": 0.02,
+            "1": 0.36,
+            "2": 0.27,
+            "3": 0.33,
+            "4": 0.02
+          }
+        },
+        "performance_roi": {
+          "type": "score",
+          "score": 0.41,
+          "confidence": 0.66,
+          "legend": {
+            "0": "Zero or negative performance impact (docs, tool, placebo)",
+            "1": "Marginal gain (<2%) or monitoring/stability utility",
+            "2": "Solid architectural gain (2-5%)",
+            "3": "High-impact gain (5-15%)",
+            "4": "Breakthrough gain (>15%)"
+          },
+          "probabilities": {
+            "0": 0.66,
+            "1": 0.29,
+            "2": 0.03,
+            "3": 0.02,
+            "4": 0.0
+          }
+        }
+      },
+      "safety": {
+        "passed": true,
+        "violations": []
+      }
+    },
+    "48": {
+      "pr_id": 48,
+      "title": "checkpoint: import an NVFP4 release as its codes beside the e4m3 table over the tensor's f32 global, and per-channel FP8 by its row scale",
+      "author": "devmilan",
+      "url": null,
+      "updated_at": "2026-10-07T23:26:31+02:00",
+      "status": "REJECTED_UNFEASIBLE",
+      "github_issue": "https://github.com/OoguroRyuuya/RadianceMine/issues/12",
+      "github_pr": null,
+      "jev": {
+        "subsystem": {
+          "type": "choice",
+          "choice": "gemm",
+          "confidence": 0.66,
+          "probabilities": {
+            "qsa": 0.0,
+            "serving": 0.01,
+            "interconnect": 0.0,
+            "gemm": 0.7,
+            "moe": 0.0,
+            "tooling": 0.0,
+            "gdn": 0.0,
+            "general": 0.29,
+            "drafter": 0.0
+          }
+        },
+        "violates_rdna4_limits": {
+          "type": "noul",
+          "noul": 0.15
+        },
+        "feasibility": {
+          "type": "score",
+          "score": 0.81,
+          "confidence": 0.33,
+          "legend": {
+            "0": "Unfeasible / contradicts hardware laws / CUDA-only",
+            "1": "High risk or complex external dependency",
+            "2": "Moderate feasibility / experimental",
+            "3": "Feasible / standard ROCm HIP implementation",
+            "4": "Immediate high-value quick win"
+          },
+          "probabilities": {
+            "0": 0.49,
+            "1": 0.29,
+            "2": 0.15,
+            "3": 0.07,
+            "4": 0.0
+          }
+        },
+        "performance_roi": {
+          "type": "score",
+          "score": 0.59,
+          "confidence": 0.48,
+          "legend": {
+            "0": "Zero or negative performance impact (docs, tool, placebo)",
+            "1": "Marginal gain (<2%) or monitoring/stability utility",
+            "2": "Solid architectural gain (2-5%)",
+            "3": "High-impact gain (5-15%)",
+            "4": "Breakthrough gain (>15%)"
+          },
+          "probabilities": {
+            "0": 0.7,
+            "1": 0.1,
+            "2": 0.09,
+            "3": 0.1,
+            "4": 0.01
+          }
+        }
+      },
+      "safety": {
+        "passed": true,
+        "violations": []
+      }
+    },
+    "45": {
+      "pr_id": 45,
+      "title": "serve: /props answers what llama-server clients read",
+      "author": "bakon",
+      "url": null,
+      "updated_at": "2026-10-08T01:12:49+02:00",
+      "status": "SERVING_ENDPOINT",
+      "github_issue": "https://github.com/OoguroRyuuya/RadianceMine/issues/13",
+      "github_pr": null,
+      "jev": {
+        "subsystem": {
+          "type": "choice",
+          "choice": "serving",
+          "confidence": 1.0,
+          "probabilities": {
+            "interconnect": 0.0,
+            "serving": 1.0,
+            "general": 0.0,
+            "qsa": 0.0,
+            "moe": 0.0,
+            "gemm": 0.0,
+            "tooling": 0.0,
+            "drafter": 0.0,
+            "gdn": 0.0
+          }
+        },
+        "violates_rdna4_limits": {
+          "type": "noul",
+          "noul": 0.05
+        },
+        "feasibility": {
+          "type": "score",
+          "score": 2.79,
+          "confidence": 0.43,
+          "legend": {
+            "0": "Unfeasible / contradicts hardware laws / CUDA-only",
+            "1": "High risk or complex external dependency",
+            "2": "Moderate feasibility / experimental",
+            "3": "Feasible / standard ROCm HIP implementation",
+            "4": "Immediate high-value quick win"
+          },
+          "probabilities": {
+            "0": 0.06,
+            "1": 0.08,
+            "2": 0.11,
+            "3": 0.52,
+            "4": 0.23
+          }
+        },
+        "performance_roi": {
+          "type": "score",
+          "score": 0.08,
+          "confidence": 0.94,
+          "legend": {
+            "0": "Zero or negative performance impact (docs, tool, placebo)",
+            "1": "Marginal gain (<2%) or monitoring/stability utility",
+            "2": "Solid architectural gain (2-5%)",
+            "3": "High-impact gain (5-15%)",
+            "4": "Breakthrough gain (>15%)"
+          },
+          "probabilities": {
+            "0": 0.94,
+            "1": 0.05,
+            "2": 0.01,
+            "3": 0.0,
+            "4": 0.0
+          }
+        }
+      },
+      "safety": {
+        "passed": true,
+        "violations": []
+      }
+    },
+    "44": {
+      "pr_id": 44,
+      "title": "serve: /v1/models reports what the server runs with; /v1/models/:id answers the entry itself",
+      "author": "bakon",
+      "url": null,
+      "updated_at": "2026-10-08T01:12:49+02:00",
+      "status": "SERVING_ENDPOINT",
+      "github_issue": "https://github.com/OoguroRyuuya/RadianceMine/issues/14",
+      "github_pr": null,
+      "jev": {
+        "subsystem": {
+          "type": "choice",
+          "choice": "serving",
+          "confidence": 1.0,
+          "probabilities": {
+            "moe": 0.0,
+            "interconnect": 0.0,
+            "gemm": 0.0,
+            "drafter": 0.0,
+            "tooling": 0.0,
+            "serving": 1.0,
+            "gdn": 0.0,
+            "qsa": 0.0,
+            "general": 0.0
+          }
+        },
+        "violates_rdna4_limits": {
+          "type": "noul",
+          "noul": 0.04
+        },
+        "feasibility": {
+          "type": "score",
+          "score": 2.33,
+          "confidence": 0.17,
+          "legend": {
+            "0": "Unfeasible / contradicts hardware laws / CUDA-only",
+            "1": "High risk or complex external dependency",
+            "2": "Moderate feasibility / experimental",
+            "3": "Feasible / standard ROCm HIP implementation",
+            "4": "Immediate high-value quick win"
+          },
+          "probabilities": {
+            "0": 0.13,
+            "1": 0.13,
+            "2": 0.18,
+            "3": 0.4,
+            "4": 0.16
+          }
+        },
+        "performance_roi": {
+          "type": "score",
+          "score": 0.34,
+          "confidence": 0.72,
+          "legend": {
+            "0": "Zero or negative performance impact (docs, tool, placebo)",
+            "1": "Marginal gain (<2%) or monitoring/stability utility",
+            "2": "Solid architectural gain (2-5%)",
+            "3": "High-impact gain (5-15%)",
+            "4": "Breakthrough gain (>15%)"
+          },
+          "probabilities": {
+            "0": 0.79,
+            "1": 0.13,
+            "2": 0.04,
+            "3": 0.03,
+            "4": 0.01
+          }
+        }
+      },
+      "safety": {
+        "passed": true,
+        "violations": []
+      }
+    },
+    "41": {
+      "pr_id": 41,
+      "title": "mx: native OCP-MX family (mxfp6/mxfp8/int5) + ParoQuant Path A + MX serving for qwen35",
+      "author": "J-Nova",
+      "url": null,
+      "updated_at": "2026-10-07T16:46:26+02:00",
+      "status": "READY_TO_TEST",
+      "github_issue": "https://github.com/OoguroRyuuya/RadianceMine/issues/15",
+      "github_pr": null,
+      "jev": {
+        "subsystem": {
+          "type": "choice",
+          "choice": "gemm",
+          "confidence": 0.94,
+          "probabilities": {
+            "drafter": 0.02,
+            "tooling": 0.0,
+            "gdn": 0.0,
+            "serving": 0.02,
+            "interconnect": 0.0,
+            "gemm": 0.95,
+            "qsa": 0.0,
+            "moe": 0.0,
+            "general": 0.01
+          }
+        },
+        "violates_rdna4_limits": {
+          "type": "noul",
+          "noul": 0.31
+        },
+        "feasibility": {
+          "type": "score",
+          "score": 1.57,
+          "confidence": 0.17,
+          "legend": {
+            "0": "Unfeasible / contradicts hardware laws / CUDA-only",
+            "1": "High risk or complex external dependency",
+            "2": "Moderate feasibility / experimental",
+            "3": "Feasible / standard ROCm HIP implementation",
+            "4": "Immediate high-value quick win"
+          },
+          "probabilities": {
+            "0": 0.21,
+            "1": 0.27,
+            "2": 0.26,
+            "3": 0.25,
+            "4": 0.01
+          }
+        },
+        "performance_roi": {
+          "type": "score",
+          "score": 1.73,
+          "confidence": 0.0,
+          "legend": {
+            "0": "Zero or negative performance impact (docs, tool, placebo)",
+            "1": "Marginal gain (<2%) or monitoring/stability utility",
+            "2": "Solid architectural gain (2-5%)",
+            "3": "High-impact gain (5-15%)",
+            "4": "Breakthrough gain (>15%)"
+          },
+          "probabilities": {
+            "0": 0.37,
+            "1": 0.09,
+            "2": 0.13,
+            "3": 0.27,
+            "4": 0.14
+          }
+        }
+      },
+      "safety": {
+        "passed": true,
+        "violations": []
+      }
+    },
+    "38": {
+      "pr_id": 38,
+      "title": "WIP: serve: --rope-scaling, #37's static YaRN on an existing container without a reconvert (supplemental to #37)",
+      "author": "bakon",
+      "url": "https://codeberg.org/StillDeadcode/radiance/pulls/38",
+      "updated_at": "2026-10-07T12:43:19+02:00",
+      "status": "QUEUED_LOW_PRIORITY",
+      "jev": {
+        "subsystem": {
+          "type": "choice",
+          "choice": "general",
+          "confidence": 0.91,
+          "probabilities": {
+            "tooling": 0.0,
+            "general": 0.92,
+            "interconnect": 0.0,
+            "gemm": 0.0,
+            "moe": 0.0,
+            "serving": 0.05,
+            "drafter": 0.03,
+            "qsa": 0.0,
+            "gdn": 0.0
+          }
+        },
+        "violates_rdna4_limits": {
+          "type": "noul",
+          "noul": 0.06
+        },
+        "feasibility": {
+          "type": "score",
+          "score": 2.02,
+          "confidence": 0.11,
+          "legend": {
+            "0": "Unfeasible / contradicts hardware laws / CUDA-only",
+            "1": "High risk or complex external dependency",
+            "2": "Moderate feasibility / experimental",
+            "3": "Feasible / standard ROCm HIP implementation",
+            "4": "Immediate high-value quick win"
+          },
+          "probabilities": {
+            "0": 0.14,
+            "1": 0.17,
+            "2": 0.27,
+            "3": 0.38,
+            "4": 0.04
+          }
+        },
+        "performance_roi": {
+          "type": "score",
+          "score": 0.47,
+          "confidence": 0.61,
+          "legend": {
+            "0": "Zero or negative performance impact (docs, tool, placebo)",
+            "1": "Marginal gain (<2%) or monitoring/stability utility",
+            "2": "Solid architectural gain (2-5%)",
+            "3": "High-impact gain (5-15%)",
+            "4": "Breakthrough gain (>15%)"
+          },
+          "probabilities": {
+            "0": 0.65,
+            "1": 0.26,
+            "2": 0.06,
+            "3": 0.03,
+            "4": 0.0
+          }
+        }
+      },
+      "safety": {
+        "passed": true,
+        "violations": []
+      }
+    },
+    "37": {
+      "pr_id": 37,
+      "title": "Add static YaRN support across Qwen rotary paths",
+      "author": "hazyumps",
+      "url": "https://codeberg.org/StillDeadcode/radiance/pulls/37",
+      "updated_at": "2026-10-07T12:43:19+02:00",
+      "status": "QUEUED_LOW_PRIORITY",
+      "jev": {
+        "subsystem": {
+          "type": "choice",
+          "choice": "general",
+          "confidence": 0.73,
+          "probabilities": {
+            "general": 0.76,
+            "interconnect": 0.0,
+            "gemm": 0.0,
+            "drafter": 0.0,
+            "tooling": 0.0,
+            "serving": 0.01,
+            "gdn": 0.0,
+            "qsa": 0.23,
+            "moe": 0.0
+          }
+        },
+        "violates_rdna4_limits": {
+          "type": "noul",
+          "noul": 0.11
+        },
+        "feasibility": {
+          "type": "score",
+          "score": 2.69,
+          "confidence": 0.72,
+          "legend": {
+            "0": "Unfeasible / contradicts hardware laws / CUDA-only",
+            "1": "High risk or complex external dependency",
+            "2": "Moderate feasibility / experimental",
+            "3": "Feasible / standard ROCm HIP implementation",
+            "4": "Immediate high-value quick win"
+          },
+          "probabilities": {
+            "0": 0.01,
+            "1": 0.07,
+            "2": 0.15,
+            "3": 0.76,
+            "4": 0.01
+          }
+        },
+        "performance_roi": {
+          "type": "score",
+          "score": 0.76,
+          "confidence": 0.38,
+          "legend": {
+            "0": "Zero or negative performance impact (docs, tool, placebo)",
+            "1": "Marginal gain (<2%) or monitoring/stability utility",
+            "2": "Solid architectural gain (2-5%)",
+            "3": "High-impact gain (5-15%)",
+            "4": "Breakthrough gain (>15%)"
+          },
+          "probabilities": {
+            "0": 0.44,
+            "1": 0.43,
+            "2": 0.07,
+            "3": 0.06,
+            "4": 0.0
+          }
+        }
+      },
+      "safety": {
+        "passed": true,
+        "violations": []
+      }
+    },
+    "36": {
+      "pr_id": 36,
+      "title": "budget: an uneven world's cheaper rank pages the common tokens and keeps its experts",
+      "author": "bakon",
+      "url": "https://codeberg.org/StillDeadcode/radiance/pulls/36",
+      "updated_at": "2026-10-07T12:43:19+02:00",
+      "status": "READY_TO_TEST",
+      "jev": {
+        "subsystem": {
+          "type": "choice",
+          "choice": "qsa",
+          "confidence": 0.68,
+          "probabilities": {
+            "gdn": 0.0,
+            "general": 0.26,
+            "interconnect": 0.0,
+            "drafter": 0.0,
+            "tooling": 0.0,
+            "gemm": 0.0,
+            "serving": 0.0,
+            "qsa": 0.72,
+            "moe": 0.02
+          }
+        },
+        "violates_rdna4_limits": {
+          "type": "noul",
+          "noul": 0.1
+        },
+        "feasibility": {
+          "type": "score",
+          "score": 2.43,
+          "confidence": 0.38,
+          "legend": {
+            "0": "Unfeasible / contradicts hardware laws / CUDA-only",
+            "1": "High risk or complex external dependency",
+            "2": "Moderate feasibility / experimental",
+            "3": "Feasible / standard ROCm HIP implementation",
+            "4": "Immediate high-value quick win"
+          },
+          "probabilities": {
+            "0": 0.06,
+            "1": 0.08,
+            "2": 0.32,
+            "3": 0.45999999999999996,
+            "4": 0.08
+          }
+        },
+        "performance_roi": {
+          "type": "score",
+          "score": 2.36,
+          "confidence": 0.17,
+          "legend": {
+            "0": "Zero or negative performance impact (docs, tool, placebo)",
+            "1": "Marginal gain (<2%) or monitoring/stability utility",
+            "2": "Solid architectural gain (2-5%)",
+            "3": "High-impact gain (5-15%)",
+            "4": "Breakthrough gain (>15%)"
+          },
+          "probabilities": {
+            "0": 0.12,
+            "1": 0.16,
+            "2": 0.13,
+            "3": 0.41,
+            "4": 0.18
+          }
+        }
+      },
+      "safety": {
+        "passed": true,
+        "violations": []
+      }
+    },
+    "35": {
+      "pr_id": 35,
+      "title": "MoE prefill: wide gather, parallel scan and map prefix, early weight loads",
+      "author": "keptn42",
+      "url": "https://codeberg.org/StillDeadcode/radiance/pulls/35",
+      "updated_at": "2026-10-07T12:43:19+02:00",
+      "status": "READY_TO_TEST",
+      "jev": {
+        "subsystem": {
+          "type": "choice",
+          "choice": "moe",
+          "confidence": 1.0,
+          "probabilities": {
+            "drafter": 0.0,
+            "gemm": 0.0,
+            "tooling": 0.0,
+            "moe": 1.0,
+            "general": 0.0,
+            "gdn": 0.0,
+            "serving": 0.0,
+            "qsa": 0.0,
+            "interconnect": 0.0
+          }
+        },
+        "violates_rdna4_limits": {
+          "type": "noul",
+          "noul": 0.23
+        },
+        "feasibility": {
+          "type": "score",
+          "score": 2.03,
+          "confidence": 0.17,
+          "legend": {
+            "0": "Unfeasible / contradicts hardware laws / CUDA-only",
+            "1": "High risk or complex external dependency",
+            "2": "Moderate feasibility / experimental",
+            "3": "Feasible / standard ROCm HIP implementation",
+            "4": "Immediate high-value quick win"
+          },
+          "probabilities": {
+            "0": 0.14,
+            "1": 0.14,
+            "2": 0.28,
+            "3": 0.43,
+            "4": 0.01
+          }
+        },
+        "performance_roi": {
+          "type": "score",
+          "score": 2.64,
+          "confidence": 0.47,
+          "legend": {
+            "0": "Zero or negative performance impact (docs, tool, placebo)",
+            "1": "Marginal gain (<2%) or monitoring/stability utility",
+            "2": "Solid architectural gain (2-5%)",
+            "3": "High-impact gain (5-15%)",
+            "4": "Breakthrough gain (>15%)"
+          },
+          "probabilities": {
+            "0": 0.09,
+            "1": 0.05,
+            "2": 0.12,
+            "3": 0.6,
+            "4": 0.14
+          }
+        }
+      },
+      "safety": {
+        "passed": true,
+        "violations": []
+      }
+    },
+    "34": {
+      "pr_id": 34,
+      "title": "moe_gemm_q decode form: down gets its own kernel",
+      "author": "keptn42",
+      "url": "https://codeberg.org/StillDeadcode/radiance/pulls/34",
+      "updated_at": "2026-10-07T12:43:19+02:00",
+      "status": "READY_TO_TEST",
+      "jev": {
+        "subsystem": {
+          "type": "choice",
+          "choice": "moe",
+          "confidence": 0.95,
+          "probabilities": {
+            "tooling": 0.0,
+            "drafter": 0.0,
+            "interconnect": 0.0,
+            "serving": 0.0,
+            "moe": 0.96,
+            "gdn": 0.0,
+            "general": 0.0,
+            "gemm": 0.04,
+            "qsa": 0.0
+          }
+        },
+        "violates_rdna4_limits": {
+          "type": "noul",
+          "noul": 0.15
+        },
+        "feasibility": {
+          "type": "score",
+          "score": 2.53,
+          "confidence": 0.56,
+          "legend": {
+            "0": "Unfeasible / contradicts hardware laws / CUDA-only",
+            "1": "High risk or complex external dependency",
+            "2": "Moderate feasibility / experimental",
+            "3": "Feasible / standard ROCm HIP implementation",
+            "4": "Immediate high-value quick win"
+          },
+          "probabilities": {
+            "0": 0.08,
+            "1": 0.06,
+            "2": 0.14,
+            "3": 0.69,
+            "4": 0.03
+          }
+        },
+        "performance_roi": {
+          "type": "score",
+          "score": 2.56,
+          "confidence": 0.6,
+          "legend": {
+            "0": "Zero or negative performance impact (docs, tool, placebo)",
+            "1": "Marginal gain (<2%) or monitoring/stability utility",
+            "2": "Solid architectural gain (2-5%)",
+            "3": "High-impact gain (5-15%)",
+            "4": "Breakthrough gain (>15%)"
+          },
+          "probabilities": {
+            "0": 0.04,
+            "1": 0.04,
+            "2": 0.26,
+            "3": 0.64,
+            "4": 0.02
+          }
+        }
+      },
+      "safety": {
+        "passed": true,
+        "violations": []
+      }
+    },
+    "30": {
+      "pr_id": 30,
+      "title": "qwen35_mxfp4 (OCP-MXFP4 W4A8 on libr4d) plus general serving features: draft refill, lookup draft, adaptive verify length, f16 delta-net state, int4 logits rows, E4M3 embedding and codebooks",
+      "author": "slydlake",
+      "url": "https://codeberg.org/StillDeadcode/radiance/pulls/30",
+      "updated_at": "2026-10-07T09:15:08+02:00",
+      "status": "READY_TO_TEST",
+      "jev": {
+        "subsystem": {
+          "type": "choice",
+          "choice": "drafter",
+          "confidence": 0.39,
+          "probabilities": {
+            "moe": 0.0,
+            "serving": 0.39,
+            "tooling": 0.0,
+            "interconnect": 0.0,
+            "gemm": 0.11,
+            "gdn": 0.0,
+            "qsa": 0.0,
+            "general": 0.04,
+            "drafter": 0.46
+          }
+        },
+        "violates_rdna4_limits": {
+          "type": "noul",
+          "noul": 0.15
+        },
+        "feasibility": {
+          "type": "score",
+          "score": 2.51,
+          "confidence": 0.5,
+          "legend": {
+            "0": "Unfeasible / contradicts hardware laws / CUDA-only",
+            "1": "High risk or complex external dependency",
+            "2": "Moderate feasibility / experimental",
+            "3": "Feasible / standard ROCm HIP implementation",
+            "4": "Immediate high-value quick win"
+          },
+          "probabilities": {
+            "0": 0.02,
+            "1": 0.09,
+            "2": 0.31,
+            "3": 0.53,
+            "4": 0.05
+          }
+        },
+        "performance_roi": {
+          "type": "score",
+          "score": 2.46,
+          "confidence": 0.23,
+          "legend": {
+            "0": "Zero or negative performance impact (docs, tool, placebo)",
+            "1": "Marginal gain (<2%) or monitoring/stability utility",
+            "2": "Solid architectural gain (2-5%)",
+            "3": "High-impact gain (5-15%)",
+            "4": "Breakthrough gain (>15%)"
+          },
+          "probabilities": {
+            "0": 0.11,
+            "1": 0.14,
+            "2": 0.13,
+            "3": 0.44,
+            "4": 0.18
+          }
+        }
+      },
+      "safety": {
+        "passed": true,
+        "violations": []
+      }
+    },
+    "27": {
+      "pr_id": 27,
+      "title": "router_gemm_topk_scatter: the router GEMM, its selection and its sort in one launch",
+      "author": "keptn42",
+      "url": "https://codeberg.org/StillDeadcode/radiance/pulls/27",
+      "updated_at": "2026-10-06T11:22:23+02:00",
+      "status": "READY_TO_TEST",
+      "jev": {
+        "subsystem": {
+          "type": "choice",
+          "choice": "moe",
+          "confidence": 1.0,
+          "probabilities": {
+            "general": 0.0,
+            "gdn": 0.0,
+            "drafter": 0.0,
+            "moe": 1.0,
+            "qsa": 0.0,
+            "gemm": 0.0,
+            "serving": 0.0,
+            "tooling": 0.0,
+            "interconnect": 0.0
+          }
+        },
+        "violates_rdna4_limits": {
+          "type": "noul",
+          "noul": 0.13
+        },
+        "feasibility": {
+          "type": "score",
+          "score": 2.21,
+          "confidence": 0.28,
+          "legend": {
+            "0": "Unfeasible / contradicts hardware laws / CUDA-only",
+            "1": "High risk or complex external dependency",
+            "2": "Moderate feasibility / experimental",
+            "3": "Feasible / standard ROCm HIP implementation",
+            "4": "Immediate high-value quick win"
+          },
+          "probabilities": {
+            "0": 0.11,
+            "1": 0.14,
+            "2": 0.22,
+            "3": 0.5,
+            "4": 0.03
+          }
+        },
+        "performance_roi": {
+          "type": "score",
+          "score": 1.88,
+          "confidence": 0.53,
+          "legend": {
+            "0": "Zero or negative performance impact (docs, tool, placebo)",
+            "1": "Marginal gain (<2%) or monitoring/stability utility",
+            "2": "Solid architectural gain (2-5%)",
+            "3": "High-impact gain (5-15%)",
+            "4": "Breakthrough gain (>15%)"
+          },
+          "probabilities": {
+            "0": 0.04,
+            "1": 0.27,
+            "2": 0.48,
+            "3": 0.21,
+            "4": 0.0
+          }
+        }
+      },
+      "safety": {
+        "passed": true,
+        "violations": []
+      }
+    },
+    "26": {
+      "pr_id": 26,
+      "title": "hc_read: a second prefill form behind R4D_HC_READ_PF2",
+      "author": "keptn42",
+      "url": "https://codeberg.org/StillDeadcode/radiance/pulls/26",
+      "updated_at": "2026-10-06T11:22:35+02:00",
+      "status": "READY_TO_TEST",
+      "jev": {
+        "subsystem": {
+          "type": "choice",
+          "choice": "gemm",
+          "confidence": 0.86,
+          "probabilities": {
+            "gemm": 0.88,
+            "gdn": 0.08,
+            "qsa": 0.0,
+            "moe": 0.03,
+            "interconnect": 0.0,
+            "drafter": 0.0,
+            "serving": 0.0,
+            "tooling": 0.0,
+            "general": 0.01
+          }
+        },
+        "violates_rdna4_limits": {
+          "type": "noul",
+          "noul": 0.16
+        },
+        "feasibility": {
+          "type": "score",
+          "score": 2.2,
+          "confidence": 0.28,
+          "legend": {
+            "0": "Unfeasible / contradicts hardware laws / CUDA-only",
+            "1": "High risk or complex external dependency",
+            "2": "Moderate feasibility / experimental",
+            "3": "Feasible / standard ROCm HIP implementation",
+            "4": "Immediate high-value quick win"
+          },
+          "probabilities": {
+            "0": 0.15,
+            "1": 0.08,
+            "2": 0.22,
+            "3": 0.52,
+            "4": 0.03
+          }
+        },
+        "performance_roi": {
+          "type": "score",
+          "score": 2.46,
+          "confidence": 0.23,
+          "legend": {
+            "0": "Zero or negative performance impact (docs, tool, placebo)",
+            "1": "Marginal gain (<2%) or monitoring/stability utility",
+            "2": "Solid architectural gain (2-5%)",
+            "3": "High-impact gain (5-15%)",
+            "4": "Breakthrough gain (>15%)"
+          },
+          "probabilities": {
+            "0": 0.14,
+            "1": 0.07,
+            "2": 0.17,
+            "3": 0.43,
+            "4": 0.19
+          }
+        }
+      },
+      "safety": {
+        "passed": true,
+        "violations": []
+      }
+    },
+    "25": {
+      "pr_id": 25,
+      "title": "moe_gemm_q decode form: weight loads without serial waits, and the run search in one round trip",
+      "author": "keptn42",
+      "url": "https://codeberg.org/StillDeadcode/radiance/pulls/25",
+      "updated_at": "2026-10-07T00:15:35+02:00",
+      "status": "READY_TO_TEST",
+      "jev": {
+        "subsystem": {
+          "type": "choice",
+          "choice": "moe",
+          "confidence": 0.94,
+          "probabilities": {
+            "moe": 0.95,
+            "qsa": 0.0,
+            "general": 0.0,
+            "interconnect": 0.0,
+            "gemm": 0.05,
+            "tooling": 0.0,
+            "drafter": 0.0,
+            "serving": 0.0,
+            "gdn": 0.0
+          }
+        },
+        "violates_rdna4_limits": {
+          "type": "noul",
+          "noul": 0.22
+        },
+        "feasibility": {
+          "type": "score",
+          "score": 2.48,
+          "confidence": 0.5,
+          "legend": {
+            "0": "Unfeasible / contradicts hardware laws / CUDA-only",
+            "1": "High risk or complex external dependency",
+            "2": "Moderate feasibility / experimental",
+            "3": "Feasible / standard ROCm HIP implementation",
+            "4": "Immediate high-value quick win"
+          },
+          "probabilities": {
+            "0": 0.02,
+            "1": 0.11,
+            "2": 0.28,
+            "3": 0.55,
+            "4": 0.04
+          }
+        },
+        "performance_roi": {
+          "type": "score",
+          "score": 3.1,
+          "confidence": 0.56,
+          "legend": {
+            "0": "Zero or negative performance impact (docs, tool, placebo)",
+            "1": "Marginal gain (<2%) or monitoring/stability utility",
+            "2": "Solid architectural gain (2-5%)",
+            "3": "High-impact gain (5-15%)",
+            "4": "Breakthrough gain (>15%)"
+          },
+          "probabilities": {
+            "0": 0.04,
+            "1": 0.02,
+            "2": 0.06,
+            "3": 0.57,
+            "4": 0.31
+          }
+        }
+      },
+      "safety": {
+        "passed": true,
+        "violations": []
+      }
+    },
+    "24": {
+      "pr_id": 24,
+      "title": "draft: an adaptive draft window per sequence, with a cap under load",
+      "author": "keptn42",
+      "url": "https://codeberg.org/StillDeadcode/radiance/pulls/24",
+      "updated_at": "2026-10-07T12:43:19+02:00",
+      "status": "READY_TO_TEST",
+      "jev": {
+        "subsystem": {
+          "type": "choice",
+          "choice": "drafter",
+          "confidence": 1.0,
+          "probabilities": {
+            "serving": 0.0,
+            "gdn": 0.0,
+            "interconnect": 0.0,
+            "drafter": 1.0,
+            "general": 0.0,
+            "moe": 0.0,
+            "gemm": 0.0,
+            "tooling": 0.0,
+            "qsa": 0.0
+          }
+        },
+        "violates_rdna4_limits": {
+          "type": "noul",
+          "noul": 0.05
+        },
+        "feasibility": {
+          "type": "score",
+          "score": 2.25,
+          "confidence": 0.6,
+          "legend": {
+            "0": "Unfeasible / contradicts hardware laws / CUDA-only",
+            "1": "High risk or complex external dependency",
+            "2": "Moderate feasibility / experimental",
+            "3": "Feasible / standard ROCm HIP implementation",
+            "4": "Immediate high-value quick win"
+          },
+          "probabilities": {
+            "0": 0.01,
+            "1": 0.1,
+            "2": 0.54,
+            "3": 0.34,
+            "4": 0.01
+          }
+        },
+        "performance_roi": {
+          "type": "score",
+          "score": 1.97,
+          "confidence": 0.41,
+          "legend": {
+            "0": "Zero or negative performance impact (docs, tool, placebo)",
+            "1": "Marginal gain (<2%) or monitoring/stability utility",
+            "2": "Solid architectural gain (2-5%)",
+            "3": "High-impact gain (5-15%)",
+            "4": "Breakthrough gain (>15%)"
+          },
+          "probabilities": {
+            "0": 0.09,
+            "1": 0.19,
+            "2": 0.39,
+            "3": 0.32,
+            "4": 0.01
+          }
+        }
+      },
+      "safety": {
+        "passed": true,
+        "violations": []
+      }
+    },
+    "23": {
+      "pr_id": 23,
+      "title": "hc_up: exact row groups up to eight, so a five- or six-row verify reads W_up once",
+      "author": "keptn42",
+      "url": "https://codeberg.org/StillDeadcode/radiance/pulls/23",
+      "updated_at": "2026-10-06T22:08:09+02:00",
+      "status": "READY_TO_TEST",
+      "jev": {
+        "subsystem": {
+          "type": "choice",
+          "choice": "gemm",
+          "confidence": 0.71,
+          "probabilities": {
+            "moe": 0.0,
+            "interconnect": 0.0,
+            "drafter": 0.2,
+            "general": 0.05,
+            "gdn": 0.01,
+            "gemm": 0.74,
+            "serving": 0.0,
+            "tooling": 0.0,
+            "qsa": 0.0
+          }
+        },
+        "violates_rdna4_limits": {
+          "type": "noul",
+          "noul": 0.09
+        },
+        "feasibility": {
+          "type": "score",
+          "score": 3.04,
+          "confidence": 0.57,
+          "legend": {
+            "0": "Unfeasible / contradicts hardware laws / CUDA-only",
+            "1": "High risk or complex external dependency",
+            "2": "Moderate feasibility / experimental",
+            "3": "Feasible / standard ROCm HIP implementation",
+            "4": "Immediate high-value quick win"
+          },
+          "probabilities": {
+            "0": 0.02,
+            "1": 0.02,
+            "2": 0.13,
+            "3": 0.55,
+            "4": 0.28
+          }
+        },
+        "performance_roi": {
+          "type": "score",
+          "score": 2.96,
+          "confidence": 0.97,
+          "legend": {
+            "0": "Zero or negative performance impact (docs, tool, placebo)",
+            "1": "Marginal gain (<2%) or monitoring/stability utility",
+            "2": "Solid architectural gain (2-5%)",
+            "3": "High-impact gain (5-15%)",
+            "4": "Breakthrough gain (>15%)"
+          },
+          "probabilities": {
+            "0": 0.01,
+            "1": 0.0,
+            "2": 0.0,
+            "3": 0.99,
+            "4": 0.0
+          }
+        }
+      },
+      "safety": {
+        "passed": true,
+        "violations": []
+      }
+    },
+    "20": {
+      "pr_id": 20,
+      "title": "any world size: the attention world, uneven delta-net heads, nothing padded",
+      "author": "bakon",
+      "url": "https://codeberg.org/StillDeadcode/radiance/pulls/20",
+      "updated_at": "2026-10-06T11:23:11+02:00",
+      "status": "READY_TO_TEST",
+      "jev": {
+        "subsystem": {
+          "type": "choice",
+          "choice": "gdn",
+          "confidence": 0.63,
+          "probabilities": {
+            "gemm": 0.03,
+            "moe": 0.0,
+            "interconnect": 0.02,
+            "qsa": 0.02,
+            "drafter": 0.0,
+            "gdn": 0.67,
+            "tooling": 0.0,
+            "serving": 0.01,
+            "general": 0.25
+          }
+        },
+        "violates_rdna4_limits": {
+          "type": "noul",
+          "noul": 0.16
+        },
+        "feasibility": {
+          "type": "score",
+          "score": 1.86,
+          "confidence": 0.04,
+          "legend": {
+            "0": "Unfeasible / contradicts hardware laws / CUDA-only",
+            "1": "High risk or complex external dependency",
+            "2": "Moderate feasibility / experimental",
+            "3": "Feasible / standard ROCm HIP implementation",
+            "4": "Immediate high-value quick win"
+          },
+          "probabilities": {
+            "0": 0.15,
+            "1": 0.2,
+            "2": 0.29,
+            "3": 0.35000000000000003,
+            "4": 0.01
+          }
+        },
+        "performance_roi": {
+          "type": "score",
+          "score": 1.32,
+          "confidence": 0.0,
+          "legend": {
+            "0": "Zero or negative performance impact (docs, tool, placebo)",
+            "1": "Marginal gain (<2%) or monitoring/stability utility",
+            "2": "Solid architectural gain (2-5%)",
+            "3": "High-impact gain (5-15%)",
+            "4": "Breakthrough gain (>15%)"
+          },
+          "probabilities": {
+            "0": 0.43,
+            "1": 0.1,
+            "2": 0.2,
+            "3": 0.25,
+            "4": 0.02
+          }
+        }
+      },
+      "safety": {
+        "passed": true,
+        "violations": []
+      }
+    },
+    "19": {
+      "pr_id": 19,
+      "title": "server: a request log at the info level",
+      "author": "bakon",
+      "url": "https://codeberg.org/StillDeadcode/radiance/pulls/19",
+      "updated_at": "2026-10-05T19:30:47+02:00",
+      "status": "SERVING_ENDPOINT",
+      "jev": {
+        "subsystem": {
+          "type": "choice",
+          "choice": "serving",
+          "confidence": 1.0,
+          "probabilities": {
+            "gdn": 0.0,
+            "qsa": 0.0,
+            "general": 0.0,
+            "gemm": 0.0,
+            "tooling": 0.0,
+            "moe": 0.0,
+            "drafter": 0.0,
+            "serving": 1.0,
+            "interconnect": 0.0
+          }
+        },
+        "violates_rdna4_limits": {
+          "type": "noul",
+          "noul": 0.02
+        },
+        "feasibility": {
+          "type": "score",
+          "score": 3.08,
+          "confidence": 0.24,
+          "legend": {
+            "0": "Unfeasible / contradicts hardware laws / CUDA-only",
+            "1": "High risk or complex external dependency",
+            "2": "Moderate feasibility / experimental",
+            "3": "Feasible / standard ROCm HIP implementation",
+            "4": "Immediate high-value quick win"
+          },
+          "probabilities": {
+            "0": 0.06,
+            "1": 0.05,
+            "2": 0.09,
+            "3": 0.34,
+            "4": 0.46
+          }
+        },
+        "performance_roi": {
+          "type": "score",
+          "score": 0.72,
+          "confidence": 0.77,
+          "legend": {
+            "0": "Zero or negative performance impact (docs, tool, placebo)",
+            "1": "Marginal gain (<2%) or monitoring/stability utility",
+            "2": "Solid architectural gain (2-5%)",
+            "3": "High-impact gain (5-15%)",
+            "4": "Breakthrough gain (>15%)"
+          },
+          "probabilities": {
+            "0": 0.28,
+            "1": 0.72,
+            "2": 0.0,
+            "3": 0.0,
+            "4": 0.0
+          }
+        }
+      },
+      "safety": {
+        "passed": true,
+        "violations": []
+      }
+    },
+    "18": {
+      "pr_id": 18,
+      "title": "deploy/grafana: a dashboard for /metrics, on Prometheus or VictoriaMetrics",
+      "author": "keptn42",
+      "url": "https://codeberg.org/StillDeadcode/radiance/pulls/18",
+      "updated_at": "2026-10-05T19:31:01+02:00",
+      "status": "READY_TO_TEST",
+      "jev": {
+        "subsystem": {
+          "type": "choice",
+          "choice": "drafter",
+          "confidence": 0.29,
+          "probabilities": {
+            "gemm": 0.0,
+            "gdn": 0.0,
+            "qsa": 0.0,
+            "moe": 0.0,
+            "interconnect": 0.0,
+            "drafter": 0.37,
+            "serving": 0.05,
+            "tooling": 0.36,
+            "general": 0.22
+          }
+        },
+        "violates_rdna4_limits": {
+          "type": "noul",
+          "noul": 0.04
+        },
+        "feasibility": {
+          "type": "score",
+          "score": 2.83,
+          "confidence": 0.35,
+          "legend": {
+            "0": "Unfeasible / contradicts hardware laws / CUDA-only",
+            "1": "High risk or complex external dependency",
+            "2": "Moderate feasibility / experimental",
+            "3": "Feasible / standard ROCm HIP implementation",
+            "4": "Immediate high-value quick win"
+          },
+          "probabilities": {
+            "0": 0.04,
+            "1": 0.12,
+            "2": 0.11,
+            "3": 0.42,
+            "4": 0.31
+          }
+        },
+        "performance_roi": {
+          "type": "score",
+          "score": 0.69,
+          "confidence": 0.74,
+          "legend": {
+            "0": "Zero or negative performance impact (docs, tool, placebo)",
+            "1": "Marginal gain (<2%) or monitoring/stability utility",
+            "2": "Solid architectural gain (2-5%)",
+            "3": "High-impact gain (5-15%)",
+            "4": "Breakthrough gain (>15%)"
+          },
+          "probabilities": {
+            "0": 0.31,
+            "1": 0.69,
+            "2": 0.0,
+            "3": 0.0,
+            "4": 0.0
+          }
+        }
+      },
+      "safety": {
+        "passed": true,
+        "violations": []
+      }
+    },
+    "17": {
+      "pr_id": 17,
+      "title": "placement: --host-weights keeps an embedding table in the pinned host pool, read in place",
+      "author": "mechkbfan",
+      "url": "https://codeberg.org/StillDeadcode/radiance/pulls/17",
+      "updated_at": "2026-10-05T12:52:39+02:00",
+      "status": "READY_TO_TEST",
+      "jev": {
+        "subsystem": {
+          "type": "choice",
+          "choice": "general",
+          "confidence": 0.99,
+          "probabilities": {
+            "interconnect": 0.01,
+            "drafter": 0.0,
+            "general": 0.99,
+            "gdn": 0.0,
+            "moe": 0.0,
+            "gemm": 0.0,
+            "serving": 0.0,
+            "tooling": 0.0,
+            "qsa": 0.0
+          }
+        },
+        "violates_rdna4_limits": {
+          "type": "noul",
+          "noul": 0.11
+        },
+        "feasibility": {
+          "type": "score",
+          "score": 1.64,
+          "confidence": 0.17,
+          "legend": {
+            "0": "Unfeasible / contradicts hardware laws / CUDA-only",
+            "1": "High risk or complex external dependency",
+            "2": "Moderate feasibility / experimental",
+            "3": "Feasible / standard ROCm HIP implementation",
+            "4": "Immediate high-value quick win"
+          },
+          "probabilities": {
+            "0": 0.23,
+            "1": 0.22,
+            "2": 0.26,
+            "3": 0.26,
+            "4": 0.03
+          }
+        },
+        "performance_roi": {
+          "type": "score",
+          "score": 2.47,
+          "confidence": 0.31,
+          "legend": {
+            "0": "Zero or negative performance impact (docs, tool, placebo)",
+            "1": "Marginal gain (<2%) or monitoring/stability utility",
+            "2": "Solid architectural gain (2-5%)",
+            "3": "High-impact gain (5-15%)",
+            "4": "Breakthrough gain (>15%)"
+          },
+          "probabilities": {
+            "0": 0.13,
+            "1": 0.09,
+            "2": 0.12,
+            "3": 0.52,
+            "4": 0.14
+          }
+        }
+      },
+      "safety": {
+        "passed": true,
+        "violations": []
+      }
+    },
+    "16": {
+      "pr_id": 16,
+      "title": "four-rank Flash-Next: routed experts in four classes",
+      "author": "keptn42",
+      "url": "https://codeberg.org/StillDeadcode/radiance/pulls/16",
+      "updated_at": "2026-10-05T12:52:46+02:00",
+      "status": "REJECTED_UNFEASIBLE",
+      "jev": {
+        "subsystem": {
+          "type": "choice",
+          "choice": "moe",
+          "confidence": 1.0,
+          "probabilities": {
+            "tooling": 0.0,
+            "gdn": 0.0,
+            "drafter": 0.0,
+            "serving": 0.0,
+            "general": 0.0,
+            "qsa": 0.0,
+            "moe": 1.0,
+            "interconnect": 0.0,
+            "gemm": 0.0
+          }
+        },
+        "violates_rdna4_limits": {
+          "type": "noul",
+          "noul": 0.12
+        },
+        "feasibility": {
+          "type": "score",
+          "score": 1.41,
+          "confidence": 0.28,
+          "legend": {
+            "0": "Unfeasible / contradicts hardware laws / CUDA-only",
+            "1": "High risk or complex external dependency",
+            "2": "Moderate feasibility / experimental",
+            "3": "Feasible / standard ROCm HIP implementation",
+            "4": "Immediate high-value quick win"
+          },
+          "probabilities": {
+            "0": 0.23,
+            "1": 0.34,
+            "2": 0.23,
+            "3": 0.19,
+            "4": 0.01
+          }
+        },
+        "performance_roi": {
+          "type": "score",
+          "score": 2.21,
+          "confidence": 0.27,
+          "legend": {
+            "0": "Zero or negative performance impact (docs, tool, placebo)",
+            "1": "Marginal gain (<2%) or monitoring/stability utility",
+            "2": "Solid architectural gain (2-5%)",
+            "3": "High-impact gain (5-15%)",
+            "4": "Breakthrough gain (>15%)"
+          },
+          "probabilities": {
+            "0": 0.09,
+            "1": 0.14,
+            "2": 0.29,
+            "3": 0.44,
+            "4": 0.04
+          }
+        }
+      },
+      "safety": {
+        "passed": true,
+        "violations": []
+      }
+    },
+    "15": {
+      "pr_id": 15,
+      "title": "n-gram table: --ngram-table ram reads it from a locked copy in RAM",
+      "author": "keptn42",
+      "url": "https://codeberg.org/StillDeadcode/radiance/pulls/15",
+      "updated_at": "2026-10-05T12:52:51+02:00",
+      "status": "READY_TO_TEST",
+      "jev": {
+        "subsystem": {
+          "type": "choice",
+          "choice": "general",
+          "confidence": 0.97,
+          "probabilities": {
+            "serving": 0.0,
+            "tooling": 0.0,
+            "gdn": 0.0,
+            "interconnect": 0.0,
+            "drafter": 0.03,
+            "gemm": 0.0,
+            "qsa": 0.0,
+            "general": 0.97,
+            "moe": 0.0
+          }
+        },
+        "violates_rdna4_limits": {
+          "type": "noul",
+          "noul": 0.07
+        },
+        "feasibility": {
+          "type": "score",
+          "score": 2.39,
+          "confidence": 0.38,
+          "legend": {
+            "0": "Unfeasible / contradicts hardware laws / CUDA-only",
+            "1": "High risk or complex external dependency",
+            "2": "Moderate feasibility / experimental",
+            "3": "Feasible / standard ROCm HIP implementation",
+            "4": "Immediate high-value quick win"
+          },
+          "probabilities": {
+            "0": 0.03,
+            "1": 0.1,
+            "2": 0.4,
+            "3": 0.41,
+            "4": 0.06
+          }
+        },
+        "performance_roi": {
+          "type": "score",
+          "score": 2.3,
+          "confidence": 0.37,
+          "legend": {
+            "0": "Zero or negative performance impact (docs, tool, placebo)",
+            "1": "Marginal gain (<2%) or monitoring/stability utility",
+            "2": "Solid architectural gain (2-5%)",
+            "3": "High-impact gain (5-15%)",
+            "4": "Breakthrough gain (>15%)"
+          },
+          "probabilities": {
+            "0": 0.05,
+            "1": 0.22,
+            "2": 0.15,
+            "3": 0.56,
+            "4": 0.02
+          }
+        }
+      },
+      "safety": {
+        "passed": true,
+        "violations": []
+      }
+    },
+    "14": {
+      "pr_id": 14,
+      "title": "four-rank fused all-reduce: ar_hc_write and ar_gather_hc_write at tp 4",
+      "author": "keptn42",
+      "url": "https://codeberg.org/StillDeadcode/radiance/pulls/14",
+      "updated_at": "2026-10-05T12:52:56+02:00",
+      "status": "READY_TO_TEST",
+      "jev": {
+        "subsystem": {
+          "type": "choice",
+          "choice": "interconnect",
+          "confidence": 1.0,
+          "probabilities": {
+            "gdn": 0.0,
+            "general": 0.0,
+            "gemm": 0.0,
+            "interconnect": 1.0,
+            "moe": 0.0,
+            "drafter": 0.0,
+            "serving": 0.0,
+            "qsa": 0.0,
+            "tooling": 0.0
+          }
+        },
+        "violates_rdna4_limits": {
+          "type": "noul",
+          "noul": 0.13
+        },
+        "feasibility": {
+          "type": "score",
+          "score": 2.91,
+          "confidence": 0.7,
+          "legend": {
+            "0": "Unfeasible / contradicts hardware laws / CUDA-only",
+            "1": "High risk or complex external dependency",
+            "2": "Moderate feasibility / experimental",
+            "3": "Feasible / standard ROCm HIP implementation",
+            "4": "Immediate high-value quick win"
+          },
+          "probabilities": {
+            "0": 0.02,
+            "1": 0.03,
+            "2": 0.1,
+            "3": 0.71,
+            "4": 0.14
+          }
+        },
+        "performance_roi": {
+          "type": "score",
+          "score": 3.37,
+          "confidence": 0.47,
+          "legend": {
+            "0": "Zero or negative performance impact (docs, tool, placebo)",
+            "1": "Marginal gain (<2%) or monitoring/stability utility",
+            "2": "Solid architectural gain (2-5%)",
+            "3": "High-impact gain (5-15%)",
+            "4": "Breakthrough gain (>15%)"
+          },
+          "probabilities": {
+            "0": 0.06,
+            "1": 0.04,
+            "2": 0.06,
+            "3": 0.16,
+            "4": 0.68
+          }
+        }
+      },
+      "safety": {
+        "passed": true,
+        "violations": []
+      }
+    },
+    "12": {
+      "pr_id": 12,
+      "title": "Three ranks for Qwen3.8-Flash-Next: pad the checkpoint, exactly; all-reduce, all-gather, the vocab and expert-width splits at world 3",
+      "author": "bakon",
+      "url": "https://codeberg.org/StillDeadcode/radiance/pulls/12",
+      "updated_at": "2026-10-05T19:31:14+02:00",
+      "status": "READY_TO_TEST",
+      "jev": {
+        "subsystem": {
+          "type": "choice",
+          "choice": "interconnect",
+          "confidence": 0.87,
+          "probabilities": {
+            "moe": 0.01,
+            "gdn": 0.0,
+            "drafter": 0.0,
+            "serving": 0.0,
+            "qsa": 0.0,
+            "tooling": 0.0,
+            "interconnect": 0.88,
+            "gemm": 0.0,
+            "general": 0.11
+          }
+        },
+        "violates_rdna4_limits": {
+          "type": "noul",
+          "noul": 0.19
+        },
+        "feasibility": {
+          "type": "score",
+          "score": 1.61,
+          "confidence": 0.39,
+          "legend": {
+            "0": "Unfeasible / contradicts hardware laws / CUDA-only",
+            "1": "High risk or complex external dependency",
+            "2": "Moderate feasibility / experimental",
+            "3": "Feasible / standard ROCm HIP implementation",
+            "4": "Immediate high-value quick win"
+          },
+          "probabilities": {
+            "0": 0.14,
+            "1": 0.29,
+            "2": 0.41,
+            "3": 0.16,
+            "4": 0.0
+          }
+        },
+        "performance_roi": {
+          "type": "score",
+          "score": 1.11,
+          "confidence": 0.06,
+          "legend": {
+            "0": "Zero or negative performance impact (docs, tool, placebo)",
+            "1": "Marginal gain (<2%) or monitoring/stability utility",
+            "2": "Solid architectural gain (2-5%)",
+            "3": "High-impact gain (5-15%)",
+            "4": "Breakthrough gain (>15%)"
+          },
+          "probabilities": {
+            "0": 0.47,
+            "1": 0.2,
+            "2": 0.12,
+            "3": 0.15,
+            "4": 0.06
+          }
+        }
+      },
+      "safety": {
+        "passed": true,
+        "violations": []
+      }
+    }
+  },
+  "commits": {},
+  "last_checked": 1791455261
+}

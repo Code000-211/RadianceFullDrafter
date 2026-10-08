@@ -1,8 +1,8 @@
 ---
 type: pipeline
-title: Upstream Codeberg Watcher & Autonomous Triage
-description: Architecture of the automated upstream Codeberg watcher, TypeSafe AI (Jev System One) triage, deterministic patch safety auditing, and autonomous GitHub issue/PR creation.
-tags: [upstream, codeberg, watcher, triage, jev, safety]
+title: Upstream Codeberg Watcher (Review List)
+description: Upstream Codeberg watcher that asks Jev whether open PRs could be useful and writes a human review list. No GitHub issues, PRs or code execution.
+tags: [upstream, codeberg, watcher, triage, jev, review]
 verified:
   - by: openwiki/0.6.1
     at: 2026-10-08T09:22:05.134Z
@@ -12,48 +12,36 @@ sources:
 generated: { by: "antigravity", at: "2026-10-08T09:22:05.134Z" }
 ---
 
-# Upstream Codeberg Watcher & Autonomous Triage
+# Upstream Codeberg Watcher (Review List)
 
-The Upstream Watcher (`scripts/watch_upstream.py`) continuously tracks updates from the official upstream Radiance repository ([StillDeadcode/radiance](https://codeberg.org/StillDeadcode/radiance)). It screens all pull requests and commits in real-time, triaging their relevance and packaging viable candidates for autonomous testing without manual intervention.
+`scripts/watch_upstream.py` polls the open pull requests of the upstream Radiance repository ([StillDeadcode/radiance](https://codeberg.org/StillDeadcode/radiance)) and maintains a reading list for a human. It does not dispatch anything.
 
-## 1. Zero-Token Deterministic Pre-Filtering
+## 1. What it does per PR
 
-To conserve API calls and maintain zero-cost idle operation:
-- **State Deduplication**: `telemetry/upstream_seen.json` records every evaluated commit SHA and PR update timestamp. Polling cycles with no new events consume 0 tokens and perform 0 external AI calls.
-- **0-Token Documentation Detection**: Patches modifying only documentation (`docs/`, `*.md`, `licenses/`) or CI configurations are classified deterministically without invoking external classifiers.
+1. Fetches title, description and the changed-file list (`/pulls/{n}/files`) from the Codeberg API.
+2. Asks Jev one `noul` question: could this PR plausibly be useful for our setup (2× R9700, gfx1201, PCIe 4.0, TP world size 2, ROCm only, Qwen FP8 MoE)? PRs that only matter for 3+ GPUs, CUDA or other model families should score low.
+3. Stores the result in `telemetry/upstream_review.json`. A PR is re-classified only when its title, description or file list changes.
 
-## 2. TypeSafe AI (Jev System One) Sub-100ms Triage
+## 2. Review list
 
-When a code PR is detected, metadata is evaluated via `typesafe_triage.py` against four calibrated criteria:
-1. **Target Subsystem**: Classifies whether changes touch `gemm`, `gdn`, `qsa`, `moe`, `interconnect`, `drafter`, `tooling`, or `serving`.
-2. **RDNA4 Hardware Violation Risk**: Returns a calibrated probability score [0.0, 1.0] flagging hardware incompatibilities (e.g., Nvidia PTX, Wave64 assumptions, >64KB LDS).
-3. **Architectural Feasibility**: Evaluates ROCm HIP viability on a 0–4 score.
-4. **Performance ROI**: Estimates throughput gains on dual R9700.
+`candidates/upstream/REVIEW.md` has three sections:
+- **Ansehen**: usefulness ≥ 0.5 (`--threshold`), or unclassified because Jev failed.
+- **Von Jev aussortiert**: below the threshold, kept visible so misjudgements can be spotted.
+- **Bereits angesehen**: marked with `python3 scripts/watch_upstream.py --done <PR> ...`. A PR moves back to *Ansehen* if it changes upstream.
 
-## 3. Deterministic Safety & Mergeability Audit
+## 3. What it never does
 
-Before a candidate is queued:
-- **Anti-Pattern Gate (`scripts/eval_patch_safety.py`)**: The raw `.patch` file is audited for prohibited patterns (unconditional per-thread `__threadfence_system()`, test tolerance tampering, and silent mocks).
-- **Clean Mergeability**: `git apply --check` validates whether the patch applies cleanly to current `main` without merge conflicts.
+It never creates GitHub issues, labels, branches or PRs, and never downloads, applies, builds or runs upstream patches. Turning an upstream PR into a candidate lever is a manual decision. The earlier auto-dispatch design was retired on 2026-10-08 (`attic/2026-10-08_upstream_watcher_v1/POSTMORTEM.md`).
 
-## 4. Automated Candidate Packaging & GitHub Dispatch
+## 4. Operation
 
-Viable upstream contributions are automatically transformed into actionable testing units:
-- **Candidate Packaging**: Files are written to `candidates/upstream/pr_{id}_{slug}/` containing `pr.patch`, `lever.patch`, `METADATA.json`, and an isolated testing walkthrough in `README.md`.
-- **GitHub Issue Creation**: Qualified candidates automatically generate an issue on `OoguroRyuuya/RadianceMine` tagged with `upstream:candidate` and `status:ready-to-test`.
-- **GitHub Draft Pull Request**: If the patch applies cleanly, an isolated git branch (`upstream/pr_{id}_{slug}`) is pushed and a Draft Pull Request is opened for visual diff review.
-- **Queue Synchronization**: `candidates/upstream/QUEUE.md` is updated with live status, Jev scores, and issue/PR links.
+It runs as the systemd service `radiance-upstream-watcher` (unit: `scripts/systemd/radiance-upstream-watcher.service`, `Restart=always`, interval 300 s). The unit runs as `orca` with no GitHub credentials, no docker socket and write access only to `telemetry/` and `candidates/upstream/`. A file lock (`telemetry/watcher.lock`) prevents a second daemon.
 
-## 5. Daemon Lifecycle Management
-
-The background daemon is managed via `scripts/upstream_watcher_manager.sh`:
 ```bash
-# Start watcher daemon (polling every 300s)
-bash scripts/upstream_watcher_manager.sh start --interval 300
-
-# Inspect daemon health and recent logs
-bash scripts/upstream_watcher_manager.sh status
-
-# Stop daemon
-bash scripts/upstream_watcher_manager.sh stop
+systemctl status radiance-upstream-watcher
+journalctl -u radiance-upstream-watcher -f      # root or systemd-journal group
+python3 scripts/watch_upstream.py --pr 56       # re-classify one PR now
+python3 scripts/watch_upstream.py --done 56 51  # mark as reviewed
 ```
+
+`scripts/upstream_watcher_manager.sh` remains as a nohup fallback for hosts without the unit and refuses to start when the unit is enabled.

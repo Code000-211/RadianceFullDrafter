@@ -70,7 +70,7 @@ def query_jev_router(query: str) -> dict[str, Any]:
                 "moe_routing": "Mixture of Experts router, top-k scatter, expert GEMMs (libr4d/r4d_moe.hip)",
                 "engine_runtime": "Engine step loop, CPU wait barriers, AQL queue dispatch (core/engine.cpp, core/device/)",
                 "governance_gates": "Master quality gate, epistemic invariants, parity checks (scripts/)",
-                "upstream_watcher": "Codeberg watcher, PR triage queue, patch safety audits (scripts/watch_upstream.py)",
+                "upstream_watcher": "Codeberg watcher, Jev usefulness triage, human review list (scripts/watch_upstream.py)",
             },
         },
         "relevant_wiki_page": {
@@ -82,7 +82,7 @@ def query_jev_router(query: str) -> dict[str, Any]:
                 "openwiki/architecture/speculative_mtp.md": "Speculative drafting, draft head, and depth controllers",
                 "openwiki/architecture/engine_runtime.md": "Engine step execution, AQL queues, and memory budgeting",
                 "openwiki/governance/quality_gates.md": "Epistemic checks, Parity checks, and ISA verification",
-                "openwiki/pipeline/upstream_watcher.md": "Upstream watcher, Jev System One triage, and patch audits",
+                "openwiki/pipeline/upstream_watcher.md": "Upstream watcher, Jev usefulness triage, and review list",
                 "openwiki/quickstart.md": "Prerequisites, build commands, worktree operations, and gate check",
             },
         },
@@ -97,7 +97,7 @@ def query_jev_router(query: str) -> dict[str, Any]:
                 "core/sched/scheduler.cpp": "Scheduler step advancing and speculative depth arbitration",
                 "scripts/gate_check.sh": "4-Tier Master Quality Gate runner",
                 "scripts/check_epistemic_invariants.py": "Tier 0 Epistemic ground truth checker",
-                "scripts/watch_upstream.py": "Upstream Codeberg monitor and triage runner",
+                "scripts/watch_upstream.py": "Upstream Codeberg monitor writing candidates/upstream/REVIEW.md",
             },
         },
     }

@@ -1,7 +1,7 @@
 # Upstream Codeberg Evaluation Queue
 
 **Repository**: [StillDeadcode/radiance](https://codeberg.org/StillDeadcode/radiance)  
-**Last Checked**: 2026-10-08 12:07:13  
+**Last Checked**: 2026-10-08 12:27:41  
 **Total Screened PRs**: 30  
 
 ---

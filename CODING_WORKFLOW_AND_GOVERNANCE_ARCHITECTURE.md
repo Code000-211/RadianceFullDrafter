@@ -281,23 +281,20 @@ Key Invariants enforced by Orca:
 
 ---
 
-## 5. Autonomous Upstream Watcher & Continuous Triage Daemon
+## 5. Upstream Watcher (Review List Only)
 
-The upstream repository ([StillDeadcode/radiance](https://codeberg.org/StillDeadcode/radiance)) is continuously monitored by an autonomous background daemon:
+The upstream repository ([StillDeadcode/radiance](https://codeberg.org/StillDeadcode/radiance)) is polled by a background service that only prepares a reading list for a human:
 
 ```
-Codeberg REST API ──► 0-Token Dedup Filter ──► TypeSafe AI (Jev) Triage ──► Patch Safety Audit ──► GitHub Issue & Draft PR
+Codeberg REST API (open PRs + changed files) ──► Jev: "could this be useful for us?" ──► candidates/upstream/REVIEW.md
 ```
 
-1. **Daemon Management**: Managed via `scripts/upstream_watcher_manager.sh` (`start`, `stop`, `restart`, `status`, `logs`).
-2. **0-Token Idle Polling**: State deduplication in `telemetry/upstream_seen.json`. Polling cycles with no changes consume 0 LLM tokens. Documentation/CI PRs are classified deterministically with 0 AI calls.
-3. **Sub-100ms TypeSafe AI (Jev System One)**: Evaluates code PRs across four metrics: Subsystem Classification, RDNA4 Hardware Risk, Expected ROI, and Autonomous Action.
-4. **Deterministic Patch Safety & Mergeability Audit**:
-   - `git apply --check` verifies mergeability against `main`.
-   - Security scanner blocks malicious patterns (`rm -rf`, curl execution, binary injections).
-5. **Automated GitHub Dispatch**:
-   - Creates GitHub Issue with labels: `upstream:candidate`, `status:ready-to-test` (or `status:needs-review`).
-   - If clean merge, creates an isolated worktree branch `upstream/pr_XX`, applies the patch, commits, pushes, and opens a GitHub Draft Pull Request.
+1. **Service**: `radiance-upstream-watcher.service` (systemd, `Restart=always`, unit file in `scripts/systemd/`). Runs as `orca` without GitHub credentials or docker socket and may write only to `telemetry/` and `candidates/upstream/`. `scripts/upstream_watcher_manager.sh` is only a fallback for hosts without the unit.
+2. **Triage**: one Jev `noul` question per PR (title, description, changed-file list, our 2×R9700 / TP2 setup). PRs are re-classified only when title, description or file list change. State: `telemetry/upstream_review.json`.
+3. **Review list**: `candidates/upstream/REVIEW.md` with sections *Ansehen* (usefulness ≥ 0.5 or unclassified), *Von Jev aussortiert* and *Bereits angesehen*. Mark reviewed with `python3 scripts/watch_upstream.py --done <PR> ...`; a PR returns to the list if it changes upstream.
+4. **No automation beyond the list**: the watcher never creates issues, labels, branches or PRs, and never applies, builds or runs upstream code. Promoting an upstream PR into a candidate is a manual decision.
+
+The previous auto-dispatch design is retired; see `attic/2026-10-08_upstream_watcher_v1/POSTMORTEM.md`.
 
 ---
 
@@ -345,7 +342,7 @@ CLAUDE.md ──► AGENTS.md ◄── GEMINI.md
   * Standalone build archival (`archive_winner.sh`) and Pull Request creation (`gh pr create`).
 - **Autonomous Daemons (Orca Runner & Upstream Watcher)**:
   * **Orca Runner (`scripts/orca_agent_runner.sh`)**: Background poller (30s interval) monitoring GitHub Issues for `status:ready-to-test`. Executes isolated worktree testing, engine hot-swapping, and gate verification.
-  * **Upstream Watcher (`scripts/watch_upstream.py`)**: 24/7 background polling of upstream Codeberg. Triage and automated Draft PR dispatch.
+  * **Upstream Watcher (`scripts/watch_upstream.py`)**: 24/7 polling of upstream Codeberg. Writes a human review list (`candidates/upstream/REVIEW.md`); no issues or PRs.
 - **Asynchronous Communication Bridge**: GitHub Issues (`gh issue create`, `gh issue comment`) and Draft PRs serve as the official durable boundary between all agents.
 
 ### Empirical Skepticism & Anti-Sycophancy:
@@ -440,4 +437,4 @@ Every component of this workflow has been verified on the physical host:
 1. `bash scripts/verify_ground_truth.sh`: 6/6 Invariants Clean Pass.
 2. `python3 scripts/locate_code.py "P2P Store Drain"`: Subsystem resolved in 62 ms with 100% confidence.
 3. `pi-lens-mcp`: Tested over JSON-RPC 2.0 stdio with live symbol search and AST-grep queries.
-4. Upstream Watcher Daemon: Running permanently in background (PID `2112491`), screening 30 PRs at 0 idle token cost.
+4. Upstream Watcher: `radiance-upstream-watcher.service` (systemd), writing `candidates/upstream/REVIEW.md`.

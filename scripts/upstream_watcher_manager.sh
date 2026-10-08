@@ -3,7 +3,8 @@
 # upstream_watcher_manager.sh — Daemon Lifecycle Manager for Upstream Watcher
 # ==============================================================================
 # Starts, stops, and checks the status of the permanent upstream watcher.
-# Automatically monitors Codeberg (StillDeadcode/radiance) in the background.
+# Automatically monitors Codeberg (StillDeadcode/radiance) in the background and
+# keeps candidates/upstream/REVIEW.md up to date. It never creates issues or PRs.
 # ==============================================================================
 set -euo pipefail
 
@@ -14,8 +15,6 @@ PID_FILE="${REPO_ROOT}/telemetry/watcher.pid"
 LOG_FILE="${REPO_ROOT}/telemetry/watcher.log"
 
 INTERVAL="${INTERVAL:-300}"
-CREATE_ISSUES="${CREATE_ISSUES:-1}"
-CREATE_PRS="${CREATE_PRS:-1}"
 
 COMMAND="${1:-status}"
 shift || true
@@ -26,14 +25,6 @@ while [[ $# -gt 0 ]]; do
         --interval)
             INTERVAL="$2"
             shift 2
-            ;;
-        --no-issues)
-            CREATE_ISSUES=0
-            shift
-            ;;
-        --no-prs)
-            CREATE_PRS=0
-            shift
             ;;
         *)
             shift
@@ -55,6 +46,10 @@ is_running() {
 }
 
 start_watcher() {
+    if systemctl is-enabled --quiet radiance-upstream-watcher 2>/dev/null; then
+        echo "ℹ️  radiance-upstream-watcher.service is installed; use systemctl instead."
+        return 1
+    fi
     if is_running; then
         local pid
         pid=$(cat "${PID_FILE}")
@@ -64,17 +59,10 @@ start_watcher() {
 
     echo "🚀 Starting Upstream Watcher daemon in background..."
     echo "  • Polling interval: ${INTERVAL}s"
-    echo "  • Create GitHub Issues: $([ "${CREATE_ISSUES}" = "1" ] && echo "YES" || echo "NO")"
-    echo "  • Create GitHub Draft PRs: $([ "${CREATE_PRS}" = "1" ] && echo "YES" || echo "NO")"
+    echo "  • Review list: ${REPO_ROOT}/candidates/upstream/REVIEW.md"
     echo "  • Log file: ${LOG_FILE}"
 
     local args=("--daemon" "--interval" "${INTERVAL}")
-    if [ "${CREATE_ISSUES}" = "1" ]; then
-        args+=("--create-issues")
-    fi
-    if [ "${CREATE_PRS}" = "1" ]; then
-        args+=("--create-prs")
-    fi
 
     nohup python3 -u "${SCRIPT_DIR}/watch_upstream.py" "${args[@]}" >> "${LOG_FILE}" 2>&1 &
     local new_pid=$!
@@ -126,7 +114,7 @@ status_watcher() {
         pid=$(cat "${PID_FILE}")
         echo " • Status:  RUNNING (PID: ${pid})"
         echo " • Log:     ${LOG_FILE}"
-        if [ -f "${REPO_ROOT}/telemetry/upstream_seen.json" ]; then
+        if [ -f "${REPO_ROOT}/telemetry/upstream_review.json" ]; then
             python3 -c '
 import json, sys
 data = json.load(open(sys.argv[1]))
@@ -137,7 +125,7 @@ if last_c:
     import time
     ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last_c))
     print(f" • Last Poll:    {ts}")
-' "${REPO_ROOT}/telemetry/upstream_seen.json"
+' "${REPO_ROOT}/telemetry/upstream_review.json"
         fi
         echo ""
         echo "--- Recent Logs (last 10 lines) ---"
@@ -175,7 +163,7 @@ case "${COMMAND}" in
         logs_watcher
         ;;
     *)
-        echo "Usage: $0 {start|stop|restart|status|logs} [--interval <secs>] [--no-issues] [--no-prs]"
+        echo "Usage: $0 {start|stop|restart|status|logs} [--interval <secs>]"
         exit 1
         ;;
 esac

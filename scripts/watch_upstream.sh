@@ -2,7 +2,7 @@
 # ==============================================================================
 # Upstream Codeberg Monitor & Triage Runner
 # Automatically monitors https://codeberg.org/StillDeadcode/radiance
-# Screens PRs with Jev System One (<100ms) and deterministic safety checks.
+# Asks Jev whether open PRs could be useful and writes candidates/upstream/REVIEW.md.
 # ==============================================================================
 set -euo pipefail
 

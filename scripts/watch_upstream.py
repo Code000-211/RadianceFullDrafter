@@ -1,26 +1,27 @@
 #!/usr/bin/env python3
 """
-watch_upstream.py — Automated Upstream Codeberg Monitor & Triage Pipeline
+watch_upstream.py — Upstream Codeberg watcher, review list only
 
-Monitors the upstream Radiance repository (https://codeberg.org/StillDeadcode/radiance):
-  1. Polls Codeberg REST API & RSS feed for new Pull Requests and Commits.
-  2. Evaluates relevance using TypeSafe AI (Jev System One) in <100ms.
-  3. Downloads .patch files and runs deterministic safety checks (eval_patch_safety.py).
-  4. Automatically queues candidate optimizations into candidates/upstream/ with full audit logs.
-  5. Optionally creates GitHub tracking Issues and Draft Pull Requests for autonomous agent dispatch.
-  6. Tracks seen state in telemetry/upstream_seen.json to eliminate redundant processing.
+Polls open pull requests of https://codeberg.org/StillDeadcode/radiance, asks Jev
+(TypeSafe System One) one question — could this be useful for our setup? — and
+writes the result into candidates/upstream/REVIEW.md for a human to look at.
 
-Zero-Token Rule:
-  Trivial docs, markdown-only, or CI-only changes are classified deterministically without burning Jev tokens.
+This script deliberately does NOT:
+  * create GitHub issues, branches or pull requests
+  * apply, build or execute upstream code
+  * set any status label that ORCA would pick up
+
+State lives in telemetry/upstream_review.json. Mark a PR as looked at with
+`--done <PR> [<PR> ...]`; it moves back onto the list if the PR changes upstream.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
+import hashlib
 import json
-import re
-import shutil
-import subprocess
 import sys
 import time
 import urllib.error
@@ -28,806 +29,302 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-# Optional import of typesafe_triage
 try:
     import typesafe_triage
 except ImportError:
-    script_dir = Path(__file__).resolve().parent
-    sys.path.append(str(script_dir))
+    sys.path.append(str(Path(__file__).resolve().parent))
     import typesafe_triage
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 TELEMETRY_DIR = BASE_DIR / "telemetry"
-UPSTREAM_CANDIDATES_DIR = BASE_DIR / "candidates" / "upstream"
-SEEN_FILE = TELEMETRY_DIR / "upstream_seen.json"
-QUEUE_FILE = UPSTREAM_CANDIDATES_DIR / "QUEUE.md"
+STATE_FILE = TELEMETRY_DIR / "upstream_review.json"
+STATE_LOCK_FILE = TELEMETRY_DIR / "upstream_review.lock"
+DAEMON_LOCK_FILE = TELEMETRY_DIR / "watcher.lock"
+REVIEW_FILE = BASE_DIR / "candidates" / "upstream" / "REVIEW.md"
 
 CODEBERG_BASE = "https://codeberg.org"
 REPO_OWNER = "StillDeadcode"
 REPO_NAME = "radiance"
 API_BASE = f"{CODEBERG_BASE}/api/v1/repos/{REPO_OWNER}/{REPO_NAME}"
-RSS_URL = f"{CODEBERG_BASE}/{REPO_OWNER}/{REPO_NAME}.rss"
-USER_AGENT = "RadianceMine-Watcher/1.0"
-GITHUB_REPO = "OoguroRyuuya/RadianceMine"
+USER_AGENT = "RadianceMine-Watcher/2.0"
+PAGE_LIMIT = 50
+
+DEFAULT_THRESHOLD = 0.5
+
+OUR_SETUP = (
+    "Our setup: exactly 2x AMD Radeon AI PRO R9700 (RDNA4, gfx1201, 32 GB each), "
+    "PCIe 4.0, no NVLink/xGMI, tensor parallel world size 2 (never 3 or 4 ranks). "
+    "ROCm/HIP only, no CUDA. Model: Qwen FP8 Mixture-of-Experts served by the "
+    "Radiance engine. Goal: faster decode/prefill throughput or better correctness "
+    "on this exact setup."
+)
 
 
-def http_get_json(url: str, timeout: float = 15.0) -> Any:
+def http_get_json(url: str, timeout: float = 20.0) -> Any:
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
-    except (urllib.error.URLError, OSError, RuntimeError) as e:
+    except (urllib.error.URLError, OSError, ValueError) as e:
         raise RuntimeError(f"HTTP GET failed for {url}: {e}") from e
 
 
-def http_get_text(url: str, timeout: float = 15.0) -> str:
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.read().decode("utf-8", errors="replace")
-    except (urllib.error.URLError, OSError, RuntimeError) as e:
-        raise RuntimeError(f"HTTP GET failed for {url}: {e}") from e
-
-
-def load_seen_state() -> dict[str, Any]:
-    if SEEN_FILE.is_file():
-        try:
-            return json.loads(SEEN_FILE.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            return {"prs": {}, "commits": {}, "last_checked": 0}
-    return {"prs": {}, "commits": {}, "last_checked": 0}
-
-
-def save_seen_state(state: dict[str, Any]) -> None:
-    TELEMETRY_DIR.mkdir(parents=True, exist_ok=True)
-    SEEN_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
-
-
-def slugify(text: str) -> str:
-    s = re.sub(r"[^\w\s-]", "", text).strip().lower()
-    return re.sub(r"[-\s]+", "_", s)[:40]
-
-
-def is_docs_or_ci_only(patch_content: str) -> bool:
-    """Deterministic check: does this patch only touch docs, markdown, or CI files?"""
-    files = re.findall(r"diff --git a/(.*?) b/", patch_content)
-    if not files:
-        return False
-    docs_extensions = {".md", ".txt", ".rst", ".png", ".jpg", ".svg"}
-    docs_dirs = ("docs/", "doc/", ".github/", ".forgejo/", "licenses/")
-
-    for f in files:
-        path = Path(f)
-        is_doc = path.suffix.lower() in docs_extensions or any(
-            f.startswith(d) for d in docs_dirs
-        )
-        if not is_doc:
-            return False
-    return True
-
-
-def evaluate_with_jev(title: str, author: str, body: str) -> dict[str, Any]:
-    """Queries Jev System One for structured triage."""
-    payload = f"Title: {title}\nAuthor: {author}\n\nDescription:\n{body[:1500]}"
-    questions = {
-        "subsystem": {
-            "type": "choice",
-            "instructions": "Which engine subsystem does this optimization proposal affect?",
-            "criteria": {
-                "gemm": "Matrix multiplication, W4A8 GEMM, and linear projection kernels",
-                "gdn": "Gated Delta Network, recurrent SSM, linear attention",
-                "qsa": "Qwen Sparse Attention, micro-block scoring, paged KV cache",
-                "moe": "Mixture of Experts router, top-k scatter, expert GEMMs",
-                "interconnect": "Dual-GPU P2P All-Reduce, PCIe DMA, memory fence synchronization",
-                "drafter": "Speculative decoding, MTP drafter, acceptance controller",
-                "serving": "OpenAI-compatible HTTP server, endpoints (/v1/models, /props, hfget)",
-                "tooling": "Benchmarking, clock monitoring, hardware inspection scripts",
-                "general": "General engine core, memory management, config, or documentation",
-            },
-        },
-        "violates_rdna4_limits": {
-            "type": "noul",
-            "instructions": "Does this proposal contradict AMD RDNA4 gfx1201 hardware constraints (e.g. CUDA PTX, Wave64, >64KB LDS)?",
-        },
-        "feasibility": {
-            "type": "score",
-            "instructions": "Feasibility and architectural viability on dual AMD Radeon AI PRO R9700",
-            "criteria": [
-                "Unfeasible / contradicts hardware laws / CUDA-only",
-                "High risk or complex external dependency",
-                "Moderate feasibility / experimental",
-                "Feasible / standard ROCm HIP implementation",
-                "Immediate high-value quick win",
-            ],
-        },
-        "performance_roi": {
-            "type": "score",
-            "instructions": "Expected performance ROI on AMD dual R9700",
-            "criteria": [
-                "Zero or negative performance impact (docs, tool, placebo)",
-                "Marginal gain (<2%) or monitoring/stability utility",
-                "Solid architectural gain (2-5%)",
-                "High-impact gain (5-15%)",
-                "Breakthrough gain (>15%)",
-            ],
-        },
-    }
-    return typesafe_triage.query_jev(payload, questions)
-
-
-def run_deterministic_safety_audit(patch_path: Path) -> tuple[bool, list[str]]:
-    """Runs scripts/eval_patch_safety.py on the downloaded patch."""
-    checker = BASE_DIR / "scripts" / "eval_patch_safety.py"
-    if not checker.is_file():
-        return True, ["eval_patch_safety.py not found; skipped"]
-
-    proc = subprocess.run(
-        [sys.executable, str(checker), str(patch_path)],
-        cwd=str(BASE_DIR),
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-
-    violations = []
-    if proc.returncode != 0:
-        for line in proc.stdout.splitlines():
-            if line.strip().startswith("•") or "violation" in line.lower() or "rejected" in line.lower():
-                violations.append(line.strip())
-        if not violations:
-            violations = [proc.stdout.strip()]
-
-    return proc.returncode == 0, violations
-
-
-def check_patch_mergeable(patch_path: Path) -> tuple[bool, str]:
-    """Checks whether the patch applies cleanly to the current HEAD without conflicts."""
-    proc = subprocess.run(
-        ["git", "apply", "--check", str(patch_path)],
-        cwd=str(BASE_DIR),
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    return proc.returncode == 0, proc.stderr.strip()
-
-
-def create_github_issue(
-    pr_id: int,
-    title: str,
-    author: str,
-    url: str,
-    status: str,
-    folder_name: str,
-    patch_clean: bool,
-    jev_result: dict[str, Any] | None,
-    safety_violations: list[str],
-) -> str | None:
-    """Creates a GitHub tracking issue for this upstream candidate."""
-    if not shutil.which("gh"):
-        return None
-
-    subsystem = (jev_result or {}).get("subsystem", {}).get("choice", "N/A")
-    feasibility = (jev_result or {}).get("feasibility", {}).get("score", 0.0)
-    violates_rdna4 = (jev_result or {}).get("violates_rdna4_limits", {}).get("noul", 0.0)
-    roi = (jev_result or {}).get("performance_roi", {}).get("score", 0.0)
-
-    # Determine labels
-    labels = ["upstream:candidate"]
-    if status == "READY_TO_TEST":
-        labels.append("status:ready-to-test" if patch_clean else "status:needs-review")
-    elif status == "DOCS_OR_TOOLING":
-        labels.append("documentation")
-    elif status == "SERVING_ENDPOINT":
-        labels.append("enhancement")
-    elif status == "REJECTED_UNFEASIBLE":
-        labels.append("invalid")
-    elif status == "REJECTED_SAFETY_VIOLATION":
-        labels.append("regression:detected")
-
-    issue_title = f"🚀 Upstream PR #{pr_id}: {title} ({folder_name})"
-
-    safety_str = chr(10).join(f"  * ⚠️ {v}" for v in safety_violations) if safety_violations else "  * Zero dangerous anti-patterns detected."
-    merge_str = "✅ Clean drop-in" if patch_clean else "⚠️ Merge conflict (rebase / adaptation required)"
-
-    body = f"""## 🎯 Upstream Pull Request Summary
-- **PR Number**: #{pr_id}
-- **Author**: @{author}
-- **Upstream Codeberg URL**: {url}
-- **Triage Status**: `{status}`
-- **Candidate Package**: `candidates/upstream/{folder_name}`
-
-## 🧠 TypeSafe AI (Jev System One) Evaluation
-- **Target Subsystem**: `{subsystem}`
-- **RDNA4 Hardware Violation Risk**: `{violates_rdna4:.2f}` (lower is safer)
-- **Architectural Feasibility**: `{feasibility:.2f} / 4.00`
-- **Expected Performance ROI**: `{roi:.2f} / 4.00`
-
-## 🛡️ Deterministic Safety & Mergeability Audit
-- **Deterministic Safety**: {"PASS" if not safety_violations else "FAIL"}
-{safety_str}
-- **Clean Mergeability (`git apply --check`)**: {merge_str}
-
-## 📋 Instructions for Autonomous Agent
-1. **Spawn isolated worktree from golden baseline**:
-   ```bash
-   bash scripts/create_worktree.sh test_upstream_pr_{pr_id}
-   cd worktrees/test_upstream_pr_{pr_id}
-   ```
-2. **Apply candidate patch**:
-   ```bash
-   git apply ../../candidates/upstream/{folder_name}/pr.patch
-   ```
-3. **Verify Ground Truth & Hardware Invariants**:
-   ```bash
-   bash scripts/verify_ground_truth.sh
-   ninja -C build_hip
-   bash scripts/verify_rdna4_invariants.sh build_hip
-   ```
-4. **Execute Master Gate (when authorized)**:
-   ```bash
-   bash scripts/gate_check.sh
-   ```
-"""
-
-    cmd = ["gh", "issue", "create", "--repo", GITHUB_REPO, "--title", issue_title, "--body", body]
-    for lbl in labels:
-        cmd.extend(["--label", lbl])
-
-    try:
-        proc = subprocess.run(cmd, cwd=str(BASE_DIR), capture_output=True, text=True, check=False)
-        if proc.returncode == 0:
-            issue_url = proc.stdout.strip()
-            print(f"  🏷️ Created GitHub Issue: {issue_url}")
-            return issue_url
-        print(f"  ⚠️ Failed to create GitHub issue: {proc.stderr.strip()}")
-        return None
-    except (OSError, RuntimeError) as e:
-        print(f"  ⚠️ Error calling gh issue create: {e}")
-        return None
-
-
-def create_github_draft_pr(
-    pr_id: int,
-    title: str,
-    author: str,
-    url: str,
-    folder_name: str,
-    patch_path: Path,
-) -> str | None:
-    """Creates an isolated branch, applies the patch, pushes to origin, and opens a Draft PR on GitHub."""
-    if not shutil.which("gh"):
-        return None
-
-    branch_name = f"upstream/pr_{pr_id}_{slugify(title)[:25]}"
-
-    # Check if branch already exists remotely
-    proc = subprocess.run(
-        ["git", "ls-remote", "--heads", "origin", branch_name],
-        cwd=str(BASE_DIR),
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if proc.returncode == 0 and branch_name in proc.stdout:
-        print(f"  🌿 Remote branch origin/{branch_name} already exists.")
-        return None
-
-    # Use a temporary worktree to apply and commit the patch cleanly without touching current HEAD
-    tmp_worktree = BASE_DIR / "worktrees" / f"tmp_pr_{pr_id}"
-    tmp_worktree.parent.mkdir(parents=True, exist_ok=True)
-
-    try:
-        # 1. Create worktree on new branch from main
-        subprocess.run(
-            ["git", "worktree", "add", "-b", branch_name, str(tmp_worktree), "main"],
-            cwd=str(BASE_DIR),
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-
-        # 2. Apply patch
-        apply_res = subprocess.run(
-            ["git", "apply", str(patch_path.resolve())],
-            cwd=str(tmp_worktree),
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if apply_res.returncode != 0:
-            print(f"  ⚠️ Could not apply patch on clean branch: {apply_res.stderr.strip()}")
-            return None
-
-        # 3. Commit
-        subprocess.run(
-            ["git", "add", "-A"],
-            cwd=str(tmp_worktree),
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        commit_msg = (
-            f"feat(upstream): Upstream PR #{pr_id} by @{author}: {title}\n\n"
-            f"Upstream URL: {url}\nImported via RadianceMine Upstream Watcher."
-        )
-        subprocess.run(
-            ["git", "commit", "-m", commit_msg],
-            cwd=str(tmp_worktree),
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-
-        # 4. Push branch to origin
-        push_res = subprocess.run(
-            ["git", "push", "-u", "origin", branch_name],
-            cwd=str(tmp_worktree),
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if push_res.returncode != 0:
-            print(f"  ⚠️ Failed to push branch {branch_name} to origin: {push_res.stderr.strip()}")
-            return None
-
-        # 5. Create Draft PR
-        pr_body = f"""## Upstream Pull Request #{pr_id}
-**Author**: @{author}  
-**Upstream Codeberg URL**: {url}  
-**Candidate Directory**: `candidates/upstream/{folder_name}`  
-
-This draft PR imports Upstream PR #{pr_id} from `StillDeadcode/radiance` into an isolated branch for testing and review.
-"""
-        pr_cmd = [
-            "gh", "pr", "create", "--draft",
-            "--repo", GITHUB_REPO,
-            "--title", f"Upstream PR #{pr_id}: {title}",
-            "--body", pr_body,
-            "--head", branch_name,
-            "--base", "main",
-        ]
-        pr_proc = subprocess.run(pr_cmd, cwd=str(BASE_DIR), capture_output=True, text=True, check=False)
-        if pr_proc.returncode == 0:
-            pr_url = pr_proc.stdout.strip()
-            print(f"  🔀 Created GitHub Draft PR: {pr_url}")
-            return pr_url
-        print(f"  ⚠️ Failed to create Draft PR: {pr_proc.stderr.strip()}")
-        return None
-    except (subprocess.SubprocessError, OSError) as e:
-        print(f"  ⚠️ Error creating draft PR: {e}")
-        return None
-    finally:
-        # Cleanup temporary worktree
-        subprocess.run(
-            ["git", "worktree", "remove", "--force", str(tmp_worktree)],
-            cwd=str(BASE_DIR),
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-
-
-def package_candidate(
-    pr_id: int,
-    title: str,
-    author: str,
-    url: str,
-    patch_content: str,
-    jev_result: dict[str, Any] | None,
-    safety_passed: bool,
-    safety_violations: list[str],
-    status: str,
-    create_issue: bool = False,
-    create_pr: bool = False,
-    existing_issue: str | None = None,
-    existing_pr: str | None = None,
-) -> tuple[Path, str | None, str | None]:
-    """Packages candidate into candidates/upstream/pr_{id}_{slug}/."""
-    UPSTREAM_CANDIDATES_DIR.mkdir(parents=True, exist_ok=True)
-    folder_name = f"pr_{pr_id}_{slugify(title)}"
-    candidate_dir = UPSTREAM_CANDIDATES_DIR / folder_name
-    candidate_dir.mkdir(parents=True, exist_ok=True)
-
-    # 1. Save patch files (both pr.patch and lever.patch for seamless tooling compatibility)
-    patch_file = candidate_dir / "pr.patch"
-    patch_file.write_text(patch_content, encoding="utf-8", errors="replace")
-    lever_file = candidate_dir / "lever.patch"
-    lever_file.write_text(patch_content, encoding="utf-8", errors="replace")
-
-    # 2. Check mergeability against HEAD
-    patch_clean, _ = check_patch_mergeable(patch_file)
-
-    # 3. Create GitHub Issue if requested
-    issue_url = existing_issue
-    if create_issue and not issue_url:
-        issue_url = create_github_issue(
-            pr_id=pr_id,
-            title=title,
-            author=author,
-            url=url,
-            status=status,
-            folder_name=folder_name,
-            patch_clean=patch_clean,
-            jev_result=jev_result,
-            safety_violations=safety_violations,
-        )
-
-    # 4. Create GitHub Draft PR if requested and patch applies cleanly
-    pr_url = existing_pr
-    if create_pr and not pr_url:
-        if patch_clean:
-            pr_url = create_github_draft_pr(
-                pr_id=pr_id,
-                title=title,
-                author=author,
-                url=url,
-                folder_name=folder_name,
-                patch_path=patch_file,
-            )
-        else:
-            print("  ⚠️ Skipping Draft PR creation: patch has merge conflicts against main.")
-
-    # 5. Extract modified files from patch
-    modified_files = re.findall(r"diff --git a/(.*?) b/", patch_content)
-
-    # 6. Save METADATA.json
-    meta = {
-        "pr_id": pr_id,
-        "title": title,
-        "author": author,
-        "url": url,
-        "status": status,
-        "modified_files": modified_files,
-        "safety_audit": {
-            "passed": safety_passed,
-            "violations": safety_violations,
-        },
-        "mergeable_clean": patch_clean,
-        "github_issue": issue_url,
-        "github_pr": pr_url,
-        "jev_evaluation": jev_result or {},
-    }
-    (candidate_dir / "METADATA.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
-
-    # 7. Generate README.md
-    subsystem = (jev_result or {}).get("subsystem", {}).get("choice", "N/A")
-    feasibility = (jev_result or {}).get("feasibility", {}).get("score", 0.0)
-    violates_rdna4 = (jev_result or {}).get("violates_rdna4_limits", {}).get("noul", 0.0)
-    roi = (jev_result or {}).get("performance_roi", {}).get("score", 0.0)
-
-    issue_link = f"- **GitHub Issue**: [Issue Link]({issue_url})\n" if issue_url else ""
-    pr_link = f"- **GitHub Draft PR**: [Draft PR Link]({pr_url})\n" if pr_url else ""
-
-    safety_lines = chr(10).join(f"- {v}" for v in safety_violations) if safety_violations else "- Zero dangerous anti-patterns detected."
-    modified_lines = chr(10).join(f"- `{f}`" for f in modified_files)
-
-    readme_content = f"""# Upstream PR #{pr_id}: {title}
-
-**Author**: @{author}  
-**Upstream URL**: {url}  
-**Status**: `{status}`  
-**Candidate Directory**: `candidates/upstream/{folder_name}`  
-{issue_link}{pr_link}
----
-
-## 1. TypeSafe AI (Jev System One) Evaluation
-- **Target Subsystem**: `{subsystem}`
-- **RDNA4 Hardware Violation Risk**: `{violates_rdna4:.2f}` (lower is safer)
-- **Feasibility Score**: `{feasibility:.2f} / 4.00`
-- **Expected Performance ROI**: `{roi:.2f} / 4.00`
-
----
-
-## 2. Deterministic Safety Audit
-- **Safety Gate Result**: `{"PASS" if safety_passed else "FAIL (REJECTED)"}`
-{safety_lines}
-- **Clean Mergeability (`git apply --check`)**: `{"PASS" if patch_clean else "CONFLICT (Requires rebase)"}`
-
----
-
-## 3. Modified Files ({len(modified_files)})
-{modified_lines}
-
----
-
-## 4. Verification & Testing Instructions
-To test this patch cleanly in an isolated worktree:
-```bash
-# 1. Create isolated worktree from golden baseline
-bash scripts/create_worktree.sh test_upstream_pr_{pr_id}
-
-# 2. Enter worktree and apply patch
-cd worktrees/test_upstream_pr_{pr_id}
-git apply ../../candidates/upstream/{folder_name}/pr.patch
-
-# 3. Build HIP kernels
-ninja -C build_hip
-
-# 4. Run Epistemic and ISA Gate Checks
-bash scripts/verify_ground_truth.sh
-bash scripts/verify_rdna4_invariants.sh build_hip
-
-# 5. Run Parity & Benchmark Gate (when authorized)
-bash scripts/gate_check.sh
-```
-"""
-    (candidate_dir / "README.md").write_text(readme_content, encoding="utf-8")
-    return candidate_dir, issue_url, pr_url
-
-
-def update_master_queue_doc(seen_state: dict[str, Any]) -> None:
-    """Updates candidates/upstream/QUEUE.md with the live queue overview."""
-    UPSTREAM_CANDIDATES_DIR.mkdir(parents=True, exist_ok=True)
-    prs = seen_state.get("prs", {})
-
-    lines = [
-        "# Upstream Codeberg Evaluation Queue",
-        "",
-        f"**Repository**: [{REPO_OWNER}/{REPO_NAME}]({CODEBERG_BASE}/{REPO_OWNER}/{REPO_NAME})  ",
-        f"**Last Checked**: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(seen_state.get('last_checked', time.time())))}  ",
-        f"**Total Screened PRs**: {len(prs)}  ",
-        "",
-        "---",
-        "",
-        "| PR # | Title | Author | Subsystem | Feas. | ROI | Safety | Status | GitHub Issue | Draft PR | Candidate |",
-        "|------|-------|--------|-----------|-------|-----|--------|--------|--------------|----------|-----------|",
+def fetch_paged(url: str) -> list[Any]:
+    sep = "&" if "?" in url else "?"
+    items: list[Any] = []
+    page = 1
+    while True:
+        batch = http_get_json(f"{url}{sep}limit={PAGE_LIMIT}&page={page}")
+        if not batch:
+            return items
+        items.extend(batch)
+        if len(batch) < PAGE_LIMIT:
+            return items
+        page += 1
+
+
+def fetch_open_prs() -> list[dict[str, Any]]:
+    return fetch_paged(f"{API_BASE}/pulls?state=open")
+
+
+def fetch_changed_files(pr_id: int) -> list[dict[str, Any]]:
+    files = fetch_paged(f"{API_BASE}/pulls/{pr_id}/files")
+    return [
+        {
+            "name": f.get("filename", "?"),
+            "add": f.get("additions", 0),
+            "del": f.get("deletions", 0),
+        }
+        for f in files
     ]
 
-    # Sort PRs by PR number descending
-    sorted_prs = sorted(prs.values(), key=lambda x: x.get("pr_id", 0), reverse=True)
 
-    for item in sorted_prs:
-        pr_id = item.get("pr_id")
-        title = item.get("title", "")[:30]
-        author = item.get("author", "")
-        jev = item.get("jev", {})
-        sub = jev.get("subsystem", {}).get("choice", "-")
-        feas = f"{jev.get('feasibility', {}).get('score', 0.0):.1f}" if jev else "-"
-        roi = f"{jev.get('performance_roi', {}).get('score', 0.0):.1f}" if jev else "-"
-        safety = "✅" if item.get("safety", {}).get("passed", True) else "❌"
-        status = item.get("status", "QUEUED")
-        slug = slugify(item.get("title", ""))
-        rel_dir = f"pr_{pr_id}_{slug}/README.md"
-
-        gh_issue = item.get("github_issue")
-        gh_pr = item.get("github_pr")
-
-        issue_col = f"[#{gh_issue.split('/')[-1]}]({gh_issue})" if gh_issue else "-"
-        pr_col = f"[#{gh_pr.split('/')[-1]}]({gh_pr})" if gh_pr else "-"
-        cand_col = f"[Inspect]({rel_dir})" if (UPSTREAM_CANDIDATES_DIR / f"pr_{pr_id}_{slug}").exists() else "-"
-
-        lines.append(
-            f"| #{pr_id} | {title} | @{author} | `{sub}` | {feas} | {roi} | {safety} | `{status}` | {issue_col} | {pr_col} | {cand_col} |"
-        )
-
-    lines.extend([
-        "",
-        "---",
-        "### Status Legend:",
-        "- `READY_TO_TEST`: Passed Jev triage + deterministic patch safety; packaged in candidate folder.",
-        "- `DOCS_OR_TOOLING`: Monitoring tool, benchmark utility, or documentation improvement.",
-        "- `SERVING_ENDPOINT`: HTTP server endpoints or client compatibility.",
-        "- `REJECTED_UNFEASIBLE`: High RDNA4 violation or unfeasible architecture (e.g. CUDA PTX).",
-        "- `REJECTED_SAFETY_VIOLATION`: Detected dangerous anti-pattern (e.g. per-thread threadfence, test tampering).",
-    ])
-
-    QUEUE_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
+def load_state() -> dict[str, Any]:
+    if STATE_FILE.is_file():
+        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    return {"prs": {}, "last_checked": 0}
 
 
-def check_and_triage_pull_requests(
-    use_typesafe: bool = True,
-    force: bool = False,
-    create_issues: bool = False,
-    create_prs: bool = False,
-    filter_pr: int | None = None,
-    include_closed: bool = False,
-) -> list[dict[str, Any]]:
-    """Polls PRs, screens them, and updates queue."""
-    seen = load_seen_state()
-    state_param = "all" if include_closed else "open"
-    prs_data = http_get_json(f"{API_BASE}/pulls?state={state_param}")
-    results = []
+@contextlib.contextmanager
+def state_lock() -> Any:
+    """Serialises access to the state file between the daemon and --done/--pr runs."""
+    with STATE_LOCK_FILE.open("w") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        yield
 
-    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 🔍 Fetched {len(prs_data)} {state_param} PRs from {API_BASE}/pulls...", flush=True)
 
-    for pr in prs_data:
+def save_state(state: dict[str, Any]) -> None:
+    TELEMETRY_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = STATE_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    tmp.replace(STATE_FILE)
+
+
+def fingerprint(title: str, body: str, files: list[dict[str, Any]]) -> str:
+    raw = json.dumps([title, body, files], sort_keys=True)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def classify_usefulness(title: str, body: str, files: list[dict[str, Any]]) -> float:
+    """Returns Jev's probability that the PR could be useful for us."""
+    file_lines = "\n".join(f"  {f['name']} (+{f['add']}/-{f['del']})" for f in files[:80])
+    if len(files) > 80:
+        file_lines += f"\n  ... and {len(files) - 80} more files"
+    state = (
+        f"{OUR_SETUP}\n\n"
+        f"Upstream pull request title: {title}\n\n"
+        f"Description:\n{body[:3000]}\n\n"
+        f"Changed files:\n{file_lines or '  (unknown)'}"
+    )
+    questions = {
+        "useful": {
+            "type": "noul",
+            "instructions": (
+                "Could this pull request plausibly be useful for our setup, so that a human "
+                "should look at it? Say no for changes that only matter for 3+ GPUs, CUDA/NVIDIA, "
+                "other model families we do not run, or pure cosmetics."
+            ),
+        },
+    }
+    answers = typesafe_triage.query_jev(state, questions)
+    return float(answers["useful"]["noul"])
+
+
+def triage(state: dict[str, Any], use_jev: bool, force: bool, only_pr: int | None) -> None:
+    open_prs = fetch_open_prs()
+    open_ids = {str(pr["number"]) for pr in open_prs}
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{now}] {len(open_prs)} open upstream PRs", flush=True)
+
+    for key, entry in state["prs"].items():
+        entry["open"] = key in open_ids
+
+    for pr in open_prs:
         pr_id = pr["number"]
-        if filter_pr is not None and pr_id != filter_pr:
+        if only_pr is not None and pr_id != only_pr:
+            continue
+        key = str(pr_id)
+        entry = state["prs"].get(key, {})
+        if not force and entry.get("updated_at") == pr.get("updated_at") and entry.get("useful") is not None:
             continue
 
-        pr_key = str(pr_id)
-        title = pr["title"]
-        author = pr["user"]["username"]
+        title = pr.get("title", "")
         body = pr.get("body") or ""
-        pr_url = f"{CODEBERG_BASE}/{REPO_OWNER}/{REPO_NAME}/pulls/{pr_id}"
-        updated_at = pr.get("updated_at", "")
-
-        existing_entry = seen.get("prs", {}).get(pr_key, {})
-        existing_issue = existing_entry.get("github_issue")
-        existing_pr = existing_entry.get("github_pr")
-
-        # Check if already screened and not updated (and issue/pr flags satisfied)
-        needs_action = (
-            force
-            or pr_key not in seen.get("prs", {})
-            or existing_entry.get("updated_at") != updated_at
-            or (create_issues and not existing_issue)
-            or (create_prs and not existing_pr)
-        )
-
-        if not needs_action:
-            continue
-
-        print(f"\n⚡ Triage PR #{pr_id}: '{title}' (@{author})")
-
-        # 1. Download patch
-        patch_url = f"{CODEBERG_BASE}/{REPO_OWNER}/{REPO_NAME}/pulls/{pr_id}.patch"
         try:
-            patch_content = http_get_text(patch_url)
-        except (urllib.error.URLError, OSError, RuntimeError) as e:
-            print(f"⚠️ Failed to download patch for PR #{pr_id}: {e}")
-            continue
+            files = fetch_changed_files(pr_id)
+        except RuntimeError as e:
+            print(f"  #{pr_id}: file list unavailable ({e})", flush=True)
+            files = []
 
-        # 2. Check if docs-only (Deterministic 0-token rule)
-        is_doc = is_docs_or_ci_only(patch_content)
-        jev_result = existing_entry.get("jev")
-
-        if is_doc:
-            status = "DOCS_OR_CI"
-            print("  📄 PR touches only docs / CI / text files (Deterministic 0-token rule).")
-        elif jev_result is not None and not force:
-            status = existing_entry.get("status", "QUEUED")
-            print("  🧠 Reusing previously cached Jev System One evaluation.")
-        elif use_typesafe:
+        fp = fingerprint(title, body, files)
+        changed = fp != entry.get("fingerprint")
+        useful = entry.get("useful") if not (changed or force) else None
+        error = None
+        if useful is None and use_jev:
             try:
-                print("  🧠 Querying TypeSafe AI (Jev System One)...")
-                jev_result = evaluate_with_jev(title, author, body)
-                sub = jev_result.get("subsystem", {}).get("choice", "general")
-                feas = jev_result.get("feasibility", {}).get("score", 0.0)
-                viol = jev_result.get("violates_rdna4_limits", {}).get("noul", 0.0)
-                roi = jev_result.get("performance_roi", {}).get("score", 0.0)
-                print(f"  • Subsystem: {sub} | Feasibility: {feas:.2f} | RDNA4 Viol: {viol:.2f} | ROI: {roi:.2f}")
+                useful = classify_usefulness(title, body, files)
+            except (RuntimeError, KeyError, TypeError, ValueError) as e:
+                error = str(e)
+                print(f"  #{pr_id}: Jev failed, listed as unclassified ({e})", flush=True)
 
-                if viol >= 0.50 or feas < 1.5:
-                    status = "REJECTED_UNFEASIBLE"
-                elif sub == "tooling":
-                    status = "DOCS_OR_TOOLING"
-                elif sub == "serving":
-                    status = "SERVING_ENDPOINT"
-                elif roi >= 1.5 or sub in ("gemm", "gdn", "qsa", "moe", "interconnect", "drafter"):
-                    status = "READY_TO_TEST"
-                else:
-                    status = "QUEUED_LOW_PRIORITY"
-            except (RuntimeError, ValueError) as e:
-                print(f"  ⚠️ Jev query failed: {e}")
-                status = "QUEUED_MANUAL_REVIEW"
-        else:
-            status = "QUEUED_NO_TYPESAFE"
-
-        # 3. Temporary patch file for deterministic safety audit
-        temp_patch = TELEMETRY_DIR / f"temp_pr_{pr_id}.patch"
-        temp_patch.write_text(patch_content, encoding="utf-8")
-        safety_passed, violations = run_deterministic_safety_audit(temp_patch)
-        temp_patch.unlink(missing_ok=True)
-
-        if not safety_passed:
-            status = "REJECTED_SAFETY_VIOLATION"
-            print(f"  ❌ Patch rejected by deterministic safety audit: {violations}")
-        else:
-            print("  🛡️ Patch safety audit: PASSED")
-
-        # 4. Package candidate directory and optionally create GitHub Issue / PR
-        c_dir, issue_url, pr_url = package_candidate(
-            pr_id=pr_id,
-            title=title,
-            author=author,
-            url=pr_url,
-            patch_content=patch_content,
-            jev_result=jev_result,
-            safety_passed=safety_passed,
-            safety_violations=violations,
-            status=status,
-            create_issue=create_issues,
-            create_pr=create_prs,
-            existing_issue=existing_issue,
-            existing_pr=existing_pr,
-        )
-        print(f"  📦 Packaged candidate into {c_dir.relative_to(BASE_DIR)}")
-
-        # 5. Record state
-        seen.setdefault("prs", {})[pr_key] = {
+        done = entry.get("done", False) and not changed
+        state["prs"][key] = {
             "pr_id": pr_id,
             "title": title,
-            "author": author,
-            "url": pr_url,
-            "updated_at": updated_at,
-            "status": status,
-            "github_issue": issue_url,
-            "github_pr": pr_url,
-            "jev": jev_result,
-            "safety": {
-                "passed": safety_passed,
-                "violations": violations,
-            },
+            "author": (pr.get("user") or {}).get("username", "?"),
+            "url": pr.get("html_url") or f"{CODEBERG_BASE}/{REPO_OWNER}/{REPO_NAME}/pulls/{pr_id}",
+            "updated_at": pr.get("updated_at"),
+            "fingerprint": fp,
+            "files": files,
+            "useful": useful,
+            "jev_error": error,
+            "done": done,
+            "changed_since_done": entry.get("done", False) and changed,
+            "open": True,
         }
-        results.append(seen["prs"][pr_key])
+        label = "unclassified" if useful is None else f"useful={useful:.2f}"
+        print(f"  #{pr_id}: {label}  {title[:70]}", flush=True)
 
-    seen["last_checked"] = int(time.time())
-    save_seen_state(seen)
-    update_master_queue_doc(seen)
-    print(f"\n✅ Upstream PR triage complete. Master queue updated at {QUEUE_FILE.relative_to(BASE_DIR)}")
-    return results
+    state["last_checked"] = int(time.time())
 
 
-def check_recent_commits() -> None:
-    """Checks recent commits on main for upstream version bumps or core kernel edits."""
-    commits = http_get_json(f"{API_BASE}/commits?limit=5")
-    print("\n🔍 Latest upstream commits on main:")
-    for c in commits:
-        sha = c["sha"][:8]
-        date = c["commit"]["committer"]["date"][:10]
-        msg = c["commit"]["message"].splitlines()[0]
-        print(f"  • [{sha}] {date} — {msg}")
+def mark_done(state: dict[str, Any], pr_ids: list[int]) -> None:
+    for pr_id in pr_ids:
+        entry = state["prs"].get(str(pr_id))
+        if entry is None:
+            print(f"PR #{pr_id} is not in the review state", file=sys.stderr)
+            continue
+        entry["done"] = True
+        entry["changed_since_done"] = False
+        print(f"PR #{pr_id} marked as reviewed")
+
+
+def md_escape(text: str) -> str:
+    return text.replace("|", "\\|").replace("\n", " ")
+
+
+def format_files(files: list[dict[str, Any]]) -> str:
+    if not files:
+        return "?"
+    shown = ", ".join(f"`{f['name']}`" for f in files[:4])
+    return shown + (f" +{len(files) - 4} weitere" if len(files) > 4 else "")
+
+
+def write_review_list(state: dict[str, Any], threshold: float) -> None:
+    entries = [e for e in state["prs"].values() if e.get("open")]
+    todo = [e for e in entries if not e.get("done") and (e.get("useful") is None or e["useful"] >= threshold)]
+    dropped = [e for e in entries if not e.get("done") and e.get("useful") is not None and e["useful"] < threshold]
+    done = [e for e in entries if e.get("done")]
+
+    def sort_key(e: dict[str, Any]) -> tuple[float, int]:
+        return (-(e["useful"] if e.get("useful") is not None else 2.0), -e["pr_id"])
+
+    def table(rows: list[dict[str, Any]]) -> list[str]:
+        if not rows:
+            return ["_keine_", ""]
+        out = ["| PR | Nützlich (Jev) | Titel | Autor | Dateien |", "|---|---|---|---|---|"]
+        for e in sorted(rows, key=sort_key):
+            score = "unklassifiziert" if e.get("useful") is None else f"{e['useful']:.2f}"
+            if e.get("changed_since_done"):
+                score += " (geändert seit Review)"
+            out.append(
+                f"| [#{e['pr_id']}]({e['url']}) | {score} | {md_escape(e['title'][:90])} "
+                f"| @{e['author']} | {format_files(e.get('files', []))} |"
+            )
+        out.append("")
+        return out
+
+    last = time.strftime("%Y-%m-%d %H:%M", time.localtime(state.get("last_checked", 0)))
+    lines = [
+        "# Upstream-PRs zum Ansehen",
+        "",
+        f"Quelle: [{REPO_OWNER}/{REPO_NAME}]({CODEBERG_BASE}/{REPO_OWNER}/{REPO_NAME}/pulls), "
+        f"zuletzt geprüft {last}. Jev schätzt nur, ob ein PR für unser Setup nützlich sein "
+        f"könnte (Schwelle {threshold:.2f}). Es wird nichts automatisch angewendet oder getestet.",
+        "",
+        "Als angesehen markieren: `python3 scripts/watch_upstream.py --done <PR> [<PR> ...]`",
+        "",
+        f"## Ansehen ({len(todo)})",
+        "",
+        *table(todo),
+        f"## Von Jev aussortiert ({len(dropped)})",
+        "",
+        *table(dropped),
+        f"## Bereits angesehen ({len(done)})",
+        "",
+        *table(done),
+    ]
+    REVIEW_FILE.parent.mkdir(parents=True, exist_ok=True)
+    REVIEW_FILE.write_text("\n".join(lines), encoding="utf-8")
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Automated Upstream Codeberg Watcher & Triage")
-    parser.add_argument("--once", action="store_true", help="Run once and exit")
-    parser.add_argument("--daemon", action="store_true", help="Run continuously in background")
+    parser = argparse.ArgumentParser(description="Upstream Codeberg watcher: Jev usefulness triage into a review list")
+    parser.add_argument("--daemon", action="store_true", help="Poll continuously")
     parser.add_argument("--interval", type=int, default=300, help="Polling interval in seconds (default: 300)")
-    parser.add_argument("--force", action="store_true", help="Force re-evaluation of seen PRs")
-    parser.add_argument("--no-typesafe", action="store_true", help="Disable Jev System One queries")
-    parser.add_argument("--pr", type=int, help="Triage a specific PR number")
-    parser.add_argument("--create-issues", action="store_true", help="Create GitHub tracking issues for screened PRs")
-    parser.add_argument("--create-prs", action="store_true", help="Create GitHub Draft PRs for clean patches")
-    parser.add_argument("--all", action="store_true", help="Include closed/merged PRs (default: only open PRs)")
-
+    parser.add_argument("--force", action="store_true", help="Re-classify all open PRs")
+    parser.add_argument("--no-typesafe", action="store_true", help="Skip Jev; everything is listed as unclassified")
+    parser.add_argument("--pr", type=int, help="Only (re-)classify this PR")
+    parser.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD, help="Usefulness cut-off for the list")
+    parser.add_argument("--done", type=int, nargs="+", metavar="PR", help="Mark PRs as reviewed and exit")
     args = parser.parse_args()
 
-    use_typesafe = not args.no_typesafe
+    TELEMETRY_DIR.mkdir(parents=True, exist_ok=True)
 
-    if args.pr:
-        print(f"Targeting single PR #{args.pr}...", flush=True)
-        check_and_triage_pull_requests(
-            use_typesafe=use_typesafe,
-            force=args.force,
-            create_issues=args.create_issues,
-            create_prs=args.create_prs,
-            filter_pr=args.pr,
-            include_closed=True,
-        )
+    if args.done:
+        with state_lock():
+            state = load_state()
+            mark_done(state, args.done)
+            save_state(state)
+            write_review_list(state, args.threshold)
         return 0
 
     if args.daemon:
-        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 🚀 Starting watch_upstream daemon (polling every {args.interval}s)...", flush=True)
-        while True:
-            try:
-                check_and_triage_pull_requests(
-                    use_typesafe=use_typesafe,
-                    force=args.force,
-                    create_issues=args.create_issues,
-                    create_prs=args.create_prs,
-                    include_closed=args.all,
-                )
-                check_recent_commits()
-            except (urllib.error.URLError, OSError, RuntimeError) as e:
-                print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] ⚠️ Error during polling cycle: {e}", flush=True)
-            print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 💤 Sleeping {args.interval}s...", flush=True)
-            time.sleep(args.interval)
-        return 0
+        daemon_lock = DAEMON_LOCK_FILE.open("w")
+        try:
+            fcntl.flock(daemon_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print(f"another watcher daemon holds {DAEMON_LOCK_FILE}; exiting", file=sys.stderr)
+            return 1
+        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] watcher daemon started, interval {args.interval}s", flush=True)
 
-    # Default: single run
-    check_and_triage_pull_requests(
-        use_typesafe=use_typesafe,
-        force=args.force,
-        create_issues=args.create_issues,
-        create_prs=args.create_prs,
-        include_closed=args.all,
-    )
-    check_recent_commits()
-    return 0
-
+    force = args.force or args.pr is not None
+    while True:
+        try:
+            with state_lock():
+                state = load_state()
+                triage(state, use_jev=not args.no_typesafe, force=force, only_pr=args.pr)
+                save_state(state)
+                write_review_list(state, args.threshold)
+            print(f"Review list: {REVIEW_FILE.relative_to(BASE_DIR)}", flush=True)
+        except RuntimeError as e:
+            print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] polling failed: {e}", flush=True)
+            if not args.daemon:
+                return 1
+        if not args.daemon:
+            return 0
+        force = False
+        time.sleep(args.interval)
 
 if __name__ == "__main__":
     sys.exit(main())

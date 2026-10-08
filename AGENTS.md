@@ -136,7 +136,7 @@ The `README.md` must include:
 ### 4.2 Literature & Reference Grounding
 - **alphaXiv**: Use alphaXiv tools (`discover_papers`, `get_paper_content`, `resolve_researchers`, `get_paper_notes`) to inspect methodology, equations, and ablation studies.
 - **GitHub**: Search and inspect reference implementations (vLLM, SGLang, FlashAttention-3, DeepSeek, AsmEvo, CUTLASS, Composable Kernel).
-- **Issue Dispatch**: Submit GitHub Issues labeled `research:new-lever` or `upstream:candidate` for automated triage.
+- **Issue Dispatch**: Submit GitHub Issues labeled `research:new-lever` for automated triage. Upstream PRs are not dispatched automatically; they land in `candidates/upstream/REVIEW.md` for human review.
 
 ### 4.3 Multi-Agent Roles & Collaboration Protocol
 - **Claude / Research Agents**: Academic & open-source mining, architectural modeling, candidate packaging, issue generation.

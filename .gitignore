@@ -73,6 +73,10 @@ benchmarks/runs/*
 !benchmarks/runs/.gitkeep
 telemetry/*.json
 telemetry/*.pid
+telemetry/*.lock
+telemetry/*.v1-moved-to-attic
+# Regenerated every poll by radiance-upstream-watcher.service
+candidates/upstream/REVIEW.md
 !telemetry/.gitkeep
 baselines/*_results.json
 tmp/
