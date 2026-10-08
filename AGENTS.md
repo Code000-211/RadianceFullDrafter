@@ -62,7 +62,22 @@ No code may be promoted to candidate status or merged into `main` without a clea
 
 ---
 
-## 3. Mandatory Agent Workflow
+## 3. Hardware Architecture Ground Truth (RDNA4 / gfx1201)
+
+All architectural proposals, kernel modifications, and performance optimizations must be strictly calibrated against the physical dual AMD Radeon AI PRO R9700 hardware:
+- **Compute Units**: 64 Dual CUs, native Wave32 scheduling (32 threads per wave).
+- **LDS (Local Data Share)**: 64 KiB per CU across 32 banks (4 bytes/bank). Must use XOR swizzling to prevent bank conflicts.
+- **Register Budget**: Max occupancy (4 waves/SIMD) requires $\le 84-96$ VGPRs per thread. Above 128 VGPRs occupancy collapses to 1-2 waves.
+- **VRAM & Memory Bus**: 32 GB GDDR6 per card, 256-bit bus, 576 GB/s memory bandwidth.
+- **Dual-GPU Interconnect**: PCIe 4.0 x16 slot-to-slot interconnect.
+  * Measured Host-to-Device DMA: $28.29\,\text{GB/s}$.
+  * Measured Device-to-Device P2P: $16.95\,\text{GB/s}$ bidirectional.
+  * **FATAL ERROR TO AVOID**: Never assume PCIe 5.0 (63 GB/s)! Any math based on PCIe 5.0 will cause buffer starvation and prefetch stalls.
+- **Memory Fence Ordering**: Avoid unconditional `__threadfence_system()` in per-thread execution loops. Use workgroup-leader store drains (`__threadfence_system()` once per workgroup) or RDNA4 store-release flags (`store_sys_rel`).
+
+---
+
+## 4. Mandatory Agent Workflow
 
 Every engineering task must follow this 7-step lifecycle:
 
@@ -84,9 +99,9 @@ Step 3: Local Compilation & Unit Verification
    └─► cmake --build build_hip --target arch_test -j$(nproc)
    └─► ./build_hip/tests/arch_test <test_filter>
 
-Step 4: Run the 3-Tier Gate
+Step 4: Run the Master Quality Gate (Tier 0 - Tier 3)
    └─► bash scripts/gate_check.sh
-       (Verifies Tier 1 Parity, Tier 2 Composite, Tier 3 Hardware Invariants)
+       (Verifies Tier 0 Epistemic, Tier 1 Parity, Tier 2 Composite, Tier 3 Hardware Invariants)
 
 Step 5: Process Results
    ├─► IF PASS:
@@ -99,9 +114,35 @@ Step 5: Process Results
          3. Cleanly rollback via bash scripts/rollback_to_winner.sh --latest.
 ```
 
+### 4.1 Candidate Lever Packaging Standard
+When packaging a new optimization lever from literature or upstream, agents must structure it strictly in `candidates/`:
+```
+candidates/lever<N>_<name>/
+├── README.md        # Comprehensive technical specification & mathematical roofline
+├── lever.patch      # Clean git patch diff against golden baseline (Opt 146)
+└── src/             # (Optional) Standalone modified kernel or header sources
+```
+The `README.md` must include:
+1. **Metadata**: Status (`Verified Candidate`), Target Baseline (Opt 146), Source Paper/Repo (exact URLs + commit SHAs), Target Files.
+2. **Expected Impact**: Quantified projection in $\text{tok/s}$ (Single-Stream Decode, Concurrency C8, or Cold 64k Prefill) and latency reduction ($\mu\text{s}$).
+3. **Architectural & Mathematical Principles**: Equations, roofline analysis, and memory traffic calculations.
+4. **AMD RDNA4 (gfx1201) Hardware Mapping**: LDS usage, VGPR occupancy, Wave32 scheduling, PCIe bus safety.
+5. **Exact Implementation**: C++/HIP code diff or kernel blueprints.
+6. **Master Gate Verification Protocol**: Concrete command to execute (`scripts/gate_check.sh`) and pass criteria.
+
+### 4.2 Literature & Reference Grounding
+- **alphaXiv**: Use alphaXiv tools (`discover_papers`, `get_paper_content`, `resolve_researchers`, `get_paper_notes`) to inspect methodology, equations, and ablation studies.
+- **GitHub**: Search and inspect reference implementations (vLLM, SGLang, FlashAttention-3, DeepSeek, AsmEvo, CUTLASS, Composable Kernel).
+- **Issue Dispatch**: Submit GitHub Issues labeled `research:new-lever` or `upstream:candidate` for automated triage.
+
+### 4.3 Multi-Agent Roles & Collaboration Protocol
+- **Claude / Research Agents**: Academic & open-source mining, architectural modeling, candidate packaging, issue generation.
+- **Antigravity / Execution Agents**: Git worktree management, HIP/C++ compilation, physical execution of Tier 0–3 Master Gates on the GPUs, PR creation and merging.
+- **Communication Protocol**: GitHub Issues (`gh issue create`, `gh issue comment`) serve as the asynchronous coordination bridge between agents.
+
 ---
 
-## 4. Context & Token Management (`ctx-enforce`)
+## 5. Context & Token Management (`ctx-enforce`)
 
 1. **Think in Code**: Never dump large raw logs, disassembly dumps, or multi-megabyte JSON files directly into chat context.
 2. **Compute in Sandbox**: Use `ctx_execute` (JavaScript/Python) to filter, aggregate, parse, and extract only the relevant summary metrics before outputting.
@@ -110,14 +151,14 @@ Step 5: Process Results
 
 ---
 
-## 5. Code Quality Gate (`auto-lint`)
+## 6. Code Quality Gate (`auto-lint`)
 
 - Every file created or edited must satisfy the Zero-Error Standard.
 - Immediately inspect and resolve any compiler warnings, syntax errors, or linter diagnostics before signaling task completion.
 
 ---
 
-## 6. The Seven Epistemic Invariants (Anti-Hallucination Operational Law)
+## 7. The Seven Epistemic Invariants (Anti-Hallucination Operational Law)
 
 Derived from Rule 5 of [`ENGINEERING_CONSTITUTION.md`](file:///home/orca/RadianceMine/ENGINEERING_CONSTITUTION.md), every agent operating in `RadianceMine` is legally and technically bound by these seven operational laws:
 
@@ -145,7 +186,7 @@ Derived from Rule 5 of [`ENGINEERING_CONSTITUTION.md`](file:///home/orca/Radianc
 
 ---
 
-## 7. Empirical Skepticism & Fact-Checking Authority (Anti-Sycophancy)
+## 8. Empirical Skepticism & Fact-Checking Authority (Anti-Sycophancy)
 
 1. **The User's Word Is Not Infallible Law**:
    - Treat user instructions, assumptions, and hypotheses as technical propositions that must be validated against hardware reality and empirical data.
@@ -156,7 +197,7 @@ Derived from Rule 5 of [`ENGINEERING_CONSTITUTION.md`](file:///home/orca/Radianc
 
 ---
 
-## 8. Regression Review Loop (GitHub Issues & PR Lifecycle)
+## 9. Regression Review Loop (GitHub Issues & PR Lifecycle)
 
 1. **Automatic Review Routing on Gate Failure**:
    - When an optimization or candidate lever is tested in a worktree and fails `scripts/gate_check.sh` (or causes throughput/parity regression):
