@@ -238,6 +238,11 @@ To eliminate token exhaustion, context pollution, and the "subagent telephone ga
    - Any proposed optimization, kernel modification, or architectural claim MUST cite the corresponding OpenWiki section or verified Claim.
 3. **Mandatory Documentation Synchronization**:
    - Whenever an optimization lever passes the 4-Tier Master Quality Gate and is merged, the modifying agent or workflow MUST update OpenWiki (`openwiki code --update` or `openwiki_begin({ mode: "update" })`) to ensure that new symbols, invariants, and claims remain 100% physically grounded for all subsequent agents.
+4. **Mandatory Call-Graph & Relationship Tracing Protocol (pi-lens / LSP)**:
+   - When tracing function call sites, class relationships, or dependency impacts across the codebase:
+     * Agents MUST NOT perform manual multi-file text grepping or eyeball multi-thousand-line source files.
+     * Agents MUST use compiler-grounded language server tools (`pi-lens` MCP: `pilens_lsp_navigation` with `references` / `incomingCalls`, `pilens_symbol_search`, `pilens_ast_grep_search`, or native `clangd` via `compile_commands.json`).
+     * To inspect definitions, use symbol-level readers (`pilens_read_symbol`, `pilens_read_enclosing`, or bounded `view_file` <= 200 lines) instead of loading whole files.
 
 ---
 

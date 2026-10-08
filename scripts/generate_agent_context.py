@@ -33,12 +33,15 @@ BASELINE_OPT146 = """
 """
 
 OPENWIKI_GROUNDING_MANDATE = """
-=== Mandatory Ground-Truth First (Zero-Blind-Exploration Law) ===
+=== Mandatory Ground-Truth First & Two-Tier Code Intelligence ===
 - You are STRICTLY PROHIBITED from blind directory searches, random multi-file greps, or dumping full source files into context memory.
-- Before reading code or formulating architecture proposals, execute:
+- Tier 1 (Macro Architecture & Subsystems): Ground in OpenWiki first:
     python3 scripts/locate_code.py "<task_or_query>"
-  or query OpenWiki directly via `openwiki_search` / `openwiki_read`.
-- Every architectural claim, kernel modification, or candidate diff must cite verified OpenWiki claims (repo://path#L...).
+  or query OpenWiki via `openwiki_search` / `openwiki_read`. Citing verified claims (repo://path#L...) is required.
+- Tier 2 (Micro Relationships & Call Sites): Trace cross-file dependencies and call sites using LSP / pi-lens:
+    * Find references & callers: `pilens_lsp_navigation` (operation: "references" / "incomingCalls") or `clangd`.
+    * Semantic AST search: `pilens_ast_grep_search`.
+    * Inspect symbols: `pilens_read_symbol` or bounded view (<= 200 lines). NEVER dump full multi-thousand-line source files.
 """
 
 def generate_research_prompt(goal: str, suggestion: str = "", lever_slug: str = "") -> str:

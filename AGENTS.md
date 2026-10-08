@@ -56,9 +56,10 @@ No code may be promoted to candidate status or merged into `main` without a clea
   * 128-bit aligned coalesced global loads
   * Zero CPU-GPU spinlock barriers in decode fast-path
 
-### ⛔ Prohibited Action 5: Blind Exploration & Multi-File Dumps Without OpenWiki Grounding
+### ⛔ Prohibited Action 5: Blind Exploration & Multi-File Dumps Without OpenWiki & LSP Grounding
 - You MUST NEVER run blind directory sweeps, random grep patterns across all files, or dump large multi-thousand-line source files into conversation memory.
 - You MUST query OpenWiki (`python3 scripts/locate_code.py "<task>"`) before inspecting code to obtain verified line numbers and ground-truth architectural claims.
+- When tracing function call sites, usages, or cross-file relationships, you MUST use compiler-accurate language server tools (`pi-lens` / `clangd` via `pilens_lsp_navigation`, `pilens_symbol_search`, `pilens_read_symbol`) rather than eyeballing raw files.
 
 ---
 
@@ -82,10 +83,12 @@ All architectural proposals, kernel modifications, and performance optimizations
 Every engineering task must follow this 7-step lifecycle:
 
 ```
-Step 0: Ground in OpenWiki (Zero-Blind-Exploration)
-   └─► python3 scripts/locate_code.py "<task_or_query>"
-       OR use openwiki_search / openwiki_read.
-       (Identifies exact subsystem, verified claims, and physical code spans)
+Step 0: Ground in OpenWiki & LSP (Zero-Blind-Exploration & Relationship Tracing)
+   ├─► Macro Architecture: python3 scripts/locate_code.py "<task_or_query>"
+   │   (Identifies exact subsystem, verified claims, and physical code spans)
+   └─► Micro Relationships & Call Sites: pi-lens LSP / clangd
+       (Uses pilens_lsp_navigation for references/incomingCalls, pilens_symbol_search,
+        pilens_ast_grep_search, and pilens_read_symbol without full file dumping)
 
 Step 1: Spawn Worktree
    └─► bash scripts/create_worktree.sh <lever_or_feature_name>
@@ -139,6 +142,19 @@ The `README.md` must include:
 - **Claude / Research Agents**: Academic & open-source mining, architectural modeling, candidate packaging, issue generation.
 - **Antigravity / Execution Agents**: Git worktree management, HIP/C++ compilation, physical execution of Tier 0–3 Master Gates on the GPUs, PR creation and merging.
 - **Communication Protocol**: GitHub Issues (`gh issue create`, `gh issue comment`) serve as the asynchronous coordination bridge between agents.
+
+### 4.4 Code Intelligence & Relationship Tracing Protocol (OpenWiki + pi-lens/LSP)
+To eliminate token waste and guarantee 100% compiler-accurate relationship tracing across the codebase, all code exploration must follow this 2-tier protocol:
+
+| Exploration Dimension | Primary Tool | How To Use / Example | What It Solves |
+|---|---|---|---|
+| **Macro Architecture & Subsystem Invariants** | **OpenWiki + Jev System One** | `python3 scripts/locate_code.py "<query>"` or `openwiki_search` / `openwiki_read` | Identifies which subsystem owns a problem, the data flow, and which invariants must not be violated. |
+| **Call Sites / References ("Where is this called?")** | **`pilens_lsp_navigation` (LSP)** | `pilens_lsp_navigation({ operation: "references", file: "core/engine.cpp", line: 120, character: 15 })` | Compiler-precise finding of every caller across all files (AST-level, handles overloads & templates). |
+| **Call Hierarchy / Dependency Tree ("Who calls whom?")** | **`pilens_lsp_navigation` (Call Tree)** | `pilens_lsp_navigation({ operation: "incomingCalls", ... })` | Traces execution paths and callers upstream without manual searching. |
+| **Fast Identifier Lookup** | **`pilens_symbol_search`** | `pilens_symbol_search({ query: "RadDraftState" })` | Ranked identifier lookup over warm word index. |
+| **Symbol Extraction (Zero-Bloat Reading)** | **`pilens_read_symbol` / `pilens_read_enclosing`** | `pilens_read_symbol({ file: "libr4d/r4d_ar.hip", symbol: "r4d_ar_step_write" })` | Retrieves only the verbatim function body; prevents dumping 2,000 lines into context. |
+| **Structural AST Patterns** | **`pilens_ast_grep_search`** | `pilens_ast_grep_search({ lang: "cpp", pattern: "RAD_ISSUE_N($$$)" })` | Searches syntax trees rather than plain text regex. |
+| **Fallback (Standalone / Non-MCP)** | **Native `clangd` + `compile_commands.json`** | `/home/orca/.local/bin/clangd` or `ctx_execute` | Uses `compile_commands.json` symlink in workspace root for compiler flags. |
 
 ---
 
