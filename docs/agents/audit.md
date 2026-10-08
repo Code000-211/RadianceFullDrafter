@@ -27,7 +27,8 @@ oder eine Host-Komponente).
 ## Ein Lauf
 
 1. Karte lesen. 1–2 Bereiche wählen: nie geprüft vor lange nicht geprüft; Decode-Hot-Path vor
-   Prefill vor Rest. Geänderte Dateien seit der letzten Prüfung (`git log --since`) zählen als
+   Prefill vor Rest; innerhalb davon nach Anteil an der Schrittzeit im Decode-Profil
+   (`/home/orca/RadianceMine/reports/profile_latest/PROFILE.md`: teuerste Kernel, größte Übergänge). Geänderte Dateien seit der letzten Prüfung (`git log --since`) zählen als
    ungeprüft.
 2. Gründlich lesen: Kernel-Quelle, Launch-Konfiguration, Datenlayout, Synchronisation. Für Kernel
    die Register- und Spill-Werte aus `python3 scripts/check_isa_compliance.py build_hip --json`.

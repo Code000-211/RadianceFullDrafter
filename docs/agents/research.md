@@ -25,7 +25,10 @@ beruht, ist nur übertragbar, wenn du den Mechanismus ohne diese Voraussetzung e
    Pfad (Decode oder Prefill). Mit `rg` geprüft, nicht vermutet.
 2. `python3 scripts/lever_review.py similar "<Idee in einem Satz>"`; Treffer über 0.8 lesen.
 3. Doppelte vermeiden: `gh issue list --label research:new-lever --state all --search "<Stichwort>"`.
-4. Erwartete Wirkung grob hergeleitet (z. B. Bytes pro Token, Kernel-Starts pro Schritt) und
+4. Den betroffenen Anteil im Decode-Profil nachgesehen
+   (`/home/orca/RadianceMine/reports/profile_latest/PROFILE.md`): Kernel-Zeit und Lücken, die die
+   Idee angreift. Eine Idee für einen Teil, der im Profil kaum vorkommt, ist kein Issue.
+5. Erwartete Wirkung grob hergeleitet (z. B. Bytes pro Token, Kernel-Starts pro Schritt) und
    gegen das Rauschen der Benchmarks gestellt. Was darunter liegt, ist kein Issue.
 
 ## Issue anlegen

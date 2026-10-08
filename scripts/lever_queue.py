@@ -4,7 +4,13 @@
     lever_queue.py add <slug> [--ref <branch>] [--abba]   queue candidates/<slug>/lever.patch
     lever_queue.py add <slug> --ref <branch> --mode merge test the branch itself (upstream sync)
     lever_queue.py list                                  show pending / done / failed jobs
-    lever_queue.py run [--daemon] [--github]             process pending jobs one at a time
+    lever_queue.py run [--daemon] [--github] [--auto-profile]
+                                                         process pending jobs one at a time
+    lever_queue.py profile                               decode profile of origin/main now
+
+--auto-profile: whenever the queue is idle and origin/main has no profile yet, the runner takes a
+decode profile of the baseline (scripts/profile_decode.py) into reports/profile_<sha>_<ts>/ and
+points reports/profile_latest at it. Planner and audit read it to judge fusions and other levers.
 
 With --github the runner also pulls issues labelled status:ready-to-test and reports
 results back to them (see gh_bridge.py). That is how Orca automations drive the queue.
@@ -53,6 +59,8 @@ QUEUE_DIR = REPO_ROOT / "queue"
 REPORTS_DIR = REPO_ROOT / "reports"
 RELEASES_DIR = REPO_ROOT / "releases"
 LOCK_FILE = QUEUE_DIR / "runner.lock"
+PROFILE_LATEST = REPORTS_DIR / "profile_latest"
+PROFILE_TRIED = QUEUE_DIR / "profile_tried"  # baseline SHA of the last profile attempt, pass or fail
 BASELINE_WT = REPO_ROOT / "worktrees" / "_baseline"
 ROCM = os.environ.get("ROCM_PATH", "/opt/rocm")
 # The systemd unit starts with a bare environment; cmake's HIP detection needs these.
@@ -247,13 +255,73 @@ def report_pending_results() -> None:
             path.write_text(json.dumps(data, indent=2))
 
 
-def cmd_run(args: argparse.Namespace) -> int:
+def profile_baseline() -> Path:
+    """Decode profile of origin/main's baseline build; the caller holds the runner lock (GPUs)."""
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    staging = REPORTS_DIR / f"profile_pending_{ts}"
+    staging.mkdir(parents=True)
+    with (staging / "run.log").open("w") as log_f:
+        run_step("fetch", ["git", "fetch", "origin", "+refs/heads/main:refs/remotes/origin/main"], log_f, REPO_ROOT)
+        # Recorded before anything can fail, so a broken baseline is not rebuilt every idle minute.
+        PROFILE_TRIED.write_text(git_out("rev-parse", "origin/main") + "\n")
+        baseline_build, sha = ensure_baseline(log_f)
+        out = REPORTS_DIR / f"profile_{sha[:10]}_{ts}"
+        staging.rename(out)
+        run_step("profile", [sys.executable, str(REPO_ROOT / "scripts" / "profile_decode.py"),
+                             "--build-dir", str(baseline_build), "--out", str(out)], log_f, REPO_ROOT)
+    link = REPORTS_DIR / f".profile_latest_{ts}"
+    link.symlink_to(out.name)
+    link.replace(PROFILE_LATEST)
+    return out
+
+
+def profile_due() -> bool:
+    proc = subprocess.run(["git", "fetch", "--quiet", "origin", "+refs/heads/main:refs/remotes/origin/main"],
+                          cwd=str(REPO_ROOT), capture_output=True, text=True, check=False)
+    if proc.returncode != 0:
+        print(f"⚠️  fetch for the profile check failed: {proc.stderr.strip()}", flush=True)
+        return False
+    tried = PROFILE_TRIED.read_text().strip() if PROFILE_TRIED.is_file() else ""
+    return tried != git_out("rev-parse", "origin/main")
+
+
+def run_profile_logged() -> None:
+    print(f"[{time.strftime('%H:%M:%S')}] profiling origin/main", flush=True)
+    try:
+        out = profile_baseline()
+        print(f"[{time.strftime('%H:%M:%S')}] profile -> {out}/PROFILE.md", flush=True)
+    except (StepFailed, OSError, subprocess.CalledProcessError) as e:
+        # Not retried for the same baseline (PROFILE_TRIED); the next main gets a new attempt.
+        print(f"⚠️  profile failed: {e} (see reports/profile_*/run.log)", flush=True)
+
+
+def take_lock():
     QUEUE_DIR.mkdir(parents=True, exist_ok=True)
     lock = LOCK_FILE.open("w")
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         print("another queue runner is active", file=sys.stderr)
+        return None
+    return lock
+
+
+def cmd_profile(_: argparse.Namespace) -> int:
+    lock = take_lock()
+    if lock is None:
+        return 1
+    try:
+        out = profile_baseline()
+    except (StepFailed, OSError, subprocess.CalledProcessError) as e:
+        print(f"profile failed: {e}", file=sys.stderr)
+        return 2
+    print(f"{out}/PROFILE.md")
+    return 0
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    lock = take_lock()
+    if lock is None:
         return 1
     if args.github:
         gh_bridge.ensure_labels()
@@ -266,6 +334,9 @@ def cmd_run(args: argparse.Namespace) -> int:
                 print(f"⚠️  GitHub pull failed: {e}", flush=True)
             report_pending_results()
         pending = sorted(queue_path("pending").glob("*.json"))
+        if not pending and args.auto_profile and profile_due():
+            run_profile_logged()
+            continue
         if not pending:
             if not args.daemon:
                 return 0
@@ -298,8 +369,10 @@ def main() -> int:
     p_run = sub.add_parser("run")
     p_run.add_argument("--daemon", action="store_true", help="keep polling for new jobs")
     p_run.add_argument("--github", action="store_true", help="pull status:ready-to-test issues and report results to them")
+    p_run.add_argument("--auto-profile", action="store_true", help="profile each new origin/main while idle")
+    sub.add_parser("profile")
     args = parser.parse_args()
-    return {"add": cmd_add, "list": cmd_list, "run": cmd_run}[args.cmd](args)
+    return {"add": cmd_add, "list": cmd_list, "run": cmd_run, "profile": cmd_profile}[args.cmd](args)
 
 
 if __name__ == "__main__":

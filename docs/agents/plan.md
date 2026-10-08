@@ -32,6 +32,27 @@ nicht deine Überlegungen. Alles, was er wissen muss, steht im Plan selbst.
 6. Laufzeit-Verbote aus `AGENTS.md` §4 gelten auch für Hebel (z. B. kein
    `RADIANCE_HEAT_RESIDENCY > 0`, kein statisches `NUM_SPECULATIVE_TOKENS > 3`).
 
+## 1a. Leistung aus dem Decode-Profil begründen
+
+`/home/orca/RadianceMine/reports/profile_latest/PROFILE.md` (Rohdaten in `summary.json`, Tabellen in
+`tsum_c*.txt`, `gaps_c*.txt`) zeigt für den aktuellen `main` bei 1 und 8 Streams, wo ein
+Decode-Schritt seine Zeit verbringt. Ist das Profil älter als `origin/main` oder fehlt es, steht
+das im Plan.
+
+- Jede Leistungs-Hypothese nennt den Anteil, den sie angreift: µs/Schritt der betroffenen Kernel
+  und die Lücken vor ihnen, im Verhältnis zur Schrittzeit ohne Trace.
+- **Fusion:** Obergrenze des Gewinns = korrigierte Lücken der Übergänge innerhalb der Kette
+  (Tabelle „Größte Übergänge“) + eingesparter Speicherverkehr der Zwischenergebnisse (Bytes ÷
+  gemessene VRAM-Bandbreite aus `HARDWARE_GROUND_TRUTH.md`). Davon abziehen, was die Fusion an
+  Belegung kosten kann: Die VGPR-Zahl des fusionierten Kernels ist die der gierigsten Phase
+  (`docs/RDNA4_ISA_ENGINEERING_RULES.md`, Regel 1). Liegt die Obergrenze unter dem Rauschen des
+  Gates, wird verworfen.
+- Lücken sind eine Obergrenze (Tracer-Anteil steckt darin, korrigiert ist geschätzt). „Busy“ sagt
+  nichts über Auslastung; ein Kernel mit wenigen Blocks (`blocks` in `tsum_c*.txt`, unter ~64)
+  füllt die Karte nicht, dort helfen Fusion oder ein anderes Grid eher als Tuning des Kernels.
+- Große Fusionen (ganzer Block, persistenter Kernel) nur, wenn das Profil nach den kleineren
+  Fusionen noch entsprechende Lücken zeigt; sie bekommen `tier:heavy`.
+
 ## 2. Verwerfen
 
 Verwerfen, wenn die Idee der Hardware widerspricht, schon gescheitert ist und nichts Neues
