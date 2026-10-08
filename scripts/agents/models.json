@@ -46,6 +46,7 @@
     "max_questions": 3,
     "max_open_ideas": 8,
     "interval_hours": {"research": 24, "audit": 12},
+    "interval_hours_goal": {"research": 2, "audit": 2},
     "cooldown_min": 60,
     "availability_fallback": false
   },

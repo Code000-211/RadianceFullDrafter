@@ -50,6 +50,9 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import goal  # noqa: E402
+
 REPO = "OoguroRyuuya/RadianceMine"
 PRIMARY = Path(os.environ.get("RADIANCE_PRIMARY", Path(__file__).resolve().parent.parent))
 CONFIG = PRIMARY / "scripts" / "agents" / "models.json"
@@ -420,12 +423,18 @@ def find_work(cfg: dict[str, Any], role: str, verbose: bool = True, only_issue: 
             return None
         title = f"{role}-Lauf"
         if role in ("research", "audit"):
+            g = goal_now()
+            if g["target_set"] and g["reached"]:
+                log("Ziel erreicht (baselines/targets.json): keine neuen Ideen")
+                return None
             ideas = [i for i in open_issues() if "research:new-lever" in i["labels"] and not i["labels"] & DEAD]
             if len(ideas) >= lim["max_open_ideas"]:
                 log(f"{len(ideas)} offene Ideen >= {lim['max_open_ideas']}: erst abarbeiten")
                 return None
+            # With an open target the pipeline is kept fed: only a short minimum spacing applies.
+            hours = lim["interval_hours_goal" if g["target_set"] else "interval_hours"][role]
             stamp = state_dir() / f"last-{role}"
-            if stamp.is_file() and time.time() - stamp.stat().st_mtime < lim["interval_hours"][role] * 3600:
+            if stamp.is_file() and time.time() - stamp.stat().st_mtime < hours * 3600:
                 return None
         else:
             state = json.loads((PRIMARY / "telemetry" / "upstream_review.json").read_text())
@@ -474,6 +483,13 @@ def limit_violation(cfg: dict[str, Any], item: dict[str, Any], rows: list[dict[s
     return None
 
 
+def goal_now() -> dict[str, Any]:
+    return goal.current(PRIMARY / "reports" / "goal_status.json", PRIMARY / "baselines" / "targets.json")
+
+
+GOAL_ROLES = ("plan", "research", "audit")
+
+
 # ---------------------------------------------------------------- agent launch
 
 def build_prompt(cfg: dict[str, Any], item: dict[str, Any], rows: list[dict[str, Any]], worktree: Path, branch: str,
@@ -501,6 +517,10 @@ def build_prompt(cfg: dict[str, Any], item: dict[str, Any], rows: list[dict[str,
     lines += [f"Jeden Kommentar beenden mit: `— Agent {item['role']} · {b['model']}`", "",
               "Lies zuerst `AGENTS.md` und `docs/ORCA_AGENT_WORKFLOW.md`.", "", "---", ""]
     text = "\n".join(lines) + (PROMPTS / f"{item['role']}.md").read_text(encoding="utf-8")
+    if item["role"] in GOAL_ROLES:
+        text += ("\n\n---\n\n# Ziel der Optimierung\n\nRichte Auswahl und Begründung danach aus, welcher Teil des "
+                 "Scores am weitesten vom Ziel entfernt ist (Spalte „fehlende gewichtete Punkte“) und welche "
+                 "Anforderung nicht erfüllt ist.\n\n" + goal.render(goal_now()))
     return text + ("\n\n---\n\n" + brief if brief else "")
 
 
@@ -923,6 +943,9 @@ def cmd_labels() -> int:
 
 def cmd_status(cfg: dict[str, Any]) -> int:
     lim = cfg["limits"]
+    g = goal_now()
+    print("Ziel:", "keins gesetzt" if not g["target_set"] else ("erreicht" if g["reached"] else "nicht erreicht"),
+          f"(letzte Messung {g['latest']['metrics'].get('total_score')} Punkte)" if g.get("latest") else "(keine Messung)")
     print(f"Slots frei: {free_slots(lim['max_parallel'])}/{lim['max_parallel']}, reserviert: {active_reservations()}"
           f"  (State: {STATE})")
     for name in cfg["backends"]:

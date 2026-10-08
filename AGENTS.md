@@ -11,7 +11,8 @@ Details stehen in genau einem Dokument je Thema:
 |---|---|
 | Hardware-Fakten (gemessen) | `HARDWARE_GROUND_TRUTH.md` |
 | Gate: was gemessen wird, Schwellen, Kalibrierung | `docs/GATE.md` |
-| Wo ein Decode-Schritt seine Zeit verbringt (Profil des aktuellen `main`) | `reports/profile_latest/PROFILE.md`, erzeugt von `scripts/profile_decode.py` |
+| Ziel der Optimierung (BetterBench-Score, Mindestwerte) und ob es erreicht ist | `baselines/targets.json` (nur Leon), `scripts/goal.py`, `reports/goal_status.json` |
+| Wie schnell `main` ist und wo die Zeit hingeht (Score, Decode, langsamste Schritte, Prefill) | `reports/profile_latest/PROFILE.md`, erzeugt von `scripts/profile_engine.py` |
 | Arbeitsablauf der Agents (Start, Modelle, Rückfragen), Hebel-Pakete, Issue-Labels | `docs/ORCA_AGENT_WORKFLOW.md` |
 | Rollen-Prompts der Agents | `docs/agents/<rolle>.md` |
 | Upstream übernehmen (PR-Bewertung, Sync von Codeberg-main, eigenes Kernel-Plugin) | `docs/UPSTREAM.md` |

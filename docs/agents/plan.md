@@ -32,12 +32,17 @@ nicht deine Überlegungen. Alles, was er wissen muss, steht im Plan selbst.
 6. Laufzeit-Verbote aus `AGENTS.md` §4 gelten auch für Hebel (z. B. kein
    `RADIANCE_HEAT_RESIDENCY > 0`, kein statisches `NUM_SPECULATIVE_TOKENS > 3`).
 
-## 1a. Leistung aus dem Decode-Profil begründen
+## 1a. Leistung aus dem Profil begründen
 
-`/home/orca/RadianceMine/reports/profile_latest/PROFILE.md` (Rohdaten in `summary.json`, Tabellen in
-`tsum_c*.txt`, `gaps_c*.txt`) zeigt für den aktuellen `main` bei 1 und 8 Streams, wo ein
-Decode-Schritt seine Zeit verbringt. Ist das Profil älter als `origin/main` oder fehlt es, steht
-das im Plan.
+`/home/orca/RadianceMine/reports/profile_latest/PROFILE.md` (Rohdaten in `summary.json` und
+`score.json`, Tabellen in `tsum_c*.txt`, `gaps_c*.txt`) zeigt für den aktuellen `main`: den
+BetterBench-Score mit Teilscores, wo ein Decode-Schritt bei 1 und 8 Streams seine Zeit verbringt,
+was die langsamsten Schritte zusätzlich brauchen (Ursache der 1%-Lows) und wo der Prefill seine
+Zeit verbringt. Das Ziel und welcher Teil am weitesten davon entfernt ist, steht unten im Abschnitt
+„Ziel der Optimierung“. Ist das Profil älter als `origin/main` oder fehlt es, steht das im Plan.
+
+- Eine Idee muss den Teil angreifen, in dem laut Ziel-Abschnitt Punkte fehlen, oder begründen,
+  warum ein anderer Teil mehr bringt.
 
 - Jede Leistungs-Hypothese nennt den Anteil, den sie angreift: µs/Schritt der betroffenen Kernel
   und die Lücken vor ihnen, im Verhältnis zur Schrittzeit ohne Trace.

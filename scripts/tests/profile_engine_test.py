@@ -1,6 +1,6 @@
-"""Tests for the trace analysis in scripts/profile_decode.py on a synthetic rocprofv3 CSV.
+"""Tests for the trace analysis in scripts/profile_engine.py on a synthetic rocprofv3 CSV.
 
-Run: python3 -m unittest scripts/tests/profile_decode_test.py
+Run: python3 -m unittest scripts/tests/profile_engine_test.py
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ from pathlib import Path
 
 SCRIPTS_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(SCRIPTS_DIR))
-spec = importlib.util.spec_from_file_location("profile_decode", SCRIPTS_DIR / "profile_decode.py")
+spec = importlib.util.spec_from_file_location("profile_engine", SCRIPTS_DIR / "profile_engine.py")
 pd = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(pd)
 
@@ -73,11 +73,45 @@ class TestAnalysis(unittest.TestCase):
 
     def test_report_renders(self) -> None:
         a = pd.analyse(pd.read_trace(self.csv), overhead_us=1.0)
+        rows = pd.read_trace(self.csv)
         md = pd.render({"commit": "abc", "build_dir": "b", "date": "d", "levels": [
             {"streams": 1, "untraced": {"decode_tps": 50.0}, "untraced_ms_per_step": 0.12, "overhead_us": 1.0,
-             "analysis": a, "warnings": ["gaps.sh rc=1"]}]})
+             "analysis": a, "slow_steps": pd.slow_steps(rows, 1.0), "warnings": ["gaps.sh rc=1"]}],
+            "prefill": {"prompt_tokens": 64000, "untraced_tps": 9000.0, "overhead_us": 1.0, "warnings": [],
+                        "analysis": pd.analyse(rows, 1.0, pd.last_burst(rows))}})
         self.assertIn("| `small_op` | `gemm_w4a8<true,1u>` |", md)
         self.assertIn("**Warnung:** gaps.sh rc=1", md)
+        self.assertIn("## Prefill, 64000 Prompt-Tokens", md)
+        self.assertIn("Langsamste Schritte", md)
+
+
+class TestOutliersAndBursts(unittest.TestCase):
+    def rows(self, slow_every: int = 0) -> list:
+        """One rank, 40 steps; every `slow_every`-th step has a 300 us longer gemm and a 500 us host wait."""
+        rows, t = [], 0
+        for i in range(40):
+            slow = slow_every and i % slow_every == 0
+            for name, dur, gap in (("r4d_rowtopk_stage1", 4_000, 2_000), ("small_op", 5_000, 520_000 if slow else 20_000),
+                                   ("gemm", 400_000 if slow else 100_000, 2_000)):
+                rows.append(("Agent 1", t, t + dur, name))
+                t += dur + gap
+        return rows
+
+    def test_slow_steps_name_their_cause(self) -> None:
+        so = pd.slow_steps(self.rows(slow_every=10), overhead_us=1.0)
+        self.assertEqual(so["slow_count"], 3)
+        causes = {(c["kernel"], c["where"]): c["extra_us"] for c in so["contributors"]}
+        self.assertAlmostEqual(causes[("gemm", "Lücke davor")], 500.0, places=0)
+        self.assertAlmostEqual(causes[("gemm", "Kernel-Zeit")], 300.0, places=0)
+        self.assertGreater(so["slow_ms"], so["typical_ms"])
+
+    def test_last_burst_skips_model_load(self) -> None:
+        load = [("Agent 1", 0, 1_000_000, "load_weights")]
+        req = [("Agent 1", 5_000_000_000 + i * 10_000, 5_000_000_000 + i * 10_000 + 8_000, "prefill_gemm") for i in range(100)]
+        t0, t1, n = pd.last_burst(load + req)
+        self.assertEqual((t0, n), (5_000_000_000, 1))
+        a = pd.analyse(load + req, 0.0, (t0, t1, n))
+        self.assertEqual([k["kernel"] for k in a["kernels"]], ["prefill_gemm"])
 
 
 if __name__ == "__main__":

@@ -41,7 +41,9 @@ LABELS = {
     "status:gate-passed": ("1d76db", "Passed parity and A/B gate; PR opened"),
     "status:needs-review": ("d93f0b", "Gate failed; needs analysis"),
     "status:blocked": ("b60205", "Too many failed attempts; needs a human"),
+    "goal:status": ("5319e7", "Stand der Engine gegen das Ziel in baselines/targets.json"),
 }
+GOAL_LABEL = "goal:status"
 
 
 def gh(*args: str) -> str:
@@ -88,6 +90,22 @@ def set_labels(number: int, add: list[str], remove: list[str]) -> None:
     for r in remove:
         args += ["--remove-label", r]
     gh(*args)
+
+
+def update_goal_issue(status_md: str, reached: bool) -> None:
+    """One issue carries the target status; its body is replaced after every measurement of main,
+    and a comment marks the moment the target is reached or lost again."""
+    body = "Automatisch gepflegt von `lever_queue.py` nach jeder Messung von `main` (`scripts/goal.py`).\n\n" + status_md
+    issues = json.loads(gh("issue", "list", "--repo", REPO, "--state", "open", "--label", GOAL_LABEL,
+                           "--limit", "5", "--json", "number,title"))
+    title = "Ziel-Status: erreicht" if reached else "Ziel-Status: nicht erreicht"
+    if not issues:
+        gh("issue", "create", "--repo", REPO, "--label", GOAL_LABEL, "--title", title, "--body", body)
+        return
+    n = issues[0]["number"]
+    if issues[0]["title"] != title:
+        comment(n, f"**{title}**\n\n{status_md}")
+    gh("issue", "edit", str(n), "--repo", REPO, "--title", title, "--body", body)
 
 
 def comment(number: int, body: str) -> None:

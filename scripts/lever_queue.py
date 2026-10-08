@@ -6,11 +6,14 @@
     lever_queue.py list                                  show pending / done / failed jobs
     lever_queue.py run [--daemon] [--github] [--auto-profile]
                                                          process pending jobs one at a time
-    lever_queue.py profile                               decode profile of origin/main now
+    lever_queue.py profile                               score and profile of origin/main now
 
---auto-profile: whenever the queue is idle and origin/main has no profile yet, the runner takes a
-decode profile of the baseline (scripts/profile_decode.py) into reports/profile_<sha>_<ts>/ and
-points reports/profile_latest at it. Planner and audit read it to judge fusions and other levers.
+--auto-profile: whenever the queue is idle and origin/main has no profile yet, the runner profiles
+the baseline (scripts/profile_engine.py: BetterBench score, decode and prefill traces) into
+reports/profile_<sha>_<ts>/, points reports/profile_latest at it and records the score against the
+target (scripts/goal.py, reports/goal_status.json). A first measurement that meets the target is
+repeated once on the same main, because the target only counts as reached twice in a row. With
+--github the status also goes to the issue labelled goal:status.
 
 With --github the runner also pulls issues labelled status:ready-to-test and reports
 results back to them (see gh_bridge.py). That is how Orca automations drive the queue.
@@ -53,6 +56,7 @@ from pathlib import Path
 from typing import Any
 
 import gh_bridge
+import goal
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 QUEUE_DIR = REPO_ROOT / "queue"
@@ -60,7 +64,7 @@ REPORTS_DIR = REPO_ROOT / "reports"
 RELEASES_DIR = REPO_ROOT / "releases"
 LOCK_FILE = QUEUE_DIR / "runner.lock"
 PROFILE_LATEST = REPORTS_DIR / "profile_latest"
-PROFILE_TRIED = QUEUE_DIR / "profile_tried"  # baseline SHA of the last profile attempt, pass or fail
+PROFILE_TRIED = QUEUE_DIR / "profile_tried.json"  # {"sha", "attempts"} of the last profiled main, pass or fail
 BASELINE_WT = REPO_ROOT / "worktrees" / "_baseline"
 ROCM = os.environ.get("ROCM_PATH", "/opt/rocm")
 # The systemd unit starts with a bare environment; cmake's HIP detection needs these.
@@ -263,12 +267,20 @@ def profile_baseline() -> Path:
     with (staging / "run.log").open("w") as log_f:
         run_step("fetch", ["git", "fetch", "origin", "+refs/heads/main:refs/remotes/origin/main"], log_f, REPO_ROOT)
         # Recorded before anything can fail, so a broken baseline is not rebuilt every idle minute.
-        PROFILE_TRIED.write_text(git_out("rev-parse", "origin/main") + "\n")
+        head = git_out("rev-parse", "origin/main")
+        tried = json.loads(PROFILE_TRIED.read_text()) if PROFILE_TRIED.is_file() else {}
+        attempts = tried.get("attempts", 0) + 1 if tried.get("sha") == head else 1
+        PROFILE_TRIED.write_text(json.dumps({"sha": head, "attempts": attempts}))
         baseline_build, sha = ensure_baseline(log_f)
         out = REPORTS_DIR / f"profile_{sha[:10]}_{ts}"
         staging.rename(out)
-        run_step("profile", [sys.executable, str(REPO_ROOT / "scripts" / "profile_decode.py"),
-                             "--build-dir", str(baseline_build), "--out", str(out)], log_f, REPO_ROOT)
+        try:
+            run_step("profile", [sys.executable, str(REPO_ROOT / "scripts" / "profile_engine.py"),
+                                 "--build-dir", str(baseline_build), "--out", str(out)], log_f, REPO_ROOT)
+        finally:
+            # The score is measured first; it counts for the target even if a trace part failed.
+            if (out / "score.json").is_file():
+                goal.record(sha, json.loads((out / "score.json").read_text()), str(out))
     link = REPORTS_DIR / f".profile_latest_{ts}"
     link.symlink_to(out.name)
     link.replace(PROFILE_LATEST)
@@ -281,11 +293,17 @@ def profile_due() -> bool:
     if proc.returncode != 0:
         print(f"⚠️  fetch for the profile check failed: {proc.stderr.strip()}", flush=True)
         return False
-    tried = PROFILE_TRIED.read_text().strip() if PROFILE_TRIED.is_file() else ""
-    return tried != git_out("rev-parse", "origin/main")
+    head = git_out("rev-parse", "origin/main")
+    tried = json.loads(PROFILE_TRIED.read_text()) if PROFILE_TRIED.is_file() else {}
+    if tried.get("sha") != head:
+        return True
+    status = goal.load_status()
+    # Confirm a first hit on the same main once; never loop on it.
+    return bool(status and status.get("needs_confirmation") and status["latest"]["sha"] == head
+                and tried.get("attempts", 0) < 2)
 
 
-def run_profile_logged() -> None:
+def run_profile_logged(github: bool) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] profiling origin/main", flush=True)
     try:
         out = profile_baseline()
@@ -293,6 +311,12 @@ def run_profile_logged() -> None:
     except (StepFailed, OSError, subprocess.CalledProcessError) as e:
         # Not retried for the same baseline (PROFILE_TRIED); the next main gets a new attempt.
         print(f"⚠️  profile failed: {e} (see reports/profile_*/run.log)", flush=True)
+    status = goal.load_status()
+    if github and status:
+        try:
+            gh_bridge.update_goal_issue(goal.render(status), status.get("reached", False))
+        except RuntimeError as e:
+            print(f"⚠️  goal issue not updated: {e}", flush=True)
 
 
 def take_lock():
@@ -335,7 +359,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             report_pending_results()
         pending = sorted(queue_path("pending").glob("*.json"))
         if not pending and args.auto_profile and profile_due():
-            run_profile_logged()
+            run_profile_logged(args.github)
             continue
         if not pending:
             if not args.daemon:

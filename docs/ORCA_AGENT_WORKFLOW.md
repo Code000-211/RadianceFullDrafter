@@ -225,6 +225,22 @@ die Rolle auf die nächsthöhere Stufe aus, aber nie deswegen auf Opus
 `~/.config/zai/api_key` nur im eigenen Prozess; für Opus-Läufe entfernt `orca_agent.py` diese
 Variablen ausdrücklich.
 
+## Ziel: weiter, bis es erreicht ist
+
+Leon setzt das Ziel in `baselines/targets.json`: einen BetterBench-Gesamtscore und/oder Mindest-
+und Höchstwerte einzelner Metriken (`scripts/goal.py`). Die Lever-Queue misst jeden neuen `main`,
+wenn sie frei ist (`lever_queue.py run --auto-profile`), mit demselben BetterBench wie das Gate,
+und trägt das Ergebnis in `reports/goal_status.json` und das Issue mit Label `goal:status` ein.
+
+- Solange das Ziel gesetzt und nicht erreicht ist, halten research und audit die Pipeline gefüllt
+  (Abstand 2 h statt 24/12 h, begrenzt durch die offenen Ideen). Planer, research und audit
+  bekommen den Zielstand in den Prompt und richten sich nach dem Teil des Scores, in dem die
+  meisten Punkte fehlen.
+- Erreicht ist das Ziel erst, wenn zwei Messungen von `main` hintereinander es erfüllen; die erste
+  Erfüllung löst eine zweite Messung desselben `main` aus.
+- Danach legen research und audit nichts mehr an; was schon in der Pipeline ist, läuft zu Ende.
+  Fällt ein späterer `main` unter das Ziel oder hebt Leon es an, geht es automatisch weiter.
+
 ## Grenzen
 
 | Grenze | Wert | Durchgesetzt von |
@@ -236,6 +252,7 @@ Variablen ausdrücklich.
 | Rückfragen pro Lauf | 3 | `orca_agent.py ask` |
 | Gate-Läufe ohne PASS | 3 | `gh_bridge.py` |
 | offene, unerledigte Ideen | 8; darüber legen research und audit nichts an | `orca_agent.py` |
+| Abstand zwischen research- bzw. audit-Läufen | 2 h, solange ein Ziel gesetzt und nicht erreicht ist; ohne Ziel 24 h bzw. 12 h; bei erreichtem Ziel keine | `orca_agent.py` |
 | Laufzeit pro Agent | je Rolle 45–120 min, Antwort 8 min | `orca_agent.py` (beendet die Prozessgruppe) |
 | Nutzungslimit eines Anbieters | 60 min Pause für dieses Backend, Lauf zählt nicht | `orca_agent.py` |
 

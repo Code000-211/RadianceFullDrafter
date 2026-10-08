@@ -56,7 +56,10 @@ def calculate_metrics(results: dict[str, Any]) -> dict[str, Any]:
     c1_itl_p99_ms = itl_samples[int(len(itl_samples) * 0.99)] if itl_samples else 0.0
     med_itl = itl_samples[len(itl_samples) // 2] if itl_samples else 0.0
     itl_med_rate = (1000.0 / med_itl) if med_itl > 0 else dec_med
-    low_1pct_idx = int(len(itl_samples) * 0.01)
+    # "1% lows" are the SLOWEST 1% of inter-token latencies, i.e. the 99th percentile of the
+    # ascending list. Index 1% picked the fastest ones, which made tail_ratio >= 1, clamped to 1.0,
+    # so the tail subscore was always 1000 and stability_factor always 1.0.
+    low_1pct_idx = int(len(itl_samples) * 0.99)
     low_1pct_ms = itl_samples[min(low_1pct_idx, len(itl_samples) - 1)] if itl_samples else 0.0
     itl_low1_rate = (1000.0 / low_1pct_ms) if low_1pct_ms > 0 else (0.8 * itl_med_rate)
 
@@ -124,4 +127,14 @@ def calculate_metrics(results: dict[str, Any]) -> dict[str, Any]:
         "c8_itl_p99_ms": round(c8_itl_p99_ms, 2),
         "ttft_p50_ms": round(ttft_p50_ms, 2),
         "categories": cat_decodes,
+        # The composite's parts, so a target can say which part is short (scripts/goal.py).
+        # Reported only; the gate compares the metrics above.
+        "itl_med_ms": round(med_itl, 3),
+        "itl_low1_ms": round(low_1pct_ms, 3),
+        "tail_ratio": round(tail_ratio, 4),
+        "stability_factor": round(stability_factor, 4),
+        "guardrail": round(guardrail, 4),
+        "subscores": {"decode": round(score_dec, 1), "prefill": round(score_pref, 1),
+                      "concurrency": round(score_conc, 1), "tail": round(score_tail, 1)},
+        "weights": {"decode": w_dec, "prefill": w_pref, "concurrency": w_conc, "tail": w_tail},
     }

@@ -1,0 +1,14 @@
+{
+  "_doc": "Ziel der automatischen Optimierung (scripts/goal.py). Nur Leon ändert diese Datei. null = keine Anforderung; ohne jede Anforderung gibt es kein Ziel. Metriknamen wie in scripts/bench_metrics.py; total_score ist der BetterBench-Gesamtscore.",
+  "total_score": null,
+  "at_least": {
+    "decode_med_tps": null,
+    "prefill_med_tps": null,
+    "concurrency_tps": null
+  },
+  "at_most": {
+    "c1_itl_p99_ms": null,
+    "c8_itl_p99_ms": null,
+    "ttft_p50_ms": null
+  }
+}

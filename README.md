@@ -49,7 +49,8 @@ in einem eigenen Worktree in Orca; Opus plant, Gemini und GLM setzen um.
 python3 scripts/lever_queue.py add <slug>          # Hebel aus candidates/<slug> testen
 python3 scripts/lever_queue.py list                # Warteschlange und Ergebnisse
 python3 scripts/orca_agent.py status              # Agent-Slots, Backends, letzte Läufe
-python3 scripts/lever_queue.py profile             # Decode-Profil von origin/main (reports/profile_latest/)
+python3 scripts/lever_queue.py profile             # Score + Profil von origin/main (reports/profile_latest/)
+python3 scripts/goal.py                            # Stand gegen das Ziel in baselines/targets.json
 python3 scripts/lever_review.py claims <slug>      # Belege im Hebel-README prüfen
 python3 scripts/lever_review.py similar "<idee>"   # schon versucht?
 python3 scripts/watch_upstream.py --done <PR> --verdict useful|not-useful
