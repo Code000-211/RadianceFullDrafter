@@ -246,6 +246,23 @@ To eliminate token exhaustion, context pollution, and the "subagent telephone ga
 
 ---
 
+## Rule 8: Autonomous GitHub Control Plane & The Orca Execution Runner
+
+1. **GitHub as the Official Durable State Machine**:
+   - To prevent context degradation, lost decisions across compaction, and unverified chat assertions, **GitHub Issues and Pull Requests are the official control plane** for RadianceMine.
+   - Every goal, optimization lever, and upstream PR must have a corresponding GitHub Issue tracking its lifecycle through explicit status labels (`research:new-lever`, `status:ready-to-test`, `status:in-progress`, `status:gate-passed`, `status:needs-review`).
+2. **Goal Registration**:
+   - All high-level objectives must be registered via `scripts/dispatch_goal.sh "<goal>"` or via structured GitHub Issue creation.
+3. **The Orca Daemon Runner (`scripts/orca_agent_runner.sh`)**:
+   - The autonomous daemon running on the host (`orca` user) continuously polls GitHub Issues for candidates labeled `status:ready-to-test`.
+   - Orca executes testing exclusively in isolated worktrees (`worktrees/<slug>`), hot-swaps the dual R9700 GPU engine, and enforces the 4-Tier Master Quality Gate.
+4. **Automated Victory Promotion**:
+   - Only when an arm passes all 4 Tiers of `scripts/gate_check.sh` cleanly does Orca freeze the golden build (`scripts/archive_winner.sh`) and open an automated Pull Request (`gh pr create`).
+5. **Mandatory Rollback & Diagnostic Review Loop on Regression**:
+   - If a gate fails, Orca MUST immediately hot-swap back to the baseline engine (`engine_manager.sh restore-golden`), collect structured telemetry, classify the failure via TypeSafe AI (Jev System One), write `REGRESSION_REPORT.md`, post the diagnostic comment to the GitHub Issue, and relabel the issue `status:needs-review,regression:detected`.
+
+---
+
 ## Enforcement & Penalties
 
 Any automated agent or developer violating this Constitution will have their branch quarantined immediately:

@@ -192,7 +192,96 @@ When tracing function callers, usages, or cross-file dependencies, agents MUST N
 
 ---
 
-## 4. Autonomous Upstream Watcher & Continuous Triage Daemon
+## 4. The Autonomous GitHub Control Plane & Orca Agent Runner (`scripts/orca_agent_runner.sh`)
+
+To eliminate informal chat promises, context loss across turns, and unverified code merges, RadianceMine anchors its entire operational lifecycle in **GitHub Issues and Pull Requests as an asynchronous, durable state machine**.
+
+The autonomous daemon on the host (`orca` user / system runner) is **`scripts/orca_agent_runner.sh`**, which continuously coordinates between GitHub and the physical dual AMD Radeon AI PRO R9700 GPUs.
+
+```
+┌────────────────────────────────────────────────────────────────────────────────────────┐
+│                        AUTONOMOUS GITHUB & ORCA CONTROL PLANE                          │
+├────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                        │
+│   Human / Agent Goal                                                                   │
+│   (dispatch_goal.sh)                                                                   │
+│           │                                                                            │
+│           ▼                                                                            │
+│   GitHub Issue Created                                                                 │
+│   [research:new-lever] ────────► Claude / Research Agent                               │
+│                                  (OpenWiki + pi-lens LSP + AlphaXiv)                   │
+│                                  Packages lever in candidates/<slug>/                  │
+│                                           │                                            │
+│                                           ▼                                            │
+│   GitHub Issue Labeled                                                                 │
+│   [status:ready-to-test]                                                               │
+│           │                                                                            │
+│           ▼                                                                            │
+│   Orca Daemon Runner (scripts/orca_agent_runner.sh, poll interval: 30s)                │
+│           │                                                                            │
+│           ├─► Labels issue: [status:in-progress]                                       │
+│           ├─► Step 0: eval_patch_safety.py (Deterministic static safety audit)         │
+│           ├─► Step 1: scripts/create_worktree.sh (Isolated Git worktree)               │
+│           ├─► Step 2: git apply lever.patch (Clean patch application)                  │
+│           ├─► Step 3: ninja -C build_hip (ROCm C++/HIP gfx1201 compilation)            │
+│           ├─► Step 4: scripts/engine_manager.sh restart (Hot-swap dual GPUs)           │
+│           └─► Step 5: scripts/gate_check.sh (Executes 4-Tier Master Quality Gate)       │
+│                       │                                                                │
+│         ┌─────────────┴────────────────────────┐                                       │
+│         ▼                                      ▼                                       │
+│   [GATE PASSED (RC=0)]                   [GATE FAILED (RC!=0)]                         │
+│   1. scripts/archive_winner.sh           1. engine_manager.sh restore-golden           │
+│      (SHA256 golden bundle)                 (Immediate GPU rollback)                   │
+│   2. gh pr create                        2. collect_telemetry.py &                     │
+│      (Head: worktree/<slug>, Base: main)    typesafe_triage.py classify-regression     │
+│   3. gh issue edit                       3. gh issue comment (Diagnostic failure dump) │
+│      [status:gate-passed]                4. gh issue edit                              │
+│   4. Human reviews & merges PR              [status:needs-review, regression:detected] │
+│                                          5. Re-routed to Claude for Root Cause Analysis│
+│                                                                                        │
+└────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 4.1 The GitHub Issue State Machine
+
+Every task, optimization hypothesis, and upstream evaluation is represented as a GitHub Issue with explicit, mutually exclusive status labels:
+
+| Issue Label | Meaning & Active Owner | Next Transition |
+|---|---|---|
+| `research:new-lever` | High-level goal registered. Active Owner: **Research Agent (Claude)**. | Moves to `status:ready-to-test` once packaged in `candidates/<slug>/`. |
+| `status:ready-to-test` | Candidate lever packaged with `README.md` and `lever.patch`. Active Owner: **Orca Runner**. | Orca picks up the issue, transitions to `status:in-progress`. |
+| `status:in-progress` | Isolated worktree active, candidate building or running on dual R9700 GPUs. | Moves to `status:gate-passed` or `status:needs-review`. |
+| `status:gate-passed` | 4-Tier Master Gate passed cleanly. Pull Request opened against `main`. | Human review & merge into `main`. |
+| `status:needs-review` | Master Gate failed or compiler error. Telemetry attached. Active Owner: **Claude**. | Claude inspects `REGRESSION_REPORT.md`, updates patch, resets to `status:ready-to-test`. |
+| `regression:detected` | Flags that the candidate regressed speed, parity, or ISA invariants. | Remains until fixed or candidate rejected to `attic/`. |
+
+### 4.2 Dispatching Objectives: `scripts/dispatch_goal.sh`
+
+Any agent or human engineer can trigger the autonomous pipeline by executing:
+```bash
+./scripts/dispatch_goal.sh "<Goal Description>" [candidate_lever_slug]
+```
+- If an existing candidate package matches (e.g. `lever6_fast_store_drain_p2p_ar`), it generates a structured issue labeled `status:ready-to-test` and immediately triggers `test_candidate_lever.sh`.
+- If it is a new research idea, it creates an issue labeled `research:new-lever` populated with context via `scripts/generate_agent_context.py --role research`.
+
+### 4.3 The Orca Autonomous Runner: `scripts/orca_agent_runner.sh`
+
+The Orca daemon runs in the background on the host system:
+```bash
+# Continuous daemon mode (polls every 30s)
+./scripts/orca_agent_runner.sh
+
+# One-shot mode (processes current queue once and exits)
+ONE_SHOT=1 ./scripts/orca_agent_runner.sh
+```
+Key Invariants enforced by Orca:
+1. **Trunk Immutability**: Orca never checks out or compiles on `main`. All operations occur in `worktrees/<candidate_slug>`.
+2. **GPU Engine Protection**: If a candidate engine crashes on startup or hangs during testing, Orca immediately executes `scripts/engine_manager.sh restore-golden` to bring the healthy baseline back online.
+3. **Structured Failure Telemetry**: Gate failures trigger `collect_telemetry.py` and `typesafe_triage.py classify-regression` (Jev System One), diagnosing whether the issue is LDS bank conflict, PCIe bus contention, parity drift, or compilation failure.
+
+---
+
+## 5. Autonomous Upstream Watcher & Continuous Triage Daemon
 
 The upstream repository ([StillDeadcode/radiance](https://codeberg.org/StillDeadcode/radiance)) is continuously monitored by an autonomous background daemon:
 
@@ -212,7 +301,7 @@ Codeberg REST API ──► 0-Token Dedup Filter ──► TypeSafe AI (Jev) Tri
 
 ---
 
-## 5. Candidate Lever Packaging Standard
+## 6. Candidate Lever Packaging Standard
 
 Every proposed optimization lever must be self-contained and isolated in `candidates/lever<N>_<name>/`:
 
@@ -233,7 +322,7 @@ candidates/lever<N>_<name>/
 
 ---
 
-## 6. Multi-Agent Roles & Collaboration Protocol
+## 7. Multi-Agent Roles & Collaboration Protocol
 
 Directives for all agents are unified in [AGENTS.md](file:///home/orca/RadianceMine/AGENTS.md), with `CLAUDE.md` and `GEMINI.md` maintained as symbolic links to eliminate duplication:
 
@@ -245,17 +334,19 @@ CLAUDE.md ──► AGENTS.md ◄── GEMINI.md
 - **Research Agents (Claude / Literature Miners)**:
   * Academic literature mining (alphaXiv).
   * Open-source kernel analysis (GitHub: vLLM, SGLang, FlashAttention-3, DeepSeek, AsmEvo, CUTLASS).
-  * Mathematical roofline modeling and candidate lever packaging (`candidates/`).
+  * Macro-architecture exploration via OpenWiki (`openwiki_search`, `openwiki/quickstart.md`).
+  * Micro-call site exploration via `pi-lens` / LSP `clangd` (`pilens_read_symbol`, `pilens_ast_grep_search`).
+  * Mathematical roofline modeling and candidate lever packaging (`candidates/lever<N>_<slug>/`).
   * Issue creation with label `research:new-lever`.
 - **Execution Agents (Antigravity / Engineering Agents)**:
   * Worktree management (`create_worktree.sh`).
   * HIP/C++ compilation (`ninja -C build_hip`).
   * Execution of the 4-Tier Master Quality Gate on the dual R9700 GPUs.
-  * Standalone build archival (`archive_winner.sh`) and Pull Request creation.
-- **Autonomous Daemons (Upstream Watcher)**:
-  * 24/7 background polling of upstream Codeberg.
-  * Triage and automated Draft PR dispatch.
-- **Asynchronous Communication Bridge**: GitHub Issues (`gh issue create`, `gh issue comment`) and Draft PRs serve as the boundary between agents.
+  * Standalone build archival (`archive_winner.sh`) and Pull Request creation (`gh pr create`).
+- **Autonomous Daemons (Orca Runner & Upstream Watcher)**:
+  * **Orca Runner (`scripts/orca_agent_runner.sh`)**: Background poller (30s interval) monitoring GitHub Issues for `status:ready-to-test`. Executes isolated worktree testing, engine hot-swapping, and gate verification.
+  * **Upstream Watcher (`scripts/watch_upstream.py`)**: 24/7 background polling of upstream Codeberg. Triage and automated Draft PR dispatch.
+- **Asynchronous Communication Bridge**: GitHub Issues (`gh issue create`, `gh issue comment`) and Draft PRs serve as the official durable boundary between all agents.
 
 ### Empirical Skepticism & Anti-Sycophancy:
 - The user's instructions or hypotheses are treated as technical propositions, not infallible laws.
@@ -263,7 +354,60 @@ CLAUDE.md ──► AGENTS.md ◄── GEMINI.md
 
 ---
 
-## 7. Hardware Ground Truth & Calibration Baseline
+## 8. The Complete End-to-End Operational Lifecycle ("Wie wir ab jetzt arbeiten")
+
+This is the standard operational procedure for all engineering and optimization tasks in RadianceMine:
+
+```
+┌────────────────────────────────────────────────────────────────────────────────────────┐
+│                    END-TO-END OPERATIONAL LIFECYCLE FOR OPTIMIZATIONS                  │
+├────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                        │
+│ 1. GOAL REGISTRATION                                                                   │
+│    User or Agent runs: ./scripts/dispatch_goal.sh "<Description>"                      │
+│    GitHub Issue created with label: [research:new-lever]                               │
+│                                                                                        │
+│ 2. RESEARCH & GROUNDED PACKAGING (Claude / AGY)                                        │
+│    - Consult OpenWiki (.claims/) for macro architecture.                               │
+│    - Consult pi-lens / LSP for micro call sites & AST patterns.                        │
+│    - Write clean patch in: candidates/lever<N>_<slug>/lever.patch                      │
+│    - Write architectural README.md with mathematical roofline & gfx1201 mapping.       │
+│    - Run static safety audit: python3 scripts/eval_patch_safety.py <patch>             │
+│    - Update GitHub Issue label: [status:ready-to-test]                                 │
+│                                                                                        │
+│ 3. AUTONOMOUS ISOLATED WORKTREE TESTING (Orca Runner)                                  │
+│    - Orca Runner picks up issue -> labels [status:in-progress]                         │
+│    - Creates clean worktree: scripts/create_worktree.sh <slug>                         │
+│    - Applies patch: git apply lever.patch                                              │
+│    - Builds binary: ninja -C build_hip (ROCm C++/HIP gfx1201)                          │
+│    - Hot-swaps dual GPUs: scripts/engine_manager.sh restart --build-dir <worktree>     │
+│    - Runs 4-Tier Master Gate: scripts/gate_check.sh --build-dir <worktree>             │
+│                                                                                        │
+│ 4. GATE VERDICT:                                                                       │
+│                                                                                        │
+│    [VICTORY: RC == 0]                                                                  │
+│    a) Golden Archival: scripts/archive_winner.sh (creates SHA256 tarball & rollback)   │
+│    b) Commit in worktree branch: worktree/<slug>                                       │
+│    c) Open GitHub PR: gh pr create --head worktree/<slug> --base main                 │
+│    d) Update Issue: [status:gate-passed], comment with benchmark metrics               │
+│    e) Restore baseline engine on GPUs: scripts/engine_manager.sh restore-golden        │
+│    f) Human merges clean PR into main.                                                 │
+│                                                                                        │
+│    [REGRESSION: RC != 0]                                                               │
+│    a) Instant Rollback: scripts/engine_manager.sh restore-golden (protects GPUs)        │
+│    b) Structured Telemetry: scripts/collect_telemetry.py                               │
+│    c) Root-Cause AI Classification: python3 scripts/typesafe_triage.py                 │
+│    d) Write REGRESSION_REPORT.md in worktree                                           │
+│    e) Post Diagnostic Dump to GitHub Issue comment                                     │
+│    f) Label Issue: [status:needs-review, regression:detected]                          │
+│    g) Re-route to Claude for Root-Cause Analysis and patch fix                         │
+│                                                                                        │
+└────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 9. Hardware Ground Truth & Calibration Baseline
 
 All math, models, and code must be calibrated against physical reality:
 

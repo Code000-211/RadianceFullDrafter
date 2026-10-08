@@ -213,18 +213,29 @@ Derived from Rule 5 of [`ENGINEERING_CONSTITUTION.md`](file:///home/orca/Radianc
 
 ---
 
-## 9. Regression Review Loop (GitHub Issues & PR Lifecycle)
+## 9. Autonomous GitHub Control Plane & Orca Runner Lifecycle
 
-1. **Automatic Review Routing on Gate Failure**:
-   - When an optimization or candidate lever is tested in a worktree and fails `scripts/gate_check.sh` (or causes throughput/parity regression):
-     * Do NOT discard the lever into a black hole or lower test standards.
-     * Post a full failure report (benchmark diff, parity mismatch, or compiler error) to the associated GitHub Issue.
-     * Label the issue `status:needs-review` and `regression:detected`.
-     * Route it back to the Research Agent (Claude) or developer for Root-Cause Analysis.
-2. **Pull Request Promotion on Gate Victory**:
+1. **Goal Registration (`scripts/dispatch_goal.sh`)**:
+   - Any agent or engineer can register a new objective via `./scripts/dispatch_goal.sh "<goal>" [candidate_slug]`.
+   - New research tasks receive label `research:new-lever`.
+   - Packaged candidates ready for GPU verification receive label `status:ready-to-test`.
+2. **The Orca Autonomous Daemon Runner (`scripts/orca_agent_runner.sh`)**:
+   - The daemon continuously monitors GitHub Issues for `status:ready-to-test`.
+   - Transitions issue to `status:in-progress`.
+   - Provisions clean isolated worktree (`scripts/create_worktree.sh`), applies patch, compiles via ROCm Ninja, hot-swaps dual GPUs via `scripts/engine_manager.sh`, and executes `scripts/gate_check.sh`.
+3. **Pull Request Promotion on Gate Victory**:
    - Only when an arm passes all 4 tiers of `scripts/gate_check.sh` and beats the baseline:
      * Archive the golden build (`scripts/archive_winner.sh`).
-     * Open a Pull Request (`gh pr create`), labeled `status:gate-passed`.
+     * Commit changes in worktree branch.
+     * Open an automated Pull Request (`gh pr create`), labeled `status:gate-passed`.
+     * Restore golden baseline engine on GPUs.
+4. **Automatic Review Routing on Gate Failure**:
+   - When an optimization fails any tier of `scripts/gate_check.sh`:
+     * Immediately hot-swap GPUs back to golden baseline (`scripts/engine_manager.sh restore-golden`).
+     * Collect telemetry and classify root cause with TypeSafe AI Jev (`scripts/typesafe_triage.py classify-regression`).
+     * Post diagnostic failure report (`REGRESSION_REPORT.md`) as a comment to the associated GitHub Issue.
+     * Label the issue `status:needs-review` and `regression:detected`.
+     * Route it back to the Research Agent (Claude) for Root-Cause Analysis and patch correction.
 
 <!-- OPENWIKI:START -->
 
