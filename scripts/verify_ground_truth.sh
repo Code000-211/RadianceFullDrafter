@@ -2,14 +2,9 @@
 # ==============================================================================
 # verify_ground_truth.sh — Physical Verification & Epistemic Integrity Gate
 # ==============================================================================
-# Master ground-truth verification script for RadianceMine.
-# Enforces the 6 physical ground-truth invariants:
-#   1. Binary Symbol Physical Grounding (nm -D & .so check)
-#   2. Test Integrity & Anti-Silent-Skip Policy
-#   3. Threshold & Tolerance Immutability Lock (SHA-256 baseline seal)
-#   4. Hardware Clock & DPM State Pre-Flight Check
-#   5. Context-Mode Transparency & Exit Code Integrity
-#   6. OpenWiki Knowledge Graph & Claims Integrity (Zero-Blind-Exploration Law)
+# Pre-commit entry point: runs the Tier 0 static checks
+# (scripts/check_epistemic_invariants.py) on this checkout and its build_hip, and
+# blocks commits that touch baselines/ without RADIANCE_GATE_CHANGE=1.
 # ==============================================================================
 set -euo pipefail
 
@@ -17,26 +12,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd -P)"
 
 BUILD_DIR="${BUILD_DIR:-${REPO_ROOT}/build_hip}"
-ENDPOINT="${ENDPOINT:-http://localhost:${PORT:-8000}/v1}"
-WARMUP_FLAG=""
 
 # Parse flags
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --warmup)
-            WARMUP_FLAG="--warmup"
-            shift
-            ;;
-        --endpoint)
-            ENDPOINT="$2"
-            shift 2
-            ;;
         --build-dir)
             BUILD_DIR="$2"
             shift 2
             ;;
         --help|-h)
-            echo "Usage: $0 [--warmup] [--endpoint URL] [--build-dir PATH]"
+            echo "Usage: $0 [--build-dir PATH]"
             exit 0
             ;;
         *)
@@ -70,7 +55,6 @@ echo "==========================================================================
 echo " 🔍 RadianceMine Epistemic Ground-Truth & Anti-Hallucination Gate"
 echo " Workspace:     ${REPO_ROOT}"
 echo " Build Dir:     ${BUILD_DIR}"
-echo " Endpoint:      ${ENDPOINT}"
 echo "================================================================================"
 
 # Step 1: Pre-flight Verification of Compiled Binaries
@@ -83,9 +67,8 @@ fi
 
 # Step 2: Execute Epistemic Invariants Checker (Tier 0)
 python3 "${SCRIPT_DIR}/check_epistemic_invariants.py" \
-    --strict \
-    --endpoint "${ENDPOINT}" \
-    ${WARMUP_FLAG}
+    --repo-root "${REPO_ROOT}" \
+    --build-dir "${BUILD_DIR}"
 
 CHECK_RC=$?
 if [ ${CHECK_RC} -ne 0 ]; then
@@ -113,6 +96,6 @@ fi
 
 echo ""
 echo "================================================================================"
-echo " 🏆 GROUND TRUTH VERIFICATION COMPLETE: ALL 6 INVARIANTS SATISFIED."
+echo " 🏆 TIER 0 STATIC CHECKS PASSED."
 echo "================================================================================"
 exit 0

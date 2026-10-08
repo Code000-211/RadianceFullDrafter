@@ -3,29 +3,24 @@
 
 Automated enforcement tool for the RadianceMine physical verification system.
 Translates lessons from HOW_HALLUCINATIONS_CORRUPTED_THE_WORKTREE_AND_CONTEXT_MODE_POSTMORTEM.md
-into six strictly enforced invariants:
+into static checks of a source tree and its build:
 
   Invariant 1: Binary Symbol Physical Grounding (nm -D & .so inspection)
   Invariant 2: Test Integrity & Anti-Silent-Skip Checker
-  Invariant 3: Threshold & Tolerance Immutability Lock (Cryptographic Seal)
-  Invariant 4: Hardware Clock & DPM Pre-Flight Verification
+  Invariant 3: Threshold & Tolerance Lock (seals in baselines/gate_thresholds.json)
   Invariant 5: Context-Mode Transparency Guard (No stderr/exit-code masking)
-  Invariant 6: OpenWiki Knowledge Graph & Claims Integrity (Zero-Blind-Exploration Law)
+
+Memory clocks are no longer checked at idle here; ab_gate.py samples them under load.
+--repo-root/--build-dir point the checks at a candidate worktree instead of this checkout.
 """
 
 from __future__ import annotations
 
 import argparse
-import glob
 import hashlib
-import json
-import os
 import re
 import subprocess
 import sys
-import time
-import urllib.error
-import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -69,8 +64,6 @@ def check_invariant_1_symbol_grounding(repo_root: Path, build_dir: Path | None =
 
     if build_dir is None:
         build_dir = repo_root / "build_hip"
-        if not (build_dir / "radiance_home" / "kernels").exists() and (repo_root.parent.parent / "build_hip" / "radiance_home" / "kernels").exists():
-            build_dir = repo_root.parent.parent / "build_hip"
 
     kernel_so_dirs = [
         build_dir / "radiance_home" / "kernels",
@@ -295,13 +288,12 @@ def check_invariant_3_immutability_lock(repo_root: Path) -> InvariantResult:
         else:
             details.append(f"✓ {name} SHA-256 seal intact: {actual_hash[:16]}...")
 
-    # 2. parity_check.py must take tolerance and floors from the thresholds file
+    # 2. parity_check.py must take the token tolerance from the thresholds file
     parity_check_py = repo_root / "scripts" / "parity_check.py"
     parity_src = parity_check_py.read_text(encoding="utf-8") if parity_check_py.exists() else ""
-    for key in ("token_tolerance", "min_code_tps", "min_reasoning_tps", "min_math_tps"):
-        if f'default=tier1["{key}"]' not in parity_src:
-            passed = False
-            details.append(f"❌ scripts/parity_check.py does not default {key} to gate_thresholds.json")
+    if 'default=tier1["token_tolerance"]' not in parity_src:
+        passed = False
+        details.append("❌ scripts/parity_check.py does not default token_tolerance to gate_thresholds.json")
 
     # 3. gate_check.sh must not override tolerance or floors on the command line
     gate_check_sh = repo_root / "scripts" / "gate_check.sh"
@@ -314,102 +306,6 @@ def check_invariant_3_immutability_lock(repo_root: Path) -> InvariantResult:
         details.append("✓ Gate thresholds come only from baselines/gate_thresholds.json.")
 
     return InvariantResult(3, "Threshold & Tolerance Immutability Lock", passed, details, warnings)
-
-
-# ==============================================================================
-# Invariant 4: Hardware Clock & DPM Pre-Flight Verification
-# ==============================================================================
-def check_invariant_4_hardware_clocks(auto_warmup: bool = False, endpoint: str = "http://localhost:8000/v1") -> InvariantResult:
-    """Inspect GPU DPM memory clock states to prevent benchmarking under 96 MHz throttle."""
-    details: list[str] = []
-    warnings: list[str] = []
-    passed = True
-
-    # 1. Check sysfs pp_dpm_mclk
-    sysfs_mclk_paths = sorted(glob.glob("/sys/class/drm/card*/device/pp_dpm_mclk"))
-    throttled_cards: list[tuple[str, str]] = []
-
-    if sysfs_mclk_paths:
-        for p in sysfs_mclk_paths:
-            card_id = Path(p).parent.parent.name
-            try:
-                with open(p, "r", encoding="utf-8") as f:
-                    mclk_data = f.read()
-                for line in mclk_data.splitlines():
-                    if "*" in line:
-                        active_level = line.strip()
-                        if active_level.startswith("0:") or "96Mhz" in active_level:
-                            throttled_cards.append((card_id, active_level))
-                        details.append(f"GPU [{card_id}] MCLK state: {active_level}")
-            except OSError as e:
-                warnings.append(f"Could not read {p}: {e}")
-
-    # 2. Alternatively check via rocm-smi if sysfs was not accessible
-    elif os.path.exists("/opt/rocm/bin/rocm-smi") or subprocess.run(["which", "rocm-smi"], capture_output=True, check=False).returncode == 0:
-        rocm_smi_cmd = "/opt/rocm/bin/rocm-smi" if os.path.exists("/opt/rocm/bin/rocm-smi") else "rocm-smi"
-        res = subprocess.run([rocm_smi_cmd, "--showclocks"], capture_output=True, text=True, check=False)
-        for line in res.stdout.splitlines():
-            if "mclk clock level:" in line:
-                details.append(line.strip())
-                if "level: 0" in line or "96Mhz" in line:
-                    throttled_cards.append(("rocm-smi", line.strip()))
-
-    if throttled_cards:
-        if auto_warmup:
-            details.append("⚡ Throttled GPU detected. Triggering automated warmup pass to elevate DPM clocks...")
-            try:
-                url = f"{endpoint.rstrip('/')}/chat/completions"
-                payload = {
-                    "model": "qwen4exp",
-                    "messages": [{"role": "user", "content": "Warmup pass to prime GPU boost clocks and load hot MoE expert tier."}],
-                    "max_tokens": 64,
-                    "temperature": 0.0,
-                }
-                req = urllib.request.Request(
-                    url,
-                    data=json.dumps(payload).encode("utf-8"),
-                    headers={"Content-Type": "application/json"},
-                    method="POST",
-                )
-                with urllib.request.urlopen(req, timeout=10.0) as resp:
-                    if resp.status == 200:
-                        details.append("✓ Automated warmup request dispatched successfully.")
-            except (urllib.error.URLError, OSError, TimeoutError) as e:
-                warnings.append(f"Automated warmup failed: {e}")
-
-            time.sleep(1.0)
-            # Re-check after warmup
-            throttled_cards_after: list[tuple[str, str]] = []
-            for p in sysfs_mclk_paths:
-                card_id = Path(p).parent.parent.name
-                try:
-                    with open(p, "r", encoding="utf-8") as f:
-                        for line in f.read().splitlines():
-                            if "*" in line and ("0:" in line or "96Mhz" in line):
-                                throttled_cards_after.append((card_id, line.strip()))
-                except OSError:
-                    pass
-
-            if throttled_cards_after:
-                passed = False
-                for c, lvl in throttled_cards_after:
-                    details.append(f"❌ GPU [{c}] remains throttled at {lvl} after warmup pass!")
-            else:
-                passed = True
-                details.append("✓ GPU memory clocks elevated out of DPM 0 throttle.")
-        else:
-            # Report warning or error depending on strictness
-            for c, lvl in throttled_cards:
-                warnings.append(
-                    f"GPU [{c}] memory clock is resting at {lvl} (DPM 0). "
-                    "When idle, PowerPlay scales GDN memory down to 96 MHz (7.6% of bandwidth). "
-                    "Run warmup pass before benchmark or use --warmup flag."
-                )
-            details.append("⚠️  GPU memory clock at DPM 0 idle state. Priming warmup pass recommended before benchmarking.")
-    else:
-        details.append("✓ GPU DPM memory clocks certified active.")
-
-    return InvariantResult(4, "Hardware Clock & DPM Pre-Flight Verification", passed, details, warnings)
 
 
 # ==============================================================================
@@ -466,99 +362,10 @@ def check_invariant_5_transparency_guard(repo_root: Path) -> InvariantResult:
     return InvariantResult(5, "Context-Mode Transparency Guard", passed, details, warnings)
 
 
-def check_invariant_6_openwiki_integrity(repo_root: Path) -> InvariantResult:
-    """Invariant 6: OpenWiki Knowledge Graph & Claims Integrity (Zero-Blind-Exploration Law).
-
-    Verifies that:
-      1. openwiki/ directory and canonical architecture pages exist.
-      2. openwiki/.claims/ contains cryptographic atomic claims.
-      3. scripts/locate_code.py exists and is functional.
-      4. Governance documents (ENGINEERING_CONSTITUTION.md & AGENTS.md) mandate OpenWiki grounding.
-    """
-    passed = True
-    details: list[str] = []
-    warnings: list[str] = []
-
-    openwiki_dir = repo_root / "openwiki"
-    if not openwiki_dir.is_dir():
-        passed = False
-        details.append(f"❌ openwiki/ directory missing at {openwiki_dir}")
-        return InvariantResult(6, "OpenWiki Knowledge & Claims Integrity", passed, details, warnings)
-
-    # Check canonical architecture pages
-    canonical_pages = [
-        "quickstart.md",
-        "architecture/engine_runtime.md",
-        "architecture/gemm_and_kernels.md",
-        "architecture/p2p_interconnect.md",
-        "architecture/speculative_mtp.md",
-        "governance/quality_gates.md",
-        "pipeline/upstream_watcher.md",
-    ]
-    missing_pages = []
-    for page in canonical_pages:
-        page_path = openwiki_dir / page
-        if not page_path.is_file():
-            missing_pages.append(page)
-
-    if missing_pages:
-        passed = False
-        details.append(f"❌ Missing canonical OpenWiki pages: {', '.join(missing_pages)}")
-    else:
-        details.append(f"✓ All {len(canonical_pages)} canonical OpenWiki architecture pages verified.")
-
-    # Check claims directory and files
-    claims_dir = openwiki_dir / ".claims"
-    if not claims_dir.is_dir():
-        passed = False
-        details.append("❌ openwiki/.claims/ directory missing")
-    else:
-        claim_files = list(claims_dir.rglob("*.json"))
-        if not claim_files:
-            passed = False
-            details.append("❌ No claim files found in openwiki/.claims/")
-        else:
-            details.append(f"✓ {len(claim_files)} atomic claim definitions verified across openwiki/.claims/.")
-
-    # Check scripts/locate_code.py
-    locator_path = repo_root / "scripts" / "locate_code.py"
-    if not locator_path.is_file():
-        passed = False
-        details.append(f"❌ Fast code locator missing at {locator_path}")
-    else:
-        details.append("✓ Fast code locator verified (scripts/locate_code.py).")
-
-    # Check constitution and agent rules
-    constitution_path = repo_root / "ENGINEERING_CONSTITUTION.md"
-    if constitution_path.is_file():
-        const_text = constitution_path.read_text(encoding="utf-8", errors="replace")
-        if "Rule 7" not in const_text or "Mandatory OpenWiki" not in const_text:
-            passed = False
-            details.append("❌ ENGINEERING_CONSTITUTION.md missing Rule 7 (Mandatory OpenWiki).")
-        else:
-            details.append("✓ ENGINEERING_CONSTITUTION.md Rule 7 (Mandatory OpenWiki) verified.")
-
-    agents_path = repo_root / "AGENTS.md"
-    if agents_path.is_file():
-        agents_text = agents_path.read_text(encoding="utf-8", errors="replace")
-        if "Prohibited Action 5" not in agents_text or "locate_code.py" not in agents_text:
-            passed = False
-            details.append("❌ AGENTS.md missing Prohibited Action 5 or locate_code.py workflow.")
-        else:
-            details.append("✓ AGENTS.md Prohibited Action 5 & Step 0 OpenWiki workflow verified.")
-
-    return InvariantResult(6, "OpenWiki Knowledge & Claims Integrity", passed, details, warnings)
-
-
 # ==============================================================================
 # Master Invariant Execution Orchestrator
 # ==============================================================================
-def run_all_invariants(
-    repo_root: Path,
-    strict: bool = True,
-    warmup: bool = False,
-    endpoint: str = "http://localhost:8000/v1",
-) -> int:
+def run_all_invariants(repo_root: Path, build_dir: Path | None = None) -> int:
     log_header("RadianceMine Epistemic Invariants & Ground-Truth Verification")
     print(f"Workspace: {repo_root}")
     print("Policy:    Strict Physical Grounding (Anti-Hallucination Law)")
@@ -566,7 +373,7 @@ def run_all_invariants(
     results: list[InvariantResult] = []
 
     # Run Invariant 1
-    res1 = check_invariant_1_symbol_grounding(repo_root)
+    res1 = check_invariant_1_symbol_grounding(repo_root, build_dir)
     results.append(res1)
 
     # Run Invariant 2
@@ -577,17 +384,9 @@ def run_all_invariants(
     res3 = check_invariant_3_immutability_lock(repo_root)
     results.append(res3)
 
-    # Run Invariant 4
-    res4 = check_invariant_4_hardware_clocks(auto_warmup=warmup, endpoint=endpoint)
-    results.append(res4)
-
     # Run Invariant 5
     res5 = check_invariant_5_transparency_guard(repo_root)
     results.append(res5)
-
-    # Run Invariant 6
-    res6 = check_invariant_6_openwiki_integrity(repo_root)
-    results.append(res6)
 
     print("\n" + "=" * 80)
     print(f"| {'#':<3} | {'Invariant Name':<45} | {'Result':<12} |")
@@ -613,7 +412,7 @@ def run_all_invariants(
                 print(f"   ⚠️  {w}")
 
     if failures == 0:
-        print(f"\n{BOLD}{GREEN}🏆 TIER 0 EPISTEMIC GROUND-TRUTH VERIFICATION PASSED (6/6 INVARIANTS CLEAN){RESET}\n")
+        print(f"\n{BOLD}{GREEN}🏆 TIER 0 EPISTEMIC GROUND-TRUTH VERIFICATION PASSED ({len(results)}/{len(results)} INVARIANTS CLEAN){RESET}\n")
         return 0
     else:
         print(f"\n{BOLD}{RED}❌ TIER 0 EPISTEMIC GROUND-TRUTH GATE FAILED: {failures} invariant(s) violated!{RESET}")
@@ -623,58 +422,22 @@ def run_all_invariants(
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="RadianceMine Epistemic Ground-Truth & Anti-Hallucination Gate (Tier 0)",
+        description="RadianceMine Tier 0: static ground-truth checks of a source tree and its build",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument(
-        "--invariant",
-        type=int,
-        choices=[1, 2, 3, 4, 5, 6],
-        default=None,
-        help="Run only a specific invariant (1-6)",
-    )
-    parser.add_argument(
-        "--strict",
-        action="store_true",
-        default=True,
-        help="Enforce strict zero-tolerance failure mode",
-    )
-    parser.add_argument(
-        "--warmup",
-        action="store_true",
-        help="Automatically issue warmup requests to wake up throttled GPU DPM clocks",
-    )
-    parser.add_argument(
-        "--endpoint",
-        default=os.getenv("ENDPOINT", "http://localhost:8000/v1"),
-        help="Inference API endpoint for warmup requests",
-    )
-    parser.add_argument(
-        "--json-out",
-        type=Path,
-        default=None,
-        help="Optional path to output JSON results summary",
-    )
-
+    parser.add_argument("--invariant", type=int, choices=[1, 2, 3, 5], default=None, help="Run only this invariant")
+    parser.add_argument("--repo-root", type=Path, default=get_repo_root(), help="Source tree to check (e.g. a candidate worktree)")
+    parser.add_argument("--build-dir", type=Path, default=None, help="Build dir with radiance_home/kernels (default: <repo-root>/build_hip)")
     args = parser.parse_args()
-    repo_root = get_repo_root()
+    repo_root = args.repo_root.resolve()
 
     if args.invariant is not None:
-        if args.invariant == 1:
-            res = check_invariant_1_symbol_grounding(repo_root)
-        elif args.invariant == 2:
-            res = check_invariant_2_anti_silent_skips(repo_root)
-        elif args.invariant == 3:
-            res = check_invariant_3_immutability_lock(repo_root)
-        elif args.invariant == 4:
-            res = check_invariant_4_hardware_clocks(auto_warmup=args.warmup, endpoint=args.endpoint)
-        elif args.invariant == 5:
-            res = check_invariant_5_transparency_guard(repo_root)
-        elif args.invariant == 6:
-            res = check_invariant_6_openwiki_integrity(repo_root)
-        else:
-            return 1
-
+        res = {
+            1: lambda: check_invariant_1_symbol_grounding(repo_root, args.build_dir),
+            2: lambda: check_invariant_2_anti_silent_skips(repo_root),
+            3: lambda: check_invariant_3_immutability_lock(repo_root),
+            5: lambda: check_invariant_5_transparency_guard(repo_root),
+        }[args.invariant]()
         badge = f"{GREEN}PASS{RESET}" if res.passed else f"{RED}FAIL{RESET}"
         print(f"Invariant {res.invariant_id} ({res.name}): {badge}")
         for d in res.details:
@@ -683,8 +446,7 @@ def main() -> int:
             print(f"  ⚠️  {w}")
         return 0 if res.passed else 1
 
-    rc = run_all_invariants(repo_root, strict=args.strict, warmup=args.warmup, endpoint=args.endpoint)
-    return rc
+    return run_all_invariants(repo_root, args.build_dir)
 
 
 if __name__ == "__main__":

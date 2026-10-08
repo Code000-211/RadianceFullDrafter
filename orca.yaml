@@ -1,0 +1,9 @@
+# Orca project defaults for RadianceMine. Agent workflow: docs/ORCA_AGENT_WORKFLOW.md
+scripts:
+  setup: |
+    bash scripts/orca_setup.sh
+setupAgentStartupPolicy: wait-for-setup
+defaultTabs:
+  - title: Agent
+  - title: Queue
+    command: python3 /home/orca/RadianceMine/scripts/lever_queue.py list

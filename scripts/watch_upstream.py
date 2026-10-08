@@ -3,16 +3,20 @@
 watch_upstream.py — Upstream Codeberg watcher, review list only
 
 Polls open pull requests of https://codeberg.org/StillDeadcode/radiance, asks Jev
-(TypeSafe System One) one question — could this be useful for our setup? — and
-writes the result into candidates/upstream/REVIEW.md for a human to look at.
+(TypeSafe System One) in one call whether each PR could be useful for our setup plus three
+reason flags (needs 3+ GPUs, CUDA-only, touches the decode/prefill hot path), and writes the
+result into candidates/upstream/REVIEW.md for a human to look at.
 
 This script deliberately does NOT:
   * create GitHub issues, branches or pull requests
   * apply, build or execute upstream code
   * set any status label that ORCA would pick up
 
-State lives in telemetry/upstream_review.json. Mark a PR as looked at with
-`--done <PR> [<PR> ...]`; it moves back onto the list if the PR changes upstream.
+State lives in telemetry/upstream_review.json.
+  --done <PR>... [--verdict useful|not-useful]   mark as looked at; the verdict is kept to
+                                                 calibrate the threshold (--calibration)
+  --assess <PR> --file <md>                      attach an agent's written assessment
+A PR moves back onto the list if it changes upstream.
 """
 
 from __future__ import annotations
@@ -41,6 +45,7 @@ STATE_FILE = TELEMETRY_DIR / "upstream_review.json"
 STATE_LOCK_FILE = TELEMETRY_DIR / "upstream_review.lock"
 DAEMON_LOCK_FILE = TELEMETRY_DIR / "watcher.lock"
 REVIEW_FILE = BASE_DIR / "candidates" / "upstream" / "REVIEW.md"
+ASSESSMENT_DIR = BASE_DIR / "candidates" / "upstream" / "assessments"
 
 CODEBERG_BASE = "https://codeberg.org"
 REPO_OWNER = "StillDeadcode"
@@ -125,8 +130,11 @@ def fingerprint(title: str, body: str, files: list[dict[str, Any]]) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
-def classify_usefulness(title: str, body: str, files: list[dict[str, Any]]) -> float:
-    """Returns Jev's probability that the PR could be useful for us."""
+FLAG_LABELS = {"needs_3plus_gpus": "≥3 GPUs", "cuda_only": "nur CUDA", "hot_path": "Hot-Path"}
+
+
+def classify_usefulness(title: str, body: str, files: list[dict[str, Any]]) -> tuple[float, dict[str, float]]:
+    """Returns Jev's probability that the PR could be useful for us, plus reason flags."""
     file_lines = "\n".join(f"  {f['name']} (+{f['add']}/-{f['del']})" for f in files[:80])
     if len(files) > 80:
         file_lines += f"\n  ... and {len(files) - 80} more files"
@@ -145,9 +153,26 @@ def classify_usefulness(title: str, body: str, files: list[dict[str, Any]]) -> f
                 "other model families we do not run, or pure cosmetics."
             ),
         },
+        "needs_3plus_gpus": {
+            "type": "noul",
+            "instructions": "Does this change only take effect with three or more GPUs / tensor-parallel ranks?",
+        },
+        "cuda_only": {
+            "type": "noul",
+            "instructions": "Does this change only apply to NVIDIA/CUDA hardware and not to AMD ROCm/HIP?",
+        },
+        "hot_path": {
+            "type": "noul",
+            "instructions": (
+                "Does this change touch code that runs on every decode or prefill step "
+                "(GPU kernels, all-reduce, attention, MoE, scheduler step), as opposed to "
+                "tooling, serving endpoints, docs or startup code?"
+            ),
+        },
     }
     answers = typesafe_triage.query_jev(state, questions)
-    return float(answers["useful"]["noul"])
+    flags = {k: float(answers[k]["noul"]) for k in FLAG_LABELS}
+    return float(answers["useful"]["noul"]), flags
 
 
 def triage(state: dict[str, Any], use_jev: bool, force: bool, only_pr: int | None) -> None:
@@ -179,10 +204,11 @@ def triage(state: dict[str, Any], use_jev: bool, force: bool, only_pr: int | Non
         fp = fingerprint(title, body, files)
         changed = fp != entry.get("fingerprint")
         useful = entry.get("useful") if not (changed or force) else None
+        flags = entry.get("flags", {}) if not (changed or force) else {}
         error = None
         if useful is None and use_jev:
             try:
-                useful = classify_usefulness(title, body, files)
+                useful, flags = classify_usefulness(title, body, files)
             except (RuntimeError, KeyError, TypeError, ValueError) as e:
                 error = str(e)
                 print(f"  #{pr_id}: Jev failed, listed as unclassified ({e})", flush=True)
@@ -197,8 +223,11 @@ def triage(state: dict[str, Any], use_jev: bool, force: bool, only_pr: int | Non
             "fingerprint": fp,
             "files": files,
             "useful": useful,
+            "flags": flags,
             "jev_error": error,
             "done": done,
+            "verdict": entry.get("verdict") if not changed else None,
+            "assessment": entry.get("assessment") if not changed else None,
             "changed_since_done": entry.get("done", False) and changed,
             "open": True,
         }
@@ -208,7 +237,7 @@ def triage(state: dict[str, Any], use_jev: bool, force: bool, only_pr: int | Non
     state["last_checked"] = int(time.time())
 
 
-def mark_done(state: dict[str, Any], pr_ids: list[int]) -> None:
+def mark_done(state: dict[str, Any], pr_ids: list[int], verdict: str | None) -> None:
     for pr_id in pr_ids:
         entry = state["prs"].get(str(pr_id))
         if entry is None:
@@ -216,7 +245,36 @@ def mark_done(state: dict[str, Any], pr_ids: list[int]) -> None:
             continue
         entry["done"] = True
         entry["changed_since_done"] = False
-        print(f"PR #{pr_id} marked as reviewed")
+        if verdict:
+            entry["verdict"] = verdict
+        print(f"PR #{pr_id} marked as reviewed" + (f" ({verdict})" if verdict else ""))
+
+
+def attach_assessment(state: dict[str, Any], pr_id: int, text: str) -> bool:
+    entry = state["prs"].get(str(pr_id))
+    if entry is None:
+        print(f"PR #{pr_id} is not in the review state", file=sys.stderr)
+        return False
+    ASSESSMENT_DIR.mkdir(parents=True, exist_ok=True)
+    path = ASSESSMENT_DIR / f"pr_{pr_id}.md"
+    path.write_text(text, encoding="utf-8")
+    first = next((line.strip("# ").strip() for line in text.splitlines() if line.strip()), "")
+    entry["assessment"] = {"file": str(path.relative_to(BASE_DIR)), "summary": first[:160]}
+    print(f"assessment for PR #{pr_id} stored in {path.relative_to(BASE_DIR)}")
+    return True
+
+
+def print_calibration(state: dict[str, Any]) -> None:
+    rated = [e for e in state["prs"].values() if e.get("verdict") and e.get("useful") is not None]
+    if not rated:
+        print("No PRs with a --verdict yet.")
+        return
+    print(f"{len(rated)} PRs with a verdict")
+    for thr in (0.3, 0.4, 0.5, 0.6, 0.7):
+        tp = sum(1 for e in rated if e["useful"] >= thr and e["verdict"] == "useful")
+        fp = sum(1 for e in rated if e["useful"] >= thr and e["verdict"] == "not-useful")
+        fn = sum(1 for e in rated if e["useful"] < thr and e["verdict"] == "useful")
+        print(f"  threshold {thr:.1f}: listed {tp + fp}, useful among them {tp}, useful missed {fn}")
 
 
 def md_escape(text: str) -> str:
@@ -242,14 +300,17 @@ def write_review_list(state: dict[str, Any], threshold: float) -> None:
     def table(rows: list[dict[str, Any]]) -> list[str]:
         if not rows:
             return ["_keine_", ""]
-        out = ["| PR | Nützlich (Jev) | Titel | Autor | Dateien |", "|---|---|---|---|---|"]
+        out = ["| PR | Nützlich (Jev) | Hinweise | Titel | Autor | Dateien | Bewertung |", "|---|---|---|---|---|---|---|"]
         for e in sorted(rows, key=sort_key):
             score = "unklassifiziert" if e.get("useful") is None else f"{e['useful']:.2f}"
             if e.get("changed_since_done"):
                 score += " (geändert seit Review)"
+            hints = ", ".join(label for key, label in FLAG_LABELS.items() if e.get("flags", {}).get(key, 0) >= 0.5) or "-"
+            assessment = e.get("assessment")
+            assessed = f"[{md_escape(assessment['summary'][:60])}]({Path(assessment['file']).name})" if assessment else "-"
             out.append(
-                f"| [#{e['pr_id']}]({e['url']}) | {score} | {md_escape(e['title'][:90])} "
-                f"| @{e['author']} | {format_files(e.get('files', []))} |"
+                f"| [#{e['pr_id']}]({e['url']}) | {score} | {hints} | {md_escape(e['title'][:90])} "
+                f"| @{e['author']} | {format_files(e.get('files', []))} | {assessed} |"
             )
         out.append("")
         return out
@@ -262,7 +323,7 @@ def write_review_list(state: dict[str, Any], threshold: float) -> None:
         f"zuletzt geprüft {last}. Jev schätzt nur, ob ein PR für unser Setup nützlich sein "
         f"könnte (Schwelle {threshold:.2f}). Es wird nichts automatisch angewendet oder getestet.",
         "",
-        "Als angesehen markieren: `python3 scripts/watch_upstream.py --done <PR> [<PR> ...]`",
+        "Als angesehen markieren: `python3 scripts/watch_upstream.py --done <PR> [<PR> ...] --verdict useful|not-useful`",
         "",
         f"## Ansehen ({len(todo)})",
         "",
@@ -287,14 +348,33 @@ def main() -> int:
     parser.add_argument("--pr", type=int, help="Only (re-)classify this PR")
     parser.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD, help="Usefulness cut-off for the list")
     parser.add_argument("--done", type=int, nargs="+", metavar="PR", help="Mark PRs as reviewed and exit")
+    parser.add_argument("--verdict", choices=["useful", "not-useful"], help="With --done: was the PR actually useful?")
+    parser.add_argument("--assess", type=int, metavar="PR", help="Attach the assessment in --file to this PR and exit")
+    parser.add_argument("--file", type=Path, help="Markdown file for --assess")
+    parser.add_argument("--calibration", action="store_true", help="Compare Jev scores with recorded verdicts and exit")
     args = parser.parse_args()
 
     TELEMETRY_DIR.mkdir(parents=True, exist_ok=True)
 
+    if args.calibration:
+        print_calibration(load_state())
+        return 0
+
+    if args.assess is not None:
+        if args.file is None:
+            print("--assess needs --file", file=sys.stderr)
+            return 1
+        with state_lock():
+            state = load_state()
+            ok = attach_assessment(state, args.assess, args.file.read_text(encoding="utf-8"))
+            save_state(state)
+            write_review_list(state, args.threshold)
+        return 0 if ok else 1
+
     if args.done:
         with state_lock():
             state = load_state()
-            mark_done(state, args.done)
+            mark_done(state, args.done, args.verdict)
             save_state(state)
             write_review_list(state, args.threshold)
         return 0

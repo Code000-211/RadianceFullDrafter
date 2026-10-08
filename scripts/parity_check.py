@@ -10,8 +10,9 @@ count drift is detected, preventing wasted benchmark runs on defective builds.
 
 Tier 1 Gate Invariants:
   1. Token Exactness: 0 token discrepancy against certified reference vectors.
-  2. Code, reasoning and math decode speed floors.
-Tolerance and floors default to baselines/gate_thresholds.json.
+  2. Optional decode speed floors (--min-*-tps, off by default). The gate does not use
+     them: speed is judged by the A/B comparison in ab_gate.py.
+Token tolerance defaults to baselines/gate_thresholds.json.
 """
 
 from __future__ import annotations
@@ -35,110 +36,6 @@ import gate_thresholds
 # ==============================================================================
 # Built-in Default Golden References (Qwen3.8 / Qwen4Exp Baseline)
 # ==============================================================================
-DEFAULT_GOLDENS: list[dict[str, Any]] = [
-    {
-        "id": "sanity_arithmetic",
-        "category": "sanity",
-        "prompt": "What is 2+2? Answer with only the number.",
-        "max_tokens": 16,
-        "temperature": 0.0,
-        "golden_tokens": 2,
-        "golden_sha256": "4b227777d4dd1fc61c6f884f48641d02b4d121d3fd328cb08b5531fcacdabf8a",
-        "expected_finish_reason": "stop",
-        "golden_text": "4",
-        "required_patterns": ["4"],
-        "forbidden_patterns": ["<|im_start|>", "<|im_end|>", "error"],
-    },
-    {
-        "id": "code_is_prime",
-        "category": "code",
-        "prompt": "Write a Python function `is_prime(n)` that returns True if n is prime and False otherwise. Include brief docstring and handle edge cases n <= 1.",
-        "max_tokens": 128,
-        "temperature": 0.0,
-        "golden_tokens": 106,
-        "golden_sha256": "7a35c5970c67530be90802ea7a6df10cb46fc1d51a69ea76c8cba766c075f80b",
-        "expected_finish_reason": "stop",
-        "golden_text": (
-            "```python\ndef is_prime(n: int) -> bool:\n"
-            "    \"\"\"Return True if n is prime, False otherwise.\"\"\"\n"
-            "    if n <= 1:\n"
-            "        return False\n"
-            "    if n <= 3:\n"
-            "        return True\n"
-            "    if n % 2 == 0 or n % 3 == 0:\n"
-            "        return False\n"
-            "    i = 5\n"
-            "    while i * i <= n:\n"
-            "        if n % i == 0 or n % (i + 2) == 0:\n"
-            "            return False\n"
-            "        i += 6\n"
-            "    return True\n```"
-        ),
-        "required_patterns": ["def is_prime", "if n <= 1:", "return True", "return False"],
-        "forbidden_patterns": ["<|im_start|>", "<|im_end|>", "Traceback"],
-    },
-    {
-        "id": "math_linear_eq",
-        "category": "math",
-        "prompt": "Solve the following equation step by step: 3*(x - 4) + 2*(2*x + 1) = 5*(x + 2) - 8. What is the value of x?",
-        "max_tokens": 256,
-        "temperature": 0.0,
-        "golden_tokens": 249,
-        "golden_sha256": "50cce287cbdfa2cf95dfb4e4708709ec543e33b5c65f9ea3f58e4483a9ce4257",
-        "expected_finish_reason": "stop",
-        "golden_text": (
-            "To solve the equation step by step:\n\n"
-            "Equation:\n"
-            "$$3(x - 4) + 2(2x + 1) = 5(x + 2) - 8$$\n\n"
-            "Step 1: Expand both sides.\n"
-            "Left-hand side:\n"
-            "$$3x - 12 + 4x + 2 = 7x - 10$$\n\n"
-            "Right-hand side:\n"
-            "$$5x + 10 - 8 = 5x + 2$$\n\n"
-            "Now the equation is:\n"
-            "$$7x - 10 = 5x + 2$$\n\n"
-            "Step 2: Subtract $5x$ from both sides.\n"
-            "$$2x - 10 = 2$$\n\n"
-            "Step 3: Add 10 to both sides.\n"
-            "$$2x = 12$$\n\n"
-            "Step 4: Divide by 2.\n"
-            "$$x = 6$$\n\n"
-            "**Final Answer:**\n"
-            "The value of $x$ is 6."
-        ),
-        "required_patterns": ["7x - 10", "5x + 2", "2x = 12", "x = 6"],
-        "forbidden_patterns": ["<|im_start|>", "<|im_end|>"],
-    },
-    {
-        "id": "reasoning_probability",
-        "category": "reasoning",
-        "prompt": "A box contains 3 red balls and 5 blue balls. Two balls are drawn sequentially at random without replacement. What is the exact probability that both balls are red? Express as a simplified fraction.",
-        "max_tokens": 256,
-        "temperature": 0.0,
-        "golden_tokens": 251,
-        "golden_sha256": "3df49c4033e6ca4a382dc3cbcc90c379a1f94d935f8a00ee6b47c4e5e78ecab7",
-        "expected_finish_reason": "stop",
-        "golden_text": (
-            "To find the probability that both balls drawn are red without replacement:\n\n"
-            "1. **Total number of balls initially**:\n"
-            "   $$3 \\text{ (red)} + 5 \\text{ (blue)} = 8 \\text{ balls}$$\n\n"
-            "2. **Probability that the first ball is red**:\n"
-            "   $$P(R_1) = \\frac{3}{8}$$\n\n"
-            "3. **Probability that the second ball is red given that the first was red**:\n"
-            "   After drawing one red ball, there are 2 red balls left and 7 balls total.\n"
-            "   $$P(R_2 \\mid R_1) = \\frac{2}{7}$$\n\n"
-            "4. **Combined probability**:\n"
-            "   $$P(R_1 \\cap R_2) = P(R_1) \\times P(R_2 \\mid R_1) = \\frac{3}{8} \\times \\frac{2}{7} = \\frac{6}{56}$$\n\n"
-            "5. **Simplify the fraction**:\n"
-            "   Dividing numerator and denominator by 2:\n"
-            "   $$\\frac{6 \\div 2}{56 \\div 2} = \\frac{3}{28}$$\n\n"
-            "**Final Answer:**\n"
-            "The exact probability is **3/28**."
-        ),
-        "required_patterns": ["3/8", "2/7", "3/28"],
-        "forbidden_patterns": ["<|im_start|>", "<|im_end|>"],
-    },
-]
 
 
 @dataclass
@@ -330,26 +227,10 @@ def evaluate_output(
 
 
 def load_goldens(custom_path: Path | None) -> list[GoldenPrompt]:
-    raw_data: list[dict[str, Any]] = []
-
-    if custom_path and custom_path.exists():
-        with open(custom_path, "r", encoding="utf-8") as f:
-            raw_data = json.load(f)
-    else:
-        # Check standard locations
-        candidates = [
-            Path(__file__).parent.parent / "baselines" / "golden_parity_reference.json",
-            Path(__file__).parent / "golden_parity_reference.json",
-        ]
-        found = False
-        for c in candidates:
-            if c.exists():
-                with open(c, "r", encoding="utf-8") as f:
-                    raw_data = json.load(f)
-                found = True
-                break
-        if not found:
-            raw_data = DEFAULT_GOLDENS
+    """Loads the golden prompts; a missing file is an error, never a silent built-in default."""
+    path = custom_path or Path(__file__).resolve().parent.parent / "baselines" / "golden_parity_reference.json"
+    with open(path, "r", encoding="utf-8") as f:
+        raw_data: list[dict[str, Any]] = json.load(f)
 
     res: list[GoldenPrompt] = []
     for d in raw_data:
@@ -408,20 +289,20 @@ def main() -> int:
     parser.add_argument(
         "--min-code-tps",
         type=float,
-        default=tier1["min_code_tps"],
-        help="Minimum required decode speed (t/s) on code prompts",
+        default=0.0,
+        help="Optional minimum decode speed (t/s) on code prompts; 0 disables",
     )
     parser.add_argument(
         "--min-reasoning-tps",
         type=float,
-        default=tier1["min_reasoning_tps"],
-        help="Minimum required decode speed (t/s) on reasoning prompts",
+        default=0.0,
+        help="Optional minimum decode speed (t/s) on reasoning prompts; 0 disables",
     )
     parser.add_argument(
         "--min-math-tps",
         type=float,
-        default=tier1["min_math_tps"],
-        help="Minimum required decode speed (t/s) on math prompts",
+        default=0.0,
+        help="Optional minimum decode speed (t/s) on math prompts; 0 disables",
     )
     parser.add_argument(
         "--fail-fast",
@@ -459,9 +340,8 @@ def main() -> int:
 
     args = parser.parse_args()
     print(
-        f"Thresholds from {gate_thresholds.THRESHOLDS_FILE.name} unless overridden: "
-        f"tolerance={args.token_tolerance}, code>={args.min_code_tps}, "
-        f"reasoning>={args.min_reasoning_tps}, math>={args.min_math_tps}"
+        f"token tolerance={args.token_tolerance} ({gate_thresholds.THRESHOLDS_FILE.name}), "
+        f"speed floors code>={args.min_code_tps}, reasoning>={args.min_reasoning_tps}, math>={args.min_math_tps} (0 = off)"
     )
 
     # Pre-flight Connectivity Verification

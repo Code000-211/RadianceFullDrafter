@@ -92,3 +92,10 @@ local_config.sh
 .typesafe*
 *api_key*
 *.key
+
+# Lever queue runtime state, gate reports and archived winner builds
+/queue/
+/reports/
+/releases/
+telemetry/engine.pgid
+candidates/upstream/assessments/

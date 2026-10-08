@@ -34,35 +34,21 @@ echo " Target Path:   ${WORKTREE_DIR}"
 echo " Branch Name:   ${BRANCH_NAME}"
 echo "================================================================================"
 
-# Check if worktree directory already exists
-if [ -d "${WORKTREE_DIR}" ]; then
-    echo "ℹ️  Worktree directory '${WORKTREE_DIR}' already exists."
-    echo "   Cleaning and resetting worktree state to pristine '${BASE_BRANCH}'..."
-    git -C "${WORKTREE_DIR}" checkout -f "${BASE_BRANCH}" 2>/dev/null || git -C "${WORKTREE_DIR}" checkout -f -B "${BRANCH_NAME}" "${BASE_BRANCH}"
-    git -C "${WORKTREE_DIR}" reset --hard "${BASE_BRANCH}" 2>/dev/null || true
-    git -C "${WORKTREE_DIR}" clean -fd 2>/dev/null || true
-    echo "✓ Worktree cleaned and synchronized with '${BASE_BRANCH}'."
-    exit 0
+# Never touch an existing worktree: it may hold uncommitted or unpushed work.
+if [ -e "${WORKTREE_DIR}" ]; then
+    echo "❌ '${WORKTREE_DIR}' already exists. Use it as is, or remove it yourself" >&2
+    echo "   (git worktree remove ${WORKTREE_DIR}) after checking its contents." >&2
+    exit 1
 fi
-
-# Check if branch exists
 if git -C "${REPO_ROOT}" show-ref --verify --quiet "refs/heads/${BRANCH_NAME}"; then
-    echo "ℹ️  Branch '${BRANCH_NAME}' already exists. Attaching worktree..."
-    git -C "${REPO_ROOT}" worktree add "${WORKTREE_DIR}" "${BRANCH_NAME}"
-else
-    echo "Creating new branch '${BRANCH_NAME}' branched from '${BASE_BRANCH}'..."
-    git -C "${REPO_ROOT}" worktree add -b "${BRANCH_NAME}" "${WORKTREE_DIR}" "${BASE_BRANCH}"
+    echo "❌ Branch '${BRANCH_NAME}' already exists; pick another name or delete the branch yourself." >&2
+    exit 1
 fi
 
-# Initialize isolated build environment directory
-mkdir -p "${WORKTREE_DIR}/build_hip/bin"
-mkdir -p "${WORKTREE_DIR}/build_hip/radiance_home"
-if [ -d "${REPO_ROOT}/build_hip/radiance_home" ]; then
-    cp -rn "${REPO_ROOT}/build_hip/radiance_home/"* "${WORKTREE_DIR}/build_hip/radiance_home/" 2>/dev/null || true
-fi
-if [ -d "${REPO_ROOT}/build_hip/bin" ]; then
-    cp -rn "${REPO_ROOT}/build_hip/bin/"* "${WORKTREE_DIR}/build_hip/bin/" 2>/dev/null || true
-fi
+git -C "${REPO_ROOT}" worktree add -b "${BRANCH_NAME}" "${WORKTREE_DIR}" "${BASE_BRANCH}"
+
+# No binaries are copied from main: the worktree builds its own build_hip, so a
+# failed or partial build can never be mistaken for the candidate.
 
 # Check if corresponding candidate lever exists
 CANDIDATE_PATH="${REPO_ROOT}/candidates/${FEATURE_SLUG}"
@@ -90,9 +76,9 @@ fi
 
 echo ""
 echo "  3. Compile test targets in isolation:"
-echo "     cmake -B build_hip -S . -DCMAKE_BUILD_TYPE=Release"
-echo "     cmake --build build_hip --target arch_test -j\$(nproc)"
+echo "     cmake -B build_hip -S . -G Ninja -DCMAKE_BUILD_TYPE=Release -DRAD_WITH_HIP=ON -DRAD_GPU_TARGETS=gfx1201 -DRAD_BUILD_TESTS=ON"
+echo "     ninja -C build_hip"
 echo ""
-echo "  4. Execute 3-Tier Regression Gate before requesting merge:"
-echo "     bash scripts/gate_check.sh"
+echo "  4. Or queue the lever for the full build + gate run:"
+echo "     python3 scripts/lever_queue.py add <slug> && python3 scripts/lever_queue.py run"
 echo "================================================================================"

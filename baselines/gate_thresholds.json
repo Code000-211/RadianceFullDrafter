@@ -1,26 +1,28 @@
 {
-  "_comment": "Single source of truth for every Master Gate threshold and baseline seal. Read by gate_check.sh, parity_check.py, check_composite_gate.py and check_epistemic_invariants.py. Commits touching this file are blocked by the pre-commit hook unless RADIANCE_GATE_CHANGE=1 is set. Values carried over unchanged on 2026-10-08; tier1 floors and tier2 slack must be re-derived from measured run-to-run noise.",
+  "_comment": "Single source of truth for Master Gate settings and baseline seals. Commits touching baselines/ are blocked by the pre-commit hook unless RADIANCE_GATE_CHANGE=1 is set. tier2.slack_pct is set just above the largest difference between two engine starts of the same binary (A/A calibration 2026-10-08, see docs/GATE.md).",
   "tier1": {
-    "token_tolerance": 0,
-    "min_code_tps": 230.0,
-    "min_reasoning_tps": 210.0,
-    "min_math_tps": 210.0
+    "token_tolerance": 0
   },
   "tier2": {
+    "mode": "ab",
+    "port": 8100,
+    "engine_ready_timeout_s": 1200,
+    "bench_config": "baselines/bench_config.json",
+    "betterbench_path": "/opt/BetterBench",
     "slack_pct": {
-      "composite": 0.0,
-      "decode": 0.0,
-      "concurrency": 2.0,
-      "prefill": 0.0
+      "decode_med_tps": 4.0,
+      "concurrency_tps": 10.0,
+      "prefill_med_tps": 2.0,
+      "c1_itl_p99_ms": 4.0,
+      "c8_itl_p99_ms": 4.0,
+      "ttft_p50_ms": 2.0
     },
     "latency_targets_ms": {
-      "c1_itl_p99": 4.5,
-      "c8_itl_p99": 15.0,
-      "ttft_p50": 100.0
+      "c8_itl_p99": 15.0
     }
   },
   "seals_sha256": {
     "golden_parity_reference.json": "75e83c3da2aa5db53e6b659068289b16e92da26fc08a4358b27aa7a10ea8c7df",
-    "baseline_opt146.json": "34b3a48652a408e103a36c29352dab0e43030fd038d21112f74c58a07539d772"
+    "bench_config.json": "fb6097a222067ded63656b2dc970d046395d5de0e4b844f6538f122a7539e379"
   }
 }

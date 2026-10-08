@@ -1,0 +1,24 @@
+# Lever test queue: runs queued candidates one at a time (build + gate_check.sh).
+# Queue a lever with: python3 scripts/lever_queue.py add <slug>
+#
+# Install (as root in CT 107):
+#   cp /home/orca/RadianceMine/scripts/systemd/radiance-lever-queue.service /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now radiance-lever-queue
+[Unit]
+Description=RadianceMine lever test queue
+After=network-online.target
+
+[Service]
+Type=simple
+User=orca
+Group=orca
+SupplementaryGroups=render
+WorkingDirectory=/home/orca/RadianceMine
+ExecStart=/usr/bin/python3 -u /home/orca/RadianceMine/scripts/lever_queue.py run --daemon --github
+Restart=on-failure
+RestartSec=60
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
