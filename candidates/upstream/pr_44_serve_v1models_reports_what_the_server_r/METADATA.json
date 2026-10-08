@@ -1,0 +1,101 @@
+{
+  "pr_id": 44,
+  "title": "serve: /v1/models reports what the server runs with; /v1/models/:id answers the entry itself",
+  "author": "bakon",
+  "url": "https://codeberg.org/StillDeadcode/radiance/pulls/44",
+  "status": "SERVING_ENDPOINT",
+  "modified_files": [
+    "core/server/oai.cpp",
+    "core/server/oai.h",
+    "core/server/server.cpp",
+    "docs/GUIDE.md",
+    "tests/server_test.cpp",
+    "tests/wire_test.cpp",
+    "core/server/oai.cpp",
+    "core/server/oai.h",
+    "core/server/server.cpp",
+    "docs/GUIDE.md",
+    "tests/server_test.cpp",
+    "tests/wire_test.cpp",
+    "core/engine.cpp",
+    "core/server/oai.cpp",
+    "core/server/oai.h",
+    "core/server/server.cpp",
+    "core/server/server.h",
+    "docs/GUIDE.md",
+    "tests/server_test.cpp",
+    "tests/wire_test.cpp",
+    "core/server/admin.cpp",
+    "core/server/oai.cpp",
+    "core/server/oai.h",
+    "core/server/server.cpp",
+    "core/server/server.h",
+    "docs/GUIDE.md",
+    "tests/server_test.cpp",
+    "tests/wire_test.cpp"
+  ],
+  "safety_audit": {
+    "passed": true,
+    "violations": []
+  },
+  "jev_evaluation": {
+    "subsystem": {
+      "type": "choice",
+      "choice": "serving",
+      "confidence": 1.0,
+      "probabilities": {
+        "moe": 0.0,
+        "interconnect": 0.0,
+        "gemm": 0.0,
+        "drafter": 0.0,
+        "tooling": 0.0,
+        "serving": 1.0,
+        "gdn": 0.0,
+        "qsa": 0.0,
+        "general": 0.0
+      }
+    },
+    "violates_rdna4_limits": {
+      "type": "noul",
+      "noul": 0.04
+    },
+    "feasibility": {
+      "type": "score",
+      "score": 2.33,
+      "confidence": 0.17,
+      "legend": {
+        "0": "Unfeasible / contradicts hardware laws / CUDA-only",
+        "1": "High risk or complex external dependency",
+        "2": "Moderate feasibility / experimental",
+        "3": "Feasible / standard ROCm HIP implementation",
+        "4": "Immediate high-value quick win"
+      },
+      "probabilities": {
+        "0": 0.13,
+        "1": 0.13,
+        "2": 0.18,
+        "3": 0.4,
+        "4": 0.16
+      }
+    },
+    "performance_roi": {
+      "type": "score",
+      "score": 0.34,
+      "confidence": 0.72,
+      "legend": {
+        "0": "Zero or negative performance impact (docs, tool, placebo)",
+        "1": "Marginal gain (<2%) or monitoring/stability utility",
+        "2": "Solid architectural gain (2-5%)",
+        "3": "High-impact gain (5-15%)",
+        "4": "Breakthrough gain (>15%)"
+      },
+      "probabilities": {
+        "0": 0.79,
+        "1": 0.13,
+        "2": 0.04,
+        "3": 0.03,
+        "4": 0.01
+      }
+    }
+  }
+}

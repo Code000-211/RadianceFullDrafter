@@ -1,0 +1,1381 @@
+From 96fa5dbe97fe7c2f616f36f8d0bbb03a0e368189 Mon Sep 17 00:00:00 2001
+From: keptn42 <keptn42@noreply.codeberg.org>
+Date: Mon, 5 Oct 2026 11:31:35 +0200
+Subject: [PATCH 1/2] four-rank ar_hc_write: the exact one-shot with the gated
+ residual's write
+
+At --tp 4 each gated-residual connection ran all_reduce and hc_write_bf16
+as two launches. ar_hc_write_4rank fuses them: the wide exact one-shot,
+reduced in place, with r4d_ar_hc_write_word as its epilogue. It takes the
+steps the exact one-shot would (under 1 MiB, and under min_bytes on wht6);
+larger and lossy messages keep the two launches. Two ranks unchanged.
+---
+ arch/common/rad_block_hc.h            |  16 ++-
+ arch/common/rad_fp8.h                 |  41 ++++++-
+ docs/ARCHITECTURES.md                 |  12 ++-
+ docs/OPS.md                           |   3 +-
+ libr4d/r4d.h                          |  10 ++
+ libr4d/r4d_ar_entry.hip               | 113 ++++++++++++++++---
+ libr4d/r4d_ar_oneshot_Nrank_exact.hip | 149 ++++++++++++++++++++++++++
+ libr4d/r4d_plugin.h                   |   3 +
+ libr4d/r4d_rows.cpp                   |  27 ++++-
+ tests/arch_test.cpp                   |  55 ++++++++--
+ 10 files changed, 394 insertions(+), 35 deletions(-)
+
+diff --git a/arch/common/rad_block_hc.h b/arch/common/rad_block_hc.h
+index 4d93fa9..1b5318a 100644
+--- a/arch/common/rad_block_hc.h
++++ b/arch/common/rad_block_hc.h
+@@ -156,9 +156,10 @@ struct HyperConn {
+ 
+     int64_t hn() const { return c.hc * g.n_embd; }
+     /* THE REDUCING WRITE THIS STEP ISSUES, on the wire its message goes out on; 0 where that wire
+-     * has no fused form, and the block's own collective then runs in front of the plain write. */
++     * has no fused form, and the block's own collective then runs in front of the plain write. At
++     * four ranks there is no rotated form, so a step ar_exact_write_takes declines gets 0. */
+     rad_op ar_write(int64_t T) const {
+-        return ar_wire_is_exact(g, T) ? op_ar_write : op_ar_write6;
++        return ar_exact_write_takes(g, T) ? op_ar_write : op_ar_write6;
+     }
+     /* WHETHER THIS STEP'S WRITE REDUCES THE BLOCK'S OUTPUT. The block in front asks the same
+      * question of the same T -- ar_taken with ar_take() -- before skipping its own collective. */
+@@ -293,15 +294,17 @@ inline int HyperConn::declare(RadBuilder* b, Names& nm, const Geom& geom, const
+                      {w.x.x, w.inj, w.h}, {w.h});
+         if (!op_write) return RAD_E_INVAL;
+         /* A handle that did not resolve is 0 and not an error: a backend without the fused kernel
+-         * keeps the pair, and takes_ar() then answers no on every step. */
+-        if (c.reduce && g.world == 2)
++         * keeps the pair, and takes_ar() then answers no on every step. At four ranks only the
++         * exact form exists, and it takes a step only where ar_wide_write_exact says the
++         * standalone collective would have been the exact one-shot. */
++        if (c.reduce && (g.world == 2 || g.world == 4))
+             op_ar_write = rw(b, RAD_OP(b, "ar_hc_write",
+                                 RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
+                                            RAD_INT("hc", c.hc), RAD_INT("world_size", g.world),
+                                            RAD_STR("dtype", g.dtype)),
+                                 RAD_NOWEIGHTS),
+                              {w.x.x, w.inj, w.h}, {w.x.x, w.h});
+-        if (op_ar_write && !g.wire_exact)
++        if (op_ar_write && !g.wire_exact && g.world == 2)
+             op_ar_write6 = rw(b, RAD_OP(b, "ar_hc_write",
+                                  RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
+                                             RAD_INT("hc", c.hc), RAD_INT("world_size", g.world),
+@@ -314,6 +317,9 @@ inline int HyperConn::declare(RadBuilder* b, Names& nm, const Geom& geom, const
+ 
+ inline int HyperConn::declare_gather(RadBuilder* b, const GatherSrc& src) {
+     if (!op_ar_write || src.top_k <= 0 || !src.ye || !src.ew || !src.sorted) return RAD_OK;
++    /* Two ranks only: there is no four-rank gather form yet, so there the block keeps its gather
++     * and this write takes the reduction alone (both bounds stay 0). */
++    if (g.world != 2) return RAD_OK;
+     const bool shared = src.sh && src.sg;
+     gsrc = src;
+     /* EVERY ROW COUNT ONE PASS CARRIES, prefill chunks included: the kernel reads its slots from
+diff --git a/arch/common/rad_fp8.h b/arch/common/rad_fp8.h
+index 753a2fe..41fc047 100644
+--- a/arch/common/rad_fp8.h
++++ b/arch/common/rad_fp8.h
+@@ -324,13 +324,50 @@ inline bool ar_fused_ok(const Geom& g, int64_t T) {
+     return ar_wire_is_exact(g, T) || (g.n_embd % kArWire6Chunk) == 0;
+ }
+ 
++/* THE FOUR-RANK FUSED WRITE'S STEPS. At four ranks ar_hc_write exists on the exact wire only, and
++ * it is the exact ONE-SHOT with the write behind it -- so it may take a message only where the
++ * standalone `all_reduce` would have sent that message exact and as a one-shot:
++ *
++ *   exact     --tp-wire exact, or a message the four-rank lossy row serves exactly itself: its
++ *             tiered-int8 groups of 32 must tile each of the four shards (numel % 128), and below
++ *             `min_bytes` it hands the message to the exact entry. ar_wire_is_exact's three facts,
++ *             with that wire's tile.
++ *   one-shot  under 1 MiB. From there libr4d's exact entry runs the two-shot instead
++ *             (R4D_AR_EXACT_TWOSHOT_MIN_BYTES, r4d_ar_entry.hip), which moves half the bytes, so
++ *             the pair stays. Either way the bytes are the same; this bound is a cost, not a
++ *             correctness line.
++ *
++ * ar_wire_is_exact itself stays false off two ranks: the embedding's collective asks it whether
++ * layer 0's fused norm absorbs that reduction, and at four no norm does. Both ranks evaluate this
++ * on the same T, so neither can take a different branch. */
++static const int64_t kArWideWireTile     = 128;
++static const int64_t kArWideOneshotBytes = 1024 * 1024;
++
++inline bool ar_wide_write_exact(const Geom& g, int64_t T) {
++    if (g.world != 4) return false;
++    const int64_t numel = T * g.n_embd;
++    const int64_t bytes = numel * 2;                      /* bf16 on the wire */
++    if (numel <= 0 || bytes >= kArWideOneshotBytes) return false;
++    if (g.wire_exact) return true;
++    if (numel % kArWideWireTile) return true;
++    return bytes < g.wire_min_bytes;
++}
++
++/* WHETHER A GATED RESIDUAL'S EXACT FUSED WRITE TAKES THE ALL-REDUCE AT T ROWS: at two ranks on every
++ * step whose wire is exact, at four where ar_wide_write_exact says so. The write
++ * (HyperConn::ar_write) and the block in front (ar_taken with kArOutExact) both ask exactly this. */
++inline bool ar_exact_write_takes(const Geom& g, int64_t T) {
++    return g.world == 2 ? ar_wire_is_exact(g, T) : ar_wide_write_exact(g, T);
++}
++
+ /* WHICH WIRES THE CONSUMER OF A BLOCK'S ALL-REDUCE TAKES. A block is declared without knowing what
+  * follows it, so the architecture tells it:
+  *
+  *   kArOutNorm   the next block's norm, which takes either wire it has a fused form for
+  *                (ar_fused_ok);
+  *   kArOutExact  a gated residual's write with the exact fused form only, so a message that would
+- *                go out compressed stays with the block;
++ *                go out compressed stays with the block (ar_exact_write_takes -- at four ranks
++ *                also one the standalone row would send as a two-shot);
+  *   kArOutBoth   a gated residual's write with a fused form on each wire, which takes every
+  *                message (HyperConn::ar_take). */
+ enum ArOut : int {
+@@ -344,7 +381,7 @@ enum ArOut : int {
+ inline bool ar_taken(const Geom& g, int64_t T, bool out, int take) {
+     if (!out) return false;
+     if (take == kArOutBoth)  return true;
+-    if (take == kArOutExact) return ar_wire_is_exact(g, T);
++    if (take == kArOutExact) return ar_exact_write_takes(g, T);
+     return ar_fused_ok(g, T);
+ }
+ 
+diff --git a/docs/ARCHITECTURES.md b/docs/ARCHITECTURES.md
+index 57ea101..47a4731 100644
+--- a/docs/ARCHITECTURES.md
++++ b/docs/ARCHITECTURES.md
+@@ -328,10 +328,14 @@ resolves to, not the same kernel over fewer heads. Any world size above the KV h
+ multiple of it: 4 is a multiple of 2, 3 and 5 are not, and those widths are refused at declare
+ time.
+ 
+-**The fused all-reduce forms are two-rank.** At four ranks nothing fuses: the hyper-connection pair
+-runs the standalone sequence — `all_reduce` (libr4d's 4-rank oneshot/twoshot), then
+-`hc_write_bf16`, then `moe_gather` — 2 to 3 extra launches per pair against the two-rank fused
+-form. The unfused sequence is declared beside the probe, so nothing is unresolved at boot. The
++**The fused all-reduce forms are two-rank, except the exact write.** At four ranks `ar_hc_write`
++exists on the exact wire only (`ar_hc_write_4rank`, the 4-rank one-shot with the write as its
++epilogue, on the plain all-reduce's buffers). A step takes it where the standalone `all_reduce`
++would have been the exact one-shot: under 1 MiB, and with `--tp-wire wht6` also under
++`--tp-wire-min-kb`. Larger messages, and every lossy one, keep the standalone sequence —
++`all_reduce` (4-rank two-shot or ti8), then `hc_write_bf16`. There is no four-rank
++`ar_gather_hc_write`, so `moe_gather` stays a launch of its own. The unfused sequence is declared
++beside the fused one, so nothing is unresolved at boot. The
+ attention's own fusion is not a collective and does carry over: the sparse decode with the output
+ gate and the quantiser in its merge (`attn_paged_gate_quant`) has gqa-6, page-4 rows. The per-step cost against tp2 on the
+ same cards is unmeasured.
+diff --git a/docs/OPS.md b/docs/OPS.md
+index 650f285..1aabc23 100644
+--- a/docs/OPS.md
++++ b/docs/OPS.md
+@@ -751,7 +751,8 @@ and the input, and the reduced sum lands in it.
+ `ar_hc_write` is `all_reduce` of `y` followed by `hc_write` of the reduced `y`, for a block whose
+ output feeds a gated residual rather than a norm. `y` is INOUT for the same reason `x` is above.
+ It serves both wires, one op a wire: a caller declares the rotated form beside the exact one and
+-issues whichever the step's message goes out on, and a `wire` of 6 is 6 at every size.
++issues whichever the step's message goes out on, and a `wire` of 6 is 6 at every size. At four
++ranks only the exact form exists.
+ 
+ `ar_gather_hc_write` is `moe_gather` followed by `ar_hc_write`: the gather's output IS the
+ message, so `y` is written by the gather half before it is reduced in place, and the five gather
+diff --git a/libr4d/r4d.h b/libr4d/r4d.h
+index fa1efd3..63cd090 100644
+--- a/libr4d/r4d.h
++++ b/libr4d/r4d.h
+@@ -340,6 +340,16 @@ void r4d_ar_oneshot_8rank_exact(long peer_scratch0, long peer_scratch1, long pee
+                                 long my_flags, long seq_ctrs, long slot_stride16, long inp,
+                                 long out, long n_elem, long dtype, long rank, long stream,
+                                 long nblocks, long nthreads, long drain, long acq, long pub);
++// r4d_ar_hc_write at four ranks: the 4-rank exact one-shot of `y` [M][n] bf16, in place, with
++// hc_write as its epilogue -- byte-identical to that all-reduce then hc_write. Same buffer trio,
++// peer order, flag values and slots as r4d_ar_oneshot_4rank_exact, so the two (and the two-shots)
++// may share one instance. `irow`/`hrow` as r4d_ar_hc_write's; y is tight.
++void r4d_ar_hc_write_4rank(long peer_scratch0, long peer_scratch1, long peer_scratch2,
++                           long peer_flags0, long peer_flags1, long peer_flags2,
++                           long my_scratch, long my_flags, long seq_ctrs, long slot_stride16,
++                           long y, long inj, long h, long M, long n, long hc, long irow,
++                           long hrow, long rank, long stream, long nblocks, long nthreads,
++                           long drain, long acq, long pub);
+ void r4d_ar_wide_dims(int* max_blocks, int* nb_design, int* max_peers);
+ 
+ // ---- all-reduce: two-shot, 4 or 8 ranks over P2P -------------------------------------------
+diff --git a/libr4d/r4d_ar_entry.hip b/libr4d/r4d_ar_entry.hip
+index 58856ec..7ff69d7 100644
+--- a/libr4d/r4d_ar_entry.hip
++++ b/libr4d/r4d_ar_entry.hip
+@@ -381,15 +381,7 @@ extern "C" int r4d_rad_ar_init(const RadParam* p, int n_p, int rank, int world,
+ 
+ /* The fused all-reduce + norm declares `M`(range) and `n` rather than `numel`: its message is the
+  * post-projection activation. Same world, same buffers, different arithmetic to get the bound. */
+-extern "C" int r4d_rad_ar_ln_init(const RadParam* p, int n_p, int rank, int world,
+-                                  void** out) {
+-    if (!out) return RAD_E_INVAL;
+-    *out = nullptr;
+-
+-    const long long ws_param = pgeti_hi(p, n_p, "world_size", world);
+-    if (ws_param != world) return RAD_E_SHAPE;
+-    if (world != 2) return RAD_E_SHAPE;   /* the handshake is one peer flag per block */
+-
++static int ar_mn_acquire(const RadParam* p, int n_p, int rank, int world, void** out) {
+     const long long M = pgeti_hi(p, n_p, "M", 0);
+     const long long K = pgeti_hi(p, n_p, "n", 0);
+     if (M <= 0 || K <= 0) return RAD_E_INVAL;
+@@ -401,6 +393,36 @@ extern "C" int r4d_rad_ar_ln_init(const RadParam* p, int n_p, int rank, int worl
+     return RAD_OK;
+ }
+ 
++extern "C" int r4d_rad_ar_ln_init(const RadParam* p, int n_p, int rank, int world,
++                                  void** out) {
++    if (!out) return RAD_E_INVAL;
++    *out = nullptr;
++
++    const long long ws_param = pgeti_hi(p, n_p, "world_size", world);
++    if (ws_param != world) return RAD_E_SHAPE;
++    if (world != 2) return RAD_E_SHAPE;   /* the handshake is one peer flag per block */
++
++    return ar_mn_acquire(p, n_p, rank, world, out);
++}
++
++/* The four-rank ar_hc_write. Its key is the one the plain all_reduce at the same call site builds
++ * -- {rank, 4, bf16, M_hi * n}, and the blocks declare that all_reduce's numel up to max_tok * n --
++ * so the fused write and the standalone collective it stands in for run on the SAME scratch, flags
++ * and counters, and a step that takes either one keeps a single launch sequence on that set.
++ * Exact wire only: a declared `wire` 6 is refused here, at declare, rather than at the first step. */
++extern "C" int r4d_rad_ar_hc_wide_init(const RadParam* p, int n_p, int rank, int world,
++                                       void** out) {
++    if (!out) return RAD_E_INVAL;
++    *out = nullptr;
++
++    const long long ws_param = pgeti_hi(p, n_p, "world_size", world);
++    if (ws_param != world) return RAD_E_SHAPE;
++    if (world != 4) return RAD_E_SHAPE;   /* the peer bundle is compiled for four */
++    if (pgeti_hi(p, n_p, "wire", 0) != 0) return RAD_E_UNSUPPORTED;
++
++    return ar_mn_acquire(p, n_p, rank, world, out);
++}
++
+ extern "C" void r4d_rad_ar_fini(void* instance) {
+     /* One fini per successful init, and the instance is shared across every op that resolved to
+      * the same world: the last release frees it. */
+@@ -1187,12 +1209,16 @@ extern "C" int64_t r4d_rad_ar_gather_hc_write_scratch(const RadArgs* a) {
+     return M > 0 && k > 0 ? M * k * (int64_t)sizeof(int) : 0;
+ }
+ 
+-extern "C" int r4d_rad_ar_hc_write(const RadArgs* a, RadStream s) {
+-    const ArInst* in = (const ArInst*)(a ? a->instance : nullptr);
+-    if (!in) return RAD_E_STATE;
+-    if (in->world != 2) return RAD_E_SHAPE;
+-    if (in->dtype != 0) return RAD_E_DTYPE;
++/* The operand and shape rules ar_hc_write states at every width. */
++struct HcWriteArgs {
++    const RadTensor* y = nullptr;
++    const RadTensor* inj = nullptr;
++    const RadTensor* h = nullptr;
++    long long M = 0, n = 0, hc = 0, irow = 0, hrow = 0;
++    int wire = 0;
++};
+ 
++static int ar_hc_write_args(const RadArgs* a, const ArInst* in, HcWriteArgs* o) {
+     const RadTensor* y   = r4d_opt(a, AH_Y);
+     const RadTensor* inj = r4d_opt(a, AH_INJ);
+     const RadTensor* h   = r4d_opt(a, AH_H);
+@@ -1214,6 +1240,27 @@ extern "C" int r4d_rad_ar_hc_write(const RadArgs* a, RadStream s) {
+     const int wire = (int)r4d_geti_or(a, "wire", 0);
+     if (wire != 0 && wire != 6) return RAD_E_INVAL;
+ 
++    o->y = y; o->inj = inj; o->h = h;
++    o->M = M; o->n = n; o->hc = hc; o->irow = irow; o->hrow = hrow;
++    o->wire = wire;
++    return RAD_OK;
++}
++
++extern "C" int r4d_rad_ar_hc_write(const RadArgs* a, RadStream s) {
++    const ArInst* in = (const ArInst*)(a ? a->instance : nullptr);
++    if (!in) return RAD_E_STATE;
++    if (in->world != 2) return RAD_E_SHAPE;
++    if (in->dtype != 0) return RAD_E_DTYPE;
++
++    HcWriteArgs w;
++    const int arc = ar_hc_write_args(a, in, &w);
++    if (arc != RAD_OK) return arc;
++    const RadTensor* const y = w.y;
++    const RadTensor* const inj = w.inj;
++    const RadTensor* const h = w.h;
++    const long long M = w.M, n = w.n, hc = w.hc, irow = w.irow, hrow = w.hrow;
++    const int wire = w.wire;
++
+     R4dArCfg cfgv;
+     r4d_cfg_ar(a, &cfgv);
+     const long words16 = (long)(M * n * 2 / 16);
+@@ -1239,3 +1286,41 @@ extern "C" int r4d_rad_ar_hc_write(const RadArgs* a, RadStream s) {
+                         nblocks, cfgv.nthreads, cfgv.drain, cfgv.acq));
+     return RAD_OK;
+ }
++
++/* AT FOUR RANKS, EXACT WIRE ONLY: the wide one-shot with the write as its epilogue. The four-rank
++ * lossy wire is the ti8 two-shot and has no fused form, so a `wire` 6 is refused (init already
++ * refuses to build it). The architecture issues this only for a message the standalone row would
++ * have served with the exact one-shot (ar_wide_write_exact, arch/common/rad_fp8.h); larger exact
++ * messages are still served correctly here, as a one-shot, which the standalone entry would have
++ * replaced by the two-shot above R4D_AR_EXACT_TWOSHOT_MIN_BYTES -- same bytes, more traffic.
++ *
++ * The block count is the plain one-shot's rule (ar_setup's nb_for over the whole message under
++ * nb_cap); a block's words, flags and slot are the one-shot's, which is what lets the two share an
++ * instance. */
++extern "C" int r4d_rad_ar_hc_write_4rank(const RadArgs* a, RadStream s) {
++    const ArInst* in = (const ArInst*)(a ? a->instance : nullptr);
++    if (!in) return RAD_E_STATE;
++    if (in->world != 4) return RAD_E_SHAPE;
++    if (in->dtype != 0) return RAD_E_DTYPE;
++
++    HcWriteArgs w;
++    const int arc = ar_hc_write_args(a, in, &w);
++    if (arc != RAD_OK) return arc;
++    if (w.wire != 0) return RAD_E_UNSUPPORTED;
++
++    R4dArCfg cfgv;
++    r4d_cfg_ar(a, &cfgv);
++    const long words16 = (long)(w.M * w.n * 2 / 16);
++    int nblocks = cfgv.nblocks > 0 ? cfgv.nblocks : nb_for(words16, in->nb_cap);
++    if (nblocks > in->max_blocks) nblocks = in->max_blocks;
++
++    R4D_TRY("ar_hc_write_4rank",
++        r4d_ar_hc_write_4rank(in->peer_scratch[0], in->peer_scratch[1], in->peer_scratch[2],
++                              in->peer_flags[0], in->peer_flags[1], in->peer_flags[2],
++                              in->my_scratch, in->my_flags, in->my_seq, in->slot16,
++                              r4d_addr(w.y), r4d_addr(w.inj), r4d_addr(w.h),
++                              (long)w.M, (long)w.n, (long)w.hc, (long)w.irow, (long)w.hrow,
++                              (long)in->rank, (long)(uintptr_t)s, nblocks, cfgv.nthreads,
++                              cfgv.drain, cfgv.acq, cfgv.pub));
++    return RAD_OK;
++}
+diff --git a/libr4d/r4d_ar_oneshot_Nrank_exact.hip b/libr4d/r4d_ar_oneshot_Nrank_exact.hip
+index a0d3095..3293e9a 100644
+--- a/libr4d/r4d_ar_oneshot_Nrank_exact.hip
++++ b/libr4d/r4d_ar_oneshot_Nrank_exact.hip
+@@ -9,9 +9,13 @@
+ // Sends (ws-1)*N bytes per rank: for small messages only, where latency dominates.
+ // The two-shot covers larger sizes.
+ //
++// Also r4d_ar_hc_write_4rank: the same one-shot with hc_write as its epilogue (ar_hc_write at
++// width, exact wire only).
++//
+ // The IPC helpers live in r4d_ar_oneshot_2rank_exact.hip; this unit links beside it.
+ #include "r4d.h"
+ #include "r4d_ar_wide.h"
++#include "r4d_ar_hc.h"      // the hc write word, shared with the two-rank fused forms
+ #include <stdexcept>
+ #include <string>
+ 
+@@ -108,6 +112,75 @@ __global__ void r4d_ar_oneshot_wide_exact_kernel(
+   }
+ }
+ 
++// THE SAME ONE-SHOT WITH THE GATED RESIDUAL'S WRITE AS ITS EPILOGUE, bf16 only. `y` is the
++// message and is reduced IN PLACE; everything up to the reduce is the kernel above, step for step,
++// because both run on one instance's buffers in one stream: the same seq take, the same handshake
++// value 2*s, the same (parity, source) slots and the same block partition of the word space. The
++// reduce is the same ar_vsum, so the stored word is the plain all-reduce's to the bit; then
++// h[r][c*n + i] += inj[r][c] * y[r][i] in hc_write's arithmetic over that bf16 word
++// (r4d_ar_hc_write_word, as the two-rank r4d_ar_hc_write_kernel).
++//
++// In place is safe: a thread reads every source of word k before it stores word k, its own block
++// pushed that word to the peers before the handshake, and no peer reads this rank's `y`. A word is
++// eight elements and n is a multiple of eight, so a word never straddles a row and the thread that
++// reduces it owns every stream element behind it.
++template <int WS>
++__global__ void r4d_ar_hc_write_wide_kernel(
++    int4* __restrict__ y4, R4DArWidePeers<int4, WS - 1> peers, const int4* __restrict__ my_base,
++    unsigned int* __restrict__ my_flags, unsigned int* __restrict__ seq_ctrs,
++    const unsigned short* __restrict__ inj, unsigned short* __restrict__ h, int n16, int n,
++    int hc, long irow, long hrow, int slot_stride16, int rank, int drain, int acq, int pub) {
++  constexpr int NPEERS = WS - 1;
++
++  const int b = blockIdx.x, nb = gridDim.x, tid = threadIdx.x, nt = blockDim.x;
++  __shared__ unsigned int s_seq, s_slot;
++  r4d_ar_seq_take(seq_ctrs, R4D_AR_WIDE_MAX_BLOCKS, s_seq, s_slot);  // device-resident, replay-safe
++  const unsigned int s = s_seq;
++  const int parity = (int)s_slot;
++
++  const int w = (n16 + nb - 1) / nb;
++  const int start = b * w;
++  int end = start + w; if (end > n16) end = n16;
++
++  int4* ps[NPEERS];
++#pragma unroll
++  for (int p = 0; p < NPEERS; ++p)
++    ps[p] = peers.scratch[p] + ((size_t)parity * WS + rank) * (size_t)slot_stride16;
++
++  {
++    int k = start + tid;
++    for (; k + 3 * nt < end; k += 4 * nt) {
++      const int4 v0 = y4[k], v1 = y4[k + nt], v2 = y4[k + 2 * nt], v3 = y4[k + 3 * nt];
++#pragma unroll
++      for (int p = 0; p < NPEERS; ++p) {
++        ps[p][k] = v0; ps[p][k + nt] = v1; ps[p][k + 2 * nt] = v2; ps[p][k + 3 * nt] = v3;
++      }
++    }
++    for (; k < end; k += nt) {
++      const int4 v = y4[k];
++#pragma unroll
++      for (int p = 0; p < NPEERS; ++p) ps[p][k] = v;
++    }
++  }
++
++  r4d_ar_handshake<WS>(peers, my_flags, b, rank, 2u * s, drain, acq, pub);
++
++  const int4* src[WS];
++#pragma unroll
++  for (int r = 0; r < WS; ++r)
++    src[r] = (r == rank) ? (const int4*)y4
++                         : (my_base + ((size_t)parity * WS + r) * (size_t)slot_stride16);
++
++  const int wpr = n >> 3;                 // 16B words a row
++  for (int k = start + tid; k < end; k += nt) {
++    const int4 v = ar_vsum<__hip_bfloat16, 8, WS>(src, k);
++    y4[k] = v;
++    const int row = k / wpr, i0 = (k - row * wpr) * 8;
++    r4d_ar_hc_write_word(inj, h, row, i0, n, hc, irow, hrow,
++                         reinterpret_cast<const unsigned short*>(&v));
++  }
++}
++
+ // --- host side ---
+ template <int WS>
+ static void ar_wide_launch(const long* peer_scratch, const long* peer_flags, long my_scratch,
+@@ -205,6 +278,82 @@ void r4d_ar_oneshot_8rank_exact(long peer_scratch0, long peer_scratch1, long pee
+                     dtype, rank, stream, nblocks, nthreads, drain, acq, pub);
+ }
+ 
++// ar_wide_launch's checks, for the fused write: the same rank range, slot stride, grid clamps and
++// allocation extents, plus the write's own two shape rules.
++template <int WS>
++static void ar_hc_write_wide_launch(const long* peer_scratch, const long* peer_flags,
++                                    long my_scratch, long my_flags, long seq_ctrs,
++                                    long slot_stride16, long y, long inj, long h, long M, long n,
++                                    long hc, long irow, long hrow, long rank, long stream_i,
++                                    long nblocks, long nthreads, long drain, long acq, long pub) {
++  constexpr int NPEERS = WS - 1;
++  static_assert(NPEERS <= R4D_AR_WIDE_MAX_PEERS, "npeers exceeds the peer bundle bound");
++
++  if (rank < 0 || rank >= WS)
++    throw std::runtime_error("ar_hc_write: rank " + std::to_string(rank) +
++                             " out of range for the " + std::to_string(WS) +
++                             " ranks this entry point is compiled for");
++  if (M <= 0 || n <= 0 || n % 8)
++    throw std::runtime_error("ar_hc_write: n must be a positive multiple of 8");
++  if (hc < 1 || hrow % 8)
++    throw std::runtime_error("ar_hc_write: the streams must be whole 16B words");
++
++  const long n16l = M * n / 8;            // bf16: eight elements a 16B word
++  if (n16l > (long)slot_stride16)
++    throw std::runtime_error("ar_hc_write: message (" + std::to_string(n16l) +
++                             " 16B words) exceeds the per-source slot stride (" +
++                             std::to_string(slot_stride16) + ")");
++  const int n16 = (int)n16l;
++
++  int nb = (int)nblocks;
++  if (nb < 1) nb = R4D_AR_NB_DESIGN;
++  if (nb > n16) nb = n16;
++  if (nb > R4D_AR_WIDE_MAX_BLOCKS) nb = R4D_AR_WIDE_MAX_BLOCKS;
++  int nt = (int)nthreads;
++  if (nt < 64) nt = 64;
++  if (nt > 1024) nt = 1024;
++
++  R4DArWidePeers<int4, NPEERS> peers{};
++  for (int i = 0; i < NPEERS; ++i) {
++    if (!peer_scratch[i] || !peer_flags[i])
++      throw std::runtime_error("ar_hc_write: null peer scratch/flag pointer at index " +
++                               std::to_string(i));
++    peers.scratch[i] = (int4*)peer_scratch[i];
++    peers.flags[i] = (unsigned int*)peer_flags[i];
++    peers.rank[i] = (i < (int)rank) ? i : i + 1;
++  }
++
++  const long slot_bytes = 2L * WS * (long)slot_stride16 * 16;
++  const long flag_bytes = (long)nb * WS * (long)sizeof(unsigned int);
++  r4d_ar_check_extent(my_scratch, slot_bytes, "ar_hc_write", "my_scratch");
++  r4d_ar_check_extent(my_flags, flag_bytes, "ar_hc_write", "my_flags");
++  r4d_ar_check_extent(seq_ctrs, 2L * R4D_AR_WIDE_MAX_BLOCKS * (long)sizeof(unsigned int),
++                      "ar_hc_write", "seq_ctrs");
++  for (int i = 0; i < NPEERS; ++i) {
++    r4d_ar_check_extent(peer_scratch[i], slot_bytes, "ar_hc_write", "peer scratch");
++    r4d_ar_check_extent(peer_flags[i], flag_bytes, "ar_hc_write", "peer flags");
++  }
++
++  hipStream_t st = (hipStream_t)stream_i;
++  r4d_ar_hc_write_wide_kernel<WS><<<nb, nt, 0, st>>>(
++      (int4*)y, peers, (const int4*)my_scratch, (unsigned int*)my_flags, (unsigned int*)seq_ctrs,
++      (const unsigned short*)inj, (unsigned short*)h, n16, (int)n, (int)hc, irow, hrow,
++      (int)slot_stride16, (int)rank, (int)drain, (int)acq, (int)pub);
++}
++
++void r4d_ar_hc_write_4rank(long peer_scratch0, long peer_scratch1, long peer_scratch2,
++                           long peer_flags0, long peer_flags1, long peer_flags2,
++                           long my_scratch, long my_flags, long seq_ctrs, long slot_stride16,
++                           long y, long inj, long h, long M, long n, long hc, long irow,
++                           long hrow, long rank, long stream, long nblocks, long nthreads,
++                           long drain, long acq, long pub) {
++  const long ps[3] = {peer_scratch0, peer_scratch1, peer_scratch2};
++  const long pf[3] = {peer_flags0, peer_flags1, peer_flags2};
++  ar_hc_write_wide_launch<4>(ps, pf, my_scratch, my_flags, seq_ctrs, slot_stride16, y, inj, h,
++                             M, n, hc, irow, hrow, rank, stream, nblocks, nthreads, drain, acq,
++                             pub);
++}
++
+ void r4d_ar_wide_dims(int* max_blocks, int* nb_design, int* max_peers) {
+   if (max_blocks) *max_blocks = R4D_AR_WIDE_MAX_BLOCKS;
+   if (nb_design) *nb_design = R4D_AR_NB_DESIGN;
+diff --git a/libr4d/r4d_plugin.h b/libr4d/r4d_plugin.h
+index 0dc49de..7045922 100644
+--- a/libr4d/r4d_plugin.h
++++ b/libr4d/r4d_plugin.h
+@@ -184,6 +184,9 @@ int  r4d_rad_ar_ln_init(const RadParam*, int, int rank, int world, void** out);
+ int  r4d_rad_ar_ln_had_quant_i8(const RadArgs*, RadStream);
+ int  r4d_rad_ar_rmsnorm_quant_fp8(const RadArgs*, RadStream);
+ int  r4d_rad_ar_hc_write(const RadArgs*, RadStream);
++/* ar_hc_write at four ranks, exact wire only, on the plain four-rank all-reduce's instance. */
++int  r4d_rad_ar_hc_wide_init(const RadParam*, int, int rank, int world, void** out);
++int  r4d_rad_ar_hc_write_4rank(const RadArgs*, RadStream);
+ int  r4d_rad_ar_gather_hc_write(const RadArgs*, RadStream);
+ int64_t r4d_rad_ar_gather_hc_write_scratch(const RadArgs*);
+ 
+diff --git a/libr4d/r4d_rows.cpp b/libr4d/r4d_rows.cpp
+index 2fda504..21f5f7f 100644
+--- a/libr4d/r4d_rows.cpp
++++ b/libr4d/r4d_rows.cpp
+@@ -2105,8 +2105,8 @@ static const RadOpSchema kSchemas[] = {
+            "the two-rank all-reduce and the residual add, RMS norm and block-scaled fp8 "
+            "quantisation that always follow it, in one kernel. Both wires."),
+     SCHEMA("ar_hc_write", pArHcWrite, oArHcWrite,
+-           "the two-rank all-reduce and the gated residual's write that follows it, in one "
+-           "kernel. Both wires."),
++           "the all-reduce and the gated residual's write that follows it, in one kernel. Both "
++           "wires at two ranks, the exact one at four."),
+     SCHEMA("ar_gather_hc_write", pArGatherHcWrite, oArGatherHcWrite,
+            "moe_gather, then ar_hc_write, in one kernel: the routed experts' rows summed back to "
+            "token order (with the shared arm folded when present) ARE the all-reduce's message, "
+@@ -2670,6 +2670,14 @@ static const RadConstraint cArHcWrite[] = {
+     C_EQ("world_size", 2),
+     C_P2P,
+ };
++/* The same bounds at four ranks, where the handshake is the wide family's (r4d_ar_wide.h). Exact
++ * wire only, and that cannot be a constraint here: the exact op declares no `wire` and an absent
++ * key fails a constraint, so the init and the entry refuse wire 6 instead. */
++static const RadConstraint cArHcWrite4[] = {
++    C_GE("M", 1), C_DIV("n", 8), C_GE("hc", 2), C_LE("hc", 8), C_IN("dtype", "bf16"),
++    C_EQ("world_size", 4),
++    C_P2P,
++};
+ /* ar_hc_write's bounds and the gather's: top_k up to the 64 slots a row's table holds in LDS. */
+ static const RadConstraint cArGatherHcWrite[] = {
+     C_GE("M", 1), C_DIV("n", 8), C_GE("hc", 2), C_LE("hc", 8), C_IN("dtype", "bf16"),
+@@ -4698,6 +4706,21 @@ static const RadKernelInfo kKernels[] = {
+   r4d_rad_ar_ln_init, r4d_rad_ar_fini, r4d_rad_ar_hc_write, nullptr, nullptr, nullptr,
+   r4d_shape_ar_hc_write },
+ 
++{ "ar_hc_write_4rank", "ar_hc_write", "norm",
++  "the four-rank exact all-reduce and the gated residual's write that follows it, in one kernel: "
++  "h[s] += inj[s] * y over the reduced y",
++  "exactly 4 ranks, all peer-accessible; exact wire only; n a multiple of 8 and y unpitched, "
++  "because y is the message and a block pushes it as 16B words; the stream pitch a multiple of 8; "
++  "hc 2..8; the wide one-shot's handshake, slots and block partition, on the plain four-rank "
++  "all-reduce's instance; cudagraph-safe",
++  "bf16 throughout; the sum in fp32 in ascending rank order and rounded to bf16 exactly as the "
++  "four-rank exact all-reduce stores it, and the write in hc_write's arithmetic over that bf16 "
++  "value -- byte-identical to the pair it replaces",
++  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
++  ROW(cArHcWrite4), ROW(tAr), nullptr,
++  r4d_rad_ar_hc_wide_init, r4d_rad_ar_fini, r4d_rad_ar_hc_write_4rank, nullptr, nullptr, nullptr,
++  r4d_shape_ar_hc_write },
++
+ { "ar_gather_hc_write", "ar_gather_hc_write", "norm",
+   "moe_gather folded in front of ar_hc_write: each block sums its words' tokens back from the "
+   "routed experts' rows, keeps the result as its message, and then reduces and writes exactly as "
+diff --git a/tests/arch_test.cpp b/tests/arch_test.cpp
+index 39b05b4..05fcfec 100644
+--- a/tests/arch_test.cpp
++++ b/tests/arch_test.cpp
+@@ -1853,10 +1853,11 @@ TEST(a_sizing_declare_leaves_the_step_state_alone_and_shrinks_only_rows) {
+  *     bf16 expert, leaving an odd count of quantised ones, and the grouped GEMM takes its experts as
+  *     two EQUAL tables by parity. The recipe protects experts in pairs for exactly that reason.
+  *   - the FUSED all-reduces are world-2 kernels (`ar_wire_is_exact` and `ar_fused_ok` both return
+- *     false off two, and `HyperConn` declares `ar_hc_write` only at world 2), so at four the chain
+- *     is unfused: a standalone `all_reduce` where the collective happens. The contrast with world 2
+- *     in the same test is the contract -- it fails loudly if a fused declare is ever gated on the
+- *     wrong condition.
++ *     false off two), with one exception: `ar_hc_write` also exists at four, on the exact wire only
++ *     (no `wire` key, never the rotated form) and with no gather in front of it. Every block still
++ *     declares its standalone `all_reduce`, which serves the steps the fused write declines. The
++ *     contrast with world 2 in the same test is the contract -- it fails loudly if a fused declare
++ *     is ever gated on the wrong condition.
+  *
+  * Every expected number is derived from the meta this file builds (n_head 24, n_head_kv 2, head_dim
+  * 256, num_experts 512), so the fixture and the assertions cannot drift apart. Where a number is
+@@ -1983,11 +1984,16 @@ TEST(flashnext_tp4_replicates_kv_heads_and_splits_expert_widths) {
+         CHECK_EQ(pint(gu, "N_odd"), 2 * (cls_hi[r][1] - cls_lo[r][1]));
+         CHECK_EQ(pint(gu, "n_expert"), ne_all);
+ 
+-        /* (4) THE UNFUSED CHAIN: a standalone collective per reduction, and none of the three
+-         * fused world-2 forms. */
++        /* (4) A standalone collective per reduction, the exact four-rank ar_hc_write beside it,
++         * and neither of the other two fused forms. */
+         CHECK(count_op(b[r], "all_reduce") > 0);
+         CHECK_EQ(pint(find_op(b[r], "all_reduce"), "world_size"), world);
+-        CHECK_EQ(count_op(b[r], "ar_hc_write"), 0);
++        CHECK(count_op(b[r], "ar_hc_write") > 0);
++        for (const RecOp& o : b[r].ops) {
++            if (o.op != "ar_hc_write") continue;
++            CHECK_EQ(pint(&o, "world_size"), world);
++            CHECK(param(&o, "wire") == nullptr);           /* exact only */
++        }
+         CHECK_EQ(count_op(b[r], "ar_gather_hc_write"), 0);
+         CHECK_EQ(count_op(b[r], "ar_rmsnorm_quant_fp8"), 0);
+     }
+@@ -2069,6 +2075,41 @@ TEST(flashnext_tp4_replicates_kv_heads_and_splits_expert_widths) {
+         }
+     }
+ 
++    /* THE FOUR-RANK FUSED WRITE'S STEPS: exactly those the standalone collective would have served
++     * as the exact one-shot -- under 1 MiB, and on the lossy wire also under its floor (or off its
++     * 128-element tile). The block in front and the write ask the same predicate. At two ranks it
++     * is ar_wire_is_exact unchanged, and ar_wire_is_exact itself stays false at four. */
++    {
++        rad::arch::Geom g4{};
++        g4.world = 4; g4.n_embd = 2560; g4.wire_exact = 1; g4.wire_min_bytes = 128 * 1024;
++        CHECK(rad::arch::ar_exact_write_takes(g4, 8));      /* a decode step, 40 KiB */
++        CHECK(rad::arch::ar_exact_write_takes(g4, 204));    /* 1020 KiB */
++        CHECK(!rad::arch::ar_exact_write_takes(g4, 205));   /* 1025 KiB: the two-shot's */
++        CHECK(!rad::arch::ar_wire_is_exact(g4, 8));
++        g4.wire_exact = 0;
++        CHECK(rad::arch::ar_exact_write_takes(g4, 25));     /* 125 KiB, under the floor */
++        CHECK(!rad::arch::ar_exact_write_takes(g4, 26));    /* 130 KiB, the ti8 wire's */
++        rad::arch::Geom g2 = g4;
++        g2.world = 2;
++        for (int64_t T : { 1, 8, 25, 26, 205, 4096 })
++            CHECK(rad::arch::ar_exact_write_takes(g2, T) == rad::arch::ar_wire_is_exact(g2, T));
++    }
++    /* ...and the lossy wire at four declares no rotated write and no gather form. */
++    {
++        RadBuilder b4;
++        RadBuildCtx c4 = build_ctx(0, world);
++        c4.max_tok = 2048; c4.max_seqs = 8; c4.max_spec = 3; c4.max_ctx = 200000;
++        c4.tp_wire_lossy = 1;
++        c4.tp_wire_min_bytes = 128 * 1024;
++        REQUIRE_EQ(qwen4exp_fp8::declare(&b4, &meta, &c4), RAD_OK);
++        CHECK(count_op(b4, "ar_hc_write") > 0);
++        for (const RecOp& o : b4.ops) {
++            if (o.op != "ar_hc_write") continue;
++            CHECK(param(&o, "wire") == nullptr);
++        }
++        CHECK_EQ(count_op(b4, "ar_gather_hc_write"), 0);
++    }
++
+     /* A WORLD THAT CANNOT REPLICATE -- not a multiple of the KV head count -- is refused by name,
+      * not rounded into a half head. */
+     {
+-- 
+2.55.0
+
+
+From e83847173d7609f2cbd4b91f817268a4a130df5b Mon Sep 17 00:00:00 2001
+From: keptn42 <keptn42@noreply.codeberg.org>
+Date: Mon, 5 Oct 2026 11:32:53 +0200
+Subject: [PATCH 2/2] four-rank ar_gather_hc_write: the MoE gather in front of
+ the exact one-shot write
+
+At --tp 4 each MoE connection ran moe_gather and the fused write as two
+launches, three or four with the inverse table. ar_gather_hc_write_4rank
+runs r4d_ar_gather_word as the prologue of ar_hc_write_4rank, with the
+two-rank slot table and grid rule. The arithmetic is moe_gather's plus
+ar_hc_write_4rank's, so the bytes are unchanged. One and two ranks unchanged.
+---
+ arch/common/rad_block_hc.h            |  10 +-
+ arch/common/rad_fp8.h                 |   6 +-
+ docs/ARCHITECTURES.md                 |  14 +-
+ docs/OPS.md                           |   3 +-
+ libr4d/r4d.h                          |  17 ++
+ libr4d/r4d_ar_entry.hip               |  85 +++++++++-
+ libr4d/r4d_ar_oneshot_2rank_exact.hip |   9 ++
+ libr4d/r4d_ar_oneshot_Nrank_exact.hip | 217 +++++++++++++++++++++++++-
+ libr4d/r4d_fuse.cpp                   |   6 +-
+ libr4d/r4d_plugin.h                   |   2 +
+ libr4d/r4d_rows.cpp                   |  30 +++-
+ tests/arch_test.cpp                   |  52 ++++--
+ 12 files changed, 415 insertions(+), 36 deletions(-)
+
+diff --git a/arch/common/rad_block_hc.h b/arch/common/rad_block_hc.h
+index 1b5318a..c8deb89 100644
+--- a/arch/common/rad_block_hc.h
++++ b/arch/common/rad_block_hc.h
+@@ -317,9 +317,10 @@ inline int HyperConn::declare(RadBuilder* b, Names& nm, const Geom& geom, const
+ 
+ inline int HyperConn::declare_gather(RadBuilder* b, const GatherSrc& src) {
+     if (!op_ar_write || src.top_k <= 0 || !src.ye || !src.ew || !src.sorted) return RAD_OK;
+-    /* Two ranks only: there is no four-rank gather form yet, so there the block keeps its gather
+-     * and this write takes the reduction alone (both bounds stay 0). */
+-    if (g.world != 2) return RAD_OK;
++    /* Two ranks, and four on the exact wire: there the fused write exists in its exact form only,
++     * so the gather does too -- op_ar_write6 is 0 at four and the rotated form below is never
++     * declared. Any other width keeps its gather and both bounds stay 0. */
++    if (g.world != 2 && g.world != 4) return RAD_OK;
+     const bool shared = src.sh && src.sg;
+     gsrc = src;
+     /* EVERY ROW COUNT ONE PASS CARRIES, prefill chunks included: the kernel reads its slots from
+@@ -386,7 +387,8 @@ inline void HyperConn::write(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) co
+     if (takes_gather(T)) {
+         const int64_t k = gsrc.top_k;
+         const bool shared = gsrc.sh && gsrc.sg;
+-        RAD_ISSUE_N(c_, ar_wire_is_exact(g, T) ? op_ar_gather_write : op_ar_gather_write6, rows,
++        const rad_op op = ar_exact_write_takes(g, T) ? op_ar_gather_write : op_ar_gather_write6;
++        RAD_ISSUE_N(c_, op, rows,
+                     brows(gsrc.ye, rows * k), brow_slice(gsrc.ew, r0, rows, k),
+                     brows(gsrc.sorted, rows * k),
+                     shared ? brow_slice(gsrc.sh, r0, rows, g.n_embd) : RAD_NONE,
+diff --git a/arch/common/rad_fp8.h b/arch/common/rad_fp8.h
+index 41fc047..ed84f41 100644
+--- a/arch/common/rad_fp8.h
++++ b/arch/common/rad_fp8.h
+@@ -388,11 +388,13 @@ inline bool ar_taken(const Geom& g, int64_t T, bool out, int take) {
+ /* WHETHER A MoE BLOCK'S GATHER RIDES IN FRONT OF THE REDUCTION THAT FOLLOWS IT (ar_gather_hc_write).
+  * `rows` and `rows6` are the bounds the fused op was declared for on the exact and on the rotated
+  * wire, 0 where it was not: at most the tokens one MoE pass carries, so a step it serves is one
+- * pass whose gather is the whole step's. The wire the step's message goes out on picks the bound.
++ * pass whose gather is the whole step's. The wire the step's message goes out on picks the bound:
++ * the exact one wherever the exact fused write takes the step (ar_exact_write_takes -- at two
++ * ranks ar_wire_is_exact itself, at four the exact one-shot's steps, where `rows6` is always 0).
+  * The block that would issue the gather and the write that would absorb it ask this of the same T
+  * and the same bounds, so neither can skip it while the other issues it. */
+ inline bool gather_taken(const Geom& g, int64_t T, int64_t rows, int64_t rows6) {
+-    const int64_t r = ar_wire_is_exact(g, T) ? rows : rows6;
++    const int64_t r = ar_exact_write_takes(g, T) ? rows : rows6;
+     return r > 0 && T <= r;
+ }
+ 
+diff --git a/docs/ARCHITECTURES.md b/docs/ARCHITECTURES.md
+index 47a4731..68a363f 100644
+--- a/docs/ARCHITECTURES.md
++++ b/docs/ARCHITECTURES.md
+@@ -330,12 +330,14 @@ time.
+ 
+ **The fused all-reduce forms are two-rank, except the exact write.** At four ranks `ar_hc_write`
+ exists on the exact wire only (`ar_hc_write_4rank`, the 4-rank one-shot with the write as its
+-epilogue, on the plain all-reduce's buffers). A step takes it where the standalone `all_reduce`
+-would have been the exact one-shot: under 1 MiB, and with `--tp-wire wht6` also under
+-`--tp-wire-min-kb`. Larger messages, and every lossy one, keep the standalone sequence —
+-`all_reduce` (4-rank two-shot or ti8), then `hc_write_bf16`. There is no four-rank
+-`ar_gather_hc_write`, so `moe_gather` stays a launch of its own. The unfused sequence is declared
+-beside the fused one, so nothing is unresolved at boot. The
++epilogue, on the plain all-reduce's buffers), and so does `ar_gather_hc_write`
++(`ar_gather_hc_write_4rank`, the same with `moe_gather` as its prologue), which the MoE
++connections take wherever the step is one MoE pass. A step takes either where the standalone
++`all_reduce` would have been the exact one-shot: under 1 MiB, and with `--tp-wire wht6` also
++under `--tp-wire-min-kb`. Larger messages, and every lossy one, keep the standalone sequence —
++`moe_gather` on the MoE connections, `all_reduce` (4-rank two-shot or ti8), then
++`hc_write_bf16`. The unfused sequence is declared beside the fused one, so nothing is unresolved
++at boot. The
+ attention's own fusion is not a collective and does carry over: the sparse decode with the output
+ gate and the quantiser in its merge (`attn_paged_gate_quant`) has gqa-6, page-4 rows. The per-step cost against tp2 on the
+ same cards is unmeasured.
+diff --git a/docs/OPS.md b/docs/OPS.md
+index 1aabc23..3bed8c4 100644
+--- a/docs/OPS.md
++++ b/docs/OPS.md
+@@ -757,7 +757,8 @@ ranks only the exact form exists.
+ `ar_gather_hc_write` is `moe_gather` followed by `ar_hc_write`: the gather's output IS the
+ message, so `y` is written by the gather half before it is reduced in place, and the five gather
+ operands and `act` mean exactly what they mean on `moe_gather`. `wire` is `ar_hc_write`'s. On
+-either wire, byte-identical to the three kernels it stands in for.
++either wire, byte-identical to the three kernels it stands in for. At four ranks only the exact
++form exists, as for `ar_hc_write`.
+ 
+ ## Vocabulary edges
+ 
+diff --git a/libr4d/r4d.h b/libr4d/r4d.h
+index 63cd090..404a4a0 100644
+--- a/libr4d/r4d.h
++++ b/libr4d/r4d.h
+@@ -350,6 +350,23 @@ void r4d_ar_hc_write_4rank(long peer_scratch0, long peer_scratch1, long peer_scr
+                            long y, long inj, long h, long M, long n, long hc, long irow,
+                            long hrow, long rank, long stream, long nblocks, long nthreads,
+                            long drain, long acq, long pub);
++// r4d_ar_gather_hc_write at four ranks: r4d_ar_hc_write_4rank with the MoE gather as its prologue
++// -- byte-identical to moe_gather, then the 4-rank exact all-reduce, then hc_write. The gather's
++// operands, `inv` and the grid rule are r4d_ar_gather_hc_write's; the buffers, peer order, flag
++// values and slots are r4d_ar_oneshot_4rank_exact's. Exact wire only.
++void r4d_ar_gather_hc_write_4rank(long peer_scratch0, long peer_scratch1, long peer_scratch2,
++                                  long peer_flags0, long peer_flags1, long peer_flags2,
++                                  long my_scratch, long my_flags, long seq_ctrs,
++                                  long slot_stride16, long y, long inj, long h, long M, long n,
++                                  long hc, long irow, long hrow, long ye, long ew, long sorted,
++                                  long sh, long sg, long ye_ld, long ew_ld, long sh_ld,
++                                  long sg_ld, long top_k, long sig, long rank, long stream,
++                                  long nblocks, long nthreads, long drain, long acq, long pub,
++                                  long inv);
++// The inverse slot table both widths' gather forms read at a prefill-sized call: inv[f] = the
++// sorted row holding slot f, -1 where none does, over T = M*top_k int32. One block, on `stream`.
++// Returns 0 or a negative / HIP error code.
++int  r4d_ar_gather_inv(long inv, long sorted, long T, long stream);
+ void r4d_ar_wide_dims(int* max_blocks, int* nb_design, int* max_peers);
+ 
+ // ---- all-reduce: two-shot, 4 or 8 ranks over P2P -------------------------------------------
+diff --git a/libr4d/r4d_ar_entry.hip b/libr4d/r4d_ar_entry.hip
+index 7ff69d7..ded05ac 100644
+--- a/libr4d/r4d_ar_entry.hip
++++ b/libr4d/r4d_ar_entry.hip
+@@ -1116,12 +1116,18 @@ enum { AH_Y = 0, AH_INJ, AH_H };
+  * ar_hc_write's; wire 6 builds its slot table in LDS at every size and takes no scratch. */
+ enum { AG_YE = 0, AG_EW, AG_SORTED, AG_SH, AG_SG, AG_Y, AG_INJ, AG_H };
+ 
+-extern "C" int r4d_rad_ar_gather_hc_write(const RadArgs* a, RadStream s) {
+-    const ArInst* in = (const ArInst*)(a ? a->instance : nullptr);
+-    if (!in) return RAD_E_STATE;
+-    if (in->world != 2) return RAD_E_SHAPE;
+-    if (in->dtype != 0) return RAD_E_DTYPE;
++/* The operand and shape rules ar_gather_hc_write states at every width: moe_gather's five and
++ * ar_hc_write's three, and the inverse table's scratch. */
++struct GatherHcWriteArgs {
++    const RadTensor *ye = nullptr, *ew = nullptr, *so = nullptr, *sh = nullptr, *sg = nullptr;
++    const RadTensor *y = nullptr, *inj = nullptr, *h = nullptr;
++    long long M = 0, n = 0, hc = 0, top_k = 0, irow = 0, hrow = 0;
++    long long ye_ld = 0, ew_ld = 0, sh_ld = 0, sg_ld = 0;
++    int sig = 0, wire = 0;
++    bool has_inv = false;
++};
+ 
++static int ar_gather_hc_write_args(const RadArgs* a, const ArInst* in, GatherHcWriteArgs* o) {
+     const RadTensor* ye  = r4d_opt(a, AG_YE);
+     const RadTensor* ew  = r4d_opt(a, AG_EW);
+     const RadTensor* so  = r4d_opt(a, AG_SORTED);
+@@ -1170,7 +1176,37 @@ extern "C" int r4d_rad_ar_gather_hc_write(const RadArgs* a, RadStream s) {
+ 
+     const int wire = (int)r4d_geti_or(a, "wire", 0);
+     if (wire != 0 && wire != 6) return RAD_E_INVAL;
+-    const bool has_inv = a->scratch && a->scratch_bytes >= T * (long long)sizeof(int);
++
++    o->ye = ye; o->ew = ew; o->so = so; o->sh = sh; o->sg = sg;
++    o->y = y; o->inj = inj; o->h = h;
++    o->M = M; o->n = n; o->hc = hc; o->top_k = top_k; o->irow = irow; o->hrow = hrow;
++    o->ye_ld = ye_ld; o->ew_ld = ew_ld; o->sh_ld = sh_ld; o->sg_ld = sg_ld;
++    o->sig = sig; o->wire = wire;
++    o->has_inv = a->scratch && a->scratch_bytes >= T * (long long)sizeof(int);
++    return RAD_OK;
++}
++
++extern "C" int r4d_rad_ar_gather_hc_write(const RadArgs* a, RadStream s) {
++    const ArInst* in = (const ArInst*)(a ? a->instance : nullptr);
++    if (!in) return RAD_E_STATE;
++    if (in->world != 2) return RAD_E_SHAPE;
++    if (in->dtype != 0) return RAD_E_DTYPE;
++
++    GatherHcWriteArgs g;
++    const int arc = ar_gather_hc_write_args(a, in, &g);
++    if (arc != RAD_OK) return arc;
++    const RadTensor* const ye = g.ye;
++    const RadTensor* const ew = g.ew;
++    const RadTensor* const so = g.so;
++    const RadTensor* const sh = g.sh;
++    const RadTensor* const sg = g.sg;
++    const RadTensor* const y = g.y;
++    const RadTensor* const inj = g.inj;
++    const RadTensor* const h = g.h;
++    const long long M = g.M, n = g.n, hc = g.hc, top_k = g.top_k, irow = g.irow, hrow = g.hrow;
++    const long long ye_ld = g.ye_ld, ew_ld = g.ew_ld, sh_ld = g.sh_ld, sg_ld = g.sg_ld;
++    const int sig = g.sig, wire = g.wire;
++    const bool has_inv = g.has_inv;
+ 
+     R4dArCfg cfgv;
+     r4d_cfg_ar(a, &cfgv);
+@@ -1201,6 +1237,43 @@ extern "C" int r4d_rad_ar_gather_hc_write(const RadArgs* a, RadStream s) {
+     return rc == 0 ? RAD_OK : RAD_E_SHAPE;
+ }
+ 
++/* AT FOUR RANKS, EXACT WIRE ONLY: r4d_rad_ar_hc_write_4rank with the gather in front, on the same
++ * instance (r4d_rad_ar_hc_wide_init). The architecture issues it only on a step whose write takes
++ * the exact one-shot (ar_exact_write_takes, arch/common/rad_fp8.h) and whose gather is one pass's.
++ * The block count is that write's rule, widened by the launcher until a block's slot table fits in
++ * LDS -- or, where that would take more blocks than the rule asks for and the scratch is there,
++ * kept and served from the inverse table, as at two ranks. */
++extern "C" int r4d_rad_ar_gather_hc_write_4rank(const RadArgs* a, RadStream s) {
++    const ArInst* in = (const ArInst*)(a ? a->instance : nullptr);
++    if (!in) return RAD_E_STATE;
++    if (in->world != 4) return RAD_E_SHAPE;
++    if (in->dtype != 0) return RAD_E_DTYPE;
++
++    GatherHcWriteArgs g;
++    const int arc = ar_gather_hc_write_args(a, in, &g);
++    if (arc != RAD_OK) return arc;
++    if (g.wire != 0) return RAD_E_UNSUPPORTED;
++
++    R4dArCfg cfgv;
++    r4d_cfg_ar(a, &cfgv);
++    const long words16 = (long)(g.M * g.n * 2 / 16);
++    int nblocks = cfgv.nblocks > 0 ? cfgv.nblocks : nb_for(words16, in->nb_cap);
++    if (nblocks > in->max_blocks) nblocks = in->max_blocks;
++
++    R4D_TRY("ar_gather_hc_write_4rank",
++        r4d_ar_gather_hc_write_4rank(
++            in->peer_scratch[0], in->peer_scratch[1], in->peer_scratch[2],
++            in->peer_flags[0], in->peer_flags[1], in->peer_flags[2],
++            in->my_scratch, in->my_flags, in->my_seq, in->slot16,
++            r4d_addr(g.y), r4d_addr(g.inj), r4d_addr(g.h), (long)g.M, (long)g.n, (long)g.hc,
++            (long)g.irow, (long)g.hrow, r4d_addr(g.ye), r4d_addr(g.ew), r4d_addr(g.so),
++            g.sh ? r4d_addr(g.sh) : 0L, g.sh ? r4d_addr(g.sg) : 0L, (long)g.ye_ld,
++            (long)g.ew_ld, (long)g.sh_ld, (long)g.sg_ld, (long)g.top_k, (long)g.sig,
++            (long)in->rank, (long)(uintptr_t)s, nblocks, cfgv.nthreads, cfgv.drain, cfgv.acq,
++            cfgv.pub, g.has_inv ? (long)(uintptr_t)a->scratch : 0L));
++    return RAD_OK;
++}
++
+ /* The inverse slot table the exact wire's prefill form reads: one int a (token, slot) at the
+  * band's M. The rotated wire's table is in LDS. */
+ extern "C" int64_t r4d_rad_ar_gather_hc_write_scratch(const RadArgs* a) {
+diff --git a/libr4d/r4d_ar_oneshot_2rank_exact.hip b/libr4d/r4d_ar_oneshot_2rank_exact.hip
+index ca4590e..4127488 100644
+--- a/libr4d/r4d_ar_oneshot_2rank_exact.hip
++++ b/libr4d/r4d_ar_oneshot_2rank_exact.hip
+@@ -474,6 +474,15 @@ int r4d_ar_gather_hc_write(long peer_scratch, long my_scratch, long peer_flags,
+   return (int)hipGetLastError();
+ }
+ 
++/* The inverse slot table alone, on `stream`, for the wide fused gather (r4d_ar_oneshot_Nrank_exact.hip):
++ * the same kernel and the same launch as above, so both widths read one table. */
++int r4d_ar_gather_inv(long inv, long sorted, long T, long stream_i) {
++  if (!inv || !sorted || T < 1) return -1;
++  r4d_ar_gather_inv_kernel<<<1, 1024, 0, (hipStream_t)stream_i>>>((int*)inv, (const int*)sorted,
++                                                                  (int)T);
++  return (int)hipGetLastError();
++}
++
+ void r4d_ar_ipc_free(long p) { if (p) (void)hipFree((void*)p); }
+ void r4d_ar_ipc_memzero(long p, long size) { if (p) HIPOK(hipMemset((void*)p, 0, size)); }
+ 
+diff --git a/libr4d/r4d_ar_oneshot_Nrank_exact.hip b/libr4d/r4d_ar_oneshot_Nrank_exact.hip
+index 3293e9a..eff9e3a 100644
+--- a/libr4d/r4d_ar_oneshot_Nrank_exact.hip
++++ b/libr4d/r4d_ar_oneshot_Nrank_exact.hip
+@@ -10,12 +10,13 @@
+ // The two-shot covers larger sizes.
+ //
+ // Also r4d_ar_hc_write_4rank: the same one-shot with hc_write as its epilogue (ar_hc_write at
+-// width, exact wire only).
++// width, exact wire only), and r4d_ar_gather_hc_write_4rank: that with moe_gather as its prologue
++// (ar_gather_hc_write at width, exact wire only).
+ //
+ // The IPC helpers live in r4d_ar_oneshot_2rank_exact.hip; this unit links beside it.
+ #include "r4d.h"
+ #include "r4d_ar_wide.h"
+-#include "r4d_ar_hc.h"      // the hc write word, shared with the two-rank fused forms
++#include "r4d_ar_hc.h"      // the gather and hc write words, shared with the two-rank fused forms
+ #include <stdexcept>
+ #include <string>
+ 
+@@ -181,6 +182,98 @@ __global__ void r4d_ar_hc_write_wide_kernel(
+   }
+ }
+ 
++// THE SAME WRITE WITH THE MoE GATHER AS ITS PROLOGUE, bf16 only: the four-rank form of the
++// two-rank r4d_ar_gather_hc_write_kernel. `y` is not read but produced -- a block's words are
++// summed back to token order from the routed experts' rows by r4d_ar_gather_word, kept as this
++// rank's message and pushed to every peer, exactly as if moe_gather had written y and the kernel
++// above had read it back. From the handshake on it IS the kernel above: the same seq take, the
++// same value 2*s, the same (parity, source) slots, the same ar_vsum in ascending rank order over
++// the same sources -- this rank's own word from y, which the same thread stored before the
++// handshake -- and the same r4d_ar_hc_write_word over the stored bf16 word. So the bytes are those
++// of moe_gather, the four-rank exact all-reduce and hc_write.
++//
++// The slot table is the two-rank kernel's: without INV a block's rows (at most R4D_ARG_ROWS, which
++// the launcher sizes the grid for) find their slots once, in LDS, by one pass over the sorted
++// list; with INV they read the inverse table r4d_ar_gather_inv built in front.
++template <int WS, bool INV>
++__global__ void r4d_ar_gather_hc_write_wide_kernel(
++    int4* __restrict__ y4, R4DArWidePeers<int4, WS - 1> peers, const int4* __restrict__ my_base,
++    unsigned int* __restrict__ my_flags, unsigned int* __restrict__ seq_ctrs,
++    const unsigned short* __restrict__ inj, unsigned short* __restrict__ h, int n16, int n,
++    int hc, long irow, long hrow, int slot_stride16, int rank, int drain, int acq, int pub,
++    R4dArGather G, const int* __restrict__ inv) {
++  constexpr int NPEERS = WS - 1;
++
++  const int b = blockIdx.x, nb = gridDim.x, tid = threadIdx.x, nt = blockDim.x;
++  __shared__ unsigned int s_seq, s_slot;
++  __shared__ int   s_i[R4D_ARG_ROWS * R4D_ARG_SLOTS];
++  __shared__ float s_w[R4D_ARG_ROWS * R4D_ARG_SLOTS];
++  __shared__ float s_g[R4D_ARG_ROWS];
++  r4d_ar_seq_take(seq_ctrs, R4D_AR_WIDE_MAX_BLOCKS, s_seq, s_slot);  // device-resident, replay-safe
++  const unsigned int s = s_seq;
++  const int parity = (int)s_slot;
++
++  const int w = (n16 + nb - 1) / nb;
++  const int start = b * w;
++  int end = start + w; if (end > n16) end = n16;
++  const int wpr = n >> 3;                 // 16B words a row
++  const int row_lo = start / wpr;
++  const int nrow = end > start ? (end - 1) / wpr - row_lo + 1 : 0;
++  const int K = G.top_k;
++
++  int4* ps[NPEERS];
++#pragma unroll
++  for (int p = 0; p < NPEERS; ++p)
++    ps[p] = peers.scratch[p] + ((size_t)parity * WS + rank) * (size_t)slot_stride16;
++
++  /* The slot table. A slot no sorted row claims reads -1, so the clear and the scan are two
++   * phases with a barrier between them, as in moe_gather. */
++  if (!INV) {
++    for (int x = tid; x < nrow * K; x += nt) s_i[x] = -1;
++    __syncthreads();
++    {
++      const int lo = row_lo * K, hi = (row_lo + nrow) * K;
++      for (int i = tid; i < G.T; i += nt) {
++        const int f = G.sorted[i];
++        if (f >= lo && f < hi) s_i[f - lo] = i;
++      }
++    }
++    for (int x = tid; x < nrow * K; x += nt)
++      s_w[x] = bf2f(G.ew[(long)(row_lo + x / K) * G.ew_ld + x % K]);
++    if (G.sh)
++      for (int r = tid; r < nrow; r += nt) {
++        const float v0 = bf2f(G.sg[(long)(row_lo + r) * G.sg_ld]);
++        s_g[r] = G.sig ? (1.0f / (1.0f + __expf(-v0))) : v0;
++      }
++    __syncthreads();
++  }
++
++  /* The gather, one word a thread a pass, kept and pushed to every peer. */
++  for (int k = start + tid; k < end; k += nt) {
++    const int row = k / wpr, i0 = (k - row * wpr) * 8;
++    const int4 out = r4d_ar_gather_word<INV>(G, inv, s_i, s_w, s_g, row, row - row_lo, i0);
++    y4[k] = out;
++#pragma unroll
++    for (int p = 0; p < NPEERS; ++p) ps[p][k] = out;
++  }
++
++  r4d_ar_handshake<WS>(peers, my_flags, b, rank, 2u * s, drain, acq, pub);
++
++  const int4* src[WS];
++#pragma unroll
++  for (int r = 0; r < WS; ++r)
++    src[r] = (r == rank) ? (const int4*)y4
++                         : (my_base + ((size_t)parity * WS + r) * (size_t)slot_stride16);
++
++  for (int k = start + tid; k < end; k += nt) {
++    const int4 v = ar_vsum<__hip_bfloat16, 8, WS>(src, k);
++    y4[k] = v;
++    const int row = k / wpr, i0 = (k - row * wpr) * 8;
++    r4d_ar_hc_write_word(inj, h, row, i0, n, hc, irow, hrow,
++                         reinterpret_cast<const unsigned short*>(&v));
++  }
++}
++
+ // --- host side ---
+ template <int WS>
+ static void ar_wide_launch(const long* peer_scratch, const long* peer_flags, long my_scratch,
+@@ -354,6 +447,126 @@ void r4d_ar_hc_write_4rank(long peer_scratch0, long peer_scratch1, long peer_scr
+                              pub);
+ }
+ 
++// ar_hc_write_wide_launch's checks plus the gather's, and the two-rank gather's grid rule: at least
++// wide enough that no block spans more than R4D_ARG_ROWS rows, or -- where that would take more
++// blocks than the reduction asked for and `inv` is given -- the reduction's count over the inverse
++// table. Every rank computes the same count and the same choice from the same M, n and scratch.
++template <int WS>
++static void ar_gather_hc_write_wide_launch(
++    const long* peer_scratch, const long* peer_flags, long my_scratch, long my_flags,
++    long seq_ctrs, long slot_stride16, long y, long inj, long h, long M, long n, long hc,
++    long irow, long hrow, long ye, long ew, long sorted, long sh, long sg, long ye_ld,
++    long ew_ld, long sh_ld, long sg_ld, long top_k, long sig, long rank, long stream_i,
++    long nblocks, long nthreads, long drain, long acq, long pub, long inv) {
++  constexpr int NPEERS = WS - 1;
++  static_assert(NPEERS <= R4D_AR_WIDE_MAX_PEERS, "npeers exceeds the peer bundle bound");
++
++  if (rank < 0 || rank >= WS)
++    throw std::runtime_error("ar_gather_hc_write: rank " + std::to_string(rank) +
++                             " out of range for the " + std::to_string(WS) +
++                             " ranks this entry point is compiled for");
++  if (M <= 0 || n <= 0 || n % 8)
++    throw std::runtime_error("ar_gather_hc_write: n must be a positive multiple of 8");
++  if (hc < 1 || hrow % 8)
++    throw std::runtime_error("ar_gather_hc_write: the streams must be whole 16B words");
++  if (top_k < 1 || top_k > R4D_ARG_SLOTS)
++    throw std::runtime_error("ar_gather_hc_write: top_k " + std::to_string(top_k) +
++                             " outside 1.." + std::to_string(R4D_ARG_SLOTS));
++  if (!ye || !ew || !sorted || ye_ld % 8 || (sh && sh_ld < n) || (sh != 0) != (sg != 0))
++    throw std::runtime_error("ar_gather_hc_write: the gather's operands are not 16B rows");
++
++  const long n16l = M * n / 8;            // bf16: eight elements a 16B word
++  if (n16l > (long)slot_stride16)
++    throw std::runtime_error("ar_gather_hc_write: message (" + std::to_string(n16l) +
++                             " 16B words) exceeds the per-source slot stride (" +
++                             std::to_string(slot_stride16) + ")");
++  const int n16 = (int)n16l;
++  const int wpr = (int)(n / 8);
++
++  int nb = (int)nblocks;
++  if (nb < 1) nb = R4D_AR_NB_DESIGN;
++  if (nb > R4D_AR_WIDE_MAX_BLOCKS) nb = R4D_AR_WIDE_MAX_BLOCKS;
++  /* A block of w words starting anywhere touches at most (w - 1) / wpr + 2 rows. */
++  const int wmax = (R4D_ARG_ROWS - 2) * wpr + 1;
++  const int nb_min = (n16 + wmax - 1) / wmax;
++  const bool by_inv = inv != 0 && nb_min > nb;
++  if (!by_inv && nb < nb_min) nb = nb_min;
++  if (nb > n16) nb = n16;
++  if (nb > R4D_AR_WIDE_MAX_BLOCKS)
++    throw std::runtime_error("ar_gather_hc_write: the slot table needs " + std::to_string(nb) +
++                             " blocks, above the " + std::to_string(R4D_AR_WIDE_MAX_BLOCKS) +
++                             " the flags hold, and no inverse table was given");
++  int nt = (int)nthreads;
++  if (nt < 64) nt = 64;
++  if (nt > 1024) nt = 1024;
++
++  R4DArWidePeers<int4, NPEERS> peers{};
++  for (int i = 0; i < NPEERS; ++i) {
++    if (!peer_scratch[i] || !peer_flags[i])
++      throw std::runtime_error("ar_gather_hc_write: null peer scratch/flag pointer at index " +
++                               std::to_string(i));
++    peers.scratch[i] = (int4*)peer_scratch[i];
++    peers.flags[i] = (unsigned int*)peer_flags[i];
++    peers.rank[i] = (i < (int)rank) ? i : i + 1;
++  }
++
++  const long slot_bytes = 2L * WS * (long)slot_stride16 * 16;
++  const long flag_bytes = (long)nb * WS * (long)sizeof(unsigned int);
++  r4d_ar_check_extent(my_scratch, slot_bytes, "ar_gather_hc_write", "my_scratch");
++  r4d_ar_check_extent(my_flags, flag_bytes, "ar_gather_hc_write", "my_flags");
++  r4d_ar_check_extent(seq_ctrs, 2L * R4D_AR_WIDE_MAX_BLOCKS * (long)sizeof(unsigned int),
++                      "ar_gather_hc_write", "seq_ctrs");
++  for (int i = 0; i < NPEERS; ++i) {
++    r4d_ar_check_extent(peer_scratch[i], slot_bytes, "ar_gather_hc_write", "peer scratch");
++    r4d_ar_check_extent(peer_flags[i], flag_bytes, "ar_gather_hc_write", "peer flags");
++  }
++
++  R4dArGather G;
++  G.ye = (const unsigned short*)ye;
++  G.ew = (const unsigned short*)ew;
++  G.sorted = (const int*)sorted;
++  G.sh = (const unsigned short*)sh;
++  G.sg = (const unsigned short*)sg;
++  G.ye_ld = ye_ld; G.ew_ld = ew_ld; G.sh_ld = sh_ld; G.sg_ld = sg_ld;
++  G.top_k = (int)top_k; G.T = (int)(M * top_k); G.sig = (int)sig;
++
++  hipStream_t st = (hipStream_t)stream_i;
++  if (by_inv) {
++    const int irc = r4d_ar_gather_inv(inv, sorted, (long)G.T, stream_i);
++    if (irc != 0)
++      throw std::runtime_error("ar_gather_hc_write: the inverse table's launch failed (" +
++                               std::to_string(irc) + ")");
++    r4d_ar_gather_hc_write_wide_kernel<WS, true><<<nb, nt, 0, st>>>(
++        (int4*)y, peers, (const int4*)my_scratch, (unsigned int*)my_flags,
++        (unsigned int*)seq_ctrs, (const unsigned short*)inj, (unsigned short*)h, n16, (int)n,
++        (int)hc, irow, hrow, (int)slot_stride16, (int)rank, (int)drain, (int)acq, (int)pub, G,
++        (const int*)inv);
++  } else {
++    r4d_ar_gather_hc_write_wide_kernel<WS, false><<<nb, nt, 0, st>>>(
++        (int4*)y, peers, (const int4*)my_scratch, (unsigned int*)my_flags,
++        (unsigned int*)seq_ctrs, (const unsigned short*)inj, (unsigned short*)h, n16, (int)n,
++        (int)hc, irow, hrow, (int)slot_stride16, (int)rank, (int)drain, (int)acq, (int)pub, G,
++        nullptr);
++  }
++}
++
++void r4d_ar_gather_hc_write_4rank(long peer_scratch0, long peer_scratch1, long peer_scratch2,
++                                  long peer_flags0, long peer_flags1, long peer_flags2,
++                                  long my_scratch, long my_flags, long seq_ctrs,
++                                  long slot_stride16, long y, long inj, long h, long M, long n,
++                                  long hc, long irow, long hrow, long ye, long ew, long sorted,
++                                  long sh, long sg, long ye_ld, long ew_ld, long sh_ld,
++                                  long sg_ld, long top_k, long sig, long rank, long stream,
++                                  long nblocks, long nthreads, long drain, long acq, long pub,
++                                  long inv) {
++  const long ps[3] = {peer_scratch0, peer_scratch1, peer_scratch2};
++  const long pf[3] = {peer_flags0, peer_flags1, peer_flags2};
++  ar_gather_hc_write_wide_launch<4>(ps, pf, my_scratch, my_flags, seq_ctrs, slot_stride16, y,
++                                    inj, h, M, n, hc, irow, hrow, ye, ew, sorted, sh, sg, ye_ld,
++                                    ew_ld, sh_ld, sg_ld, top_k, sig, rank, stream, nblocks,
++                                    nthreads, drain, acq, pub, inv);
++}
++
+ void r4d_ar_wide_dims(int* max_blocks, int* nb_design, int* max_peers) {
+   if (max_blocks) *max_blocks = R4D_AR_WIDE_MAX_BLOCKS;
+   if (nb_design) *nb_design = R4D_AR_NB_DESIGN;
+diff --git a/libr4d/r4d_fuse.cpp b/libr4d/r4d_fuse.cpp
+index 52f2223..80c2caa 100644
+--- a/libr4d/r4d_fuse.cpp
++++ b/libr4d/r4d_fuse.cpp
+@@ -706,7 +706,8 @@ extern "C" int r4d_fuse_attn_paged_gate_quant(const RadParam* p, int n_p, uint64
+ 
+ /* ==========================================================================================
+  * ar_gather_hc_write -- moe_gather, then ar_hc_write.
+- * (kernel: libr4d/r4d_ar_oneshot_2rank_exact.hip, r4d_ar_gather_hc_write_kernel; shim: r4d_ar_entry.hip)
++ * (kernel: libr4d/r4d_ar_oneshot_2rank_exact.hip, r4d_ar_gather_hc_write_kernel, and at four ranks
++ * libr4d/r4d_ar_oneshot_Nrank_exact.hip, r4d_ar_gather_hc_write_wide_kernel; shim: r4d_ar_entry.hip)
+  *
+  * Operands: [0] y_expert  [1] expert_w  [2] sorted_tok  [3] shared?  [4] shared_gate?  [5] y (inout)
+  *           [6] inj  [7] h (inout)
+@@ -714,7 +715,8 @@ extern "C" int r4d_fuse_attn_paged_gate_quant(const RadParam* p, int n_p, uint64
+  * Two declared ops and nothing in between: the gather writes `y`, which is the reduction's message
+  * and is then reduced in place and written into the streams. The shared-arm pair is optional in
+  * both ops at the same positions, so its absence propagates through the wiring. `wire` is the
+- * reducing write's, and it goes to that step unchanged.
++ * reducing write's, and it goes to that step unchanged; so does `world_size`, which at four selects
++ * ar_hc_write_4rank, the reduction and write the four-rank row runs.
+  */
+ extern "C" int r4d_fuse_ar_gather_hc_write(const RadParam* p, int n_p, uint64_t present, int step,
+                                            RadFuseStep* out) {
+diff --git a/libr4d/r4d_plugin.h b/libr4d/r4d_plugin.h
+index 7045922..69becc0 100644
+--- a/libr4d/r4d_plugin.h
++++ b/libr4d/r4d_plugin.h
+@@ -189,6 +189,8 @@ int  r4d_rad_ar_hc_wide_init(const RadParam*, int, int rank, int world, void** o
+ int  r4d_rad_ar_hc_write_4rank(const RadArgs*, RadStream);
+ int  r4d_rad_ar_gather_hc_write(const RadArgs*, RadStream);
+ int64_t r4d_rad_ar_gather_hc_write_scratch(const RadArgs*);
++/* ar_gather_hc_write at four ranks, exact wire only, on ar_hc_write_4rank's instance. */
++int  r4d_rad_ar_gather_hc_write_4rank(const RadArgs*, RadStream);
+ 
+ /* -- GEMM (r4d_gemm_*.hip) -- */
+ int r4d_rad_gemm_bf16_m16   (const RadArgs*, RadStream);
+diff --git a/libr4d/r4d_rows.cpp b/libr4d/r4d_rows.cpp
+index 21f5f7f..3495031 100644
+--- a/libr4d/r4d_rows.cpp
++++ b/libr4d/r4d_rows.cpp
+@@ -2110,7 +2110,8 @@ static const RadOpSchema kSchemas[] = {
+     SCHEMA("ar_gather_hc_write", pArGatherHcWrite, oArGatherHcWrite,
+            "moe_gather, then ar_hc_write, in one kernel: the routed experts' rows summed back to "
+            "token order (with the shared arm folded when present) ARE the all-reduce's message, "
+-           "and the gated residual's write follows the reduction. Both wires."),
++           "and the gated residual's write follows the reduction. Both wires at two ranks, the "
++           "exact one at four."),
+ };
+ 
+ /* ================================================================================ constraints
+@@ -2684,6 +2685,13 @@ static const RadConstraint cArGatherHcWrite[] = {
+     C_EQ("world_size", 2), C_GE("top_k", 1), C_LE("top_k", 64),
+     C_P2P,
+ };
++/* The same at four ranks, exact wire only for cArHcWrite4's reason: the init and the entry refuse a
++ * declared `wire` 6, since the exact op declares no `wire` and an absent key fails a constraint. */
++static const RadConstraint cArGatherHcWrite4[] = {
++    C_GE("M", 1), C_DIV("n", 8), C_GE("hc", 2), C_LE("hc", 8), C_IN("dtype", "bf16"),
++    C_EQ("world_size", 4), C_GE("top_k", 1), C_LE("top_k", 64),
++    C_P2P,
++};
+ static const RadConstraint cGatedQuantFp8[] = {
+     C_DIV("n", 4), C_EQ("group", R4D_FP8_BLOCK), C_IN("dtype", "bf16"),
+ };
+@@ -4738,6 +4746,26 @@ static const RadKernelInfo kKernels[] = {
+   r4d_rad_ar_gather_hc_write_scratch, nullptr, nullptr,
+   r4d_shape_ar_gather_hc_write, nullptr, r4d_fuse_ar_gather_hc_write },
+ 
++{ "ar_gather_hc_write_4rank", "ar_gather_hc_write", "norm",
++  "moe_gather folded in front of the four-rank ar_hc_write: each block sums its words' tokens "
++  "back from the routed experts' rows, keeps the result as its message and pushes it, and then "
++  "reduces and writes exactly as ar_hc_write_4rank does",
++  "exactly 4 ranks, all peer-accessible; exact wire only; n a multiple of 8, y unpitched and "
++  "y_expert's pitch a multiple of 8, because both move as 16B words; top_k <= 64; the stream "
++  "pitch a multiple of 8; hc 2..8; the wide one-shot's handshake and slots on the plain four-rank "
++  "all-reduce's instance; the grid widened until a block's slot table fits in LDS, or the "
++  "inverse table in the scratch where that would take more blocks than the reduction asks for; "
++  "cudagraph-safe",
++  "bf16 throughout; the gather's sums and narrows are moe_gather's (round-to-nearest-even, the "
++  "shared arm's product rounded before the add), the sum in fp32 in ascending rank order and "
++  "rounded to bf16 exactly as the four-rank exact all-reduce stores it, and the write in "
++  "hc_write's arithmetic over that bf16 value -- byte-identical to the three kernels it replaces",
++  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
++  ROW(cArGatherHcWrite4), ROW(tAr), nullptr,
++  r4d_rad_ar_hc_wide_init, r4d_rad_ar_fini, r4d_rad_ar_gather_hc_write_4rank,
++  r4d_rad_ar_gather_hc_write_scratch, nullptr, nullptr,
++  r4d_shape_ar_gather_hc_write, nullptr, r4d_fuse_ar_gather_hc_write },
++
+ { "qk_norm_rope_gate", "qk_norm_rope_gate", "attn",
+   "the gated-attention QKV preamble in one pass: split [q|gate] per head, QK RMS norm over the "
+   "head, partial NeoX RoPE and the gate copy",
+diff --git a/tests/arch_test.cpp b/tests/arch_test.cpp
+index 05fcfec..7f86404 100644
+--- a/tests/arch_test.cpp
++++ b/tests/arch_test.cpp
+@@ -1853,11 +1853,12 @@ TEST(a_sizing_declare_leaves_the_step_state_alone_and_shrinks_only_rows) {
+  *     bf16 expert, leaving an odd count of quantised ones, and the grouped GEMM takes its experts as
+  *     two EQUAL tables by parity. The recipe protects experts in pairs for exactly that reason.
+  *   - the FUSED all-reduces are world-2 kernels (`ar_wire_is_exact` and `ar_fused_ok` both return
+- *     false off two), with one exception: `ar_hc_write` also exists at four, on the exact wire only
+- *     (no `wire` key, never the rotated form) and with no gather in front of it. Every block still
+- *     declares its standalone `all_reduce`, which serves the steps the fused write declines. The
+- *     contrast with world 2 in the same test is the contract -- it fails loudly if a fused declare
+- *     is ever gated on the wrong condition.
++ *     false off two), with one exception: the gated residual's write. `ar_hc_write` and
++ *     `ar_gather_hc_write` also exist at four, on the exact wire only (no `wire` key, never the
++ *     rotated form). Every block still declares its standalone `all_reduce`, and every MoE block
++ *     its `moe_gather`, which serve the steps the fused write declines. The contrast with world 2
++ *     in the same test is the contract -- it fails loudly if a fused declare is ever gated on the
++ *     wrong condition.
+  *
+  * Every expected number is derived from the meta this file builds (n_head 24, n_head_kv 2, head_dim
+  * 256, num_experts 512), so the fixture and the assertions cannot drift apart. Where a number is
+@@ -1984,17 +1985,20 @@ TEST(flashnext_tp4_replicates_kv_heads_and_splits_expert_widths) {
+         CHECK_EQ(pint(gu, "N_odd"), 2 * (cls_hi[r][1] - cls_lo[r][1]));
+         CHECK_EQ(pint(gu, "n_expert"), ne_all);
+ 
+-        /* (4) A standalone collective per reduction, the exact four-rank ar_hc_write beside it,
+-         * and neither of the other two fused forms. */
++        /* (4) A standalone collective per reduction, the exact four-rank ar_hc_write and
++         * ar_gather_hc_write beside it -- the gather form on every MoE connection, so one a layer
++         * plus the MTP head's if there is one -- and not the fused norm. */
+         CHECK(count_op(b[r], "all_reduce") > 0);
+         CHECK_EQ(pint(find_op(b[r], "all_reduce"), "world_size"), world);
+         CHECK(count_op(b[r], "ar_hc_write") > 0);
++        CHECK(count_op(b[r], "moe_gather") > 0);
++        CHECK(count_op(b[r], "ar_gather_hc_write") > 0);
++        CHECK(count_op(b[r], "ar_gather_hc_write") <= count_op(b[r], "moe_gather"));
+         for (const RecOp& o : b[r].ops) {
+-            if (o.op != "ar_hc_write") continue;
++            if (o.op != "ar_hc_write" && o.op != "ar_gather_hc_write") continue;
+             CHECK_EQ(pint(&o, "world_size"), world);
+             CHECK(param(&o, "wire") == nullptr);           /* exact only */
+         }
+-        CHECK_EQ(count_op(b[r], "ar_gather_hc_write"), 0);
+         CHECK_EQ(count_op(b[r], "ar_rmsnorm_quant_fp8"), 0);
+     }
+ 
+@@ -2094,7 +2098,31 @@ TEST(flashnext_tp4_replicates_kv_heads_and_splits_expert_widths) {
+         for (int64_t T : { 1, 8, 25, 26, 205, 4096 })
+             CHECK(rad::arch::ar_exact_write_takes(g2, T) == rad::arch::ar_wire_is_exact(g2, T));
+     }
+-    /* ...and the lossy wire at four declares no rotated write and no gather form. */
++    /* THE FOUR-RANK GATHER'S STEPS: the fused write's, and within one MoE pass. The exact bound
++     * is the only one at four (the rotated form is never declared there, so `rows6` is 0), and a
++     * step the write declines keeps its gather. At two ranks the bound is still picked by
++     * ar_wire_is_exact. */
++    {
++        rad::arch::Geom g4{};
++        g4.world = 4; g4.n_embd = 2560; g4.wire_exact = 1; g4.wire_min_bytes = 128 * 1024;
++        CHECK(rad::arch::gather_taken(g4, 8, 2048, 0));      /* a decode step */
++        CHECK(rad::arch::gather_taken(g4, 204, 2048, 0));    /* 1020 KiB, one pass */
++        CHECK(!rad::arch::gather_taken(g4, 205, 2048, 0));   /* the two-shot's */
++        CHECK(!rad::arch::gather_taken(g4, 8, 0, 0));        /* not declared */
++        CHECK(!rad::arch::gather_taken(g4, 100, 64, 0));     /* two passes */
++        g4.wire_exact = 0;
++        CHECK(rad::arch::gather_taken(g4, 25, 2048, 0));     /* under the floor */
++        CHECK(!rad::arch::gather_taken(g4, 26, 2048, 0));    /* the ti8 wire's */
++        rad::arch::Geom g2 = g4;
++        g2.world = 2;
++        for (int64_t T : { 1, 8, 25, 26, 205, 4096 })
++            for (int64_t r6 : { 0, 2048 }) {
++                const int64_t r = rad::arch::ar_wire_is_exact(g2, T) ? 2048 : r6;
++                CHECK(rad::arch::gather_taken(g2, T, 2048, r6) == (r > 0 && T <= r));
++            }
++    }
++    /* ...and the lossy wire at four declares no rotated write and no rotated gather form: the
++     * exact ones only, for the steps under the floor. */
+     {
+         RadBuilder b4;
+         RadBuildCtx c4 = build_ctx(0, world);
+@@ -2103,11 +2131,11 @@ TEST(flashnext_tp4_replicates_kv_heads_and_splits_expert_widths) {
+         c4.tp_wire_min_bytes = 128 * 1024;
+         REQUIRE_EQ(qwen4exp_fp8::declare(&b4, &meta, &c4), RAD_OK);
+         CHECK(count_op(b4, "ar_hc_write") > 0);
++        CHECK(count_op(b4, "ar_gather_hc_write") > 0);
+         for (const RecOp& o : b4.ops) {
+-            if (o.op != "ar_hc_write") continue;
++            if (o.op != "ar_hc_write" && o.op != "ar_gather_hc_write") continue;
+             CHECK(param(&o, "wire") == nullptr);
+         }
+-        CHECK_EQ(count_op(b4, "ar_gather_hc_write"), 0);
+     }
+ 
+     /* A WORLD THAT CANNOT REPLICATE -- not a multiple of the KV head count -- is refused by name,
+-- 
+2.55.0
+

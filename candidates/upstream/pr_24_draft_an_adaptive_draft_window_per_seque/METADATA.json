@@ -1,0 +1,100 @@
+{
+  "pr_id": 24,
+  "title": "draft: an adaptive draft window per sequence, with a cap under load",
+  "author": "keptn42",
+  "url": "https://codeberg.org/StillDeadcode/radiance/pulls/24",
+  "status": "READY_TO_TEST",
+  "modified_files": [
+    "core/sched/draft.cpp",
+    "core/sched/draft.h",
+    "core/sched/metrics.h",
+    "core/sched/scheduler.cpp",
+    "core/sched/scheduler.h",
+    "core/server/adapters.h",
+    "core/server/iface.h",
+    "core/server/metrics.cpp",
+    "core/server/metrics.h",
+    "tests/sched_test.cpp",
+    "tests/server_test.cpp",
+    "core/sched/draft.cpp",
+    "core/sched/draft.h",
+    "core/sched/scheduler.cpp",
+    "core/sched/scheduler.h",
+    "tests/sched_test.cpp",
+    "core/engine.cpp",
+    "core/sched/scheduler.cpp",
+    "core/sched/scheduler.h",
+    "tests/sched_test.cpp",
+    "docs/GUIDE.md",
+    "core/server/metrics.cpp",
+    "core/server/metrics.h",
+    "docs/GUIDE.md",
+    "tests/server_test.cpp",
+    "deploy/grafana/README.md",
+    "deploy/grafana/radiance.json"
+  ],
+  "safety_audit": {
+    "passed": true,
+    "violations": []
+  },
+  "jev_evaluation": {
+    "subsystem": {
+      "type": "choice",
+      "choice": "drafter",
+      "confidence": 1.0,
+      "probabilities": {
+        "serving": 0.0,
+        "gdn": 0.0,
+        "interconnect": 0.0,
+        "drafter": 1.0,
+        "general": 0.0,
+        "moe": 0.0,
+        "gemm": 0.0,
+        "tooling": 0.0,
+        "qsa": 0.0
+      }
+    },
+    "violates_rdna4_limits": {
+      "type": "noul",
+      "noul": 0.05
+    },
+    "feasibility": {
+      "type": "score",
+      "score": 2.25,
+      "confidence": 0.6,
+      "legend": {
+        "0": "Unfeasible / contradicts hardware laws / CUDA-only",
+        "1": "High risk or complex external dependency",
+        "2": "Moderate feasibility / experimental",
+        "3": "Feasible / standard ROCm HIP implementation",
+        "4": "Immediate high-value quick win"
+      },
+      "probabilities": {
+        "0": 0.01,
+        "1": 0.1,
+        "2": 0.54,
+        "3": 0.34,
+        "4": 0.01
+      }
+    },
+    "performance_roi": {
+      "type": "score",
+      "score": 1.97,
+      "confidence": 0.41,
+      "legend": {
+        "0": "Zero or negative performance impact (docs, tool, placebo)",
+        "1": "Marginal gain (<2%) or monitoring/stability utility",
+        "2": "Solid architectural gain (2-5%)",
+        "3": "High-impact gain (5-15%)",
+        "4": "Breakthrough gain (>15%)"
+      },
+      "probabilities": {
+        "0": 0.09,
+        "1": 0.19,
+        "2": 0.39,
+        "3": 0.32,
+        "4": 0.01
+      }
+    }
+  }
+}

@@ -1,0 +1,91 @@
+{
+  "pr_id": 55,
+  "title": "libr4d: --tp-wire wht6 at three ranks, the tiered-int8 wire over the uneven two-shot (#46)",
+  "author": "bakon",
+  "url": "https://codeberg.org/StillDeadcode/radiance/pulls/55",
+  "status": "READY_TO_TEST",
+  "modified_files": [
+    "docs/TP3.md",
+    "libr4d/r4d.h",
+    "libr4d/r4d_ar_entry.hip",
+    "libr4d/r4d_ar_twoshot_Nrank_exact.hip",
+    "libr4d/r4d_plugin.h",
+    "libr4d/r4d_rows.cpp",
+    "libr4d/r4d_selftest.cpp",
+    "README.md",
+    "core/config.cpp",
+    "core/engine_bringup.cpp",
+    "docs/GUIDE.md",
+    "docs/TP3.md",
+    "libr4d/r4d.h",
+    "libr4d/r4d_ar_entry.hip",
+    "libr4d/r4d_ar_twoshot_Nrank_ti8.hip",
+    "libr4d/r4d_plugin.h",
+    "libr4d/r4d_rows.cpp",
+    "libr4d/r4d_selftest.cpp"
+  ],
+  "safety_audit": {
+    "passed": true,
+    "violations": []
+  },
+  "jev_evaluation": {
+    "subsystem": {
+      "type": "choice",
+      "choice": "interconnect",
+      "confidence": 0.95,
+      "probabilities": {
+        "tooling": 0.0,
+        "drafter": 0.0,
+        "serving": 0.0,
+        "general": 0.03,
+        "moe": 0.0,
+        "gemm": 0.01,
+        "qsa": 0.0,
+        "gdn": 0.0,
+        "interconnect": 0.96
+      }
+    },
+    "violates_rdna4_limits": {
+      "type": "noul",
+      "noul": 0.11
+    },
+    "feasibility": {
+      "type": "score",
+      "score": 1.82,
+      "confidence": 0.0,
+      "legend": {
+        "0": "Unfeasible / contradicts hardware laws / CUDA-only",
+        "1": "High risk or complex external dependency",
+        "2": "Moderate feasibility / experimental",
+        "3": "Feasible / standard ROCm HIP implementation",
+        "4": "Immediate high-value quick win"
+      },
+      "probabilities": {
+        "0": 0.2,
+        "1": 0.2,
+        "2": 0.22,
+        "3": 0.36,
+        "4": 0.02
+      }
+    },
+    "performance_roi": {
+      "type": "score",
+      "score": 1.56,
+      "confidence": 0.0,
+      "legend": {
+        "0": "Zero or negative performance impact (docs, tool, placebo)",
+        "1": "Marginal gain (<2%) or monitoring/stability utility",
+        "2": "Solid architectural gain (2-5%)",
+        "3": "High-impact gain (5-15%)",
+        "4": "Breakthrough gain (>15%)"
+      },
+      "probabilities": {
+        "0": 0.27999999999999997,
+        "1": 0.18,
+        "2": 0.25,
+        "3": 0.27,
+        "4": 0.02
+      }
+    }
+  }
+}

@@ -1,0 +1,2274 @@
+From 66414241114fa34fce27c195c2fb2d2743e41f8b Mon Sep 17 00:00:00 2001
+From: keptn42 <keptn42@noreply.codeberg.org>
+Date: Mon, 5 Oct 2026 20:43:28 +0000
+Subject: [PATCH 1/6] draft: an adaptive draft window per sequence
+ (RADIANCE_DRAFT_ADAPT)
+
+One depth for every request is too shallow for code and JSON and too deep
+for prose. With RADIANCE_DRAFT_ADAPT=1, --num-speculative-tokens becomes
+the ceiling and each sequence drafts into the window d that maximises
+E(d)/T(d): the tokens a step is expected to emit from the sequence's own
+smoothed acceptance at each position, over the step's cost
+(RADIANCE_DRAFT_COST, depth:ms pairs). The serial head runs as many rounds
+as the deepest window in the step. A window moves only past a hysteresis
+and a hold, since a new window is a new pass shape. Acceptance is
+unchanged. /metrics gains radiance:draft_depth_adaptive and
+radiance:draft_verify_depth_total{depth} while it is on. Unset, nothing
+changes. Greedy at up to 6 against fixed 3: code +7.7 %, JSON +16.3 %.
+---
+ core/sched/draft.cpp     | 255 ++++++++++++++++++++++++++++++++-
+ core/sched/draft.h       |  91 +++++++++++-
+ core/sched/metrics.h     |   7 +
+ core/sched/scheduler.cpp |  89 +++++++++++-
+ core/sched/scheduler.h   |  21 ++-
+ core/server/adapters.h   |   7 +
+ core/server/iface.h      |   5 +
+ core/server/metrics.cpp  |  29 ++++
+ core/server/metrics.h    |   7 +
+ tests/sched_test.cpp     | 297 +++++++++++++++++++++++++++++++++++++++
+ tests/server_test.cpp    |  32 +++++
+ 11 files changed, 830 insertions(+), 10 deletions(-)
+
+diff --git a/core/sched/draft.cpp b/core/sched/draft.cpp
+index 4dbe8b9..3b3eef4 100644
+--- a/core/sched/draft.cpp
++++ b/core/sched/draft.cpp
+@@ -1,19 +1,185 @@
+-/* draft.cpp -- the static draft-depth policy. See draft.h for why it is static.
++/* draft.cpp -- the static draft-depth policy, and the adaptive one RADIANCE_DRAFT_ADAPT turns on.
++ * See draft.h for why the first is the default and what the second changes.
+  */
+ #include "draft.h"
+ 
++#include <cmath>
++#include <cstdint>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++
+ namespace rad {
+ 
++namespace {
++
++/* THE COST MODEL WHEN NO TABLE IS GIVEN: every draft adds six percent to a step -- one round of
++ * the head (about 0.4 ms profiled on QFN at tp4) and one more verify row, against a step of about
++ * 12 ms. A guess at a shape, not a measurement of any deployment: one that has measured its own
++ * steps by depth gives them as RADIANCE_DRAFT_COST. */
++constexpr double kCostSlope = 0.06;
++
++/* THE PRIOR WEIGHS AS MUCH AS THIS MANY VERIFIES. The (n+1)-th real one moves an estimate by
++ * 1 / (n + k + 1) -- a running mean over the prior and the evidence -- until that step falls below
++ * the half-life's, and from then on it is the moving average it is meant to be. Without it a
++ * sequence would spend its first ~16 verifies at whatever window the prior chose, which is most of
++ * a short answer. */
++constexpr double kPriorWeight = 4.0;
++
++/* A POSITION THE DEPLOYMENT HAS EVALUATED FEWER TIMES THAN THIS starts a new sequence from the
++ * fixed prior rather than from the global count: a rate over a handful of verifies is noise, and a
++ * position nobody has drafted to is no rate at all. */
++constexpr int64_t kGlobalMinReach = 64;
++
++/* RADIANCE_DRAFT_COST="1:10.6,2:11.3,3:12.0": depth:cost pairs, comma separated. Returns how many
++ * it read, or -1 when the string is not that. */
++int parse_cost(const char* s, float* cost) {
++    int n = 0;
++    const char* p = s;
++    for (;;) {
++        while (*p == ' ') ++p;
++        if (!*p) return n;
++        char* end = nullptr;
++        const long d = std::strtol(p, &end, 10);
++        if (end == p || *end != ':') return -1;
++        p = end + 1;
++        const double v = std::strtod(p, &end);
++        if (end == p) return -1;
++        if (d < 1 || d > RAD_SCHED_MAX_SPEC || !std::isfinite(v) || !(v > 0.0)) return -1;
++        cost[d] = (float)v;
++        ++n;
++        p = end;
++        while (*p == ' ') ++p;
++        if (*p == ',') ++p;
++        else if (*p) return -1;
++    }
++}
++
++/* One knob, or the default with a warning when it does not parse. A knob that is silently not
++ * read is the one that gets reported as "made no difference". */
++void env_real(const char* name, double lo, double hi, float* out) {
++    const char* v = std::getenv(name);
++    if (!v || !*v) return;
++    char* end = nullptr;
++    const double x = std::strtod(v, &end);
++    if (end == v || *end || !(x >= lo && x <= hi)) {
++        RAD_WARN("%s=%s is not a number in [%g, %g]; keeping %g", name, v, lo, hi, (double)*out);
++        return;
++    }
++    *out = (float)x;
++}
++
++void env_int(const char* name, long lo, long hi, int* out) {
++    const char* v = std::getenv(name);
++    if (!v || !*v) return;
++    char* end = nullptr;
++    const long x = std::strtol(v, &end, 10);
++    if (end == v || *end || x < lo || x > hi) {
++        RAD_WARN("%s=%s is not an integer in [%ld, %ld]; keeping %d", name, v, lo, hi, *out);
++        return;
++    }
++    *out = (int)x;
++}
++
++}  /* namespace */
++
++void DraftController::from_env(Params* p) {
++    static const Params env = [] {
++        Params e;
++        const char* on = std::getenv("RADIANCE_DRAFT_ADAPT");
++        e.adapt = on && *on && *on != '0';
++        if (const char* c = std::getenv("RADIANCE_DRAFT_COST"); c && *c) {
++            const int n = parse_cost(c, e.cost);
++            if (n < 2) {
++                RAD_WARN("RADIANCE_DRAFT_COST=\"%s\" %s; the adaptive draft depth prices a step at "
++                         "1 + %.2f per draft instead", c,
++                         n < 0 ? "is not a list of depth:cost pairs"
++                               : "has fewer than two depth:cost pairs", kCostSlope);
++                std::memset(e.cost, 0, sizeof e.cost);
++            }
++        }
++        env_real("RADIANCE_DRAFT_ADAPT_HYST", 0.0, 10.0, &e.hyst);
++        env_int ("RADIANCE_DRAFT_ADAPT_HOLD", 0, 1000000, &e.hold);
++        env_real("RADIANCE_DRAFT_ADAPT_HALFLIFE", 0.5, 1e6, &e.half_life);
++        env_real("RADIANCE_DRAFT_ADAPT_PRIOR", 0.0, 1.0, &e.prior);
++        env_int ("RADIANCE_DRAFT_ADAPT_MIN", 1, RAD_SCHED_MAX_SPEC, &e.min_depth);
++        return e;
++    }();
++    p->adapt     = env.adapt;
++    std::memcpy(p->cost, env.cost, sizeof p->cost);
++    p->hyst      = env.hyst;
++    p->hold      = env.hold;
++    p->half_life = env.half_life;
++    p->prior     = env.prior;
++    p->min_depth = env.min_depth;
++}
++
+ int DraftController::configure(const Params& p) {
+     if (p.max_depth < 0 || p.max_depth > RAD_SCHED_MAX_SPEC) {
+         RAD_ERR("draft depth %d is outside 0..%d -- the verify kernel band is %d query rows",
+                 p.max_depth, RAD_SCHED_MAX_SPEC, RAD_SCHED_MAX_SPEC);
+         return RAD_E_INVAL;
+     }
++    if (p.adapt && (!(p.hyst >= 0.0f) || p.hold < 0 || !(p.half_life > 0.0f) ||
++                    !(p.prior >= 0.0f && p.prior <= 1.0f) || p.min_depth < 1)) {
++        RAD_ERR("adaptive draft depth: hysteresis %g, hold %d, half-life %g, prior %g, minimum %d "
++                "-- they want >= 0, >= 0, > 0, 0..1 and >= 1", (double)p.hyst, p.hold,
++                (double)p.half_life, (double)p.prior, p.min_depth);
++        return RAD_E_INVAL;
++    }
+     p_ = p;
+     tot_drafted_ = tot_accepted_ = 0;
+     for (int j = 0; j < RAD_SCHED_MAX_SPEC; ++j) { reach_[j] = 0; hit_[j] = 0; }
+     seen_ = 0;
++
++    adapt_ = p.adapt && p.max_depth > 0;
++    alpha_ = 0.0;
++    for (int d = 0; d <= RAD_SCHED_MAX_SPEC; ++d) { cost_[d] = 0.0; by_depth_[d] = 0; }
++    /* SAID, because a switch that does nothing reads exactly like a switch that made no
++     * difference. */
++    if (p.adapt && !adapt_)
++        RAD_WARN("RADIANCE_DRAFT_ADAPT is set and this deployment does not speculate "
++                 "(--num-speculative-tokens 0): there is no window to adapt");
++    if (!adapt_) return RAD_OK;
++    if (p_.min_depth > p_.max_depth) p_.min_depth = p_.max_depth;
++    alpha_ = 1.0 - std::exp2(-1.0 / (double)p_.half_life);
++
++    /* THE COST TABLE, resolved for every window the policy may choose. A point that was measured
++     * is taken as it is; between two points the line between them; past the ends the line through
++     * the nearest two -- a table for depths 1..6 still prices depth 8 the way its own last two
++     * steps say. A table that extrapolates to a cost at or below zero is a table with the wrong
++     * sign in it, and the default is the better guess. */
++    int    pd[RAD_SCHED_MAX_SPEC];
++    double pv[RAD_SCHED_MAX_SPEC];
++    int    np = 0;
++    for (int d = 1; d <= RAD_SCHED_MAX_SPEC; ++d)
++        if (std::isfinite(p.cost[d]) && p.cost[d] > 0.0f) {
++            pd[np] = d;
++            pv[np] = (double)p.cost[d];
++            ++np;
++        }
++    bool table = np >= 2;
++    for (int d = 1; table && d <= p_.max_depth; ++d) {
++        int i = 0;
++        while (i + 2 < np && pd[i + 1] < d) ++i;
++        const double t = (double)(d - pd[i]) / (double)(pd[i + 1] - pd[i]);
++        cost_[d] = pv[i] + t * (pv[i + 1] - pv[i]);
++        if (!(cost_[d] > 0.0)) {
++            RAD_WARN("adaptive draft depth: the cost table extrapolates to %g at depth %d; pricing "
++                     "a step at 1 + %.2f per draft instead", cost_[d], d, kCostSlope);
++            table = false;
++        }
++    }
++    if (!table)
++        for (int d = 1; d <= p_.max_depth; ++d) cost_[d] = 1.0 + kCostSlope * (double)d;
++
++    std::string t;
++    for (int d = 1; d <= p_.max_depth; ++d) t += fmt("%s%d:%.3g", d > 1 ? " " : "", d, cost_[d]);
++    RAD_INFO("draft depth: ADAPTIVE per sequence (RADIANCE_DRAFT_ADAPT), %d..%d -- the window "
++             "maximising E(d)/T(d) for T = [%s]%s; moves at +%.1f%% and at most every %d verifies; "
++             "acceptance half-life %.1f verifies, prior %.2f",
++             p_.min_depth, p_.max_depth, t.c_str(), table ? "" : " (the default model)",
++             100.0 * (double)p_.hyst, p_.hold, (double)p_.half_life, (double)p_.prior);
+     return RAD_OK;
+ }
+ 
+@@ -34,6 +200,93 @@ void DraftController::observe(int drafted, int accepted) {
+         if (j < accepted) ++hit_[j];
+     }
+     if (drafted > seen_) seen_ = drafted;
++    if (adapt_) ++by_depth_[drafted];
++}
++
++/* ------------------------------------------------------------------ the adaptive policy */
++int DraftController::best_depth(const float* a, int at, double* best, double* at_gain) const {
++    double e = 1.0, run = 1.0, bg = -1.0, ag = 0.0;
++    int arg = p_.min_depth;
++    for (int d = 1; d <= p_.max_depth; ++d) {
++        run *= (double)a[d - 1];
++        e += run;
++        const double g = e / cost_[d];
++        if (d == at) ag = g;
++        if (d >= p_.min_depth && g > bg) { bg = g; arg = d; }
++    }
++    if (best) *best = bg;
++    if (at_gain) *at_gain = ag;
++    return arg;
++}
++
++double DraftController::gain(const DraftAdapt& s, int d) const {
++    if (!adapt_ || d < 1 || d > p_.max_depth) return 0.0;
++    double e = 1.0, run = 1.0;
++    for (int k = 1; k <= d; ++k) { run *= (double)s.a[k - 1]; e += run; }
++    return e / cost_[d];
++}
++
++int DraftController::depth_for(DraftAdapt& s) const {
++    if (!adapt_) return p_.max_depth;
++    if (s.depth > 0) return s.depth;
++    /* NOT STARTED. Each position from what the deployment has measured there, where it has
++     * measured enough; otherwise from the fixed prior, which is optimistic on purpose: a window
++     * that starts deep evaluates every position and learns all of them, and one that starts
++     * shallow learns nothing about the positions it never drafts to. */
++    for (int j = 0; j < p_.max_depth; ++j) {
++        s.a[j] = reach_[j] >= kGlobalMinReach ? (float)((double)hit_[j] / (double)reach_[j])
++                                              : p_.prior;
++        s.n[j] = 0;
++    }
++    s.depth = best_depth(s.a, 0, nullptr, nullptr);
++    s.held  = 0;
++    return s.depth;
++}
++
++int DraftController::adapt_observe(DraftAdapt& s, int drafted, int accepted) const {
++    if (!adapt_) return p_.max_depth;
++    if (s.depth <= 0) (void)depth_for(s);
++    if (drafted <= 0) return s.depth;
++    const int D = p_.max_depth;
++    if (drafted > D) drafted = D;
++    if (accepted < 0) accepted = 0;
++    if (accepted > drafted) accepted = drafted;
++
++    /* THE POSITIONS THIS VERIFY EVALUATED, by observe()'s rule: every one before the first
++     * rejection, taken, and the rejected one, refused. A position behind the rejection was drafted
++     * and never looked at, and says nothing either way. */
++    const int last = accepted < drafted ? accepted : drafted - 1;
++    for (int j = 0; j <= last; ++j) {
++        const double w = std::fmax(alpha_, 1.0 / ((double)s.n[j] + kPriorWeight + 1.0));
++        const double x = j < accepted ? 1.0 : 0.0;
++        s.a[j] = (float)((double)s.a[j] + w * (x - (double)s.a[j]));
++        if (s.n[j] < UINT16_MAX) ++s.n[j];
++    }
++    /* AND THE POSITIONS THE WINDOW DID NOT REACH DRIFT TOWARD THE DEEPEST ONE IT DID. Nothing is
++     * learned about them while the window is shorter -- and a sequence held at three by prose that
++     * turns into code would otherwise keep pricing positions four and up at whatever they read
++     * before, and never draft deep enough to find out. The guess is that acceptance decays with
++     * position rather than falling off a cliff, which is what QFN's head measured, so the window's
++     * edge stands in for what lies past it. Where that is wrong it costs a move out, the verifies
++     * that refute it, and a move back. */
++    const double edge = (double)s.a[drafted - 1];
++    for (int j = drafted; j < D; ++j)
++        s.a[j] = (float)((double)s.a[j] + alpha_ * (edge - (double)s.a[j]));
++
++    /* THE MOVE, rate-limited twice. A window changes the shape of the verify pass and of the
++     * head's history pass, and a shape is a new recording before it plays (runtime/ctx.h); a
++     * window that follows every flicker of the estimate pays that for nothing. So it moves only
++     * when the window it would take is worth `hyst` more than the one it has, and not again within
++     * `hold` verifies of the last move. */
++    if (s.held < INT32_MAX) ++s.held;
++    if (s.held < p_.hold) return s.depth;
++    double best = 0.0, cur = 0.0;
++    const int d = best_depth(s.a, s.depth, &best, &cur);
++    if (d != s.depth && best > cur * (1.0 + (double)p_.hyst)) {
++        s.depth = d;
++        s.held  = 0;
++    }
++    return s.depth;
+ }
+ 
+ }  /* namespace rad */
+diff --git a/core/sched/draft.h b/core/sched/draft.h
+index 6ca63c8..cb77758 100644
+--- a/core/sched/draft.h
++++ b/core/sched/draft.h
+@@ -16,6 +16,29 @@
+  *
+  * What survives is the accounting, because the acceptance rate is a reported metric (spec §14)
+  * and because a verify that accepts nothing has to be visible.
++ *
++ * UNLESS RADIANCE_DRAFT_ADAPT=1, and then the premise above is what does not hold. On a model
++ * whose weights stream -- a MoE that reads experts per verify row, a head that runs one pass a
++ * round -- a step is NOT flat in depth: each draft is one more round of the head and one more
++ * verify row, and on QFN at tp4 a step measured 12.0 ms at depth 3 and 15.0 ms at depth 5. And
++ * the best depth is not a property of the model pair but of the TEXT: per-position acceptance
++ * holds at ~0.9 to position five on code and JSON, sits near 0.6 on prose and falls to 0.2-0.4
++ * past the third position on a summary. No constant is right for all of them, and the one that is
++ * right for one costs the others either rounds nobody accepts or tokens nobody drafted.
++ *
++ * So the switch adds a policy, per sequence and on the host: a smoothed estimate of each
++ * position's conditional acceptance, fed by the same verify outcomes observe() counts (DraftAdapt),
++ * and before every draft the window d that maximises E(d) / T(d) -- the tokens a step of that
++ * window is expected to emit, 1 + sum_k prod_{j<=k} a_j, over what such a step costs. It moves
++ * only when the gain is worth a re-recorded pass (Params::hyst, Params::hold). `max_depth` stays
++ * the ceiling, and everything sized for it stays sized for it.
++ *
++ * IT CHANGES HOW MANY DRAFTS A STEP VERIFIES AND NOTHING ELSE. Acceptance is the rule in
++ * core/sample/accept.h, so what a step emits is the target's own token at every position whatever
++ * window it verified. At temperature 0 that is the same text at every window, to exactly the
++ * degree a speculative run matches a plain one at all: exact given the same logits, and a verify
++ * row's logits are computed at an M that now moves with the window (accept.h says what that does
++ * and does not change).
+  */
+ #pragma once
+ #include "rad_core.h"
+@@ -26,18 +49,74 @@ namespace rad {
+  * band (spec §10), so 64 is the largest window any batch can carry. */
+ enum { RAD_SCHED_MAX_SPEC = 64 };
+ 
++/* ONE SEQUENCE'S HALF OF THE ADAPTIVE POLICY: what the drafter has done on this sequence's own
++ * text, and the window that buys. It lives in the scheduler's per-request state and the controller
++ * does the arithmetic, so neither has to look the other up.
++ *
++ * `depth` 0 is "not started": the first ask fills the estimate from the prior and picks a window.
++ * It belongs to the REQUEST, not to the cache it holds -- a preemption keeps it, because the text
++ * it describes is still the text the request is writing -- and a recycled slot starts it over. */
++struct DraftAdapt {
++    int32_t  depth = 0;                       /* the window the sequence gets now; 0 = not started */
++    int32_t  held  = 0;                       /* verifies since `depth` last moved */
++    float    a[RAD_SCHED_MAX_SPEC] = {};      /* conditional acceptance at each draft position */
++    uint16_t n[RAD_SCHED_MAX_SPEC] = {};      /* verifies that evaluated each one, saturating */
++};
++
+ class DraftController {
+ public:
+     struct Params {
+         int max_depth = 0;        /* the deployment's window; 0 disables speculation entirely */
++
++        /* THE ADAPTIVE POLICY (see the top of this file), off unless RADIANCE_DRAFT_ADAPT=1 --
++         * from_env() is where the switch and the knobs below are read, once per process. With it
++         * off every field below is ignored and the depth is max_depth, as it always was. */
++        bool  adapt     = false;
++        /* T(d), what a step verifying d drafts costs, by d; any unit, only ratios are read. An
++         * entry above zero is a measured point, the rest are interpolated between the points and
++         * extrapolated past them along the nearest two. Fewer than two points is no table, and
++         * then T(d) = 1 + 0.06 d. Index 0 is unused. */
++        float cost[RAD_SCHED_MAX_SPEC + 1] = {};
++        float hyst      = 0.02f;  /* a move must buy this much more E/T than the window it leaves */
++        int   hold      = 8;      /* and come at least this many verifies after the last move */
++        float half_life = 16.0f;  /* of each position's estimate, in verifies that evaluate it */
++        float prior     = 0.8f;   /* for a position too few verifies have evaluated to say */
++        int   min_depth = 1;      /* the policy never drafts fewer */
+     };
+ 
+     int  configure(const Params& p);
+     const Params& params() const { return p_; }
+ 
+-    /* The draft depth for the next step. 0 means "do not speculate". Constant by construction. */
++    /* RADIANCE_DRAFT_ADAPT and its companions (RADIANCE_DRAFT_COST, _HYST, _HOLD, _HALFLIFE,
++     * _PRIOR, _MIN), parsed ONCE per process and copied into the adaptive fields of `p`;
++     * max_depth is left alone. Once, so that every step of a run is decided by the same rule --
++     * a pass recorded under one setting and played under another is a pass the audit fails. */
++    static void from_env(Params* p);
++
++    /* The draft depth for the next step. 0 means "do not speculate". Constant by construction:
++     * under the adaptive policy it is the CEILING, and depth_for() is the window. */
+     int  next_depth() const { return p_.max_depth; }
+ 
++    /* ---------------------------------------------------------- the adaptive policy */
++    bool adaptive() const { return adapt_; }
++    /* The window this sequence may draft into: its policy depth, starting the estimate on the
++     * first ask; max_depth when the policy is off. */
++    int  depth_for(DraftAdapt& s) const;
++    /* One verify of this sequence: `drafted` proposed, a prefix of `accepted` taken. Moves its
++     * estimate, and its depth when that clears the hysteresis. Returns the depth after. */
++    int  adapt_observe(DraftAdapt& s, int drafted, int accepted) const;
++    /* What the policy maximises, E(d) / T(d), for `s`'s estimate as it stands. For tests and logs. */
++    double gain(const DraftAdapt& s, int d) const;
++    /* The cost table as configured, T(1..max_depth). */
++    double cost(int d) const {
++        return (d >= 1 && d <= RAD_SCHED_MAX_SPEC) ? cost_[d] : 0.0;
++    }
++    /* Verifies by the window they carried, counted only under the policy: the histogram of the
++     * depths it actually chose, which the mean gauge on its own cannot show. */
++    int64_t verified_at(int d) const {
++        return (d >= 0 && d <= RAD_SCHED_MAX_SPEC) ? by_depth_[d] : 0;
++    }
++
+     /* One verify's outcome: `drafted` tokens were proposed and a prefix of `accepted` of them was
+      * taken. Feeds the reported metrics and nothing else. */
+     void observe(int drafted, int accepted);
+@@ -76,6 +155,16 @@ private:
+     int64_t reach_[RAD_SCHED_MAX_SPEC] = {};
+     int64_t hit_  [RAD_SCHED_MAX_SPEC] = {};
+     int     seen_ = 0;
++
++    /* The adaptive policy as configure() resolved it. */
++    bool    adapt_ = false;
++    double  cost_[RAD_SCHED_MAX_SPEC + 1] = {};   /* T(d), resolved for 1..max_depth */
++    double  alpha_ = 0.0;                         /* the smoothing step from half_life */
++    int64_t by_depth_[RAD_SCHED_MAX_SPEC + 1] = {};
++
++    /* The window in [min_depth, max_depth] that maximises E/T for estimate `a`, the smaller on a
++     * tie; its E/T in *best, and the E/T of window `at` in *at_gain. */
++    int     best_depth(const float* a, int at, double* best, double* at_gain) const;
+ };
+ 
+ }  /* namespace rad */
+diff --git a/core/sched/metrics.h b/core/sched/metrics.h
+index 0c01068..0b25eca 100644
+--- a/core/sched/metrics.h
++++ b/core/sched/metrics.h
+@@ -137,6 +137,13 @@ struct SchedMetrics {
+     int     draft_depth_seen = 0;
+     int64_t draft_pos_reached [RAD_METRICS_MAX_SPEC] = {};
+     int64_t draft_pos_accepted[RAD_METRICS_MAX_SPEC] = {};
++    /* THE ADAPTIVE WINDOW (RADIANCE_DRAFT_ADAPT, draft.h), all zero while it is off. The mean
++     * window it gives the sequences running now -- at one sequence, that sequence's window -- and
++     * the verifies by the window they carried, index = drafts verified, cumulative: the gauge says
++     * where the policy stands, the histogram where it has been. */
++    bool    draft_adaptive = false;
++    float   draft_depth_adaptive = 0.0f;
++    int64_t draft_verify_depth[RAD_METRICS_MAX_SPEC + 1] = {};
+ };
+ 
+ }  /* namespace rad */
+diff --git a/core/sched/scheduler.cpp b/core/sched/scheduler.cpp
+index bfd6931..27eb164 100644
+--- a/core/sched/scheduler.cpp
++++ b/core/sched/scheduler.cpp
+@@ -97,6 +97,8 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
+ 
+     DraftController::Params dp;
+     dp.max_depth = cfg.n_spec;
++    /* The adaptive window's switch and knobs, read once per process (draft.h). Off unless set. */
++    DraftController::from_env(&dp);
+     RAD_TRY(draft_.configure(dp));
+ 
+     RAD_TRY(builder_.init(prog, cfg, geo_, kvgeom_, ranks));
+@@ -178,6 +180,9 @@ int Scheduler::add_locked(std::unique_ptr<Request> r) {
+     s.card = -1;
+     s.running = false;
+     s.drafter_reset();
++    /* A NEW REQUEST'S TEXT, so a new estimate: the slot's last tenant was writing something else. */
++    s.adapt.depth = 0;
++    s.adapt.held  = 0;
+     s.sched_tokens = 0;
+     s.entry = -1;
+     s.entry_next = -1;
+@@ -221,8 +226,15 @@ int Scheduler::set_draft(uint64_t id, const int32_t* tokens, int n) {
+ 
+     /* THE NEXT STEP ALREADY VERIFIES THESE. It was planned with the count the drafter issued, and
+      * the card already put the tokens in its batch; the host copy is what that step's commit
+-     * emits the accepted ones from, so it takes exactly those, unclamped. */
++     * emits the accepted ones from, so it takes exactly those, unclamped.
++     *
++     * UNDER THE ADAPTIVE WINDOW THE DRAFTER RAN AS MANY ROUNDS AS THE DEEPEST SEQUENCE WANTED,
++     * and expect_draft() already cut this one's count to its own window -- the card verifies the
++     * FIRST draft_next of the proposals, which are these. So a longer proposal is cut to that
++     * count here, against the number the step was planned with: the window itself may have moved
++     * at the commit in between, and the planned step is what these tokens are for. */
+     if (next_open_ && s.entry_next >= 0) {
++        if (draft_.adaptive() && n > s.draft_next) n = s.draft_next;
+         if (n != s.draft_next) {
+             RAD_ERR("request %llu: %d draft(s) published for a step planned to verify %d",
+                     (unsigned long long)id, n, s.draft_next);
+@@ -244,7 +256,7 @@ int Scheduler::set_draft(uint64_t id, const int32_t* tokens, int n) {
+         return RAD_OK;
+     }
+ 
+-    int cap = draft_.next_depth();
++    int cap = draft_cap(s);
+     if (n > cap) n = cap;
+     if (n > RAD_SCHED_MAX_SPEC) n = RAD_SCHED_MAX_SPEC;
+     for (int i = 0; i < n; ++i) s.draft[i] = tokens[i];
+@@ -979,10 +991,15 @@ const RadBatch* Scheduler::step() {
+             /* THE LAST GATE, and it has to be here rather than only at set_draft, because the
+              * n-gram fallback below fills any proposal a drafter left empty -- so refusing a
+              * draft upstream and stopping there hands the request a different draft instead of
+-             * none. Request::may_speculate says why a request can be ineligible. */
++             * none. Request::may_speculate says why a request can be ineligible.
++             *
++             * AND THE CAP IS THE SEQUENCE'S OWN WINDOW, which is `depth` unless the adaptive
++             * policy is on -- then it is what this sequence's acceptance pays for, and the n-gram
++             * fallback is held to it like any other proposal. */
++            const int cap = draft_.adaptive() ? draft_.depth_for(s.adapt) : depth;
+             if (!r.may_speculate) s.n_draft = 0;
+-            else if (s.n_draft == 0) s.n_draft = (int32_t)draft_ngram(s, depth);
+-            if (s.n_draft > depth) s.n_draft = depth;
++            else if (s.n_draft == 0) s.n_draft = (int32_t)draft_ngram(s, cap);
++            if (s.n_draft > cap) s.n_draft = cap;
+             /* NO VERIFIED POSITION AT OR PAST THE CONTEXT. The step computes positions n_computed
+              * .. n_computed + n_draft, and nothing past ctx_limit_ - 1 has a rotary row or a
+              * block-table column. commit() finishes a sequence before its length reaches the
+@@ -1325,7 +1342,15 @@ void Scheduler::expect_draft(uint64_t id, int n) {
+     std::lock_guard<std::mutex> lk(mu_);
+     auto it = by_id_.find(id);
+     if (it == by_id_.end()) return;
+-    reqs_[(size_t)it->second]->draft_next = n > 0 ? n : 0;
++    SchedReq& s = *reqs_[(size_t)it->second];
++    /* UNDER THE ADAPTIVE WINDOW THE ROUNDS RAN FOR THE DEEPEST SEQUENCE, and this one verifies the
++     * first of them up to its own window -- the cap serial_begin sized the rounds from, unchanged
++     * since, because nothing commits between the two. */
++    if (draft_.adaptive() && n > 0) {
++        const int cap = draft_.depth_for(s.adapt);
++        if (n > cap) n = cap;
++    }
++    s.draft_next = n > 0 ? n : 0;
+ }
+ 
+ const RadBatch* Scheduler::step_next() {
+@@ -1566,6 +1591,24 @@ int Scheduler::commit(const StepResult& res) {
+ 
+             if (e.n_spec > 0) {
+                 draft_.observe(e.n_spec, a);
++                /* AND THIS SEQUENCE'S OWN ESTIMATE, from the same outcome, under the adaptive
++                 * window. A move takes effect at the next draft: this step's drafter has already
++                 * run, sized from the estimate as it stood before this commit. */
++                if (draft_.adaptive()) {
++                    const int was = s.adapt.depth;
++                    const int now = draft_.adapt_observe(s.adapt, e.n_spec, a);
++                    if (now != was && was > 0 && (int)log_level() >= (int)Log::Debug) {
++                        char est[8 * RAD_SCHED_MAX_SPEC];
++                        int o = 0;
++                        for (int j = 0; j < draft_.next_depth() && o < (int)sizeof est - 8; ++j)
++                            o += std::snprintf(est + o, sizeof est - (size_t)o, "%s%.2f",
++                                               j ? " " : "", (double)s.adapt.a[j]);
++                        est[o] = 0;
++                        RAD_DEBUG("draft window: request %llu %d -> %d (E/T %.4f -> %.4f; "
++                                  "acceptance by position %s)", (unsigned long long)r.id, was,
++                                  now, draft_.gain(s.adapt, was), draft_.gain(s.adapt, now), est);
++                    }
++                }
+                 m_.draft_tokens += e.n_spec;
+                 m_.draft_accepted += a;
+                 server::sink_drafts(r.sink, e.n_spec, a);
+@@ -1725,6 +1768,27 @@ int Scheduler::serial_begin(int* rounds, SerialRow* out, int max) {
+     if (depth > 0 && *rounds > depth) *rounds = depth;
+     if (*rounds > RAD_SCHED_MAX_SPEC) *rounds = RAD_SCHED_MAX_SPEC;
+ 
++    /* UNDER THE ADAPTIVE WINDOW, NO MORE ROUNDS THAN THE DEEPEST SEQUENCE WANTS. A round is one
++     * pass of the head over every drafting row, so the step runs as many as its deepest window,
++     * and a sequence that wants fewer verifies the first of them (expect_draft, set_draft); a
++     * round past the deepest window is a pass whose proposal nobody verifies. Only a row that will
++     * draft and be given its drafts counts. When no row does, the rounds stay as they are: round 0
++     * is the history pass, and that still has to run. The reservation below is then made for the
++     * rounds that will actually run, which is what it is for. */
++    if (may_draft && draft_.adaptive()) {
++        int want = 0;
++        for (const StepEntry& e : plan_.e) {
++            if (!e.produces_token || e.slot < 0 || (size_t)e.slot >= reqs_.size()) continue;
++            SchedReq& s = *reqs_[(size_t)e.slot];
++            if (!s.req || s.req->state != ReqState::Running || !s.running ||
++                !s.req->may_speculate)
++                continue;
++            const int c = draft_.depth_for(s.adapt);
++            if (c > want) want = c;
++        }
++        if (want > 0 && *rounds > want) *rounds = want;
++    }
++
+     int n_draft_rows = 0;
+     int64_t cu = 0;                     /* this entry's first token in the step just run */
+     for (size_t i = 0; i < plan_.e.size(); ++i) {
+@@ -2278,6 +2342,19 @@ SchedMetrics Scheduler::metrics_locked() const {
+         m.draft_pos_reached [j] = draft_.reached(j);
+         m.draft_pos_accepted[j] = draft_.hits(j);
+     }
++    if (draft_.adaptive()) {
++        m.draft_adaptive = true;
++        /* Over the running sequences whose estimate has started; one that has not drafted yet
++         * has no window to report. */
++        int64_t sum = 0, n = 0;
++        for (int32_t slot : running_) {
++            const SchedReq& s = *reqs_[(size_t)slot];
++            if (s.adapt.depth > 0) { sum += s.adapt.depth; ++n; }
++        }
++        m.draft_depth_adaptive = n ? (float)((double)sum / (double)n) : 0.0f;
++        const int kDepth = (int)(sizeof m.draft_verify_depth / sizeof m.draft_verify_depth[0]);
++        for (int d = 0; d < kDepth; ++d) m.draft_verify_depth[d] = draft_.verified_at(d);
++    }
+     return m;
+ }
+ 
+diff --git a/core/sched/scheduler.h b/core/sched/scheduler.h
+index 42f73b3..dcb740f 100644
+--- a/core/sched/scheduler.h
++++ b/core/sched/scheduler.h
+@@ -109,6 +109,12 @@ struct SchedReq {
+         draft_hi     = 0;
+     }
+ 
++    /* THE ADAPTIVE DRAFT WINDOW'S ESTIMATE FOR THIS REQUEST (RADIANCE_DRAFT_ADAPT, draft.h), and
++     * deliberately NOT in drafter_reset(): it describes the text the request is writing, which a
++     * preemption does not change, rather than any cache the request holds. A recycled slot starts
++     * it over in add_locked. Untouched while the policy is off. */
++    DraftAdapt adapt;
++
+     int32_t  sched_tokens = 0;   /* tokens given to this request in the current step */
+     int32_t  entry = -1;         /* its index in the current StepPlan, or -1 */
+     /* Its index in the NEXT step, already issued while this one runs (step_next), or -1; and the
+@@ -280,7 +286,8 @@ public:
+      * the one that is stuck. Returns how many were written. */
+     int requests(ReqStat* out, int max) const;
+ 
+-    /* The drafter's proposal for a request's next step. n is clamped to the controller's depth. */
++    /* The drafter's proposal for a request's next step. n is clamped to the sequence's window
++     * (draft_cap): the controller's depth, or what the adaptive policy gives the sequence. */
+     int      set_draft(uint64_t id, const int32_t* tokens, int n);
+ 
+     /* ---------------------------------------------------------- media the encoder owes
+@@ -318,7 +325,8 @@ public:
+      * from one to the other.
+      *
+      *   expect_draft   after the drafter is issued: how many drafts it proposes for a sequence,
+-     *               which is how many the next step verifies.
++     *               which is how many the next step verifies -- capped at the sequence's window,
++     *               which under the adaptive policy can be fewer than the rounds that ran.
+      *   step_next      plans and builds that step: every row of this one, as a device row, at
+      *               the furthest context it can reach. Null -- and the engine plans with step()
+      *               after this one commits -- whenever the step needs a decision only a
+@@ -491,6 +499,15 @@ private:
+         return hit_holes_draft_ ? ctx_len : 0;
+     }
+ 
++    /* THE WINDOW A SEQUENCE MAY DRAFT INTO: the configured depth, or under RADIANCE_DRAFT_ADAPT
++     * the one its own acceptance pays for (DraftController::depth_for, which starts the estimate
++     * on the first ask). It is the rule every site that caps a proposal applies -- step(),
++     * set_draft(), expect_draft() and the rounds in serial_begin() -- and with the policy off it
++     * is next_depth(), exactly as before. */
++    int draft_cap(SchedReq& s) const {
++        return draft_.adaptive() ? draft_.depth_for(s.adapt) : draft_.next_depth();
++    }
++
+     /* The built-in prompt-lookup drafter (scheduler.cpp). Fills s.draft and returns how many
+      * tokens it proposed; 0 when the sequence has no repeated pattern to extend. The pattern
+      * lengths it tries, longest first. */
+diff --git a/core/server/adapters.h b/core/server/adapters.h
+index ba49902..284b38f 100644
+--- a/core/server/adapters.h
++++ b/core/server/adapters.h
+@@ -280,6 +280,13 @@ public:
+             o.draft_pos_reached [j] = m.draft_pos_reached [j];
+             o.draft_pos_accepted[j] = m.draft_pos_accepted[j];
+         }
++        o.draft_adaptive = m.draft_adaptive;
++        o.draft_depth_adaptive = m.draft_depth_adaptive;
++        {
++            const int ka = (int)(sizeof m.draft_verify_depth / sizeof m.draft_verify_depth[0]);
++            const int kb = (int)(sizeof o.draft_verify_depth / sizeof o.draft_verify_depth[0]);
++            for (int d = 0; d < ka && d < kb; ++d) o.draft_verify_depth[d] = m.draft_verify_depth[d];
++        }
+         o.preemptions = m.preemptions;
+         o.total_requests = m.admitted;
+         o.steps = m.steps;
+diff --git a/core/server/iface.h b/core/server/iface.h
+index 816e059..a5e4b3d 100644
+--- a/core/server/iface.h
++++ b/core/server/iface.h
+@@ -114,6 +114,11 @@ struct SchedMetrics {
+     int     draft_depth_seen = 0;
+     int64_t draft_pos_reached [MAX_DRAFT_POS] = {};
+     int64_t draft_pos_accepted[MAX_DRAFT_POS] = {};
++    /* THE ADAPTIVE DRAFT WINDOW (RADIANCE_DRAFT_ADAPT), all zero while it is off: the mean window
++     * of the running sequences, and the verifies by the window they carried (index = drafts). */
++    bool    draft_adaptive = false;
++    double  draft_depth_adaptive = 0.0;
++    int64_t draft_verify_depth[MAX_DRAFT_POS + 1] = {};
+     int64_t preemptions = 0;
+     int64_t total_requests = 0;
+     /* ENGINE STEPS. One forward pass of the model plus whatever draft rounds followed it, which
+diff --git a/core/server/metrics.cpp b/core/server/metrics.cpp
+index 80b50e2..4201ed1 100644
+--- a/core/server/metrics.cpp
++++ b/core/server/metrics.cpp
+@@ -145,6 +145,17 @@ void Metrics::sample(const SchedMetrics& m) {
+     /* Published after the gauges it bounds, so a concurrent render never lists a position whose
+      * gauge has not been written yet. */
+     draft_pos_seen_.store(seen, std::memory_order_release);
++    if (m.draft_adaptive) {
++        g_draft_depth_adapt_.set(m.draft_depth_adaptive);
++        int top = 0;
++        for (int d = 1; d <= (int)MAX_DRAFT_POS; ++d) {
++            g_draft_vdepth_[d].set((double)m.draft_verify_depth[d]);
++            if (m.draft_verify_depth[d] > 0) top = d;
++        }
++        /* After the gauges, for the reason above. */
++        draft_vdepth_top_.store(top, std::memory_order_release);
++        draft_adapt_on_.store(true, std::memory_order_release);
++    }
+     c_preemptions_.inc(std::max(0.0, (double)m.preemptions - c_preemptions_.get()));
+     c_steps_.inc(std::max(0.0, (double)m.steps - c_steps_.get()));
+     c_steps_prefill_.inc(std::max(0.0, (double)m.steps_prefill - c_steps_prefill_.get()));
+@@ -398,6 +409,24 @@ std::string Metrics::render() const {
+             w.out += "radiance:draft_position_reached_total" + base + ",position=\"" +
+                      std::to_string(j) + "\"} " + num(g_draft_pos_reached_[j].get()) + '\n';
+     }
++    /* THE ADAPTIVE DRAFT WINDOW, only while RADIANCE_DRAFT_ADAPT is on: where the policy stands --
++     * at one sequence, that sequence's window -- and where it has been, as verifies by the
++     * number of drafts they carried. */
++    if (draft_adapt_on_.load(std::memory_order_acquire)) {
++        w.gauge("radiance:draft_depth_adaptive",
++                "Mean draft window the adaptive policy gives the running sequences.",
++                L, g_draft_depth_adapt_.get());
++        const int top = draft_vdepth_top_.load(std::memory_order_acquire);
++        if (top > 0) {
++            const std::string base = L.substr(0, L.size() - 1);
++            w.help("radiance:draft_verify_depth_total",
++                   "Verifies by the number of drafts they carried, under the adaptive window.",
++                   "counter");
++            for (int d = 1; d <= top; ++d)
++                w.out += "radiance:draft_verify_depth_total" + base + ",depth=\"" +
++                         std::to_string(d) + "\"} " + num(g_draft_vdepth_[d].get()) + '\n';
++        }
++    }
+     w.gauge("radiance:num_requests_preempted",
+             "Requests currently preempted and awaiting recompute.", L, g_preempted_.get());
+     w.gauge("radiance:http_queue_depth",
+diff --git a/core/server/metrics.h b/core/server/metrics.h
+index 756aac0..ac29760 100644
+--- a/core/server/metrics.h
++++ b/core/server/metrics.h
+@@ -122,6 +122,13 @@ private:
+     Gauge   g_draft_pos_[MAX_DRAFT_POS];
+     Gauge   g_draft_pos_reached_[MAX_DRAFT_POS];
+     std::atomic<int> draft_pos_seen_{0};
++    /* THE ADAPTIVE DRAFT WINDOW (RADIANCE_DRAFT_ADAPT): the mean window of the running sequences,
++     * and the verifies by the window they carried, index = drafts. Rendered only while the policy
++     * is on, so a deployment without it exposes exactly what it always did. */
++    Gauge   g_draft_depth_adapt_;
++    Gauge   g_draft_vdepth_[MAX_DRAFT_POS + 1];
++    std::atomic<bool> draft_adapt_on_{false};
++    std::atomic<int>  draft_vdepth_top_{0};   /* the deepest window with a verify counted */
+ 
+     /* sample() turns the scheduler's cumulative totals into counter increments by reading each
+      * counter and adding the difference. Two scrapes doing that at once both read the old value
+diff --git a/tests/sched_test.cpp b/tests/sched_test.cpp
+index 6252f4a..c183353 100644
+--- a/tests/sched_test.cpp
++++ b/tests/sched_test.cpp
+@@ -1570,6 +1570,303 @@ TEST(the_draft_depth_is_the_configured_one_whatever_the_acceptance_trace) {
+     CHECK_EQ(d3.next_depth(), 0);
+ }
+ 
++/* ------------------------------------------------------------------ the adaptive window
++ * RADIANCE_DRAFT_ADAPT (draft.h). The switch is read from the environment once per process, so
++ * these cases turn the policy on through Params instead -- the controller cannot tell the two
++ * apart, and the tests do not depend on what the suite was started with. */
++
++/* A small deterministic coin, the one the static case above uses. */
++namespace {
++struct Coin {
++    uint64_t s = 12345;
++    bool operator()(double pr) {
++        s = s * 6364136223846793005ull + 1442695040888963407ull;
++        return ((double)((s >> 33) & 0xFFFFFF) / (double)0x1000000) < pr;
++    }
++};
++}  /* namespace */
++
++TEST(the_adaptive_window_follows_each_sequences_own_acceptance) {
++    DraftController c;
++    DraftController::Params p;
++    p.max_depth = 6;
++    p.adapt = true;
++    CHECK_OK(c.configure(p));
++    CHECK(c.adaptive());
++    CHECK_EQ(c.next_depth(), 6);                 /* the ceiling is still the flag */
++
++    /* Nothing measured yet: both start from the prior, which on the default cost wants it all. */
++    DraftAdapt code, summary;
++    CHECK_EQ(c.depth_for(code), 6);
++    CHECK_EQ(c.depth_for(summary), 6);
++
++    /* Two texts through one controller. The drafter almost always agrees on one; on the other it
++     * agrees at the first position and rarely after it. Each window follows its own text. */
++    Coin coin;
++    for (int t = 0; t < 600; ++t) {
++        int d = c.depth_for(code), a = 0;
++        while (a < d && coin(0.95)) ++a;
++        c.observe(d, a);
++        c.adapt_observe(code, d, a);
++
++        d = c.depth_for(summary);
++        a = 0;
++        while (a < d && coin(a == 0 ? 0.6 : 0.2)) ++a;
++        c.observe(d, a);
++        c.adapt_observe(summary, d, a);
++    }
++    CHECK_EQ(c.depth_for(code), 6);
++    CHECK(c.depth_for(summary) >= 1);
++    CHECK(c.depth_for(summary) <= 2);
++    CHECK(code.a[0] > 0.85f);
++    CHECK_NEAR(summary.a[0], 0.6, 0.2);
++    /* The estimate is the conditional rate, and the global hazard is still counted. */
++    CHECK(c.reached(0) == 1200);
++    /* The windows the verifies carried are counted while the policy is on: 6 throughout for one,
++     * and 6 until the other moved off it. */
++    CHECK(c.verified_at(6) >= 600);
++    CHECK(c.verified_at(1) + c.verified_at(2) > 0);
++    CHECK_EQ(c.verified_at(1) + c.verified_at(2) + c.verified_at(3) + c.verified_at(4) +
++             c.verified_at(5) + c.verified_at(6), (int64_t)1200);
++
++    /* And a window that went shallow comes back when the text changes: the positions it stopped
++     * drafting drift toward the deepest it still drafts, so a text the drafter predicts again is
++     * found without anyone drafting deep first. */
++    for (int t = 0; t < 600; ++t) {
++        const int d = c.depth_for(summary);
++        int a = 0;
++        while (a < d && coin(0.95)) ++a;
++        c.adapt_observe(summary, d, a);
++    }
++    CHECK_EQ(c.depth_for(summary), 6);
++}
++
++/* A MOVE IS RATE-LIMITED: not within `hold` verifies of the last one, and only for a window worth
++ * `hyst` more than the one it leaves. A window that followed every flicker of its estimate would
++ * re-record its passes for nothing (runtime/ctx.h). */
++TEST(the_adaptive_window_moves_only_past_its_hold_and_its_hysteresis) {
++    DraftController c;
++    DraftController::Params p;
++    p.max_depth = 6;
++    p.adapt = true;
++    p.hold = 50;
++    CHECK_OK(c.configure(p));
++    DraftAdapt s;
++    CHECK_EQ(c.depth_for(s), 6);
++    for (int t = 0; t < 49; ++t) CHECK_EQ(c.adapt_observe(s, 6, 0), 6);   /* held */
++    CHECK(c.adapt_observe(s, 6, 0) < 6);                                    /* the 50th moves */
++
++    /* The same trace with a hysteresis no estimate can clear never moves at all. */
++    DraftController h;
++    p.hold = 0;
++    p.hyst = 1000.0f;
++    CHECK_OK(h.configure(p));
++    DraftAdapt u;
++    CHECK_EQ(h.depth_for(u), 6);
++    for (int t = 0; t < 200; ++t) h.adapt_observe(u, 6, 0);
++    CHECK_EQ(u.depth, 6);
++
++    /* The floor holds whatever the estimate says. */
++    DraftController m;
++    p.hyst = 0.0f;
++    p.min_depth = 2;
++    CHECK_OK(m.configure(p));
++    DraftAdapt v;
++    for (int t = 0; t < 200; ++t) m.adapt_observe(v, m.depth_for(v), 0);
++    CHECK_EQ(m.depth_for(v), 2);
++
++    /* Off, the window is the flag and an observation is not taken. */
++    DraftController off;
++    DraftController::Params q;
++    q.max_depth = 5;
++    CHECK_OK(off.configure(q));
++    CHECK(!off.adaptive());
++    DraftAdapt w;
++    CHECK_EQ(off.depth_for(w), 5);
++    CHECK_EQ(off.adapt_observe(w, 5, 0), 5);
++    CHECK_EQ(w.depth, 0);
++    off.observe(5, 2);
++    CHECK_EQ(off.verified_at(5), (int64_t)0);
++
++    /* Nonsense knobs are refused rather than run. */
++    DraftController bad;
++    DraftController::Params r;
++    r.max_depth = 4;
++    r.adapt = true;
++    r.half_life = 0.0f;
++    CHECK(bad.configure(r) < 0);
++}
++
++/* THE COST TABLE: measured points as they are, lines between them, the nearest two past the ends;
++ * and with fewer than two points, the default 1 + 0.06 d. A dear depth is a shallower window at
++ * the same estimate. */
++TEST(the_adaptive_window_prices_a_step_from_the_cost_table) {
++    DraftController c;
++    DraftController::Params p;
++    p.max_depth = 6;
++    p.adapt = true;
++    p.cost[2] = 11.3f;
++    p.cost[3] = 12.0f;
++    CHECK_OK(c.configure(p));
++    CHECK_NEAR(c.cost(2), 11.3, 1e-4);
++    CHECK_NEAR(c.cost(3), 12.0, 1e-4);
++    CHECK_NEAR(c.cost(1), 10.6, 1e-4);                 /* extrapolated below */
++    CHECK_NEAR(c.cost(6), 14.1, 1e-4);                 /* and above */
++
++    DraftController d;
++    DraftController::Params q;
++    q.max_depth = 6;
++    q.adapt = true;
++    q.cost[1] = 1.0f;
++    q.cost[2] = 10.0f;                                 /* a second draft costs nine times the first */
++    CHECK_OK(d.configure(q));
++    DraftAdapt s;
++    CHECK_EQ(d.depth_for(s), 1);
++
++    DraftController e;
++    DraftController::Params r;
++    r.max_depth = 4;
++    r.adapt = true;
++    r.cost[3] = 5.0f;                                  /* one point is no table */
++    CHECK_OK(e.configure(r));
++    CHECK_NEAR(e.cost(1), 1.06, 1e-9);
++    CHECK_NEAR(e.cost(4), 1.24, 1e-9);
++
++    /* A table whose line runs below zero is the wrong sign, and the default is used. */
++    DraftController g;
++    DraftController::Params t;
++    t.max_depth = 6;
++    t.adapt = true;
++    t.cost[1] = 10.0f;
++    t.cost[2] = 4.0f;
++    CHECK_OK(g.configure(t));
++    CHECK_NEAR(g.cost(6), 1.36, 1e-9);
++}
++
++/* THE SCHEDULER'S HALF: the cap on a proposal, and the rounds the head runs. One sequence whose
++ * prior pays for two drafts of a ceiling of four verifies two, and the head runs two rounds. */
++TEST(the_adaptive_window_caps_the_proposal_and_the_rounds) {
++    Fixture f;
++    f.build(/*blocks=*/4096, /*states=*/64);
++    f.cfg.n_spec = 4;
++    CHECK_OK(f.start());
++    DraftController::Params p;
++    p.max_depth = 4;
++    p.adapt = true;
++    p.prior = 0.3f;                                    /* on the default cost: two */
++    CHECK_OK(f.sch.draft().configure(p));
++
++    const uint64_t a = f.submit(160, 64);
++    CHECK(f.sch.step() != nullptr);
++    f.commit_plain(11);
++
++    int32_t draft[4] = { 21, 22, 23, 24 };
++    CHECK_OK(f.sch.set_draft(a, draft, 4));
++    CHECK_EQ(f.sch.find(a)->n_draft, 2);
++    const RadBatch* b = f.sch.step();
++    REQUIRE(b != nullptr);
++    CHECK_EQ(b->n_spec, 2);
++    CHECK_EQ(b->n_tok, 3);
++    CHECK_EQ(f.sch.plan().e[0].n_spec, 2);
++
++    int rounds = 4;
++    Scheduler::SerialRow rows[4];
++    CHECK_EQ(f.sch.serial_begin(&rounds, rows, 4), 1);
++    CHECK_EQ(rounds, 2);
++    const RadBatch* hb = f.sch.serial_batch(0, 1);
++    REQUIRE(hb != nullptr);
++    CHECK_EQ(hb->n_tok, 3);                            /* every verified position, as ever */
++    CHECK(f.sch.serial_batch(2, 1) != nullptr);
++    f.sch.serial_end(2);
++
++    const SchedMetrics m = f.sch.metrics();
++    CHECK(m.draft_adaptive);
++    CHECK_NEAR(m.draft_depth_adaptive, 2.0, 1e-6);
++    CHECK_EQ(m.draft_depth, 4);                        /* the ceiling, as before */
++}
++
++/* EACH SEQUENCE ITS OWN WINDOW, AND THE ROUNDS FOLLOW THE DEEPEST. The step issued ahead of a
++ * commit verifies, for each sequence, the first of those rounds up to its own window -- and the
++ * drafter's longer proposal is taken cut to that count rather than refused as a mismatch. */
++TEST(the_adaptive_window_is_per_sequence_and_the_rounds_follow_the_deepest) {
++    Fixture f;
++    f.build(/*blocks=*/4096, /*states=*/64);
++    f.cfg.n_spec = 4;
++    CHECK_OK(f.start());
++    DraftController::Params p;
++    p.max_depth = 4;
++    p.adapt = true;
++    p.hold = 0;
++    p.hyst = 0.0f;
++    CHECK_OK(f.sch.draft().configure(p));
++
++    const uint64_t a = f.submit(160, 2000);
++    const uint64_t b = f.submit(160, 2000);
++    CHECK(f.sch.step() != nullptr);
++    f.commit_plain(11);
++
++    /* `a`'s drafts are never taken and `b`'s always are. */
++    int32_t draft[4] = { 21, 22, 23, 24 };
++    auto commit_ab = [&]() {
++        const StepPlan& pl = f.sch.plan();
++        std::vector<int32_t> acc(pl.e.size(), 0), tok(pl.e.size(), 9);
++        std::vector<uint8_t> eos(pl.e.size(), 0);
++        for (size_t i = 0; i < pl.e.size(); ++i) acc[i] = pl.e[i].seq == b ? pl.e[i].n_spec : 0;
++        Scheduler::StepResult r;
++        r.n_seq = (int)pl.e.size();
++        r.n_accepted = acc.data();
++        r.token = tok.data();
++        r.eos = eos.data();
++        CHECK_OK(f.sch.commit(r));
++    };
++    for (int t = 0; t < 64; ++t) {
++        CHECK_OK(f.sch.set_draft(a, draft, 4));
++        CHECK_OK(f.sch.set_draft(b, draft, 4));
++        REQUIRE(f.sch.step() != nullptr);
++        commit_ab();
++    }
++
++    CHECK_OK(f.sch.set_draft(a, draft, 4));
++    CHECK_OK(f.sch.set_draft(b, draft, 4));
++    const RadBatch* s = f.sch.step();
++    REQUIRE(s != nullptr);
++    CHECK_EQ(s->n_spec, 4);
++    CHECK_EQ(s->n_tok, 2 + 5);
++    for (const StepEntry& e : f.sch.plan().e) CHECK_EQ(e.n_spec, e.seq == a ? 1 : 4);
++    CHECK_NEAR(f.sch.metrics().draft_depth_adaptive, 2.5, 1e-6);
++
++    /* The head runs for the deepest. */
++    int rounds = 4;
++    Scheduler::SerialRow rows[4];
++    CHECK_EQ(f.sch.serial_begin(&rounds, rows, 4), 2);
++    CHECK_EQ(rounds, 4);
++    REQUIRE(f.sch.serial_batch(0, 1) != nullptr);
++    for (int rd = 2; rd <= rounds; ++rd) REQUIRE(f.sch.serial_batch(rd, 1) != nullptr);
++
++    /* The step issued ahead: `a` verifies one of the four rounds, `b` all four. */
++    f.sch.find(a)->speculation_fixed = true;
++    f.sch.find(b)->speculation_fixed = true;
++    f.sch.expect_draft(a, rounds);
++    f.sch.expect_draft(b, rounds);
++    const RadBatch* nb = f.sch.step_next();
++    REQUIRE(nb != nullptr);
++    CHECK_EQ(nb->n_spec, 4);
++    CHECK_EQ(nb->n_tok, 2 + 5);
++
++    /* Its commit, the watermark, and the proposals published for the step already on the card:
++     * four rounds' worth to both, and each keeps what its step was planned to verify. */
++    commit_ab();
++    f.sch.serial_end(rounds);
++    CHECK_OK(f.sch.set_draft(a, draft, rounds));
++    CHECK_OK(f.sch.set_draft(b, draft, rounds));
++    CHECK_EQ(f.sch.find(a)->n_draft, 1);
++    CHECK_EQ(f.sch.find(b)->n_draft, 4);
++    f.sch.promote_next();
++    for (const StepEntry& e : f.sch.plan().e) CHECK_EQ(e.n_spec, e.seq == a ? 1 : 4);
++    CHECK(f.sch.metrics().draft_verify_depth[1] > 0);
++    CHECK(f.sch.metrics().draft_verify_depth[4] > 0);
++}
++
+ /* ================================================================== the step path */
+ TEST(the_step_path_does_not_allocate) {
+     Fixture f;
+diff --git a/tests/server_test.cpp b/tests/server_test.cpp
+index 7537259..5a572b0 100644
+--- a/tests/server_test.cpp
++++ b/tests/server_test.cpp
+@@ -2308,6 +2308,38 @@ TEST(concurrent_scrapes_count_each_total_once) {
+     CHECK_EQ(value("radiance:prefill_tokens_total"), 5000.0);
+ }
+ 
++/* THE ADAPTIVE DRAFT WINDOW (RADIANCE_DRAFT_ADAPT) IS EXPOSED ONLY WHILE IT IS ON, so a deployment
++ * without it scrapes exactly what it always did -- and when it is on, the gauge and the histogram
++ * are well-formed families with the labels every other sample carries. */
++TEST(the_adaptive_draft_window_is_exposed_only_while_it_is_on) {
++    Metrics m("m", 1024);
++    server::SchedMetrics s;
++    m.sample(s);
++    std::string body = m.render();
++    CHECK(body.find("radiance:draft_depth_adaptive") == std::string::npos);
++    CHECK(body.find("radiance:draft_verify_depth_total") == std::string::npos);
++
++    s.draft_adaptive = true;
++    s.draft_depth_adaptive = 2.5;
++    s.draft_verify_depth[2] = 7;
++    s.draft_verify_depth[5] = 3;
++    m.sample(s);
++    PromDoc d = parse_prom(m.render());
++    CHECK_EQ((int)d.errors.size(), 0);
++    CHECK_EQ(d.type["radiance:draft_depth_adaptive"], std::string("gauge"));
++    CHECK_EQ(d.type["radiance:draft_verify_depth_total"], std::string("counter"));
++    auto value = [&d](const std::string& name) {
++        auto it = d.samples.find(name);
++        return it == d.samples.end() ? -1.0 : it->second;
++    };
++    const std::string L = "{model_name=\"m\",engine=\"0\"";
++    CHECK_NEAR(value("radiance:draft_depth_adaptive" + L + "}"), 2.5, 1e-9);
++    CHECK_NEAR(value("radiance:draft_verify_depth_total" + L + ",depth=\"1\"}"), 0.0, 1e-9);
++    CHECK_NEAR(value("radiance:draft_verify_depth_total" + L + ",depth=\"2\"}"), 7.0, 1e-9);
++    CHECK_NEAR(value("radiance:draft_verify_depth_total" + L + ",depth=\"5\"}"), 3.0, 1e-9);
++    CHECK_NEAR(value("radiance:draft_verify_depth_total" + L + ",depth=\"6\"}"), -1.0, 1e-9);
++}
++
+ TEST(models_and_health_answer) {
+     Fixture f;
+     HttpResponse r = f.get("/v1/models");
+-- 
+2.55.0
+
+
+From d229d24f97b2e5078239a0a000a3b92e1183a638 Mon Sep 17 00:00:00 2001
+From: keptn42 <keptn42@noreply.codeberg.org>
+Date: Mon, 5 Oct 2026 22:40:14 +0000
+Subject: [PATCH 2/6] draft: cap every adaptive window under load
+ (RADIANCE_DRAFT_ADAPT_BUSY)
+
+The cost table prices a step at one sequence. Under load every row a step
+adds is expert bandwidth its neighbours wait on, and the adaptive window
+lost 4 % at 8 concurrent requests. With RADIANCE_DRAFT_ADAPT_BUSY=N and
+more than N sequences running, every window is capped at
+RADIANCE_DRAFT_ADAPT_BUSY_DEPTH (default 3); the estimates keep learning.
+The count is taken once a cycle and held to its end, so the plan, the
+rounds, expect_draft and set_draft see one cap. Unset, nothing changes.
+---
+ core/sched/draft.cpp     |  17 +++--
+ core/sched/draft.h       |  14 +++-
+ core/sched/scheduler.cpp |  30 ++++++--
+ core/sched/scheduler.h   |  23 +++++--
+ tests/sched_test.cpp     | 145 +++++++++++++++++++++++++++++++++++++++
+ 5 files changed, 215 insertions(+), 14 deletions(-)
+
+diff --git a/core/sched/draft.cpp b/core/sched/draft.cpp
+index 3b3eef4..34ac12f 100644
+--- a/core/sched/draft.cpp
++++ b/core/sched/draft.cpp
+@@ -103,6 +103,8 @@ void DraftController::from_env(Params* p) {
+         env_real("RADIANCE_DRAFT_ADAPT_HALFLIFE", 0.5, 1e6, &e.half_life);
+         env_real("RADIANCE_DRAFT_ADAPT_PRIOR", 0.0, 1.0, &e.prior);
+         env_int ("RADIANCE_DRAFT_ADAPT_MIN", 1, RAD_SCHED_MAX_SPEC, &e.min_depth);
++        env_int ("RADIANCE_DRAFT_ADAPT_BUSY", 0, 1000000, &e.busy);
++        env_int ("RADIANCE_DRAFT_ADAPT_BUSY_DEPTH", 1, RAD_SCHED_MAX_SPEC, &e.busy_depth);
+         return e;
+     }();
+     p->adapt     = env.adapt;
+@@ -112,6 +114,8 @@ void DraftController::from_env(Params* p) {
+     p->half_life = env.half_life;
+     p->prior     = env.prior;
+     p->min_depth = env.min_depth;
++    p->busy       = env.busy;
++    p->busy_depth = env.busy_depth;
+ }
+ 
+ int DraftController::configure(const Params& p) {
+@@ -121,10 +125,12 @@ int DraftController::configure(const Params& p) {
+         return RAD_E_INVAL;
+     }
+     if (p.adapt && (!(p.hyst >= 0.0f) || p.hold < 0 || !(p.half_life > 0.0f) ||
+-                    !(p.prior >= 0.0f && p.prior <= 1.0f) || p.min_depth < 1)) {
+-        RAD_ERR("adaptive draft depth: hysteresis %g, hold %d, half-life %g, prior %g, minimum %d "
+-                "-- they want >= 0, >= 0, > 0, 0..1 and >= 1", (double)p.hyst, p.hold,
+-                (double)p.half_life, (double)p.prior, p.min_depth);
++                    !(p.prior >= 0.0f && p.prior <= 1.0f) || p.min_depth < 1 || p.busy < 0 ||
++                    p.busy_depth < 1)) {
++        RAD_ERR("adaptive draft depth: hysteresis %g, hold %d, half-life %g, prior %g, minimum %d, "
++                "busy %d, busy depth %d -- they want >= 0, >= 0, > 0, 0..1, >= 1, >= 0 and >= 1",
++                (double)p.hyst, p.hold, (double)p.half_life, (double)p.prior, p.min_depth, p.busy,
++                p.busy_depth);
+         return RAD_E_INVAL;
+     }
+     p_ = p;
+@@ -180,6 +186,9 @@ int DraftController::configure(const Params& p) {
+              "acceptance half-life %.1f verifies, prior %.2f",
+              p_.min_depth, p_.max_depth, t.c_str(), table ? "" : " (the default model)",
+              100.0 * (double)p_.hyst, p_.hold, (double)p_.half_life, (double)p_.prior);
++    if (p_.busy > 0)
++        RAD_INFO("draft depth: above %d running sequences every window is capped at %d "
++                 "(RADIANCE_DRAFT_ADAPT_BUSY)", p_.busy, p_.busy_depth);
+     return RAD_OK;
+ }
+ 
+diff --git a/core/sched/draft.h b/core/sched/draft.h
+index cb77758..c2e8777 100644
+--- a/core/sched/draft.h
++++ b/core/sched/draft.h
+@@ -82,13 +82,20 @@ public:
+         float half_life = 16.0f;  /* of each position's estimate, in verifies that evaluate it */
+         float prior     = 0.8f;   /* for a position too few verifies have evaluated to say */
+         int   min_depth = 1;      /* the policy never drafts fewer */
++        /* THE LOAD CAP. The cost table is a step's cost at ONE sequence, and a deeper window costs
++         * more under load than it says -- every row a step adds is expert bandwidth all its
++         * neighbours wait on. So with more than `busy` sequences running, every window is capped
++         * at `busy_depth`; the estimates go on learning underneath and the windows come back when
++         * the load does. 0 is no cap. */
++        int   busy       = 0;
++        int   busy_depth = 3;
+     };
+ 
+     int  configure(const Params& p);
+     const Params& params() const { return p_; }
+ 
+     /* RADIANCE_DRAFT_ADAPT and its companions (RADIANCE_DRAFT_COST, _HYST, _HOLD, _HALFLIFE,
+-     * _PRIOR, _MIN), parsed ONCE per process and copied into the adaptive fields of `p`;
++     * _PRIOR, _MIN, _BUSY, _BUSY_DEPTH), parsed ONCE per process and copied into the adaptive fields of `p`;
+      * max_depth is left alone. Once, so that every step of a run is decided by the same rule --
+      * a pass recorded under one setting and played under another is a pass the audit fails. */
+     static void from_env(Params* p);
+@@ -105,6 +112,11 @@ public:
+     /* One verify of this sequence: `drafted` proposed, a prefix of `accepted` taken. Moves its
+      * estimate, and its depth when that clears the hysteresis. Returns the depth after. */
+     int  adapt_observe(DraftAdapt& s, int drafted, int accepted) const;
++    /* The load cap for a cycle with `n_running` sequences running: busy_depth past the threshold,
++     * 0 for none. The scheduler asks once a cycle and holds the answer (Scheduler::draft_cycle). */
++    int  busy_cap(int n_running) const {
++        return (adapt_ && p_.busy > 0 && n_running > p_.busy) ? p_.busy_depth : 0;
++    }
+     /* What the policy maximises, E(d) / T(d), for `s`'s estimate as it stands. For tests and logs. */
+     double gain(const DraftAdapt& s, int d) const;
+     /* The cost table as configured, T(1..max_depth). */
+diff --git a/core/sched/scheduler.cpp b/core/sched/scheduler.cpp
+index 27eb164..2b4c3e3 100644
+--- a/core/sched/scheduler.cpp
++++ b/core/sched/scheduler.cpp
+@@ -100,6 +100,7 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
+     /* The adaptive window's switch and knobs, read once per process (draft.h). Off unless set. */
+     DraftController::from_env(&dp);
+     RAD_TRY(draft_.configure(dp));
++    draft_busy_cap_ = 0;
+ 
+     RAD_TRY(builder_.init(prog, cfg, geo_, kvgeom_, ranks));
+     /* The builder's bound and not a second derivation of it: it is what the block tables were
+@@ -936,6 +937,8 @@ void Scheduler::undo_hit(SchedReq& s) {
+ /* ------------------------------------------------------------------ the step */
+ const RadBatch* Scheduler::step() {
+     std::lock_guard<std::mutex> lk(mu_);
++    /* A cycle opens here, so its load cap is counted here (scheduler.h, draft_busy_cap_). */
++    draft_cycle();
+ 
+     /* The drafter's snapshots describe the step before this one and nothing reads them from here
+      * on. block_end() and serial_end() clear them already; this covers a drafter that stopped
+@@ -996,7 +999,7 @@ const RadBatch* Scheduler::step() {
+              * AND THE CAP IS THE SEQUENCE'S OWN WINDOW, which is `depth` unless the adaptive
+              * policy is on -- then it is what this sequence's acceptance pays for, and the n-gram
+              * fallback is held to it like any other proposal. */
+-            const int cap = draft_.adaptive() ? draft_.depth_for(s.adapt) : depth;
++            const int cap = draft_.adaptive() ? draft_cap(s) : depth;
+             if (!r.may_speculate) s.n_draft = 0;
+             else if (s.n_draft == 0) s.n_draft = (int32_t)draft_ngram(s, cap);
+             if (s.n_draft > cap) s.n_draft = cap;
+@@ -1337,6 +1340,15 @@ void Scheduler::take_encodes(std::vector<std::shared_ptr<mm::Item>>* out) {
+     out->swap(enc_want_);
+ }
+ 
++/* ------------------------------------------------------------------ the load cap */
++void Scheduler::draft_cycle() {
++    const int32_t cap = (int32_t)draft_.busy_cap((int)running_.size());
++    if (cap != draft_busy_cap_)
++        RAD_DEBUG("draft window: %zu running, %s", running_.size(),
++                  cap > 0 ? "every window capped at the busy depth" : "the cap is lifted");
++    draft_busy_cap_ = cap;
++}
++
+ /* ------------------------------------------------------------------ the next step */
+ void Scheduler::expect_draft(uint64_t id, int n) {
+     std::lock_guard<std::mutex> lk(mu_);
+@@ -1345,9 +1357,9 @@ void Scheduler::expect_draft(uint64_t id, int n) {
+     SchedReq& s = *reqs_[(size_t)it->second];
+     /* UNDER THE ADAPTIVE WINDOW THE ROUNDS RAN FOR THE DEEPEST SEQUENCE, and this one verifies the
+      * first of them up to its own window -- the cap serial_begin sized the rounds from, unchanged
+-     * since, because nothing commits between the two. */
++     * since: nothing commits between the two, and the load cap is the cycle's (draft_busy_cap_). */
+     if (draft_.adaptive() && n > 0) {
+-        const int cap = draft_.depth_for(s.adapt);
++        const int cap = draft_cap(s);
+         if (n > cap) n = cap;
+     }
+     s.draft_next = n > 0 ? n : 0;
+@@ -1434,6 +1446,10 @@ const RadBatch* Scheduler::step_next_locked() {
+ void Scheduler::promote_next() {
+     std::lock_guard<std::mutex> lk(mu_);
+     if (!next_open_) return;
++    /* The other place a cycle opens: the step issued ahead becomes this one, and step() is not
++     * called. Its proposals were counted under the last cycle's cap; the next ones are drafted
++     * under this one. */
++    draft_cycle();
+     std::swap(plan_, plan_next_);
+     plan_next_.reset();
+     step_prefill_tok_ = 0;
+@@ -1783,7 +1799,7 @@ int Scheduler::serial_begin(int* rounds, SerialRow* out, int max) {
+             if (!s.req || s.req->state != ReqState::Running || !s.running ||
+                 !s.req->may_speculate)
+                 continue;
+-            const int c = draft_.depth_for(s.adapt);
++            const int c = draft_cap(s);
+             if (c > want) want = c;
+         }
+         if (want > 0 && *rounds > want) *rounds = want;
+@@ -2349,7 +2365,11 @@ SchedMetrics Scheduler::metrics_locked() const {
+         int64_t sum = 0, n = 0;
+         for (int32_t slot : running_) {
+             const SchedReq& s = *reqs_[(size_t)slot];
+-            if (s.adapt.depth > 0) { sum += s.adapt.depth; ++n; }
++            if (s.adapt.depth <= 0) continue;
++            /* The window it drafts into, which under load is the cap and not its estimate. */
++            sum += (draft_busy_cap_ > 0 && s.adapt.depth > draft_busy_cap_) ? draft_busy_cap_
++                                                                           : s.adapt.depth;
++            ++n;
+         }
+         m.draft_depth_adaptive = n ? (float)((double)sum / (double)n) : 0.0f;
+         const int kDepth = (int)(sizeof m.draft_verify_depth / sizeof m.draft_verify_depth[0]);
+diff --git a/core/sched/scheduler.h b/core/sched/scheduler.h
+index dcb740f..a4f6ade 100644
+--- a/core/sched/scheduler.h
++++ b/core/sched/scheduler.h
+@@ -501,13 +501,28 @@ private:
+ 
+     /* THE WINDOW A SEQUENCE MAY DRAFT INTO: the configured depth, or under RADIANCE_DRAFT_ADAPT
+      * the one its own acceptance pays for (DraftController::depth_for, which starts the estimate
+-     * on the first ask). It is the rule every site that caps a proposal applies -- step(),
+-     * set_draft(), expect_draft() and the rounds in serial_begin() -- and with the policy off it
+-     * is next_depth(), exactly as before. */
++     * on the first ask), under this cycle's load cap. It is the rule every site that caps a
++     * proposal applies -- step(), set_draft(), expect_draft() and the rounds in serial_begin() --
++     * and with the policy off it is next_depth(), exactly as before. */
+     int draft_cap(SchedReq& s) const {
+-        return draft_.adaptive() ? draft_.depth_for(s.adapt) : draft_.next_depth();
++        if (!draft_.adaptive()) return draft_.next_depth();
++        const int d = draft_.depth_for(s.adapt);
++        return (draft_busy_cap_ > 0 && d > draft_busy_cap_) ? draft_busy_cap_ : d;
+     }
+ 
++    /* THE LOAD CAP OF THE CYCLE IN FLIGHT (RADIANCE_DRAFT_ADAPT_BUSY, draft.h), 0 for none.
++     *
++     * COUNTED ONCE A CYCLE AND HELD, by draft_cycle(), which is the first thing step() and
++     * promote_next() do -- every cycle opens with exactly one of the two. A cycle's proposal
++     * passes through four sites -- the plan that verifies it, the rounds that draft the next one,
++     * expect_draft() and set_draft() -- and the step issued ahead holds them to agree: it was
++     * built with the count expect_draft() gave it, and set_draft() refuses a different one. A
++     * cap read live could move between them, because a commit or a client hanging up takes a
++     * sequence out of running_ mid-cycle; held, it moves only where a cycle starts, and a
++     * proposal drafted under one cap and planned under the next is only ever cut shorter. */
++    int32_t draft_busy_cap_ = 0;
++    void    draft_cycle();
++
+     /* The built-in prompt-lookup drafter (scheduler.cpp). Fills s.draft and returns how many
+      * tokens it proposed; 0 when the sequence has no repeated pattern to extend. The pattern
+      * lengths it tries, longest first. */
+diff --git a/tests/sched_test.cpp b/tests/sched_test.cpp
+index c183353..98936b9 100644
+--- a/tests/sched_test.cpp
++++ b/tests/sched_test.cpp
+@@ -1867,6 +1867,151 @@ TEST(the_adaptive_window_is_per_sequence_and_the_rounds_follow_the_deepest) {
+     CHECK(f.sch.metrics().draft_verify_depth[4] > 0);
+ }
+ 
++/* THE LOAD CAP (RADIANCE_DRAFT_ADAPT_BUSY) IS COUNTED ONCE A CYCLE AND HELD FOR IT. The load moves
++ * between cycles -- a sequence admitted, a client hanging up -- and the cap follows it from the
++ * next cycle on; within one, the plan, the rounds, the step issued ahead and the proposal
++ * published after the commit all see the same cap, so a count that changes mid-cycle is never a
++ * mismatch. The estimates learn on underneath: the windows come back with the load. */
++TEST(the_busy_cap_is_counted_once_a_cycle_and_follows_the_load_between_cycles) {
++    Fixture f;
++    f.build(/*blocks=*/4096, /*states=*/64);
++    f.cfg.n_spec = 4;
++    CHECK_OK(f.start());
++    DraftController::Params p;
++    p.max_depth = 4;
++    p.adapt = true;
++    p.busy = 2;                                        /* more than two running is busy */
++    p.busy_depth = 2;
++    CHECK_OK(f.sch.draft().configure(p));
++    CHECK_EQ(f.sch.draft().busy_cap(2), 0);
++    CHECK_EQ(f.sch.draft().busy_cap(3), 2);
++
++    int32_t draft[4] = { 21, 22, 23, 24 };
++    /* Every draft taken, so every estimate stays at the whole window. */
++    auto commit_all = [&]() {
++        const StepPlan& pl = f.sch.plan();
++        std::vector<int32_t> acc(pl.e.size(), 0), tok(pl.e.size(), 9);
++        std::vector<uint8_t> eos(pl.e.size(), 0);
++        for (size_t i = 0; i < pl.e.size(); ++i) acc[i] = pl.e[i].is_prefill ? 0 : pl.e[i].n_spec;
++        Scheduler::StepResult r;
++        r.n_seq = (int)pl.e.size();
++        r.n_accepted = acc.data();
++        r.token = tok.data();
++        r.eos = eos.data();
++        CHECK_OK(f.sch.commit(r));
++    };
++    auto spec_of = [&](uint64_t id) {
++        for (const StepEntry& e : f.sch.plan().e) if (e.seq == id) return (int)e.n_spec;
++        return -1;
++    };
++
++    const uint64_t a = f.submit(160, 2000);
++    const uint64_t b = f.submit(160, 2000);
++    REQUIRE(f.sch.step() != nullptr);                 /* both prompts */
++    commit_all();
++
++    /* Two running is not busy: each takes its own window. */
++    CHECK_OK(f.sch.set_draft(a, draft, 4));
++    CHECK_OK(f.sch.set_draft(b, draft, 4));
++    REQUIRE(f.sch.step() != nullptr);
++    CHECK_EQ(spec_of(a), 4);
++    CHECK_EQ(spec_of(b), 4);
++    commit_all();
++
++    /* A third arrives. The plan that admits it counted two when its cycle opened, so that cycle
++     * is not busy yet... */
++    const uint64_t c = f.submit(160, 2000);
++    CHECK_OK(f.sch.set_draft(a, draft, 4));
++    CHECK_OK(f.sch.set_draft(b, draft, 4));
++    REQUIRE(f.sch.step() != nullptr);
++    CHECK_EQ(spec_of(a), 4);
++    CHECK_EQ(spec_of(c), 0);                          /* its prompt */
++    commit_all();
++
++    /* ...and the next one is: three running, every window capped, no estimate moved. The
++     * proposals were published under the last cycle, four long; this plan cuts them. */
++    CHECK_OK(f.sch.set_draft(a, draft, 4));
++    CHECK_OK(f.sch.set_draft(b, draft, 4));
++    REQUIRE(f.sch.step() != nullptr);
++    CHECK_EQ(spec_of(a), 2);
++    CHECK_EQ(spec_of(b), 2);
++    CHECK(spec_of(c) <= 2);
++    CHECK_NEAR(f.sch.metrics().draft_depth_adaptive, 2.0, 1e-6);
++    int rounds = 4;
++    Scheduler::SerialRow rows[4];
++    CHECK_EQ(f.sch.serial_begin(&rounds, rows, 4), 3);
++    CHECK_EQ(rounds, 2);
++    REQUIRE(f.sch.serial_batch(0, 1) != nullptr);
++    REQUIRE(f.sch.serial_batch(2, 1) != nullptr);
++
++    /* The step issued ahead verifies the cycle's count... */
++    for (uint64_t id : { a, b, c }) f.sch.find(id)->speculation_fixed = true;
++    for (uint64_t id : { a, b, c }) f.sch.expect_draft(id, rounds);
++    const RadBatch* nb = f.sch.step_next();
++    REQUIRE(nb != nullptr);
++    CHECK_EQ(nb->n_spec, 2);
++
++    /* ...and a client hangs up before the commit. Two running would not be busy, and the cycle
++     * keeps its cap anyway: the proposal published after the commit matches the step that is
++     * already on the card, so set_draft has nothing to refuse. */
++    CHECK_OK(f.sch.cancel(c));
++    CHECK_NEAR(f.sch.metrics().draft_depth_adaptive, 2.0, 1e-6);
++    commit_all();
++    f.sch.serial_end(rounds);
++    CHECK_OK(f.sch.set_draft(a, draft, rounds));
++    CHECK_OK(f.sch.set_draft(b, draft, rounds));
++    CHECK_EQ(f.sch.find(a)->n_draft, 2);
++
++    /* The next cycle opens on the load as it now is: two running, the cap lifted, and the
++     * windows are the whole window again at once -- the estimates never stopped learning. */
++    f.sch.promote_next();
++    CHECK_EQ(spec_of(a), 2);                          /* planned last cycle */
++    rounds = 4;
++    CHECK_EQ(f.sch.serial_begin(&rounds, rows, 4), 2);
++    CHECK_EQ(rounds, 4);
++    REQUIRE(f.sch.serial_batch(0, 1) != nullptr);
++    for (int rd = 2; rd <= rounds; ++rd) REQUIRE(f.sch.serial_batch(rd, 1) != nullptr);
++    commit_all();
++    f.sch.serial_end(rounds);
++    CHECK_OK(f.sch.set_draft(a, draft, rounds));
++    CHECK_OK(f.sch.set_draft(b, draft, rounds));
++    REQUIRE(f.sch.step() != nullptr);
++    CHECK_EQ(spec_of(a), 4);
++    CHECK_EQ(spec_of(b), 4);
++    CHECK_NEAR(f.sch.metrics().draft_depth_adaptive, 4.0, 1e-6);
++    commit_all();
++
++    /* THE SAME HANG-UP WITH NO STEP ISSUED AHEAD, where the held cap is what the proposal gets: a
++     * busy cycle stays busy to its end, and the next plan is the first to see the load fall. */
++    const uint64_t e = f.submit(160, 2000);
++    CHECK_OK(f.sch.set_draft(a, draft, 4));
++    CHECK_OK(f.sch.set_draft(b, draft, 4));
++    REQUIRE(f.sch.step() != nullptr);                 /* admits it; counted two */
++    commit_all();
++    CHECK_OK(f.sch.set_draft(a, draft, 4));
++    CHECK_OK(f.sch.set_draft(b, draft, 4));
++    REQUIRE(f.sch.step() != nullptr);                 /* counted three: busy */
++    CHECK_EQ(spec_of(a), 2);
++    CHECK_OK(f.sch.cancel(e));
++    commit_all();
++    CHECK_OK(f.sch.set_draft(a, draft, 4));
++    CHECK_EQ(f.sch.find(a)->n_draft, 2);              /* the cycle's cap, not the live count's */
++    REQUIRE(f.sch.step() != nullptr);                 /* counted two: lifted */
++    CHECK_EQ(spec_of(a), 2);                          /* drafted under the busy cycle */
++    rounds = 4;
++    CHECK_EQ(f.sch.serial_begin(&rounds, rows, 4), 2);
++    CHECK_EQ(rounds, 4);
++    f.sch.serial_end(0);
++
++    /* No threshold set: no cap, whatever the load. */
++    DraftController::Params q;
++    q.max_depth = 4;
++    q.adapt = true;
++    DraftController d;
++    CHECK_OK(d.configure(q));
++    CHECK_EQ(d.busy_cap(1000), 0);
++}
++
+ /* ================================================================== the step path */
+ TEST(the_step_path_does_not_allocate) {
+     Fixture f;
+-- 
+2.55.0
+
+
+From 72bed0dd9903c20ff0bed8c1461e8b6e489ccae3 Mon Sep 17 00:00:00 2001
+From: keptn42 <keptn42@noreply.codeberg.org>
+Date: Tue, 6 Oct 2026 16:40:24 +0000
+Subject: [PATCH 3/6] draft: the adaptive window is the serial drafter's; a
+ block drafter keeps its depth
+
+RADIANCE_DRAFT_ADAPT prices a draft as one more round of the head. A block
+drafter proposes its whole block in one pass, so it is not that trade; with
+a block drafter the engine now turns the policy off before the first step
+and says so. New sched_test case.
+---
+ core/engine.cpp          |  2 ++
+ core/sched/scheduler.cpp | 11 +++++++++++
+ core/sched/scheduler.h   |  7 +++++++
+ tests/sched_test.cpp     | 28 ++++++++++++++++++++++++++++
+ 4 files changed, 48 insertions(+)
+
+diff --git a/core/engine.cpp b/core/engine.cpp
+index ec45fa6..b741dfa 100644
+--- a/core/engine.cpp
++++ b/core/engine.cpp
+@@ -410,6 +410,8 @@ int Engine::step_loop() {
+      * collected, and a pass issued ahead would have overwritten them by then. */
+     pipelining_ = !cfg_.kld() && drafter_.kind != RAD_DRAFT_BLOCK &&
+                   (serial_drafting() || cfg_.n_spec <= 0);
++    /* The adaptive draft window prices serial rounds; a block drafter keeps its depth (scheduler.h). */
++    if (drafter_.kind == RAD_DRAFT_BLOCK) sched_.draft_adapt_off("a block drafter");
+     const bool t_on = (int)log_level() >= (int)Log::Debug;
+     /* Read once. See the block in the idle branch below for what it is for. */
+     /* "kv" | "arena" | "all" | "kv:<name>,<name>" -- the last narrows the KV scrub to named groups,
+diff --git a/core/sched/scheduler.cpp b/core/sched/scheduler.cpp
+index 2b4c3e3..2d00f63 100644
+--- a/core/sched/scheduler.cpp
++++ b/core/sched/scheduler.cpp
+@@ -1341,6 +1341,17 @@ void Scheduler::take_encodes(std::vector<std::shared_ptr<mm::Item>>* out) {
+ }
+ 
+ /* ------------------------------------------------------------------ the load cap */
++void Scheduler::draft_adapt_off(const char* why) {
++    std::lock_guard<std::mutex> lk(mu_);
++    if (!draft_.adaptive()) return;
++    DraftController::Params p = draft_.params();
++    p.adapt = false;
++    if (draft_.configure(p) == RAD_OK)
++        RAD_WARN("RADIANCE_DRAFT_ADAPT is set and the drafter is %s: the adaptive window is the serial "
++                 "drafter's policy, so this run keeps the configured depth %d", why, p.max_depth);
++    draft_busy_cap_ = 0;
++}
++
+ void Scheduler::draft_cycle() {
+     const int32_t cap = (int32_t)draft_.busy_cap((int)running_.size());
+     if (cap != draft_busy_cap_)
+diff --git a/core/sched/scheduler.h b/core/sched/scheduler.h
+index a4f6ade..8fa1330 100644
+--- a/core/sched/scheduler.h
++++ b/core/sched/scheduler.h
+@@ -290,6 +290,13 @@ public:
+      * (draft_cap): the controller's depth, or what the adaptive policy gives the sequence. */
+     int      set_draft(uint64_t id, const int32_t* tokens, int n);
+ 
++    /* RADIANCE_DRAFT_ADAPT is the SERIAL drafter's policy: every draft there is one more round of
++     * the head, which is what its cost table prices. A block drafter proposes its whole block in
++     * one pass, so a shorter window only saves verify rows -- a different trade with a policy of its
++     * own. The engine calls this once, before the first step, when the drafter is a block drafter;
++     * the switch then changes nothing about that run. Says so when it was on. */
++    void     draft_adapt_off(const char* why);
++
+     /* ---------------------------------------------------------- media the encoder owes
+      * A REQUEST CARRYING MEDIA IS ADMITTED ONLY ONCE EVERY ITEM IS ENCODED. Until then it keeps
+      * its place in the queue, the requests behind it are admitted around it, and its items wait
+diff --git a/tests/sched_test.cpp b/tests/sched_test.cpp
+index 98936b9..be975b4 100644
+--- a/tests/sched_test.cpp
++++ b/tests/sched_test.cpp
+@@ -1785,6 +1785,34 @@ TEST(the_adaptive_window_caps_the_proposal_and_the_rounds) {
+     CHECK_EQ(m.draft_depth, 4);                        /* the ceiling, as before */
+ }
+ 
++/* A BLOCK DRAFTER KEEPS ITS DEPTH. The engine turns the policy off before the first step when the
++ * drafter proposes its block in one pass; the proposal then reaches the step uncut, as without the
++ * switch. */
++TEST(the_adaptive_window_turns_off_for_a_block_drafter) {
++    Fixture f;
++    f.build(/*blocks=*/4096, /*states=*/64);
++    f.cfg.n_spec = 4;
++    CHECK_OK(f.start());
++    DraftController::Params p;
++    p.max_depth = 4;
++    p.adapt = true;
++    p.prior = 0.3f;                                    /* on the default cost: two */
++    CHECK_OK(f.sch.draft().configure(p));
++    f.sch.draft_adapt_off("a block drafter");
++    CHECK(!f.sch.draft().adaptive());
++
++    const uint64_t a = f.submit(160, 64);
++    CHECK(f.sch.step() != nullptr);
++    f.commit_plain(11);
++    int32_t draft[4] = { 21, 22, 23, 24 };
++    CHECK_OK(f.sch.set_draft(a, draft, 4));
++    CHECK_EQ(f.sch.find(a)->n_draft, 4);
++    const SchedMetrics m = f.sch.metrics();
++    CHECK(!m.draft_adaptive);
++    f.sch.draft_adapt_off("again");                    /* a second call is a no-op */
++    CHECK(!f.sch.draft().adaptive());
++}
++
+ /* EACH SEQUENCE ITS OWN WINDOW, AND THE ROUNDS FOLLOW THE DEEPEST. The step issued ahead of a
+  * commit verifies, for each sequence, the first of those rounds up to its own window -- and the
+  * drafter's longer proposal is taken cut to that count rather than refused as a mismatch. */
+-- 
+2.55.0
+
+
+From 34933a6811523b16784fbf96c985421c7d61c267 Mon Sep 17 00:00:00 2001
+From: keptn42 <keptn42@noreply.codeberg.org>
+Date: Tue, 6 Oct 2026 20:53:00 +0000
+Subject: [PATCH 4/6] docs/GUIDE: the adaptive draft window, its metrics and
+ its environment
+
+---
+ docs/GUIDE.md | 27 +++++++++++++++++++++++++++
+ 1 file changed, 27 insertions(+)
+
+diff --git a/docs/GUIDE.md b/docs/GUIDE.md
+index 28ddef2..e317965 100644
+--- a/docs/GUIDE.md
++++ b/docs/GUIDE.md
+@@ -706,6 +706,28 @@ from the first token. The reply is the same either way. A hit whose nearest chec
+ point would give back more than two windows is kept whole. `radiance:draft_refills_total` counts
+ the hits ended early and `radiance:draft_refill_tokens_total` the tokens they recomputed.
+ 
++**One depth for every request is a compromise; `RADIANCE_DRAFT_ADAPT=1` gives each sequence its
++own.** Acceptance depends on the text: code and JSON keep accepting deep into the window, prose and
++summaries fall off after a position or two. With the switch set, `--num-speculative-tokens` is the
++ceiling, each sequence keeps a smoothed acceptance per draft position, and it drafts into the window
++that maximises the tokens a step is expected to emit over what that step costs. The costs are
++`RADIANCE_DRAFT_COST`, the step time at each fixed depth on the same setup, in any unit:
++
++```sh
++RADIANCE_DRAFT_ADAPT=1 RADIANCE_DRAFT_COST=1:9.9,2:11.0,3:12.06,4:13.32,5:14.37,6:15.77 \
++RADIANCE_DRAFT_ADAPT_BUSY=3 radiance --model m.rad --num-speculative-tokens 6
++```
++
++The table belongs to the hardware; without one a step is priced at 1 + 0.06·d. A window moves only
++past a hysteresis and a hold, because every new window is a new pass shape and a new recording. The
++table prices a step at one sequence, and with more running a deeper window also costs every
++neighbour, so `RADIANCE_DRAFT_ADAPT_BUSY=N` caps every window at `RADIANCE_DRAFT_ADAPT_BUSY_DEPTH`
++(default 3) while more than N sequences run. The window is the serial drafter's policy: with a block
++drafter the switch is turned off at load, with a warning. At temperature 0 the text is that of a
++fixed depth wherever fixed depths agree with each other; above 0 it is distribution-exact.
++`radiance:draft_depth_adaptive` and `radiance:draft_verify_depth_total` (§6.3) show where the
++windows stand.
++
+ ### 4.7 Two cards
+ 
+ ```sh
+@@ -1423,6 +1445,7 @@ under the request's own spelling of each. `server.default_max_tokens` is `null`
+ | `draft_position_reached_total`, `draft_position_acceptance_ratio` | acceptance by position, since start |
+ | `draft_refills_total`, `draft_refill_tokens_total` | prefix hits ended a drafter window early, and the tokens recomputed (§4.6) |
+ | `decode_rows_unspeculated_total` | rows that never drafted at all |
++| `draft_depth_adaptive`, `draft_verify_depth_total{depth}` | the adaptive window's mean over the running sequences, and verifies by the drafts they carried; only with `RADIANCE_DRAFT_ADAPT` (§4.6) |
+ | `attn_cached_tokens_total`, `linear_cached_tokens_total` | prefix reuse, both halves |
+ | `linear_checkpoints_written_total`, `linear_prefix_cache_hit_rate` | |
+ | `prefix_cache_evictions_total`, `prefix_cache_ckpt_evictions_total` | |
+@@ -1536,6 +1559,10 @@ rad-kbench --home $RADIANCE_HOME --max-cases 1   # are the kernels correct at al
+ | `RADIANCE_HOME` | where `kernels/`, `architectures/` and `quantizers/` live; a `:`-separated search path, the first home winning. Same as `--radiance-home` |
+ | `RADIANCE_KERNELS` | default kernel hierarchy, comma-separated. Same as `--kernels`, read by the engine *and* every tool, so a plugin validated with `rad-kbench` can be served without editing launchers |
+ | `RADIANCE_LOG` | `error` \| `warn` \| `info` \| `debug` \| `trace` |
++| `RADIANCE_DRAFT_ADAPT` | `1`: a draft window per sequence, `--num-speculative-tokens` the ceiling (§4.6) |
++| `RADIANCE_DRAFT_COST` | with it, the step cost by depth, `d:cost,…` |
++| `RADIANCE_DRAFT_ADAPT_BUSY`, `_BUSY_DEPTH` | above N running sequences, every window capped at `_BUSY_DEPTH` (3) |
++| `RADIANCE_DRAFT_ADAPT_HYST`, `_HOLD`, `_HALFLIFE`, `_PRIOR`, `_MIN` | the policy's knobs: 0.02, 8 verifies, 16 verifies, 0.8, 1 |
+ | `ROCM_PATH` | where ROCm lives, if not `/opt/rocm` |
+ | `HF_TOKEN` | for `scripts/hfget.sh` on a gated repo |
+ 
+-- 
+2.55.0
+
+
+From 22681a6a0e29bab00e4769b7790d71016178a337 Mon Sep 17 00:00:00 2001
+From: keptn42 <keptn42@noreply.codeberg.org>
+Date: Wed, 7 Oct 2026 06:37:34 +0000
+Subject: [PATCH 5/6] metrics: count each draft position's acceptances
+
+radiance:draft_position_accepted_total{position}, next to the reach. At a
+fixed depth the next position's reach is this position's acceptances, so
+reached(j+1) / reached(j) gives the conditional acceptance over a window.
+Under the adaptive window a verify can end at j with j taken, and that
+ratio drops wherever windows end; accepted(j) / reached(j) does not.
+---
+ core/server/metrics.cpp | 10 +++++++++-
+ core/server/metrics.h   |  1 +
+ docs/GUIDE.md           |  2 +-
+ tests/server_test.cpp   | 29 +++++++++++++++++++++++++++++
+ 4 files changed, 40 insertions(+), 2 deletions(-)
+
+diff --git a/core/server/metrics.cpp b/core/server/metrics.cpp
+index 4201ed1..04f45b3 100644
+--- a/core/server/metrics.cpp
++++ b/core/server/metrics.cpp
+@@ -140,6 +140,7 @@ void Metrics::sample(const SchedMetrics& m) {
+     for (int j = 0; j < seen; ++j) {
+         const int64_t r = m.draft_pos_reached[j];
+         g_draft_pos_reached_[j].set((double)r);
++        g_draft_pos_accepted_[j].set((double)m.draft_pos_accepted[j]);
+         g_draft_pos_[j].set(r ? (double)m.draft_pos_accepted[j] / (double)r : 0.0);
+     }
+     /* Published after the gauges it bounds, so a concurrent render never lists a position whose
+@@ -393,7 +394,9 @@ std::string Metrics::render() const {
+     /* CONDITIONAL, per draft position: of the verifies that reached position j -- every earlier
+      * one accepted -- the fraction that took j as well. The pooled ratio above cannot tell a
+      * drafter that decays from one whose later rounds are broken; these can, and the companion
+-     * `_reached_total` says how much evidence each position carries. */
++     * `_reached_total` says how much evidence each position carries. `_accepted_total` gives the
++     * same ratio over any window: at a fixed depth the next position's reach would do, but an
++     * adaptive window can end at j with j taken. */
+     const int seen = draft_pos_seen_.load(std::memory_order_acquire);
+     if (seen > 0) {
+         const std::string base = L.substr(0, L.size() - 1);
+@@ -408,6 +411,11 @@ std::string Metrics::render() const {
+         for (int j = 0; j < seen; ++j)
+             w.out += "radiance:draft_position_reached_total" + base + ",position=\"" +
+                      std::to_string(j) + "\"} " + num(g_draft_pos_reached_[j].get()) + '\n';
++        w.help("radiance:draft_position_accepted_total",
++               "Verifies that accepted each draft position.", "counter");
++        for (int j = 0; j < seen; ++j)
++            w.out += "radiance:draft_position_accepted_total" + base + ",position=\"" +
++                     std::to_string(j) + "\"} " + num(g_draft_pos_accepted_[j].get()) + '\n';
+     }
+     /* THE ADAPTIVE DRAFT WINDOW, only while RADIANCE_DRAFT_ADAPT is on: where the policy stands --
+      * at one sequence, that sequence's window -- and where it has been, as verifies by the
+diff --git a/core/server/metrics.h b/core/server/metrics.h
+index ac29760..c81b3d7 100644
+--- a/core/server/metrics.h
++++ b/core/server/metrics.h
+@@ -121,6 +121,7 @@ private:
+     enum { MAX_DRAFT_POS = 64 };
+     Gauge   g_draft_pos_[MAX_DRAFT_POS];
+     Gauge   g_draft_pos_reached_[MAX_DRAFT_POS];
++    Gauge   g_draft_pos_accepted_[MAX_DRAFT_POS];
+     std::atomic<int> draft_pos_seen_{0};
+     /* THE ADAPTIVE DRAFT WINDOW (RADIANCE_DRAFT_ADAPT): the mean window of the running sequences,
+      * and the verifies by the window they carried, index = drafts. Rendered only while the policy
+diff --git a/docs/GUIDE.md b/docs/GUIDE.md
+index e317965..ac282a5 100644
+--- a/docs/GUIDE.md
++++ b/docs/GUIDE.md
+@@ -1442,7 +1442,7 @@ under the request's own spelling of each. `server.default_max_tokens` is `null`
+ | `decode_tokens_total`, `prefill_tokens_total` | |
+ | `decode_tokens_per_second`, `prefill_tokens_per_second` | |
+ | `draft_tokens_total`, `draft_accepted_total`, `draft_acceptance_ratio` | |
+-| `draft_position_reached_total`, `draft_position_acceptance_ratio` | acceptance by position, since start |
++| `draft_position_reached_total`, `draft_position_accepted_total`, `draft_position_acceptance_ratio` | acceptance by position: the two counters over any window, the ratio since start |
+ | `draft_refills_total`, `draft_refill_tokens_total` | prefix hits ended a drafter window early, and the tokens recomputed (§4.6) |
+ | `decode_rows_unspeculated_total` | rows that never drafted at all |
+ | `draft_depth_adaptive`, `draft_verify_depth_total{depth}` | the adaptive window's mean over the running sequences, and verifies by the drafts they carried; only with `RADIANCE_DRAFT_ADAPT` (§4.6) |
+diff --git a/tests/server_test.cpp b/tests/server_test.cpp
+index 5a572b0..03cb601 100644
+--- a/tests/server_test.cpp
++++ b/tests/server_test.cpp
+@@ -2308,6 +2308,35 @@ TEST(concurrent_scrapes_count_each_total_once) {
+     CHECK_EQ(value("radiance:prefill_tokens_total"), 5000.0);
+ }
+ 
++/* EACH DRAFT POSITION'S ACCEPTANCES ARE A COUNTER NEXT TO ITS REACH. At a fixed depth position
++ * j+1's reach is j's acceptances, but an adaptive window can end at j with j taken, so a ratio
++ * over a window needs both. Here two verifies end at position 1 with it accepted. */
++TEST(each_draft_position_counts_its_acceptances) {
++    Metrics m("m", 1024);
++    server::SchedMetrics s;
++    s.draft_depth_seen = 3;
++    s.draft_pos_reached[0] = 10; s.draft_pos_accepted[0] = 7;
++    s.draft_pos_reached[1] = 7;  s.draft_pos_accepted[1] = 5;
++    s.draft_pos_reached[2] = 3;  s.draft_pos_accepted[2] = 2;
++    m.sample(s);
++    PromDoc d = parse_prom(m.render());
++    CHECK_EQ((int)d.errors.size(), 0);
++    CHECK_EQ(d.type["radiance:draft_position_accepted_total"], std::string("counter"));
++    CHECK_EQ(d.type["radiance:draft_position_reached_total"], std::string("counter"));
++    auto value = [&d](const std::string& name) {
++        auto it = d.samples.find(name);
++        return it == d.samples.end() ? -1.0 : it->second;
++    };
++    const std::string L = "{model_name=\"m\",engine=\"0\"";
++    const std::string A = "radiance:draft_position_accepted_total" + L + ",position=";
++    CHECK_NEAR(value(A + "\"0\"}"), 7.0, 1e-9);
++    CHECK_NEAR(value(A + "\"1\"}"), 5.0, 1e-9);
++    CHECK_NEAR(value(A + "\"2\"}"), 2.0, 1e-9);
++    CHECK_NEAR(value(A + "\"3\"}"), -1.0, 1e-9);
++    CHECK_NEAR(value("radiance:draft_position_acceptance_ratio" + L + ",position=\"1\"}"),
++               5.0 / 7.0, 1e-9);
++}
++
+ /* THE ADAPTIVE DRAFT WINDOW (RADIANCE_DRAFT_ADAPT) IS EXPOSED ONLY WHILE IT IS ON, so a deployment
+  * without it scrapes exactly what it always did -- and when it is on, the gauge and the histogram
+  * are well-formed families with the labels every other sample carries. */
+-- 
+2.55.0
+
+
+From 7036cadb369f5dc79c5a4dfcc355dd8aa848c2c4 Mon Sep 17 00:00:00 2001
+From: keptn42 <keptn42@noreply.codeberg.org>
+Date: Tue, 6 Oct 2026 20:48:43 +0000
+Subject: [PATCH 6/6] deploy/grafana: the adaptive draft window, verifies by
+ draft depth
+
+Two panels for RADIANCE_DRAFT_ADAPT: the mean window of the running
+sequences (a gap while none runs) and the share of verifies by the drafts
+they carried.
+
+Conditional acceptance by position is now accepted(j) / reached(j). The
+old reached(j+1) / reached(j) needs every verify to carry the same depth;
+on an adaptive instance it showed 0.24 at position 2 where the engine's
+own ratio was 0.72, and the last-position series is no longer defined.
+---
+ deploy/grafana/README.md     |   7 +-
+ deploy/grafana/radiance.json | 176 ++++++++++++++++++++++++++++-------
+ 2 files changed, 146 insertions(+), 37 deletions(-)
+
+diff --git a/deploy/grafana/README.md b/deploy/grafana/README.md
+index e774390..49f0d1d 100644
+--- a/deploy/grafana/README.md
++++ b/deploy/grafana/README.md
+@@ -28,11 +28,10 @@ Window values are counter ratios with the definitions of the since-start gauges:
+ | prompt from attention cache | `attn_cached_tokens` / `prompt_tokens` | `vllm:gpu_prefix_cache_hit_rate` |
+ | prompt from linear checkpoint | `linear_cached_tokens` / (`linear_cached_tokens` + `prefill_tokens`) | `radiance:linear_prefix_cache_hit_rate` |
+ | draft acceptance | `draft_accepted` / `draft_tokens` | `radiance:draft_acceptance_ratio` |
+-| conditional acceptance at j | `draft_position_reached`(j+1) / `draft_position_reached`(j) | `radiance:draft_position_acceptance_ratio` |
++| conditional acceptance at j | `draft_position_accepted`(j) / `draft_position_reached`(j) | `radiance:draft_position_acceptance_ratio` |
+ 
+-Position j+1 is evaluated only when j was accepted, so its reach counts j's acceptances. The last
+-position's acceptances are the total accepted minus every later reach. Draft blocks per decode step is
+-the reach of position 0 over `engine_steps_decode_total` (GUIDE §6.3).
++Draft blocks per decode step is the reach of position 0 over `engine_steps_decode_total` (GUIDE §6.3).
++The adaptive draft window and verifies by draft depth have data only while `RADIANCE_DRAFT_ADAPT` is on.
+ 
+ Prometheus extrapolates `rate()` inside the window and VictoriaMetrics does not, so short windows at
+ the edge of a burst differ between the two. The overview's ratios are taken over the dashboard's time
+diff --git a/deploy/grafana/radiance.json b/deploy/grafana/radiance.json
+index 30dc72b..e041ef3 100644
+--- a/deploy/grafana/radiance.json
++++ b/deploy/grafana/radiance.json
+@@ -1252,7 +1252,7 @@
+         "type": "prometheus",
+         "uid": "${datasource}"
+       },
+-      "description": "In the window: of the verifies that reached position j, the fraction that took j as well. Position j+1 is reached only when j was accepted, so this is reached(j+1) / reached(j); the last position is the total accepted minus every later reach. A late position that collapses while the pooled rate looks fine shows here first.",
++      "description": "In the window: of the verifies that reached position j, the fraction that took j as well, accepted(j) / reached(j). A late position that collapses while the pooled rate looks fine shows here first.",
+       "gridPos": {
+         "h": 8,
+         "w": 12,
+@@ -1265,7 +1265,7 @@
+             "type": "prometheus",
+             "uid": "${datasource}"
+           },
+-          "expr": "sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"1\"}[$__rate_interval])) / sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"0\"}[$__rate_interval]))",
++          "expr": "sum(rate(radiance:draft_position_accepted_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"0\"}[$__rate_interval])) / sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"0\"}[$__rate_interval]))",
+           "legendFormat": "position 0",
+           "refId": "A",
+           "range": true,
+@@ -1276,7 +1276,7 @@
+             "type": "prometheus",
+             "uid": "${datasource}"
+           },
+-          "expr": "sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"2\"}[$__rate_interval])) / sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"1\"}[$__rate_interval]))",
++          "expr": "sum(rate(radiance:draft_position_accepted_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"1\"}[$__rate_interval])) / sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"1\"}[$__rate_interval]))",
+           "legendFormat": "position 1",
+           "refId": "B",
+           "range": true,
+@@ -1287,7 +1287,7 @@
+             "type": "prometheus",
+             "uid": "${datasource}"
+           },
+-          "expr": "sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"3\"}[$__rate_interval])) / sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"2\"}[$__rate_interval]))",
++          "expr": "sum(rate(radiance:draft_position_accepted_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"2\"}[$__rate_interval])) / sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"2\"}[$__rate_interval]))",
+           "legendFormat": "position 2",
+           "refId": "C",
+           "range": true,
+@@ -1298,7 +1298,7 @@
+             "type": "prometheus",
+             "uid": "${datasource}"
+           },
+-          "expr": "sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"4\"}[$__rate_interval])) / sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"3\"}[$__rate_interval]))",
++          "expr": "sum(rate(radiance:draft_position_accepted_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"3\"}[$__rate_interval])) / sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"3\"}[$__rate_interval]))",
+           "legendFormat": "position 3",
+           "refId": "D",
+           "range": true,
+@@ -1309,7 +1309,7 @@
+             "type": "prometheus",
+             "uid": "${datasource}"
+           },
+-          "expr": "sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"5\"}[$__rate_interval])) / sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"4\"}[$__rate_interval]))",
++          "expr": "sum(rate(radiance:draft_position_accepted_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"4\"}[$__rate_interval])) / sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"4\"}[$__rate_interval]))",
+           "legendFormat": "position 4",
+           "refId": "E",
+           "range": true,
+@@ -1320,7 +1320,7 @@
+             "type": "prometheus",
+             "uid": "${datasource}"
+           },
+-          "expr": "sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"6\"}[$__rate_interval])) / sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"5\"}[$__rate_interval]))",
++          "expr": "sum(rate(radiance:draft_position_accepted_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"5\"}[$__rate_interval])) / sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"5\"}[$__rate_interval]))",
+           "legendFormat": "position 5",
+           "refId": "F",
+           "range": true,
+@@ -1331,7 +1331,7 @@
+             "type": "prometheus",
+             "uid": "${datasource}"
+           },
+-          "expr": "sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"7\"}[$__rate_interval])) / sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"6\"}[$__rate_interval]))",
++          "expr": "sum(rate(radiance:draft_position_accepted_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"6\"}[$__rate_interval])) / sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"6\"}[$__rate_interval]))",
+           "legendFormat": "position 6",
+           "refId": "G",
+           "range": true,
+@@ -1342,7 +1342,7 @@
+             "type": "prometheus",
+             "uid": "${datasource}"
+           },
+-          "expr": "sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"8\"}[$__rate_interval])) / sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"7\"}[$__rate_interval]))",
++          "expr": "sum(rate(radiance:draft_position_accepted_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"7\"}[$__rate_interval])) / sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"7\"}[$__rate_interval]))",
+           "legendFormat": "position 7",
+           "refId": "H",
+           "range": true,
+@@ -1353,7 +1353,7 @@
+             "type": "prometheus",
+             "uid": "${datasource}"
+           },
+-          "expr": "sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"9\"}[$__rate_interval])) / sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"8\"}[$__rate_interval]))",
++          "expr": "sum(rate(radiance:draft_position_accepted_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"8\"}[$__rate_interval])) / sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"8\"}[$__rate_interval]))",
+           "legendFormat": "position 8",
+           "refId": "I",
+           "range": true,
+@@ -1364,7 +1364,7 @@
+             "type": "prometheus",
+             "uid": "${datasource}"
+           },
+-          "expr": "sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"10\"}[$__rate_interval])) / sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"9\"}[$__rate_interval]))",
++          "expr": "sum(rate(radiance:draft_position_accepted_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"9\"}[$__rate_interval])) / sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"9\"}[$__rate_interval]))",
+           "legendFormat": "position 9",
+           "refId": "J",
+           "range": true,
+@@ -1375,7 +1375,7 @@
+             "type": "prometheus",
+             "uid": "${datasource}"
+           },
+-          "expr": "sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"11\"}[$__rate_interval])) / sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"10\"}[$__rate_interval]))",
++          "expr": "sum(rate(radiance:draft_position_accepted_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"10\"}[$__rate_interval])) / sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"10\"}[$__rate_interval]))",
+           "legendFormat": "position 10",
+           "refId": "K",
+           "range": true,
+@@ -1386,7 +1386,7 @@
+             "type": "prometheus",
+             "uid": "${datasource}"
+           },
+-          "expr": "sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"12\"}[$__rate_interval])) / sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"11\"}[$__rate_interval]))",
++          "expr": "sum(rate(radiance:draft_position_accepted_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"11\"}[$__rate_interval])) / sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"11\"}[$__rate_interval]))",
+           "legendFormat": "position 11",
+           "refId": "L",
+           "range": true,
+@@ -1397,7 +1397,7 @@
+             "type": "prometheus",
+             "uid": "${datasource}"
+           },
+-          "expr": "sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"13\"}[$__rate_interval])) / sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"12\"}[$__rate_interval]))",
++          "expr": "sum(rate(radiance:draft_position_accepted_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"12\"}[$__rate_interval])) / sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"12\"}[$__rate_interval]))",
+           "legendFormat": "position 12",
+           "refId": "M",
+           "range": true,
+@@ -1408,7 +1408,7 @@
+             "type": "prometheus",
+             "uid": "${datasource}"
+           },
+-          "expr": "sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"14\"}[$__rate_interval])) / sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"13\"}[$__rate_interval]))",
++          "expr": "sum(rate(radiance:draft_position_accepted_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"13\"}[$__rate_interval])) / sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"13\"}[$__rate_interval]))",
+           "legendFormat": "position 13",
+           "refId": "N",
+           "range": true,
+@@ -1419,7 +1419,7 @@
+             "type": "prometheus",
+             "uid": "${datasource}"
+           },
+-          "expr": "sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"15\"}[$__rate_interval])) / sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"14\"}[$__rate_interval]))",
++          "expr": "sum(rate(radiance:draft_position_accepted_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"14\"}[$__rate_interval])) / sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"14\"}[$__rate_interval]))",
+           "legendFormat": "position 14",
+           "refId": "O",
+           "range": true,
+@@ -1430,8 +1430,8 @@
+             "type": "prometheus",
+             "uid": "${datasource}"
+           },
+-          "expr": "(sum(rate(radiance:draft_accepted_total{instance=~\"$instance\", model_name=~\"$model_name\"}[$__rate_interval])) - sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position!=\"0\"}[$__rate_interval]))) / min(sum by (position) (rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\"}[$__rate_interval])))",
+-          "legendFormat": "last position",
++          "expr": "sum(rate(radiance:draft_position_accepted_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"15\"}[$__rate_interval])) / sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"15\"}[$__rate_interval]))",
++          "legendFormat": "position 15",
+           "refId": "P",
+           "range": true,
+           "instant": false
+@@ -1743,6 +1743,116 @@
+         }
+       }
+     },
++    {
++      "type": "timeseries",
++      "title": "Adaptive draft window",
++      "id": 42,
++      "datasource": {
++        "type": "prometheus",
++        "uid": "${datasource}"
++      },
++      "description": "Mean draft window the adaptive policy gives the running sequences; a gap while none runs. Only while RADIANCE_DRAFT_ADAPT is on; no data otherwise.",
++      "gridPos": {
++        "h": 8,
++        "w": 12,
++        "x": 0,
++        "y": 43
++      },
++      "targets": [
++        {
++          "datasource": {
++            "type": "prometheus",
++            "uid": "${datasource}"
++          },
++          "expr": "max by (instance) (radiance:draft_depth_adaptive{instance=~\"$instance\", model_name=~\"$model_name\"}) > 0",
++          "legendFormat": "{{instance}}",
++          "refId": "A",
++          "range": true,
++          "instant": false
++        }
++      ],
++      "fieldConfig": {
++        "defaults": {
++          "unit": "short",
++          "custom": {
++            "lineWidth": 1,
++            "fillOpacity": 5,
++            "showPoints": "never",
++            "stacking": {
++              "mode": "none",
++              "group": "A"
++            }
++          }
++        },
++        "overrides": []
++      },
++      "options": {
++        "legend": {
++          "displayMode": "list",
++          "placement": "bottom",
++          "showLegend": true
++        },
++        "tooltip": {
++          "mode": "multi",
++          "sort": "desc"
++        }
++      }
++    },
++    {
++      "type": "timeseries",
++      "title": "Verifies by draft depth",
++      "id": 43,
++      "datasource": {
++        "type": "prometheus",
++        "uid": "${datasource}"
++      },
++      "description": "Share of verifies by the number of drafts they carried, under the adaptive window. Only while RADIANCE_DRAFT_ADAPT is on; no data otherwise.",
++      "gridPos": {
++        "h": 8,
++        "w": 12,
++        "x": 12,
++        "y": 43
++      },
++      "targets": [
++        {
++          "datasource": {
++            "type": "prometheus",
++            "uid": "${datasource}"
++          },
++          "expr": "sum by (depth) (rate(radiance:draft_verify_depth_total{instance=~\"$instance\", model_name=~\"$model_name\"}[$__rate_interval]))",
++          "legendFormat": "depth {{depth}}",
++          "refId": "A",
++          "range": true,
++          "instant": false
++        }
++      ],
++      "fieldConfig": {
++        "defaults": {
++          "unit": "percentunit",
++          "custom": {
++            "lineWidth": 1,
++            "fillOpacity": 40,
++            "showPoints": "never",
++            "stacking": {
++              "mode": "percent",
++              "group": "A"
++            }
++          }
++        },
++        "overrides": []
++      },
++      "options": {
++        "legend": {
++          "displayMode": "list",
++          "placement": "bottom",
++          "showLegend": true
++        },
++        "tooltip": {
++          "mode": "multi",
++          "sort": "desc"
++        }
++      }
++    },
+     {
+       "type": "row",
+       "title": "Scheduler",
+@@ -1753,7 +1863,7 @@
+         "h": 1,
+         "w": 24,
+         "x": 0,
+-        "y": 43
++        "y": 51
+       }
+     },
+     {
+@@ -1769,7 +1879,7 @@
+         "h": 8,
+         "w": 8,
+         "x": 0,
+-        "y": 44
++        "y": 52
+       },
+       "targets": [
+         {
+@@ -1846,7 +1956,7 @@
+         "h": 8,
+         "w": 8,
+         "x": 8,
+-        "y": 44
++        "y": 52
+       },
+       "targets": [
+         {
+@@ -1912,7 +2022,7 @@
+         "h": 8,
+         "w": 8,
+         "x": 16,
+-        "y": 44
++        "y": 52
+       },
+       "targets": [
+         {
+@@ -1977,7 +2087,7 @@
+         "h": 1,
+         "w": 24,
+         "x": 0,
+-        "y": 52
++        "y": 60
+       }
+     },
+     {
+@@ -1993,7 +2103,7 @@
+         "h": 8,
+         "w": 8,
+         "x": 0,
+-        "y": 53
++        "y": 61
+       },
+       "targets": [
+         {
+@@ -2070,7 +2180,7 @@
+         "h": 8,
+         "w": 8,
+         "x": 8,
+-        "y": 53
++        "y": 61
+       },
+       "targets": [
+         {
+@@ -2147,7 +2257,7 @@
+         "h": 8,
+         "w": 8,
+         "x": 16,
+-        "y": 53
++        "y": 61
+       },
+       "targets": [
+         {
+@@ -2221,7 +2331,7 @@
+         "h": 1,
+         "w": 24,
+         "x": 0,
+-        "y": 61
++        "y": 69
+       }
+     },
+     {
+@@ -2237,7 +2347,7 @@
+         "h": 8,
+         "w": 8,
+         "x": 0,
+-        "y": 62
++        "y": 70
+       },
+       "targets": [
+         {
+@@ -2294,7 +2404,7 @@
+         "h": 8,
+         "w": 8,
+         "x": 8,
+-        "y": 62
++        "y": 70
+       },
+       "targets": [
+         {
+@@ -2362,7 +2472,7 @@
+         "h": 8,
+         "w": 8,
+         "x": 16,
+-        "y": 62
++        "y": 70
+       },
+       "targets": [
+         {
+@@ -2447,7 +2557,7 @@
+         "h": 1,
+         "w": 24,
+         "x": 0,
+-        "y": 70
++        "y": 78
+       }
+     },
+     {
+@@ -2463,7 +2573,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 0,
+-        "y": 71
++        "y": 79
+       },
+       "targets": [
+         {
+@@ -2518,7 +2628,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 12,
+-        "y": 71
++        "y": 79
+       },
+       "targets": [
+         {
+-- 
+2.55.0
+

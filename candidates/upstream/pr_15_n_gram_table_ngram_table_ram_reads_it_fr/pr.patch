@@ -1,0 +1,874 @@
+From e2ef42b5e8eee1b5307ea48d6c312f9449dfae7f Mon Sep 17 00:00:00 2001
+From: keptn42 <keptn42@noreply.codeberg.org>
+Date: Mon, 5 Oct 2026 11:50:13 +0200
+Subject: [PATCH 1/2] n-gram table: --ngram-table ram reads it from a locked
+ copy in RAM
+
+embed_lookup_q reads the n-gram table through a row cache and direct reads,
+and about half of a step's rows are first-seen, so steps wait on the drive.
+--ngram-table ram (default disk, unchanged) copies the table into locked
+huge pages in the background, checks the copy against the mapping and then
+serves the gather from memory. MemAvailable, RLIMIT_MEMLOCK and the cgroup
+limit are checked first; if any is short the table stays on disk. The flag
+reaches the plugin as an optional `resident` parameter of embed_lookup_q.
+---
+ abi/rad_builder.h           |  11 ++
+ arch/common/rad_arch.h      |   4 +
+ arch/common/rad_block_ple.h |  21 ++--
+ core/config.cpp             |  10 ++
+ core/engine_bringup.cpp     |   1 +
+ core/rad_core.h             |   8 ++
+ docs/DOCKER.md              |   5 +
+ docs/GUIDE.md               |   1 +
+ docs/OPS.md                 |   8 +-
+ libavx/avx_check.cpp        |  14 ++-
+ libavx/avx_check_rows.cpp   |  71 +++++++++---
+ libavx/avx_gemm.cpp         |   1 +
+ libavx/avx_ngram.cpp        | 209 +++++++++++++++++++++++++++++++++---
+ libavx/avx_registry.cpp     |  15 ++-
+ libavx/avx_rows.h           |   9 +-
+ libref/ref_registry.cpp     |  10 +-
+ tests/CMakeLists.txt        |   3 +-
+ tests/config_test.cpp       |  18 ++++
+ 18 files changed, 363 insertions(+), 56 deletions(-)
+
+diff --git a/abi/rad_builder.h b/abi/rad_builder.h
+index 21da712..feb360a 100644
+--- a/abi/rad_builder.h
++++ b/abi/rad_builder.h
+@@ -130,6 +130,17 @@ typedef struct RadBuildCtx {
+      *
+      * Trailing and zero-defaulted, so a plugin built against the older struct is unchanged. */
+     int64_t  max_out_rows;
++
++    /* WHERE A HOST GATHER OVER A FILE-BACKED TABLE READS ITS ROWS. 0 -- what a zero-initialised
++     * context gives -- reads them from the container through the kernel's own row cache, holding
++     * no more of the table than that. Nonzero asks for the whole table copied into locked host
++     * memory and read from there: a deployment choice, because it costs the table's size in RAM
++     * (Qwen3.8-Flash-Next's n-gram table is 47.7 GiB) and buys prefill and throughput, and it
++     * changes no result. The plugin passes it to `embed_lookup_q` as `resident`; a kernel that
++     * cannot hold the copy says so and reads the file. --ngram-table disk|ram.
++     *
++     * Trailing and zero-defaulted, so a plugin built against the older struct is unchanged. */
++    int      ngram_table_ram;
+ } RadBuildCtx;
+ 
+ /* ================================================================== weights */
+diff --git a/arch/common/rad_arch.h b/arch/common/rad_arch.h
+index 6b06bfb..2f43630 100644
+--- a/arch/common/rad_arch.h
++++ b/arch/common/rad_arch.h
+@@ -595,6 +595,9 @@ struct Geom {
+      * message anyway. Straight through to `all_reduce`'s `min_bytes`; 0 leaves the choice to
+      * the kernel plugin, which has the measured default. */
+     int64_t wire_min_bytes = 0;
++    /* 1 = keep a file-backed table a host gather reads in RAM (--ngram-table ram). Straight
++     * through to `embed_lookup_q`'s `resident`; RadBuildCtx says what it costs and buys. */
++    int     ngram_ram  = 0;
+     float   eps        = 1e-6f;
+     /* GemmaRMSNorm's `1 +`. Qwen3.5, Qwen3-Next and Gemma normalise with `x_hat * (1 + w)` and
+      * store `w` around 0.1, not around 1.0 -- so reading the gain as a plain RMSNorm gain shrinks
+@@ -732,6 +735,7 @@ inline int geom_from(Geom& g, const RadModelMeta* m, const RadBuildCtx* c,
+     g.world     = c->world_size ? c->world_size : 1;
+     g.wire_exact= c->tp_wire_lossy ? 0 : 1;
+     g.wire_min_bytes = c->tp_wire_min_bytes;
++    g.ngram_ram = c->ngram_table_ram ? 1 : 0;
+     g.eps       = m->rms_eps;
+     g.theta     = m->rope_theta;
+     g.rope_scale= m->rope_scale ? m->rope_scale : 1.0f;
+diff --git a/arch/common/rad_block_ple.h b/arch/common/rad_block_ple.h
+index 8a82cfc..cfa3921 100644
+--- a/arch/common/rad_block_ple.h
++++ b/arch/common/rad_block_ple.h
+@@ -367,19 +367,18 @@ inline int PleLayer::declare(RadBuilder* b, Names& nm, const Geom& geom, const C
+                {}, {b_ids});
+ 
+     /* M IS T * heads HERE, not T: the gather fetches one table row per HEAD per token, and the
+-     * band this op resolves on is that count. */
++     * band this op resolves on is that count. `resident` only when the deployment asked for the
++     * table in RAM (--ngram-table ram), so the default declares exactly the op it always has. */
++    const RadParam gp[] = { RAD_RANGE("M", 1, g.max_tok * c.heads), RAD_INT("n_embd", HD),
++                            RAD_INT("n_vocab", c.rows), RAD_STR("dtype", g.dtype),
++                            RAD_INT("resident", 1) };
++    const int n_gp = g.ngram_ram ? 5 : 4;
+     if (table_bf16)
+-        op_gather = rw(b, RAD_OP(b, "embed_lookup_q",
+-                          RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok * c.heads), RAD_INT("n_embd", HD),
+-                                     RAD_INT("n_vocab", c.rows), RAD_STR("dtype", g.dtype)),
+-                          RAD_WEIGHTS(w_table)),
+-                      {b_ids}, {b_emb});
++        op_gather = rw(b, RAD_OP(b, "embed_lookup_q", gp, n_gp, RAD_WEIGHTS(w_table)),
++                       {b_ids}, {b_emb});
+     else
+-    op_gather = rw(b, RAD_OP(b, "embed_lookup_q",
+-                      RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok * c.heads), RAD_INT("n_embd", HD),
+-                                 RAD_INT("n_vocab", c.rows), RAD_STR("dtype", g.dtype)),
+-                      RAD_WEIGHTS(w_table, w_scale)),
+-                  {b_ids}, {b_emb});
++        op_gather = rw(b, RAD_OP(b, "embed_lookup_q", gp, n_gp, RAD_WEIGHTS(w_table, w_scale)),
++                       {b_ids}, {b_emb});
+ 
+     op_embd = rw(b, RAD_OP(b, "cast",
+                      RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", c.embed_dim),
+diff --git a/core/config.cpp b/core/config.cpp
+index 5df6fc6..5108576 100644
+--- a/core/config.cpp
++++ b/core/config.cpp
+@@ -58,6 +58,10 @@ static const Flag g_flags[] = {
+     { "--weights-disk-tier",  nullptr,  "read weights that fit neither VRAM nor the host pool from the\n"
+     "                                    container on disk (O_DIRECT); a routed expert is read a layer\n"
+     "                                    at a time, so a step is paced by the drive" },
++    { "--ngram-table",        "MODE",   "disk (default) or ram: where the n-gram embedding's host gather\n"
++    "                                    reads its rows. ram copies the table into locked host memory\n"
++    "                                    in the background from the first request and reads the copy\n"
++    "                                    (Qwen3.8-Flash-Next: 47.7 GiB; needs a memlock limit that large)" },
+     { "--prefix-cache-host-mib", "N",   "copy finished conversations' KV to host memory, up to N MiB,\n"
+     "                                    so their VRAM can go to experts and a return restores\n"
+     "                                    instead of re-prefilling. 0 is off. Part of it holds\n"
+@@ -376,6 +380,12 @@ int config_parse(int argc, char** argv, Config* c) {
+         }
+         else if (S("--host-pool-mib"))         { if (!(v = need(i))) return RAD_E_INVAL; c->host_pool_mib = atoll(v); }
+         else if (S("--weights-disk-tier"))     { c->weights_disk_tier = true; }
++        else if (S("--ngram-table")) {
++            if (!(v = need(i))) return RAD_E_INVAL;
++            if      (!std::strcmp(v, "disk")) c->ngram_table_ram = false;
++            else if (!std::strcmp(v, "ram"))  c->ngram_table_ram = true;
++            else { RAD_ERR("--ngram-table takes disk or ram, not '%s'", v); return RAD_E_INVAL; }
++        }
+         else if (S("--prefix-cache-host-mib"))     { if (!(v = need(i))) return RAD_E_INVAL; c->prefix_cache_host_mib = atoll(v); }
+         else if (S("--prefix-cache-dir"))          { if (!(v = need(i))) return RAD_E_INVAL; c->prefix_cache_dir = v; }
+         else if (S("--prefix-cache-disk-mib"))     { if (!(v = need(i))) return RAD_E_INVAL; c->prefix_cache_disk_mib = atoll(v); }
+diff --git a/core/engine_bringup.cpp b/core/engine_bringup.cpp
+index 4c8f078..9e9c40c 100644
+--- a/core/engine_bringup.cpp
++++ b/core/engine_bringup.cpp
+@@ -413,6 +413,7 @@ RadBuildCtx Engine::build_ctx(int rank, int64_t max_tok) const {
+     /* A row at every token of the step and the sampler's row a sequence before them
+      * (core/kld.h); the KL mode has no speculation, so a sequence samples one. */
+     bc.max_out_rows = cfg_.kld() ? max_tok + cfg_.max_seqs : 0;
++    bc.ngram_table_ram = cfg_.ngram_table_ram ? 1 : 0;
+     return bc;
+ }
+ 
+diff --git a/core/rad_core.h b/core/rad_core.h
+index 1366f83..8117992 100644
+--- a/core/rad_core.h
++++ b/core/rad_core.h
+@@ -614,6 +614,14 @@ struct Config {
+      * is a server that is correct and several orders of magnitude slow. The tier needs no directory
+      * of its own; the container is the file. */
+     bool    weights_disk_tier = false;
++    /* --ngram-table disk|ram: where the host gather of a table too large for any card -- the n-gram
++     * embedding, 47.7 GiB in Qwen3.8-Flash-Next -- reads its rows. disk, the default, reads them
++     * from the container through a row cache and holds no more of the table than that. ram copies
++     * the table once into locked host memory, in the background from the first request, and reads
++     * the copy: a faster prefill and a few percent of throughput, for the table's size in RAM. A
++     * process that cannot lock that much says so and stays on disk. A deployment choice and not a
++     * tuning one, because only the operator knows what else the host's memory is for. */
++    bool    ngram_table_ram = false;
+ 
+     std::string placement = "auto";    /* all_vram | layer_offload | expert_tiered | auto */
+     bool    deterministic = false;
+diff --git a/docs/DOCKER.md b/docs/DOCKER.md
+index 5ad7bec..2deb9c2 100644
+--- a/docs/DOCKER.md
++++ b/docs/DOCKER.md
+@@ -91,6 +91,11 @@ Every one of these options is needed:
+ - **`--network host`**: the server binds the host's addresses directly, IPv4 and IPv6, with no
+   NAT in front of it.
+ 
++And one more for `--ngram-table ram`: **`--ulimit memlock=-1`**. The copy of the n-gram table is
++locked in RAM, and Docker's default memlock limit is far below its 47.7 GiB; without it the server
++says so at the first request and reads the table from the container as it does by default.
++`deploy/compose/common.yaml` sets it.
++
+ The image sets `GPU_MAX_ALLOC_PERCENT=100` and `GPU_MAX_HEAP_SIZE=100`. The HIP runtime's defaults
+ cap one allocation, and the heap, below what the placement plan hands out.
+ 
+diff --git a/docs/GUIDE.md b/docs/GUIDE.md
+index cacd311..1d982fc 100644
+--- a/docs/GUIDE.md
++++ b/docs/GUIDE.md
+@@ -844,6 +844,7 @@ one line naming each one the command line moved.
+ | `--kv-cache-dtype T` | bf16 | `bf16` or `fp8` |
+ | `--host-pool-mib N` | 0 | pinned host tier (weights) |
+ | `--weights-disk-tier` | off | read weights that fit neither VRAM nor the host pool from the container (O_DIRECT); routed experts a layer at a time |
++| `--ngram-table MODE` | disk | where the n-gram embedding's host gather reads its rows: `disk` from the container through a row cache, `ram` from a copy of the whole table in locked host memory (Qwen3.8-Flash-Next: 47.7 GiB), made in the background from the first request. `ram` needs the memory and a memlock limit that large (`--ulimit memlock=-1` in Docker); short of either it says so and stays on `disk` |
+ 
+ **Idle session tiers**
+ 
+diff --git a/docs/OPS.md b/docs/OPS.md
+index 650f285..aaca468 100644
+--- a/docs/OPS.md
++++ b/docs/OPS.md
+@@ -763,7 +763,7 @@ either wire, byte-identical to the three kernels it stands in for.
+ | op | params | operands |
+ |---|---|---|
+ | `embed_lookup` | `M`(range) `n_embd` `n_vocab` `dtype` `vocab_offset`/opt `wscale`:f64/opt | `tokens`, `wte`w → `x` |
+-| `embed_lookup_q` | `M`(range) `n_embd` `n_vocab` `dtype` `vocab_offset`/opt `wscale`:f64/opt | `tokens`, `wte`w, `scale`w? → `x`, `ahead`? |
++| `embed_lookup_q` | `M`(range) `n_embd` `n_vocab` `dtype` `vocab_offset`/opt `wscale`:f64/opt `resident`/opt | `tokens`, `wte`w, `scale`w? → `x`, `ahead`? |
+ | `logits_gemm` | `M`(range) `n_vocab` `n_embd` `dtype` | `x`, `lm_head`w → `logits` |
+ | `ngram_ids` | `M`(range) `heads` `ngram` `eos` | `tok`, `state`:inout, `cu`, `mult`w, `vocab_sizes`w, `offsets`w, `cache_idx`?, `has_init`?, `num_accepted`? → `ids`, `ahead_ids`? |
+ | `ple_gate` | `M`(range) `n` `hc` `eps`:f64 `dtype` `wadd`:f64/opt `gate_eps`:f64/opt | `k`, `q`, `v`, `w_key`w, `w_query`w, `w_conv`w → `gv`, `gvn` |
+@@ -871,6 +871,12 @@ the alignment the filesystem reports for direct I/O, or its block size where it
+ btrfs does; one read of the table proves it before the first row is served. A filesystem with no
+ direct I/O at all cannot hold a container with this table.
+ 
++**`resident` keeps the table in RAM instead**, for a deployment that has the memory: libavx copies
++it once into locked huge pages, in the background from the first gather that carries it, and reads
++the copy from then on; until the copy is in place, and wherever the process cannot lock that much,
++the rows come from the file as above. The result is the same either way. An architecture sets it
++from `RadBuildCtx::ngram_table_ram` (`--ngram-table ram`).
++
+ The placement planner runs an op on the host when **every weight operand of it** is `Site::Host`,
+ which is why the table must be a weight operand at all: `gather_rows` takes a plain `IN` operand and
+ would never trigger it. And the host kernel has to live in a production plugin — libavx, the host
+diff --git a/libavx/avx_check.cpp b/libavx/avx_check.cpp
+index 5a2f6b8..7eaa578 100644
+--- a/libavx/avx_check.cpp
++++ b/libavx/avx_check.cpp
+@@ -799,9 +799,10 @@ static bool schema_same(const RadOpSchema& a, const RadOpSchema& b, std::string*
+     return true;
+ }
+ 
+-/* embed_lookup_q over a file-backed table, two ranks and the reader racing (avx_check_rows.cpp). */
++/* embed_lookup_q over a file-backed table, two ranks and the reader racing, or with the table
++ * copied into RAM (avx_check_rows.cpp). */
+ bool row_gather_case(const Lib& avx, const std::string& dir, int64_t calls, bool verbose,
+-                     bool bf16);
++                     bool bf16, bool resident);
+ /* embed_lookup_q's init, where io_uring is refused and here (avx_check_rows.cpp). */
+ bool ngram_init_case(const Lib& avx);
+ 
+@@ -945,13 +946,16 @@ int main(int argc, char** argv) {
+             const std::string at = sl == std::string::npos ? "." : self.substr(0, sl);
+             /* The E4M3 table the quantised containers carry, and the plain bf16 one a checkpoint
+              * served as it ships carries: one path, two row sizes. */
+-            if (!row_gather_case(avx, at, 1000, verbose, false)) rc = 1;
+-            if (!row_gather_case(avx, at, 1000, verbose, true)) rc = 1;
++            if (!row_gather_case(avx, at, 1000, verbose, false, false)) rc = 1;
++            if (!row_gather_case(avx, at, 1000, verbose, true, false)) rc = 1;
++            /* The copy in RAM is the process's, made once a table, so at one level: the last. */
++            if (lvl == hi && !row_gather_case(avx, at, 1000, verbose, false, true)) rc = 1;
+             /* And in TMPDIR, which is a tmpfs on most machines: since Linux 6.6 a tmpfs does
+              * direct reads and reports no alignment for them, as btrfs does, so the gather finds
+              * its granule from the block size there. */
+             const char* tmp = std::getenv("TMPDIR");
+-            if (!row_gather_case(avx, tmp && *tmp ? tmp : "/tmp", 1000, verbose, false)) rc = 1;
++            if (!row_gather_case(avx, tmp && *tmp ? tmp : "/tmp", 1000, verbose, false, false))
++                rc = 1;
+         }
+     }
+     if (!declined_ops.empty()) {
+diff --git a/libavx/avx_check_rows.cpp b/libavx/avx_check_rows.cpp
+index 535c216..75a3a9d 100644
+--- a/libavx/avx_check_rows.cpp
++++ b/libavx/avx_check_rows.cpp
+@@ -20,10 +20,17 @@
+  * takes one full 32-code step and a masked tail. The table is a file in `dir`, and the filesystem
+  * there decides how the gather aligns its direct reads: by the alignment the filesystem reports
+  * (ext4, XFS), or by its block size where it reports none (btrfs, and a tmpfs since Linux 6.6). The
+- * case says which it ran. */
++ * case says which it ran.
++ *
++ * With `resident` the op is asked to copy the table into locked RAM (--ngram-table ram), over a
++ * table small enough for a default memlock limit. The calls run while the copy is being made, then
++ * the case waits for the process's locked memory to grow by the table and runs them again, from
++ * the copy. Where the process may not lock that much the gather says so and keeps reading the file,
++ * and the case says which of the two it checked; either way every row must be the file's. */
+ #include "avx_harness.h"
+ 
+ #include <barrier>
++#include <chrono>
+ #include <cerrno>
+ #include <cstring>
+ #include <thread>
+@@ -126,10 +133,23 @@ bool ngram_init_case(const Lib& avx) {
+     return ok && right;
+ }
+ 
++/* This process's locked memory, in bytes: VmLck. */
++static long long locked_bytes() {
++    long long kb = 0;
++    if (std::FILE* f = std::fopen("/proc/self/status", "re")) {
++        char line[256];
++        while (std::fgets(line, sizeof line, f)) (void)std::sscanf(line, "VmLck: %lld", &kb);
++        std::fclose(f);
++    }
++    return kb << 10;
++}
++
+ bool row_gather_case(const Lib& avx, const std::string& dir, int64_t calls, bool verbose,
+-                     bool bf16) {
++                     bool bf16, bool resident) {
+     const RadKernelInfo* r = avx.row("embed_lookup_q");
+-    const char* what = bf16 ? "embed_lookup_q from a file, bf16 table" : "embed_lookup_q from a file";
++    const char* what = resident ? "embed_lookup_q from a file, resident"
++                     : bf16     ? "embed_lookup_q from a file, bf16 table"
++                                : "embed_lookup_q from a file";
+     if (!r || !r->launch) {
+         std::printf("  %s: no row\n", what);
+         return false;
+@@ -150,7 +170,8 @@ bool row_gather_case(const Lib& avx, const std::string& dir, int64_t calls, bool
+         }
+         ::close((int)ring);
+     }
+-    const int64_t n = 40, V = int64_t(1) << 21, M = 512, hot = 4096;
++    /* 2.5 MiB resident, which a default memlock limit of 8 MiB holds. */
++    const int64_t n = 40, V = int64_t(1) << (resident ? 16 : 21), M = 512, hot = 4096;
+     const int64_t rb = bf16 ? 2 * n : n;
+     const float scale = 0.375f;
+ 
+@@ -238,13 +259,14 @@ bool row_gather_case(const Lib& avx, const std::string& dir, int64_t calls, bool
+             tensor(const_cast<uint8_t*>(tab), bf16 ? RAD_BF16 : RAD_F8E4M3, {V, n}),
+             tensor(bf16 ? nullptr : &sc, RAD_BF16, {1}), tensor(out.data(), RAD_BF16, {M, n}),
+             tensor(nullptr, RAD_I32, {M}) };
+-        RadParam ps[3] = {};
+-        ps[0].key = "M";       ps[0].kind = RAD_P_INT; ps[0].ival = M;
+-        ps[1].key = "n_embd";  ps[1].kind = RAD_P_INT; ps[1].ival = n;
+-        ps[2].key = "n_vocab"; ps[2].kind = RAD_P_INT; ps[2].ival = V;
++        RadParam ps[4] = {};
++        ps[0].key = "M";        ps[0].kind = RAD_P_INT; ps[0].ival = M;
++        ps[1].key = "n_embd";   ps[1].kind = RAD_P_INT; ps[1].ival = n;
++        ps[2].key = "n_vocab";  ps[2].kind = RAD_P_INT; ps[2].ival = V;
++        ps[3].key = "resident"; ps[3].kind = RAD_P_INT; ps[3].ival = 1;
+         RadArgs a{};
+         a.t = ts.data(); a.n_t = (int)ts.size();
+-        a.p = ps; a.n_p = 3;
++        a.p = ps; a.n_p = resident ? 4 : 3;
+         a.rank = rk; a.world_size = 2;
+         for (int64_t c = 0; c < calls; ++c) {
+             ts[0].data = &ids[(size_t)(c * M)];
+@@ -264,9 +286,23 @@ bool row_gather_case(const Lib& avx, const std::string& dir, int64_t calls, bool
+             }
+         }
+     };
+-    std::thread t0(rank, 0), t1(rank, 1);
+-    t0.join();
+-    t1.join();
++    const long long locked0 = locked_bytes();
++    auto round = [&] {
++        std::thread t0(rank, 0), t1(rank, 1);
++        t0.join();
++        t1.join();
++    };
++    round();
++    /* The copy is made in the background from the first call. Once the locked memory has grown
++     * by the table it is in place, or about to be, so a short wait more and every call reads it. */
++    bool copied = false;
++    if (resident) {
++        for (int i = 0; i < 300 && !copied; ++i) {
++            copied = locked_bytes() - locked0 >= V * rb;
++            std::this_thread::sleep_for(std::chrono::milliseconds(100));
++        }
++        if (copied) round();
++    }
+     /* THE ADDRESS RANGE STAYS RESERVED. libavx resolves a table to its file once, by the address
+      * range of its mapping, for the life of the process (avx_ngram.cpp, table_file) -- the
+      * engine's container mapping is one. A case that unmapped here could have the next case's file
+@@ -279,13 +315,16 @@ bool row_gather_case(const Lib& avx, const std::string& dir, int64_t calls, bool
+     ::unlink(path.c_str());
+ 
+     const bool pass = bad[0] + bad[1] + refused[0] + refused[1] == 0;
++    const char* from = !resident ? ""
++                     : copied    ? ", then as many again from the copy in RAM"
++                                 : ", all from the file: the copy was not made here (above)";
+     if (verbose || !pass)
+-        std::printf("  %s in %s (%s): %lld calls x 2 ranks, rows wrong %lld/%lld, "
++        std::printf("  %s in %s (%s): %lld calls x 2 ranks%s, rows wrong %lld/%lld, "
+                     "calls refused %lld/%lld %s\n", what, dir.c_str(), granule, (long long)calls,
+-                    (long long)bad[0], (long long)bad[1], (long long)refused[0],
++                    from, (long long)bad[0], (long long)bad[1], (long long)refused[0],
+                     (long long)refused[1], pass ? "ok" : "FAIL");
+     else
+-        std::printf("  %s in %s (%s): %lld calls x 2 ranks, every row exact\n", what, dir.c_str(),
+-                    granule, (long long)calls);
++        std::printf("  %s in %s (%s): %lld calls x 2 ranks%s, every row exact\n", what,
++                    dir.c_str(), granule, (long long)calls, from);
+     return pass;
+ }
+diff --git a/libavx/avx_gemm.cpp b/libavx/avx_gemm.cpp
+index 63a7b49..87608b5 100644
+--- a/libavx/avx_gemm.cpp
++++ b/libavx/avx_gemm.cpp
+@@ -700,6 +700,7 @@ static bool rows_form(const RadArgs* a, RowGather* g) {
+     g->n_ahead = ahead ? numel(ahd) : 0;
+     g->rank = a->rank;
+     g->world_size = a->world_size;
++    g->resident = p_int(a, "resident", 0) != 0;
+     return true;
+ }
+ 
+diff --git a/libavx/avx_ngram.cpp b/libavx/avx_ngram.cpp
+index c300553..aa17389 100644
+--- a/libavx/avx_ngram.cpp
++++ b/libavx/avx_ngram.cpp
+@@ -57,7 +57,18 @@
+  * plugin ABI carries no file, so /proc/self/maps says which file and offset back that address, once
+  * a table. A table no file backs -- a test's heap buffer -- is read as the memory it is. A file on a
+  * filesystem that cannot do direct I/O is refused; direct_granule below finds the alignment the
+- * reads keep, including on a filesystem that does not report one. */
++ * reads keep, including on a filesystem that does not report one.
++ *
++ * ============================== OR THE WHOLE TABLE IN RAM ==============================
++ *
++ * All of the above is the default, and it holds no more of the table than the row cache does.
++ * With `resident` set on the op -- the engine's --ngram-table ram -- the table is copied once into
++ * locked host memory and every gather reads the copy, so a miss is a load instead of a read: on
++ * Flash-Next at four ranks a 2k-token prompt prefills 24% faster and 16 to 32 streams gain 4 to 5%,
++ * for 47.7 GiB of RAM. The first gather that asks starts the copy in the background and, until it
++ * is in place, every gather reads the file exactly as it does without it, so serving never waits
++ * for the copy. A process that cannot hold it -- RLIMIT_MEMLOCK, the memory available, a cgroup's
++ * limit -- says so once and keeps reading the file. make_resident has the detail. */
+ #include "avx_rows.h"
+ #include "avx_common.h"
+ 
+@@ -68,7 +79,9 @@
+ #include <cstring>
+ #include <cstdlib>
+ 
++#include <algorithm>
+ #include <atomic>
++#include <chrono>
+ #include <condition_variable>
+ #include <deque>
+ #include <memory>
+@@ -82,6 +95,7 @@
+ #include <fcntl.h>
+ #include <linux/io_uring.h>
+ #include <sys/mman.h>
++#include <sys/resource.h>
+ #include <sys/stat.h>
+ #include <sys/syscall.h>
+ #include <unistd.h>
+@@ -158,6 +172,15 @@ struct TableFile {
+     int            fd    = -1;
+     long long      off   = 0;
+     long long      align = 0;
++    std::string    path;
++    /* --ngram-table ram: the table's own copy, [copy, copy + copy_n) holding [copy_lo, copy_lo +
++     * copy_n) of the mapping. `copy` is stored last, once the copy is filled, locked and checked;
++     * null, the gather reads the file. One copy a file, of the table the first resident gather
++     * names, which in every container so far is the only table in it. */
++    std::once_flag              copy_once;
++    std::atomic<const uint8_t*> copy{nullptr};
++    const uint8_t*              copy_lo = nullptr;
++    long long                   copy_n  = 0;
+ };
+ 
+ /* THE GRANULE OF A DIRECT READ of `t`'s file, opened for them as `t.fd`: the alignment a read's
+@@ -237,10 +260,12 @@ long long direct_granule(const TableFile& t, const uint8_t* p, long long n, unsi
+ /* The file behind [p, p + n): the mapping holding `p`, extended over the mappings that continue it
+  * in the same file (a madvise over a sub-range splits one mapping into several). Looked up once per
+  * table and kept for the life of the process; every rank thread shares the entry and the fd, and a
+- * read at an explicit offset has no file position to share. */
+-const TableFile* table_file(const uint8_t* p, long long n, int* err) {
+-    static std::mutex mu;
+-    static std::vector<std::unique_ptr<TableFile>> known;
++ * read at an explicit offset has no file position to share. The list is never destroyed: a copy
++ * thread (make_resident) may still be filling an entry when the process exits. */
++TableFile* table_file(const uint8_t* p, long long n, int* err) {
++    static std::mutex& mu = *new std::mutex;
++    static std::vector<std::unique_ptr<TableFile>>& known =
++        *new std::vector<std::unique_ptr<TableFile>>;
+     std::lock_guard<std::mutex> lk(mu);
+     for (const auto& t : known)
+         if (p >= t->lo && p + n <= t->hi) return t.get();
+@@ -287,6 +312,7 @@ const TableFile* table_file(const uint8_t* p, long long n, int* err) {
+     if (found) {
+         if ((uintptr_t)(p + n) > end) { *err = RAD_E_IO; return nullptr; }
+         t->hi = (const uint8_t*)end;
++        t->path = path;
+         t->fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
+         const char* why = t->fd < 0 ? std::strerror(errno) : nullptr;
+         if (t->fd >= 0) t->align = direct_granule(*t, p, n, ino, path.c_str(), &why);
+@@ -303,6 +329,155 @@ const TableFile* table_file(const uint8_t* p, long long n, int* err) {
+     return known.back().get();
+ }
+ 
++/* A size for a message: GiB from one up, MiB below. */
++std::string size_str(unsigned long long b) {
++    char s[32];
++    if (b >= 1ull << 30) std::snprintf(s, sizeof s, "%.1f GiB", (double)b / (1ull << 30));
++    else                 std::snprintf(s, sizeof s, "%.1f MiB", (double)b / (1ull << 20));
++    return s;
++}
++
++/* WHETHER `bytes` MORE CAN BE LOCKED IN RAM, or why not. Each limit is one the copy would
++ * otherwise meet after reading the whole table: RLIMIT_MEMLOCK, unless the process has
++ * CAP_IPC_LOCK; what the kernel says is available, less a margin for everything else; and the
++ * cgroup's memory.max, which Docker's --memory sets and which the kernel enforces by killing the
++ * process. A limit that cannot be read is not one. */
++bool room_to_lock(unsigned long long bytes, std::string* why) {
++    const unsigned long long margin = 4ull << 30;
++    unsigned long long locked = 0, caps = 0, avail = 0;
++    bool have_avail = false;
++    char line[256];
++    if (std::FILE* f = std::fopen("/proc/self/status", "re")) {
++        while (std::fgets(line, sizeof line, f)) {
++            (void)std::sscanf(line, "VmLck: %llu", &locked);
++            (void)std::sscanf(line, "CapEff: %llx", &caps);
++        }
++        std::fclose(f);
++    }
++    struct rlimit rl {};
++    if (!(caps >> 14 & 1) && ::getrlimit(RLIMIT_MEMLOCK, &rl) == 0 &&
++        rl.rlim_cur != RLIM_INFINITY && rl.rlim_cur < (locked << 10) + bytes) {
++        *why = "the copy locks " + size_str(bytes) + " and RLIMIT_MEMLOCK allows " +
++               size_str(rl.rlim_cur) + " (in Docker, --ulimit memlock=-1 lifts it)";
++        return false;
++    }
++    if (std::FILE* f = std::fopen("/proc/meminfo", "re")) {
++        while (!have_avail && std::fgets(line, sizeof line, f))
++            have_avail = std::sscanf(line, "MemAvailable: %llu", &avail) == 1;
++        std::fclose(f);
++    }
++    if (have_avail && (avail << 10) < bytes + margin) {
++        *why = size_str(avail << 10) + " of memory is available, and the copy wants " +
++               size_str(bytes) + " with " + size_str(margin) + " to spare";
++        return false;
++    }
++    /* cgroup v2: the process's group is the "0::" line. */
++    std::string cg;
++    if (std::FILE* f = std::fopen("/proc/self/cgroup", "re")) {
++        while (std::fgets(line, sizeof line, f))
++            if (std::strncmp(line, "0::", 3) == 0) {
++                cg = line + 3;
++                while (!cg.empty() && cg.back() == '\n') cg.pop_back();
++            }
++        std::fclose(f);
++    }
++    auto read_ull = [](const std::string& file, unsigned long long* v) {
++        std::FILE* f = std::fopen(file.c_str(), "re");
++        if (!f) return false;
++        const bool got = std::fscanf(f, "%llu", v) == 1;    /* "max" reads as no limit */
++        std::fclose(f);
++        return got;
++    };
++    unsigned long long max = 0, cur = 0;
++    const std::string dir = "/sys/fs/cgroup" + (cg == "/" ? std::string() : cg);
++    if (!cg.empty() && read_ull(dir + "/memory.max", &max) &&
++        read_ull(dir + "/memory.current", &cur) && (cur > max || max - cur < bytes + margin)) {
++        *why = "the cgroup's memory.max leaves " + size_str(cur > max ? 0 : max - cur) +
++               ", and the copy wants " + size_str(bytes) + " with " + size_str(margin) +
++               " to spare";
++        return false;
++    }
++    return true;
++}
++
++/* --ngram-table ram: KEEP THE WHOLE TABLE IN RAM, [p, p + n) of `t`'s mapping. Called once a table,
++ * by the first gather whose op carries `resident`.
++ *
++ * A COPY IN HUGE PAGES, NOT THE MAPPING LOCKED. Faulting the mapping in costs a fault a 4 KiB page
++ * -- 12.5 million of them, ~140 s inside a VM -- and leaves every row behind a 4 KiB translation,
++ * so a gather of scattered rows walks the page tables on nearly every row. Parallel buffered reads
++ * into an anonymous MADV_HUGEPAGE region fill it in 18.7 s for Flash-Next's 47.7 GiB, a 2 MiB page
++ * covers 13,000 rows, and the pages read are dropped from the page cache behind them, so the copy
++ * does not hold the table twice. A thread fills, locks and checks the copy and only then
++ * stores `copy`; until it does the gather reads the file. Whatever stops it -- a limit checked here
++ * before a byte is read, or a failure on the way -- leaves the table on the file path and says
++ * why, once. */
++void make_resident(TableFile* t, const uint8_t* p, long long n) {
++    auto refuse = [n](const std::string& why) {
++        std::fprintf(stderr, "libavx: --ngram-table ram: the n-gram table (%s) stays on disk and is "
++                     "read from the container: %s\n", size_str((unsigned long long)n).c_str(),
++                     why.c_str());
++    };
++    const size_t huge = (size_t)2 << 20;
++    const size_t sz = ((size_t)n + huge - 1) & ~(huge - 1);
++    std::string why;
++    if (!room_to_lock(sz, &why)) { refuse(why); return; }
++    const long long foff = t->off + (long long)(p - t->lo);
++    std::thread([t, p, n, sz, foff, refuse] {
++        const auto t0 = std::chrono::steady_clock::now();
++        auto fail = [&](const char* what, int e) {
++            refuse(std::string(what) + " failed (" + std::strerror(e) + ")");
++        };
++        void* m = ::mmap(nullptr, sz, PROT_READ | PROT_WRITE,
++                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
++        if (m == MAP_FAILED) { fail("mmap", errno); return; }
++        uint8_t* buf = static_cast<uint8_t*>(m);
++        (void)::madvise(buf, sz, MADV_HUGEPAGE);
++        const int fd = ::open(t->path.c_str(), O_RDONLY | O_CLOEXEC);
++        if (fd < 0) { fail("open", errno); ::munmap(m, sz); return; }
++        const int nt = 16;
++        const long long step = (n / nt + (long long)huge - 1) & ~((long long)huge - 1);
++        std::atomic<int> err{0};
++        std::vector<std::thread> fill;
++        for (int i = 0; i < nt; ++i) {
++            const long long lo = (long long)i * step, hi = std::min(n, lo + step);
++            if (lo >= hi) break;
++            fill.emplace_back([&, lo, hi] {
++                for (long long o = lo; o < hi && !err.load();) {
++                    const size_t want = (size_t)std::min(hi - o, (long long)(64 << 20));
++                    const ssize_t r = ::pread(fd, buf + o, want, (off_t)(foff + o));
++                    if (r <= 0) { err.store(r < 0 ? errno : EIO); return; }
++                    (void)::posix_fadvise(fd, (off_t)(foff + o), (off_t)r, POSIX_FADV_DONTNEED);
++                    o += r;
++                }
++            });
++        }
++        for (auto& th : fill) th.join();
++        ::close(fd);
++        if (err.load()) { fail("reading the container", err.load()); ::munmap(m, sz); return; }
++        if (::mlock(buf, sz) != 0) { fail("mlock", errno); ::munmap(m, sz); return; }
++        /* The copy has to be the mapping's bytes: a wrong offset would serve every row from the
++         * wrong place without an error. Both ends and a stride of rows in between. */
++        const long long probe = std::min(n, (long long)4096);
++        bool same = std::memcmp(buf, p, (size_t)probe) == 0 &&
++                    std::memcmp(buf + n - probe, p + n - probe, (size_t)probe) == 0;
++        for (long long o = 0; same && o + 4096 <= n; o += n / 64)
++            same = std::memcmp(buf + o, p + o, 4096) == 0;
++        if (!same) {
++            fail("checking the copy against the mapping", EIO);
++            ::munlock(buf, sz);
++            ::munmap(m, sz);
++            return;
++        }
++        t->copy_lo = p;
++        t->copy_n = n;
++        t->copy.store(buf, std::memory_order_release);
++        std::fprintf(stderr, "libavx: n-gram table resident in RAM: %s copied to locked huge pages "
++                     "in %.1f s\n", size_str((unsigned long long)n).c_str(),
++                     std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
++    }).detach();
++}
++
+ /* ============================== THE ROW CACHE ==============================
+  *
+  * Set-associative: a row's key -- its byte offset in the file -- hashes to a set of kWays slots, and
+@@ -861,7 +1036,7 @@ inline std::FILE* trace_file() {
+ 
+ #else   /* not Linux: no file reads; a table is read as memory */
+ struct TableFile { int fd = -1; };
+-inline const TableFile* table_file(const uint8_t*, long long, int*) { static TableFile m; return &m; }
++inline TableFile* table_file(const uint8_t*, long long, int*) { static TableFile m; return &m; }
+ inline std::FILE* trace_file() { return nullptr; }
+ #endif
+ 
+@@ -888,14 +1063,24 @@ int avx::row_gather(const RowGather& q, RowDecode decode) {
+     for (int b = 0; b < 256; ++b)
+         lut[b] = rad_f32_to_bf16(rad_fp8e4m3_to_f32((uint8_t)b) * q.scale);
+ 
+-    /* The rows: through the shared cache from the file behind the table, or, for a table no file
+-     * backs, from the table itself. The caller has refused an id past the table already; an id
+-     * turned into a file offset has to be one. */
++    /* The rows: through the shared cache from the file behind the table, or from the table's copy
++     * in RAM once there is one, or, for a table no file backs, from the table itself. The caller
++     * has refused an id past the table already; an id turned into a file offset has to be one. */
+     int ferr = RAD_OK;
+-    const TableFile* tfile = table_file(q.tab, q.n_vocab * q.row_bytes, &ferr);
++    const long long bytes = q.n_vocab * q.row_bytes;
++    TableFile* tfile = table_file(q.tab, bytes, &ferr);
+     if (!tfile) return ferr;
++    const uint8_t* tab = q.tab;
+ #if defined(__linux__)
+-    if (tfile->fd >= 0) {
++    bool from_copy = false;
++    if (q.resident && tfile->fd >= 0)
++        std::call_once(tfile->copy_once, [&] { make_resident(tfile, q.tab, bytes); });
++    if (const uint8_t* copy = tfile->copy.load(std::memory_order_acquire))
++        if (q.tab >= tfile->copy_lo && q.tab + bytes <= tfile->copy_lo + tfile->copy_n) {
++            tab = copy + (q.tab - tfile->copy_lo);
++            from_copy = true;
++        }
++    if (tfile->fd >= 0 && !from_copy) {
+         int why = 0;
+         ReadRing* rr = read_ring(&why);
+         if (!rr) {
+@@ -926,7 +1111,7 @@ int avx::row_gather(const RowGather& q, RowDecode decode) {
+             std::memset(dst, 0, (size_t)q.n_embd * sizeof(uint16_t));
+             continue;
+         }
+-        g.src.push_back(q.tab + id * q.row_bytes);
++        g.src.push_back(tab + id * q.row_bytes);
+         g.dst.push_back(dst);
+     }
+     if (!g.src.empty()) decode(g.src.data(), g.dst.data(), (int64_t)g.src.size(), q.n_embd, lut);
+diff --git a/libavx/avx_registry.cpp b/libavx/avx_registry.cpp
+index 17d687e..53949ca 100644
+--- a/libavx/avx_registry.cpp
++++ b/libavx/avx_registry.cpp
+@@ -361,6 +361,10 @@ static const RadParamSpec pEmbed[]    = { P_INT("M"), P_INT("n_embd"), P_INT("n_
+                                           P_STR("dtype"), P_INTO("vocab_offset"),
+                                           P_F64O("wscale") };
+ static const RadOperandSpec oEmbed[]  = { OPD("tokens"), WGT("wte"), OUT("x") };
++/* embed_lookup_q's, and `resident`: keep the table's copy in RAM (avx_ngram.cpp). */
++static const RadParamSpec pEmbedQ[]   = { P_INT("M"), P_INT("n_embd"), P_INT("n_vocab"),
++                                          P_STR("dtype"), P_INTO("vocab_offset"),
++                                          P_F64O("wscale"), P_INTO("resident") };
+ static const RadOperandSpec oEmbedQ[] = { OPD("tokens"), WGT("wte"), WGT_O("scale"), OUT("x"),
+                                           OPD_O("ahead") };
+ 
+@@ -525,7 +529,7 @@ static const RadOpSchema kSchemas[] = {
+   "sum across ranks, f32, ascending rank order." },
+ { "all_gather", ARR(pAllGather), ARR(oAllGather), "gather every rank's shard." },
+ { "embed_lookup", ARR(pEmbed), ARR(oEmbed), "embedding gather, vocab-parallel with an offset." },
+-{ "embed_lookup_q", ARR(pEmbed), ARR(oEmbedQ),
++{ "embed_lookup_q", ARR(pEmbedQ), ARR(oEmbedQ),
+   "embedding gather, one scale for the table; without a scale the table is read as it is." },
+ { "logits_gemm", ARR(pLogits), ARR(oLogits), "the lm_head projection." },
+ { "sample_penalties", ARR(pPenal), ARR(oPenalties),
+@@ -725,12 +729,13 @@ SIMPLE("avx_all_gather", "all_gather", "ar", "gather every rank's shard; world_s
+ SIMPLE("avx_embed_lookup", "embed_lookup", "vocab", "embedding gather", DT_FLOAT, L(embed_lookup)),
+ /* THE ONE ROW WITH A LAYOUT HOOK, and it only checks: the table is read as it is stored, and the
+  * hook refuses a table encoded any other way (avx_ngram.cpp). An E4M3 table into bf16 goes through
+- * the row cache; every other dtype pair takes the general gather. Its init refuses a process that
+- * may not make the io_uring ring the cache's misses are read through, at declare and not at the
+- * first request. */
++ * the row cache, or with `resident` from a copy in RAM once there is one; every other dtype pair
++ * takes the general gather. Its init refuses a process that may not make the io_uring ring the
++ * cache's misses are read through, at declare and not at the first request. */
+ { "avx_embed_lookup_q", "embed_lookup_q", "vocab",
+   "embedding gather, one scale for the table: an E4M3 table into bf16 through a shared row cache "
+-  "and direct reads of the container, a later call's rows read ahead",
++  "and direct reads of the container, a later call's rows read ahead, or with `resident` from a "
++  "copy of the table in locked RAM",
+   SHAPE_ANY, DT_ANY, RAD_DOMAIN_HOST, 0,
+   nullptr, 0, nullptr, 0, nullptr,
+   /* INIT, fini, LAUNCH, scratch, layout, relayout, opd_shape, unrelayout */
+diff --git a/libavx/avx_rows.h b/libavx/avx_rows.h
+index d54ccb4..49c1edc 100644
+--- a/libavx/avx_rows.h
++++ b/libavx/avx_rows.h
+@@ -26,7 +26,8 @@ typedef void (*RowDecode)(const uint8_t* const* src, uint16_t* const* dst, int64
+  * elements -- E4M3 codes, or bf16 as stored -- `row_bytes` apart, `out` M rows of n_embd bf16
+  * `x_ld` elements apart. The row cache and the reads deal in `row_bytes`; the decode in elements.
+  * `ahead` holds n_ahead ids a later call will gather, or is null. rank and world_size are the
+- * call's. */
++ * call's. `resident` is the op's parameter of that name: keep a copy of the table in RAM and read
++ * that, once it is there (avx_ngram.cpp). */
+ struct RowGather {
+     const int32_t* ids;
+     int64_t        M;
+@@ -39,10 +40,12 @@ struct RowGather {
+     const int32_t* ahead;
+     int64_t        n_ahead;
+     int            rank, world_size;
++    int            resident;
+ };
+ 
+-/* The gather, through the row cache when a file backs the table and from the table's memory when
+- * none does. Returns a RAD_* status; on anything but RAD_OK the output is not complete. */
++/* The gather, through the row cache when a file backs the table, from its copy in RAM once
++ * `resident` has made one, and from the table's memory when no file backs it. Returns a RAD_*
++ * status; on anything but RAD_OK the output is not complete. */
+ int row_gather(const RowGather& g, RowDecode decode);
+ 
+ }  /* namespace avx */
+diff --git a/libref/ref_registry.cpp b/libref/ref_registry.cpp
+index 96ec77d..e47e87d 100644
+--- a/libref/ref_registry.cpp
++++ b/libref/ref_registry.cpp
+@@ -476,7 +476,13 @@ static const RadParamSpec pEmbed[] = { P_INT("M"), P_INT("n_embd"), P_INT("n_voc
+                                        P_F64O("wscale") };
+ static const RadOperandSpec oEmbed[] = { OPD("tokens"), WGT("wte"), OUT("x") };
+ /* The quantised table: one scale for all of it. A SEPARATE OP and not a dtype on the above --
+- * the operand list differs and operands are positional, the same argument gemm_nt_q makes. */
++ * the operand list differs and operands are positional, the same argument gemm_nt_q makes.
++ * `resident` asks a kernel that reads a file-backed table from disk to keep a copy of it in RAM
++ * instead (--ngram-table ram). It changes where the rows come from and not what they are, and a
++ * kernel that reads the table as memory, as this one does, has nothing to do for it. */
++static const RadParamSpec pEmbedQ[] = { P_INT("M"), P_INT("n_embd"), P_INT("n_vocab"),
++                                        P_STR("dtype"), P_INTO("vocab_offset"), P_F64O("wscale"),
++                                        P_INTO("resident") };
+ static const RadOperandSpec oEmbedQ[] = { OPD("tokens"), WGT("wte"), WGT_O("scale"), OUT("x"),
+                                           OPD_O("ahead") };
+ 
+@@ -851,7 +857,7 @@ static const RadOpSchema kSchemas[] = {
+ { "embed_lookup", ARR(pEmbed), ARR(oEmbed),
+   "A gather from wte[n_vocab, n_embd]. A negative token id writes a zero row (padding); an id at "
+   "or above n_vocab fails the launch." },
+-{ "embed_lookup_q", ARR(pEmbed), ARR(oEmbedQ),
++{ "embed_lookup_q", ARR(pEmbedQ), ARR(oEmbedQ),
+   "The same gather from a table quantised with ONE scale for all of it: x[m] = wte[id] * scale[0]. "
+   "Qwen3.8-Flash-Next-FP8's 320-million-row n-gram embedding is stored that way -- E4M3 codes and a "
+   "single bf16 `weight_scale` -- and it can be, because E4M3 carries its own exponent and a row's "
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 4b43854..9ac8811 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -158,7 +158,8 @@ endif()
+ # runs embed_lookup_q over a file-backed table with two ranks and the read-ahead racing: the path a
+ # model's host gather takes and that no geometry reaches. It writes its table beside itself, where
+ # the filesystem reports its direct-I/O alignment, and again in TMPDIR, where a tmpfs reports none
+-# and the gather aligns its reads by the block size, as it does on btrfs.
++# and the gather aligns its reads by the block size, as it does on btrfs. And once with `resident`,
++# from the table's copy in RAM where the process may lock it.
+ if(TARGET libavx AND TARGET rad-avx-check)
+   add_test(NAME avx_check
+            COMMAND rad-avx-check --ref ${RAD_PLUGIN_OUT}/kernels/libref.so
+diff --git a/tests/config_test.cpp b/tests/config_test.cpp
+index 9ece1ca..20ba265 100644
+--- a/tests/config_test.cpp
++++ b/tests/config_test.cpp
+@@ -324,6 +324,23 @@ TEST(the_kv_cache_dtype_is_one_of_two_names) {
+     CHECK_EQ(d.kv_cache_dtype, std::string("bf16"));
+ }
+ 
++TEST(the_ngram_table_is_on_disk_or_in_ram) {
++    Config d;
++    CHECK_EQ(parse({}, &d), RAD_OK);
++    CHECK(!d.ngram_table_ram);
++    Config c;
++    CHECK_EQ(parse({ "--ngram-table", "ram" }, &c), RAD_OK);
++    CHECK(c.ngram_table_ram);
++    CHECK_EQ(parse({ "--ngram-table", "disk" }, &c), RAD_OK);
++    CHECK(!c.ngram_table_ram);
++    /* 47.7 GiB of locked memory is the operator's to give, so a name this build does not know
++     * stops the server rather than picking either side. */
++    CHECK_EQ(parse({ "--ngram-table", "memory" }, &c), RAD_E_INVAL);
++    CHECK_EQ(parse({ "--ngram-table", "RAM" }, &c), RAD_E_INVAL);
++    CHECK_EQ(parse({ "--ngram-table", "" }, &c), RAD_E_INVAL);
++    CHECK_EQ(parse({ "--ngram-table" }, &c), RAD_E_INVAL);
++}
++
+ /* THE FLAG THAT DECIDES WHETHER MULTI-TURN WORKS. It is the WEIGHTS share, strictly inside
+  * (0, 1): either endpoint gives one side of the split nothing at all, and the server would come
+  * up and then fail to place either the experts or the cache. */
+@@ -797,6 +814,7 @@ TEST(usage_names_every_flag_it_documents) {
+     CHECK(text.find("--checkpoint-policy") != std::string::npos);
+     CHECK(text.find("--prefix-cache-host-mib") != std::string::npos);
+     CHECK(text.find("--tp-wire") != std::string::npos);
++    CHECK(text.find("--ngram-table") != std::string::npos);
+     CHECK(text.find("--kld-record") != std::string::npos);
+     CHECK(text.find("--kld-ref") != std::string::npos);
+     for (const char* f : { "--default-max-tokens", "--max-tokens-cap", "--presence-penalty",
+-- 
+2.55.0
+
+
+From 450196f6cef64c951775b01a256521f173c307a2 Mon Sep 17 00:00:00 2001
+From: keptn42 <keptn42@noreply.codeberg.org>
+Date: Mon, 5 Oct 2026 11:50:44 +0200
+Subject: [PATCH 2/2] libavx/README: the resident n-gram table
+
+---
+ libavx/README.md | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/libavx/README.md b/libavx/README.md
+index 79f2d4f..1dfdfb2 100644
+--- a/libavx/README.md
++++ b/libavx/README.md
+@@ -30,8 +30,15 @@ codes; below it, one code at a time. The row's layout hook only checks the table
+ E4M3 with one bf16 scale, or the checkpoint's plain bf16 — and asks for no re-layout, because the
+ gather reads the rows from the container file in the layout they are stored in.
+ 
++With the op's `resident` parameter (`--ngram-table ram`) the first gather instead starts a copy of
++the whole table into locked huge pages, in the background, and every gather reads the copy once it
++is in place: 47.7 GiB of RAM for Flash-Next, checked against RLIMIT_MEMLOCK, MemAvailable and the
++cgroup's memory.max before a byte is read. A process short of any of them says so and keeps
++reading the file.
++
+ `rad-avx-check` runs the op over a file-backed table with two ranks and the reader racing, at
+-every level, and compares every row with the file's bytes.
++every level, and compares every row with the file's bytes; and once more with `resident`, before
++and after the copy is in place.
+ 
+ ## The build is the dispatch
+ 
+-- 
+2.55.0
+

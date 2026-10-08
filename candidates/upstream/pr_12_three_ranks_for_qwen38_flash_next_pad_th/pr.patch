@@ -1,0 +1,1253 @@
+From 760c2e7c372821f540a84d8e4d87af13482bfda7 Mon Sep 17 00:00:00 2001
+From: baKon <mike.ski83@gmail.com>
+Date: Sun, 4 Oct 2026 12:07:21 -0500
+Subject: [PATCH 1/4] libr4d: all-reduce and all-gather at three ranks
+
+Instantiate the wide one-shot all-reduce at WS=3 and add an all-gather on the
+wide transport (ar_gather_3rank), with dispatch rows for world_size 3, so a
+three-card box resolves 'all_reduce' and the vocab-parallel sampler's
+'all_gather'. The two-shot is not instantiated at 3: it shards the message
+world ways and the residual width does not divide. Selftest: 3-rank sum,
+block-count sweep and both gather placements (skipped on fewer than 3 cards).
+
+Local lab build on top of 1.0.3 (f487864); not submitted upstream.
+
+(cherry picked from commit a76f2ab66500b9a7711b8f52abbf48eb88758359)
+---
+ docs/OPS.md                           |   7 +
+ libr4d/r4d.h                          |  17 +++
+ libr4d/r4d_ar_entry.hip               |  35 ++++-
+ libr4d/r4d_ar_gather_Nrank.hip        |  21 ++-
+ libr4d/r4d_ar_oneshot_Nrank_exact.hip |  21 ++-
+ libr4d/r4d_plugin.h                   |   2 +
+ libr4d/r4d_rows.cpp                   |  28 ++++
+ libr4d/r4d_selftest.cpp               | 190 ++++++++++++++++++++++++--
+ 8 files changed, 302 insertions(+), 19 deletions(-)
+
+diff --git a/docs/OPS.md b/docs/OPS.md
+index 98ca358..a23f18b 100644
+--- a/docs/OPS.md
++++ b/docs/OPS.md
+@@ -738,6 +738,13 @@ rows start above 524288 elements, which makes that a band edge of the ranged `nu
+ states nothing for it. `hops` is a caller's request for one or the other (1 or 2); libref accepts
+ and ignores it, and no libr4d row reads it. Every all-reduce kernel serves `y` absent, in place.
+ 
++libr4d serves these at **2, 3, 4 and 8 ranks**. Two ranks have their own kernels (one flag word a
++block, the rotated 6-bit wire, the fused norm-and-reduce forms). The wide family is one template on
++the world size; 4 and 8 have both hops, 3 has the one-shot only -- the two-shot shards the message
++`world` ways and a residual width such as 2560 does not divide by 3 -- and `all_gather` at width
++rides the same instance as the wide `all_reduce` (`ar_gather_3rank`, `_4rank`, `_8rank`). The fused forms are declared
++only at two ranks by the arch blocks, which fall back to the plain pair at any other width.
++
+ `min_bytes` is the byte floor under which a LOSSY row must serve the message exactly anyway, and it
+ is a parameter rather than a constant in the library because it is a property of the link and not
+ of the kernel. Compression only pays once the transfer is bandwidth-bound: a decode step
+diff --git a/libr4d/r4d.h b/libr4d/r4d.h
+index 404a4a0..c9b6da0 100644
+--- a/libr4d/r4d.h
++++ b/libr4d/r4d.h
+@@ -326,12 +326,29 @@ void r4d_ar_gather_2rank(long peer_scratch, long my_scratch, long peer_flags, lo
+ // words parity x source rank, this rank's own slot unused); flags are max_blocks*ws words indexed 
+ // [block][source rank]; seq_ctrs is 2 * max_blocks words, a handshake and a slot-parity counter
+ // per block of capacity (r4d_ar_seq.h).
++// Three ranks: the same kernel instantiated at WS=3 (two peers). Nothing in the wide family is
++// power-of-two; the two-shot cannot serve 3 because it shards the message `world` ways.
++void r4d_ar_oneshot_3rank_exact(long peer_scratch0, long peer_scratch1,
++                                long peer_flags0, long peer_flags1,
++                                long my_scratch, long my_flags, long seq_ctrs, long slot_stride16,
++                                long inp, long out, long n_elem, long dtype, long rank,
++                                long stream, long nblocks, long nthreads, long drain, long acq,
++                                long pub);
+ void r4d_ar_oneshot_4rank_exact(long peer_scratch0, long peer_scratch1, long peer_scratch2,
+                                 long peer_flags0, long peer_flags1, long peer_flags2,
+                                 long my_scratch, long my_flags, long seq_ctrs, long slot_stride16,
+                                 long inp, long out, long n_elem, long dtype, long rank,
+                                 long stream, long nblocks, long nthreads, long drain, long acq,
+                                 long pub);
++// ---- all-gather at width (r4d_ar_gather_Nrank.hip) ------------------------------------------
++// The 2-rank gather's placement on the wide family's transport: `out` is world * n_elem elements,
++// rank r's slice at r * n_elem, or row-interleaved [rows][world][row] when row_elems > 0. Shares
++// the wide all-reduce's instance (scratch, [block][source] flags, seq counters).
++void r4d_ar_gather_3rank(long peer_scratch0, long peer_scratch1, long peer_flags0,
++                         long peer_flags1, long my_scratch, long my_flags, long seq_ctrs,
++                         long slot_stride16, long inp, long out, long n_elem, long dtype,
++                         long rank, long row_elems, long stream, long nblocks, long nthreads,
++                         long drain, long acq, long pub);
+ void r4d_ar_oneshot_8rank_exact(long peer_scratch0, long peer_scratch1, long peer_scratch2,
+                                 long peer_scratch3, long peer_scratch4, long peer_scratch5,
+                                 long peer_scratch6, long peer_flags0, long peer_flags1,
+diff --git a/libr4d/r4d_ar_entry.hip b/libr4d/r4d_ar_entry.hip
+index dfe374d..21c64f6 100644
+--- a/libr4d/r4d_ar_entry.hip
++++ b/libr4d/r4d_ar_entry.hip
+@@ -551,7 +551,7 @@ extern "C" int r4d_rad_ar_gather_2rank(const RadArgs* a, RadStream s) {
+     return RAD_OK;
+ }
+ 
+-/* ------------------------------------------------------------------ wide (4 / 8 rank) all-gather
++/* ------------------------------------------------------------------ wide (3 / 4 / 8 rank) all-gather
+  * The gather the 2-rank one cannot be at width: its handshake is one peer flag per block, so the
+  * wide form takes the wide family's peer arrays and r4d_ar_handshake instead (r4d_ar_wide.h), and
+  * it rides the SAME instance, scratch, flags and counters as the wide one-shots above -- a slot
+@@ -623,6 +623,21 @@ static int ar_gather_wide_setup(const RadArgs* a, int ws, const ArInst** out_in,
+     return RAD_OK;
+ }
+ 
++extern "C" int r4d_rad_ar_gather_3rank(const RadArgs* a, RadStream s) {
++    const ArInst* in = nullptr;
++    ArCall c;
++    long long row = 0;
++    int rc = ar_gather_wide_setup(a, 3, &in, &c, &row);
++    if (rc != RAD_OK) return rc;
++    R4D_TRY("ar_gather_3rank",
++        r4d_ar_gather_3rank(in->peer_scratch[0], in->peer_scratch[1],
++                            in->peer_flags[0], in->peer_flags[1],
++                            in->my_scratch, in->my_flags, in->my_seq, in->slot16,
++                            c.inp, c.out, c.numel, in->dtype, in->rank, (long)row,
++                            (long)(uintptr_t)s, c.nblocks, c.nthreads, c.drain, c.acq, c.pub));
++    return RAD_OK;
++}
++
+ extern "C" int r4d_rad_ar_gather_4rank(const RadArgs* a, RadStream s) {
+     const ArInst* in = nullptr;
+     ArCall c;
+@@ -737,7 +752,7 @@ extern "C" int r4d_rad_ar_oneshot_2rank_wht6(const RadArgs* a, RadStream s) {
+     return RAD_OK;
+ }
+ 
+-/* ------------------------------------------------------------------ wide (4 / 8 rank)
++/* ------------------------------------------------------------------ wide (3 / 4 / 8 rank)
+  *
+  * The peer arguments are ascending global rank with the current rank removed, which is exactly
+  * the order build() filled peer_scratch/peer_flags in. */
+@@ -745,6 +760,22 @@ extern "C" int r4d_rad_ar_oneshot_2rank_wht6(const RadArgs* a, RadStream s) {
+ /* The one-shots run in place: the thread that stores word k of the output is the one that read
+  * word k of the input, for its push and again as its own term of the fold, and peers read only
+  * their own scratch (r4d_ar_oneshot_Nrank_exact.hip). */
++extern "C" int r4d_rad_ar_oneshot_3rank_exact(const RadArgs* a, RadStream s) {
++    ArCall c;
++    int rc = ar_setup(a, &c, 0);
++    if (rc != RAD_OK) return rc;
++    if (c.in->world != 3) return RAD_E_SHAPE;
++    const ArInst* in = c.in;
++    R4D_TRY("ar_oneshot_3rank_exact",
++        r4d_ar_oneshot_3rank_exact(in->peer_scratch[0], in->peer_scratch[1],
++                                   in->peer_flags[0], in->peer_flags[1],
++                                   in->my_scratch, in->my_flags, in->my_seq, in->slot16,
++                                   c.inp, c.out, c.numel, in->dtype, in->rank,
++                                   (long)(uintptr_t)s, c.nblocks, c.nthreads, c.drain, c.acq,
++                                   c.pub));
++    return RAD_OK;
++}
++
+ extern "C" int r4d_rad_ar_oneshot_4rank_exact(const RadArgs* a, RadStream s) {
+     ArCall c;
+     int rc = ar_setup(a, &c, 0);
+diff --git a/libr4d/r4d_ar_gather_Nrank.hip b/libr4d/r4d_ar_gather_Nrank.hip
+index d89c504..3a521e5 100644
+--- a/libr4d/r4d_ar_gather_Nrank.hip
++++ b/libr4d/r4d_ar_gather_Nrank.hip
+@@ -1,4 +1,4 @@
+-// r4d_ar_gather_Nrank.hip: r4d_ar_gather_4rank, r4d_ar_gather_8rank -- one-shot P2P all-GATHER,
++// r4d_ar_gather_Nrank.hip: r4d_ar_gather_3rank, r4d_ar_gather_4rank, r4d_ar_gather_8rank -- one-shot P2P all-GATHER,
+ // 4 or 8 ranks, gfx1201. WS is compile-time; the 2-rank gather keeps its own file, exactly as the
+ // one-shot all-reduce's does.
+ //
+@@ -34,6 +34,12 @@
+ // "C" here, at arm's length from the definitions below, so those definitions get C linkage; the
+ // caller is r4d_ar_entry.hip, which owns the instance and repeats the two prototypes at its call
+ // site (r4d.h declares the rest of the family and is not this unit's file).
++extern "C" void r4d_ar_gather_3rank(long peer_scratch0, long peer_scratch1,
++                                    long peer_flags0, long peer_flags1,
++                                    long my_scratch, long my_flags, long seq_ctrs,
++                                    long slot_stride16, long inp, long out, long n_elem,
++                                    long dtype, long rank, long row_elems, long stream,
++                                    long nblocks, long nthreads, long drain, long acq, long pub);
+ extern "C" void r4d_ar_gather_4rank(long peer_scratch0, long peer_scratch1, long peer_scratch2,
+                                     long peer_flags0, long peer_flags1, long peer_flags2,
+                                     long my_scratch, long my_flags, long seq_ctrs,
+@@ -215,6 +221,19 @@ static void ar_gather_wide_launch(const long* peer_scratch, const long* peer_fla
+       (int)pub);
+ }
+ 
++/* Three ranks: the same launch with two peers. The vocab-parallel sampler's gather at a world of
++ * three (Qwen3.8-Flash-Next padded to 36 heads / 3 KV heads, docs/TP3.md) resolves here. */
++void r4d_ar_gather_3rank(long peer_scratch0, long peer_scratch1,
++                         long peer_flags0, long peer_flags1, long my_scratch,
++                         long my_flags, long seq_ctrs, long slot_stride16, long inp, long out,
++                         long n_elem, long dtype, long rank, long row_elems, long stream,
++                         long nblocks, long nthreads, long drain, long acq, long pub) {
++  const long ps[2] = {peer_scratch0, peer_scratch1};
++  const long pf[2] = {peer_flags0, peer_flags1};
++  ar_gather_wide_launch<3>(ps, pf, my_scratch, my_flags, seq_ctrs, slot_stride16, inp, out, n_elem,
++                           dtype, rank, row_elems, stream, nblocks, nthreads, drain, acq, pub);
++}
++
+ void r4d_ar_gather_4rank(long peer_scratch0, long peer_scratch1, long peer_scratch2,
+                          long peer_flags0, long peer_flags1, long peer_flags2, long my_scratch,
+                          long my_flags, long seq_ctrs, long slot_stride16, long inp, long out,
+diff --git a/libr4d/r4d_ar_oneshot_Nrank_exact.hip b/libr4d/r4d_ar_oneshot_Nrank_exact.hip
+index ebf329a..d2fe58e 100644
+--- a/libr4d/r4d_ar_oneshot_Nrank_exact.hip
++++ b/libr4d/r4d_ar_oneshot_Nrank_exact.hip
+@@ -1,5 +1,5 @@
+-// r4d_ar_oneshot_Nrank_exact.hip: r4d_ar_oneshot_4rank_exact,
+-// r4d_ar_oneshot_8rank_exact -- one-shot P2P push all-reduce, 4 or 8
++// r4d_ar_oneshot_Nrank_exact.hip: r4d_ar_oneshot_3rank_exact, r4d_ar_oneshot_4rank_exact,
++// r4d_ar_oneshot_8rank_exact -- one-shot P2P push all-reduce, 3, 4 or 8
+ // ranks, gfx1201. WS is compile-time; the 2-rank kernel keeps its own file.
+ //
+ // Per-block handshake: block b waits only on the peers' block b, so push
+@@ -343,6 +343,23 @@ static void ar_wide_launch(const long* peer_scratch, const long* peer_flags, lon
+ #undef R4D_AR_WIDE_LAUNCH
+ }
+ 
++// Three ranks: the same kernel at WS=3. Nothing in the push, the handshake or the ascending-rank
++// reduce assumes a power of two -- the peer bundle is WS-1 wide and the slot/flag layout is
++// parity x source rank -- so this is an instantiation, not a variant. It exists because a 3-card
++// box is a real configuration (three R9700s) and the two-shot cannot serve it: that one shards the
++// message `world` ways and a residual width of 2560 does not divide by 3.
++void r4d_ar_oneshot_3rank_exact(long peer_scratch0, long peer_scratch1,
++                                long peer_flags0, long peer_flags1,
++                                long my_scratch, long my_flags, long seq_ctrs, long slot_stride16,
++                                long inp, long out, long n_elem, long dtype, long rank,
++                                long stream, long nblocks, long nthreads, long drain, long acq,
++                                long pub) {
++  const long ps[2] = {peer_scratch0, peer_scratch1};
++  const long pf[2] = {peer_flags0, peer_flags1};
++  ar_wide_launch<3>(ps, pf, my_scratch, my_flags, seq_ctrs, slot_stride16, inp, out, n_elem,
++                    dtype, rank, stream, nblocks, nthreads, drain, acq, pub);
++}
++
+ void r4d_ar_oneshot_4rank_exact(long peer_scratch0, long peer_scratch1, long peer_scratch2,
+                                 long peer_flags0, long peer_flags1, long peer_flags2,
+                                 long my_scratch, long my_flags, long seq_ctrs, long slot_stride16,
+diff --git a/libr4d/r4d_plugin.h b/libr4d/r4d_plugin.h
+index 5ac110e..0c66deb 100644
+--- a/libr4d/r4d_plugin.h
++++ b/libr4d/r4d_plugin.h
+@@ -173,6 +173,8 @@ int  r4d_rad_ar_gather_2rank       (const RadArgs*, RadStream);
+ int  r4d_rad_ar_gather_4rank       (const RadArgs*, RadStream);
+ int  r4d_rad_ar_gather_8rank       (const RadArgs*, RadStream);
+ int  r4d_rad_ar_oneshot_2rank_wht6 (const RadArgs*, RadStream);
++int  r4d_rad_ar_oneshot_3rank_exact(const RadArgs*, RadStream);
++int  r4d_rad_ar_gather_3rank       (const RadArgs*, RadStream);
+ int  r4d_rad_ar_oneshot_4rank_exact(const RadArgs*, RadStream);
+ int  r4d_rad_ar_oneshot_8rank_exact(const RadArgs*, RadStream);
+ int  r4d_rad_ar_twoshot_4rank_exact(const RadArgs*, RadStream);
+diff --git a/libr4d/r4d_rows.cpp b/libr4d/r4d_rows.cpp
+index 6beac27..0a94898 100644
+--- a/libr4d/r4d_rows.cpp
++++ b/libr4d/r4d_rows.cpp
+@@ -2432,6 +2432,14 @@ static const RadConstraint cArExact[] = {
+     C_EQ("world_size", 2), C_EQ("exact", 1), C_IN("dtype", "bf16 fp16 fp32"),
+     C_P2P,
+ };
++static const RadConstraint cArGather3[] = {
++    C_EQ("world_size", 3), C_IN("dtype", "bf16 fp16 f16 fp32 f32"),
++    C_P2P,
++};
++static const RadConstraint cArExact3[] = {
++    C_EQ("world_size", 3), C_EQ("exact", 1), C_IN("dtype", "bf16 fp16 fp32"),
++    C_P2P,
++};
+ static const RadConstraint cArExact4[] = {
+     C_EQ("world_size", 4), C_EQ("exact", 1), C_IN("dtype", "bf16 fp16 fp32"),
+     C_P2P,
+@@ -4010,6 +4018,26 @@ static const RadKernelInfo kKernels[] = {
+   r4d_rad_ar_init, r4d_rad_ar_fini, r4d_rad_ar_oneshot_2rank_wht6, nullptr, nullptr, nullptr,
+   r4d_shape_all_reduce },
+ 
++{ "ar_gather_3rank", "all_gather", "ar",
++  "all-gather, one-shot push over P2P IPC scratch, the wide family's per-block handshake",
++  "exactly 3 ranks, all peer-accessible; y is [3 * numel] with rank r's input at r * numel, or "
++  "row-interleaved [rows][3][row] when `row` is given; shares the wide family's "
++  "flag/seq/scratch set; cudagraph-safe",
++  "any payload -- the bytes are moved, never summed, so the (u32 id, f32 logit) pairs the "
++  "vocab-parallel sampler gathers survive intact",
++  RAD_DOMAIN_DEVICE, R4D_PRIO_AR_ONESHOT,
++  ROW(cArGather3), ROW(tAr), nullptr,
++  r4d_rad_ar_init, r4d_rad_ar_fini, r4d_rad_ar_gather_3rank, nullptr, nullptr, nullptr,
++  r4d_shape_all_gather },
++{ "ar_oneshot_3rank_exact", "all_reduce", "ar",
++  "all-reduce (sum), one-shot push over P2P IPC scratch, per-block handshake",
++  "exactly 3 ranks, all peer-accessible; one scratch slot per (parity, source rank); "
++  "the only wide form at three -- the two-shot shards the message `world` ways; cudagraph-safe",
++  "bf16 / fp16 / fp32 payload, fp32 accumulate in ascending rank order, bit-identical across ranks",
++  RAD_DOMAIN_DEVICE, R4D_PRIO_AR_ONESHOT,
++  ROW(cArExact3), ROW(tAr), nullptr,
++  r4d_rad_ar_init, r4d_rad_ar_fini, r4d_rad_ar_oneshot_3rank_exact, nullptr, nullptr, nullptr,
++  r4d_shape_all_reduce },
+ { "ar_oneshot_4rank_exact", "all_reduce", "ar",
+   "all-reduce (sum), one-shot push over P2P IPC scratch, per-block handshake",
+   "exactly 4 ranks, all peer-accessible; one scratch slot per (parity, source rank); in "
+diff --git a/libr4d/r4d_selftest.cpp b/libr4d/r4d_selftest.cpp
+index 745b284..9f3ab66 100644
+--- a/libr4d/r4d_selftest.cpp
++++ b/libr4d/r4d_selftest.cpp
+@@ -8820,14 +8820,17 @@ struct ArThread {
+     /* The all-gather row width in ELEMENTS. 0 is the plain concatenation; anything else asks for
+      * the row-interleaved placement the vocab-parallel sampler needs. */
+     int64_t row_elems = 0;
++    /* Ranks in the collective. 2 is the pair; 3 exercises the wide family at the one width that
++     * is not a power of two. */
++    int world = 2;
+ };
+ 
+ static void ar_worker(ArThread* t) {
+     if (st_set_device(t->dev) != hipSuccess) { t->rc_init = RAD_E_DEVICE; return; }
+     std::vector<RadParam> ps = {
+-        PI("world_size", 2), PI("numel", t->numel), PS("dtype", "fp32"), PI("exact", 1),
++        PI("world_size", t->world), PI("numel", t->numel), PS("dtype", "fp32"), PI("exact", 1),
+     };
+-    t->rc_init = t->row->init(ps.data(), (int)ps.size(), t->rank, 2, &t->inst);
++    t->rc_init = t->row->init(ps.data(), (int)ps.size(), t->rank, t->world, &t->inst);
+     if (t->rc_init != RAD_OK) return;
+ 
+     void* in = nullptr;
+@@ -8845,7 +8848,7 @@ static void ar_worker(ArThread* t) {
+     a.p = ps.data(); a.n_p = (int)ps.size();
+     a.instance = t->inst;
+     a.rank = t->rank;
+-    a.world_size = 2;
++    a.world_size = t->world;
+     t->rc_launch = t->row->launch(&a, nullptr);
+     st_stream_sync(nullptr);
+ 
+@@ -8905,6 +8908,7 @@ struct ArSweep {
+     void* inst = nullptr;
+     int rc_init = RAD_E_STATE, rc_launch = RAD_OK;
+     int64_t bad = 0;
++    int world = 2;
+ };
+ 
+ static void ar_sweep_worker(ArSweep* t) {
+@@ -8912,10 +8916,12 @@ static void ar_sweep_worker(ArSweep* t) {
+     int64_t most = 0;
+     for (int64_t n : kArSweepNumel) most = n > most ? n : most;
+     std::vector<RadParam> ps = {
+-        PI("world_size", 2), PI("numel", most), PS("dtype", "fp32"), PI("exact", 1),
++        PI("world_size", t->world), PI("numel", most), PS("dtype", "fp32"), PI("exact", 1),
+     };
+-    t->rc_init = t->row->init(ps.data(), (int)ps.size(), t->rank, 2, &t->inst);
++    t->rc_init = t->row->init(ps.data(), (int)ps.size(), t->rank, t->world, &t->inst);
+     if (t->rc_init != RAD_OK) return;
++    /* Rank r contributes (r + 1) * (j + 1), so launch j sums to (1 + 2 + .. + world) * (j + 1). */
++    const float tri = (float)(t->world * (t->world + 1) / 2);
+ 
+     void* in[kArSweepN] = {};
+     void* out[kArSweepN] = {};
+@@ -8939,14 +8945,14 @@ static void ar_sweep_worker(ArSweep* t) {
+         a.p = ps.data(); a.n_p = (int)ps.size();
+         a.instance = t->inst;
+         a.rank = t->rank;
+-        a.world_size = 2;
++        a.world_size = t->world;
+         t->rc_launch = t->row->launch(&a, nullptr);
+     }
+     st_stream_sync(nullptr);
+     for (int j = 0; j < kArSweepN; ++j) {
+         std::vector<float> h((size_t)kArSweepNumel[j]);
+         st_memcpy(h.data(), out[j], h.size() * 4, hipMemcpyDeviceToHost);
+-        for (float v : h) if (v != (float)(3 * (j + 1))) ++t->bad;
++        for (float v : h) if (v != tri * (float)(j + 1)) ++t->bad;
+         st_free(in[j]);
+         st_free(out[j]);
+     }
+@@ -8984,16 +8990,16 @@ static void ar_two_rank_sweep(const Plugin& pl, const std::vector<int>& devs) {
+ static void gather_worker(ArThread* t) {
+     if (st_set_device(t->dev) != hipSuccess) { t->rc_init = RAD_E_DEVICE; return; }
+     std::vector<RadParam> ps = {
+-        PI("world_size", 2), PI("numel", t->numel), PS("dtype", "f32"),
++        PI("world_size", t->world), PI("numel", t->numel), PS("dtype", "f32"),
+     };
+     if (t->row_elems > 0) ps.push_back(PI("row", t->row_elems));
+-    t->rc_init = t->row->init(ps.data(), (int)ps.size(), t->rank, 2, &t->inst);
++    t->rc_init = t->row->init(ps.data(), (int)ps.size(), t->rank, t->world, &t->inst);
+     if (t->rc_init != RAD_OK) return;
+ 
+     void* in = nullptr;
+     void* out = nullptr;
+     if (hipMalloc(&in, (size_t)t->numel * 4) != hipSuccess) { t->rc_launch = RAD_E_NOMEM; return; }
+-    if (hipMalloc(&out, (size_t)t->numel * 8) != hipSuccess) { t->rc_launch = RAD_E_NOMEM; return; }
++    if (hipMalloc(&out, (size_t)t->numel * 4 * t->world) != hipSuccess) { t->rc_launch = RAD_E_NOMEM; return; }
+ 
+     std::vector<uint32_t> h((size_t)t->numel);
+     for (int64_t i = 0; i < t->numel; i += 2) {
+@@ -9002,20 +9008,20 @@ static void gather_worker(ArThread* t) {
+         std::memcpy(&h[(size_t)i + 1], &v, 4);
+     }
+     st_memcpy(in, h.data(), h.size() * 4, hipMemcpyHostToDevice);
+-    st_memset(out, 0xAB, (size_t)t->numel * 8);   /* so an untouched half is visibly untouched */
++    st_memset(out, 0xAB, (size_t)t->numel * 4 * t->world);   /* so an untouched slice is visibly untouched */
+ 
+-    RadTensor ts[2] = { T(in, RAD_F32, { t->numel }), T(out, RAD_F32, { t->numel * 2 }) };
++    RadTensor ts[2] = { T(in, RAD_F32, { t->numel }), T(out, RAD_F32, { t->numel * t->world }) };
+     RadArgs a;
+     std::memset(&a, 0, sizeof(a));
+     a.t = ts; a.n_t = 2;
+     a.p = ps.data(); a.n_p = (int)ps.size();
+     a.instance = t->inst;
+     a.rank = t->rank;
+-    a.world_size = 2;
++    a.world_size = t->world;
+     t->rc_launch = t->row->launch(&a, nullptr);
+     st_stream_sync(nullptr);
+ 
+-    t->out.assign((size_t)t->numel * 2, 0.0f);
++    t->out.assign((size_t)t->numel * t->world, 0.0f);
+     st_memcpy(t->out.data(), out, t->out.size() * 4, hipMemcpyDeviceToHost);
+     st_free(in);
+     st_free(out);
+@@ -9105,6 +9111,151 @@ static void gather_two_rank(const Plugin& pl, const std::vector<int>& devs) {
+     ok("2-rank all-gather fini ran", true);
+ }
+ 
++/* ------------------------------------------------------------------ the three-rank wide family */
++/* THE ONE WIDTH THAT IS NOT A POWER OF TWO. The wide kernels are templated on the world size and
++ * shipped at 4 and 8; three cards instantiate the same template at 3, and these are the checks that
++ * the instantiation, the dispatch rows and the entry points agree: a rendezvous of three, a sum of
++ * 1 + 2 + 3 on every rank bit for bit, the slot parity surviving a block-count sweep, and the
++ * gather placing three slices in both of its layouts. Skipped, not failed, on fewer cards. */
++static void ar_three_rank(const Plugin& pl, const std::vector<int>& devs) {
++    const RadKernelInfo* row = find(pl, "ar_oneshot_3rank_exact");
++    if (!row) { ok("ar_oneshot_3rank_exact", false, "row absent"); return; }
++    if (devs.size() < 3) { skip("ar_oneshot_3rank_exact (3 ranks)", "fewer than three gfx1201 cards"); return; }
++    const int64_t numel = 8192;
++    ArThread a{ row, 0, devs[0], numel }, b{ row, 1, devs[1], numel }, c{ row, 2, devs[2], numel };
++    a.world = b.world = c.world = 3;
++    std::thread ta(ar_worker, &a), tb(ar_worker, &b), tc(ar_worker, &c);
++    ta.join();
++    tb.join();
++    tc.join();
++    ok("3-rank all-reduce init (peer rendezvous)",
++       a.rc_init == RAD_OK && b.rc_init == RAD_OK && c.rc_init == RAD_OK,
++       "rc " + std::to_string(a.rc_init) + "/" + std::to_string(b.rc_init) + "/" +
++           std::to_string(c.rc_init));
++    if (a.rc_init != RAD_OK || b.rc_init != RAD_OK || c.rc_init != RAD_OK) return;
++    ok("3-rank all-reduce launch",
++       a.rc_launch == RAD_OK && b.rc_launch == RAD_OK && c.rc_launch == RAD_OK,
++       "rc " + std::to_string(a.rc_launch) + "/" + std::to_string(b.rc_launch) + "/" +
++           std::to_string(c.rc_launch));
++    int64_t bad = 0;
++    for (int64_t i = 0; i < numel; ++i) {
++        if (a.out[(size_t)i] != 6.0f) ++bad;
++        if (b.out[(size_t)i] != 6.0f) ++bad;
++        if (c.out[(size_t)i] != 6.0f) ++bad;
++    }
++    ok("3-rank all-reduce sums 1 + 2 + 3 == 6 on every rank, bit for bit", bad == 0,
++       std::to_string(bad) + " elements wrong");
++    if (row->fini) { row->fini(a.inst); row->fini(b.inst); row->fini(c.inst); }
++    ok("3-rank all-reduce fini ran", true);
++
++    /* Block counts that change launch to launch on one instance: the wide family takes its slot
++     * parity from the shared counters exactly as the pair does, and this is the check that it
++     * does so at a width whose flag array is [block][3]. */
++    ArSweep x{ row, 0, devs[0] }, y{ row, 1, devs[1] }, z{ row, 2, devs[2] };
++    x.world = y.world = z.world = 3;
++    std::thread tx(ar_sweep_worker, &x), ty(ar_sweep_worker, &y), tz(ar_sweep_worker, &z);
++    tx.join();
++    ty.join();
++    tz.join();
++    const bool up = x.rc_init == RAD_OK && y.rc_init == RAD_OK && z.rc_init == RAD_OK &&
++                    x.rc_launch == RAD_OK && y.rc_launch == RAD_OK && z.rc_launch == RAD_OK;
++    ok("3-rank all-reduce, eight launches at changing block counts on one instance",
++       up && x.bad == 0 && y.bad == 0 && z.bad == 0,
++       up ? std::to_string(x.bad + y.bad + z.bad) + " elements wrong"
++          : "rc " + std::to_string(x.rc_init) + "/" + std::to_string(y.rc_init) + "/" +
++                std::to_string(z.rc_init) + " init, " + std::to_string(x.rc_launch) + "/" +
++                std::to_string(y.rc_launch) + "/" + std::to_string(z.rc_launch) + " launch");
++    if (row->fini) {
++        if (x.inst) row->fini(x.inst);
++        if (y.inst) row->fini(y.inst);
++        if (z.inst) row->fini(z.inst);
++    }
++}
++
++static void gather_three_rank(const Plugin& pl, const std::vector<int>& devs) {
++    const RadKernelInfo* row = find(pl, "ar_gather_3rank");
++    if (!row) { ok("ar_gather_3rank", false, "row absent"); return; }
++    if (devs.size() < 3) { skip("ar_gather_3rank (3 ranks)", "fewer than three gfx1201 cards"); return; }
++    const int64_t numel = 8192;   /* the sampler's own message at 4 rows and 1024 candidates */
++    const int W = 3;
++    /* What each rank sent, rebuilt here rather than read back off the device (gather_two_rank). */
++    auto sent = [](int rank, int64_t i) -> uint32_t {
++        if ((i & 1) == 0) return (uint32_t)(rank * 124160 + (int)i + 1);
++        uint32_t u; const float v = (float)(rank + 1) * 0.5f + (float)(i - 1);
++        std::memcpy(&u, &v, 4);
++        return u;
++    };
++    {
++        ArThread a{ row, 0, devs[0], numel }, b{ row, 1, devs[1], numel }, c{ row, 2, devs[2], numel };
++        a.world = b.world = c.world = W;
++        std::thread ta(gather_worker, &a), tb(gather_worker, &b), tc(gather_worker, &c);
++        ta.join();
++        tb.join();
++        tc.join();
++        ok("3-rank all-gather init (peer rendezvous)",
++           a.rc_init == RAD_OK && b.rc_init == RAD_OK && c.rc_init == RAD_OK,
++           "rc " + std::to_string(a.rc_init) + "/" + std::to_string(b.rc_init) + "/" +
++               std::to_string(c.rc_init));
++        if (a.rc_init != RAD_OK || b.rc_init != RAD_OK || c.rc_init != RAD_OK) return;
++        ok("3-rank all-gather launch",
++           a.rc_launch == RAD_OK && b.rc_launch == RAD_OK && c.rc_launch == RAD_OK,
++           "rc " + std::to_string(a.rc_launch) + "/" + std::to_string(b.rc_launch) + "/" +
++               std::to_string(c.rc_launch));
++        int64_t bad = 0, bad_id = 0;
++        for (const ArThread* t : { &a, &b, &c }) {
++            for (int r = 0; r < W; ++r) {
++                for (int64_t i = 0; i < numel; ++i) {
++                    uint32_t got;
++                    std::memcpy(&got, &t->out[(size_t)(r * numel + i)], 4);
++                    if (got == sent(r, i)) continue;
++                    ++bad;
++                    if ((i & 1) == 0) ++bad_id;
++                }
++            }
++        }
++        ok("3-rank all-gather places every rank's bytes on every rank, bit for bit", bad == 0,
++           std::to_string(bad) + " words wrong, " + std::to_string(bad_id) + " of them token ids");
++        if (row->fini) { row->fini(a.inst); row->fini(b.inst); row->fini(c.inst); }
++    }
++
++    /* The row-interleaved placement the sampler asks for: [rows][3][row]. */
++    const int64_t rowe = 2048;                     /* 4 rows of 1024 (id, logit) pairs */
++    ArThread c{ row, 0, devs[0], numel }, d{ row, 1, devs[1], numel }, e{ row, 2, devs[2], numel };
++    c.world = d.world = e.world = W;
++    c.row_elems = d.row_elems = e.row_elems = rowe;
++    std::thread tc(gather_worker, &c), td(gather_worker, &d), te(gather_worker, &e);
++    tc.join();
++    td.join();
++    te.join();
++    if (c.rc_init != RAD_OK || d.rc_init != RAD_OK || e.rc_init != RAD_OK ||
++        c.rc_launch != RAD_OK || d.rc_launch != RAD_OK || e.rc_launch != RAD_OK) {
++        ok("3-rank all-gather, row-interleaved", false,
++           "rc " + std::to_string(c.rc_init) + "/" + std::to_string(d.rc_init) + "/" +
++               std::to_string(e.rc_init) + " init, " + std::to_string(c.rc_launch) + "/" +
++               std::to_string(d.rc_launch) + "/" + std::to_string(e.rc_launch) + " launch");
++        return;
++    }
++    const int64_t nrows = numel / rowe;
++    int64_t bad = 0, bad_id = 0;
++    for (const ArThread* t : { &c, &d, &e }) {
++        for (int64_t m = 0; m < nrows; ++m) {
++            for (int r = 0; r < W; ++r) {
++                for (int64_t j = 0; j < rowe; ++j) {
++                    uint32_t got;
++                    std::memcpy(&got, &t->out[(size_t)(m * W * rowe + r * rowe + j)], 4);
++                    if (got == sent(r, m * rowe + j)) continue;
++                    ++bad;
++                    if ((j & 1) == 0) ++bad_id;
++                }
++            }
++        }
++    }
++    ok("3-rank all-gather interleaves by row, so one row carries all three ranks", bad == 0,
++       std::to_string(bad) + " words wrong, " + std::to_string(bad_id) + " of them token ids");
++    if (row->fini) { row->fini(c.inst); row->fini(d.inst); row->fini(e.inst); }
++    ok("3-rank all-gather fini ran", true);
++}
++
+ /* ------------------------------------------------------------------ the device sweep */
+ 
+ /* NGRAM_IDS' `ahead_ids`: the prompt that follows the step, hashed in the same launch. Step one
+@@ -10297,6 +10448,17 @@ static void device_phase(const Plugin& pl) {
+         if (!g_case) std::printf("\ncross-rank\n");
+         gather_two_rank(pl, devs);
+     }
++    /* The wide family at three. Its own rows, so the sweep names them (a row the sweep never
++     * mentions is reported as a coverage hole) and so `--case ar_oneshot_3rank_exact` reproduces
++     * one of them alone. */
++    if (sel("ar_oneshot_3rank_exact")) {
++        if (!g_case) std::printf("\ncross-rank, three\n");
++        ar_three_rank(pl, devs);
++    }
++    if (sel("ar_gather_3rank")) {
++        if (!g_case) std::printf("\ncross-rank, three\n");
++        gather_three_rank(pl, devs);
++    }
+     /* The 4- and 8-rank rows cannot be exercised on a two-card box. Reported as skipped rather
+      * than quietly passing: a row that has never been launched is not a row that works. */
+     for (const char* n : { "ar_oneshot_4rank_exact", "ar_oneshot_8rank_exact",
+-- 
+2.55.0
+
+
+From b2f3132d2fd05f2713be1cbc591e4f123f8638d0 Mon Sep 17 00:00:00 2001
+From: baKon <mike.ski83@gmail.com>
+Date: Sun, 4 Oct 2026 14:22:32 -0500
+Subject: [PATCH 2/4] vocab edges at a world that does not divide them:
+ block-aligned split, declared as a span
+
+token_embd / output are RAD_SHARD_ROW; at three ranks 248320 rows do not
+divide, and share.cpp refuses a row shard without a declared span.
+qwen4exp now declares [vocab_off, vocab_off + n_vocab) for both. The split
+rule (rad_arch.h shard_extent/shard_begin, restated in core/engine.cpp)
+keeps the even share whenever the world divides the vocabulary -- two and
+four ranks are untouched -- and only otherwise rounds the per-rank count
+up to a 128-row block, because a block-scaled fp8 head refuses a cut
+inside a tile: at three the ranks take 82816, 82816, 82688.
+---
+ arch/common/rad_arch.h             | 20 ++++++++++++++++++--
+ arch/qwen4exp_fp8/qwen4exp_fp8.cpp |  8 ++++++++
+ core/engine.cpp                    |  9 +++++++--
+ 3 files changed, 33 insertions(+), 4 deletions(-)
+
+diff --git a/arch/common/rad_arch.h b/arch/common/rad_arch.h
+index 6b06bfb..23193c8 100644
+--- a/arch/common/rad_arch.h
++++ b/arch/common/rad_arch.h
+@@ -675,14 +675,30 @@ inline int divide_or_fail(int64_t v, int world, const char* what, int64_t* out)
+  * absurd. So the last rank holds fewer rows. The sampler merges candidate sets rather than
+  * gathering full logits (spec §9, §13), so a ragged shard costs it nothing; a padded one would
+  * cost a fake token id that has to be masked everywhere forever. */
+-inline int64_t shard_extent(int64_t total, int world, int rank) {
++/* THE VOCABULARY SPLIT: ceil(total / world) rows a rank, ROUNDED UP TO A WHOLE 128-ROW BLOCK, the
++ * last rank short. The block is RAD_FP8_BLOCK: a block-scaled fp8 lm_head is stored in 128x128
++ * tiles and a row span that cuts a tile is refused (rad_weight_shard_span), so the cut has to land
++ * on one. At two ranks on 248320 or 151936 the rounding changes nothing -- both halves are block
++ * multiples -- and a vocabulary the world divides is never rounded; at three it is what makes the
++ * head shardable at all (248320 / 3 = 82773.3; the ranks take 82816, 82816, 82688). core/engine.cpp
++ * RESTATES this rule and checks it against the width the plugin declared; the two must move together. */
++inline int64_t vocab_per_rank(int64_t total, int world) {
++    /* A vocabulary the world divides keeps the even share, whatever the world: every container
++     * served today splits that way (248320 at 2 and 4, 151936 at 2 -- the last halves mid-block and
++     * is served with an untiled head). Only a vocabulary the world does NOT divide takes the
++     * block-aligned ceil, which is what makes a tiled head shardable at all. */
++    if (total % world == 0) return total / world;
+     const int64_t per = (total + world - 1) / world;
++    return (per + 127) / 128 * 128;
++}
++inline int64_t shard_extent(int64_t total, int world, int rank) {
++    const int64_t per = vocab_per_rank(total, world);
+     const int64_t beg = per * rank;
+     const int64_t end = beg + per < total ? beg + per : total;
+     return end > beg ? end - beg : 0;
+ }
+ inline int64_t shard_begin(int64_t total, int world, int rank) {
+-    const int64_t per = (total + world - 1) / world;
++    const int64_t per = vocab_per_rank(total, world);
+     const int64_t beg = per * rank;
+     return beg < total ? beg : total;
+ }
+diff --git a/arch/qwen4exp_fp8/qwen4exp_fp8.cpp b/arch/qwen4exp_fp8/qwen4exp_fp8.cpp
+index cf5778d..aa2670e 100644
+--- a/arch/qwen4exp_fp8/qwen4exp_fp8.cpp
++++ b/arch/qwen4exp_fp8/qwen4exp_fp8.cpp
+@@ -914,6 +914,14 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
+                          weight_codes_dtype(b, nm.f("output.weight"), RAD_BF16),
+                          {g.n_vocab, g.n_embd}, RAD_ACCESS_VOCAB, RAD_SHARD_ROW, grp_model());
+     if (!m.w_tok || !m.w_lm_head) return RAD_E_INVAL;
++    /* THE RANK'S ROWS, STATED: a vocabulary that does not divide by the world (248320 at three
++     * ranks) is split by rad_arch.h's rule -- ceil to a 128-row block, last rank short -- and that
++     * is a span, not the even share the core would otherwise cut. Harmless where it does divide
++     * (the span IS the even share). */
++    if (g.world > 1) {
++        RAD_ARCH_TRY(rad_weight_shard_span(b, m.w_tok,     g.vocab_off, g.vocab_off + g.n_vocab));
++        RAD_ARCH_TRY(rad_weight_shard_span(b, m.w_lm_head, g.vocab_off, g.vocab_off + g.n_vocab));
++    }
+ 
+     m.op_embed = rw(b, RAD_OP(b, "embed_lookup",
+                        RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("n_embd", g.n_embd),
+diff --git a/core/engine.cpp b/core/engine.cpp
+index 8736b0d..71b4dea 100644
+--- a/core/engine.cpp
++++ b/core/engine.cpp
+@@ -122,13 +122,18 @@ int Engine::declare_sampler(int rank, RadBuilder* b, int64_t logits_width, bool
+     sc.n_vocab_local = logits_width > 0 ? logits_width : meta_.n_vocab;
+     /* THIS RANK'S FIRST VOCABULARY ROW, and it is the one thing the declared width cannot say:
+      * a width tells you how many rows a rank owns, not which. The rule is arch/common/rad_arch.h's
+-     * shard_begin -- ceil(total/world) per rank with the last one short -- and it is restated here
++     * shard_begin -- ceil(total/world) per rank, rounded up to a 128-row block, the last one short -- and it is restated here
+      * rather than carried through the ABI, so the restatement is CHECKED against what the plugin
+      * actually declared. A plugin that shards some other way gets a named refusal at startup
+      * instead of a sampler that names rank 0's tokens with rank 1's ids. */
+     sc.vocab_off = 0;
+     if (sc.n_vocab_local < sc.n_vocab) {
+-        const int64_t per = (sc.n_vocab + cfg_.tp - 1) / cfg_.tp;
++        /* rad_arch.h vocab_per_rank, restated: the even share when the world divides the vocabulary;
++         * otherwise ceil(n / tp) rounded up to a whole 128-row block so a block-scaled head can be
++         * cut there. */
++        const int64_t ceil_per = (sc.n_vocab + cfg_.tp - 1) / cfg_.tp;
++        const int64_t per = (sc.n_vocab % cfg_.tp == 0) ? sc.n_vocab / cfg_.tp
++                                                        : (ceil_per + 127) / 128 * 128;
+         sc.vocab_off = per * rank;
+         const int64_t want = std::min<int64_t>(per, sc.n_vocab - sc.vocab_off);
+         if (sc.vocab_off >= sc.n_vocab || want != sc.n_vocab_local) {
+-- 
+2.55.0
+
+
+From be1ed7a9143bd06e7d189b4e6f3763714b8a6229 Mon Sep 17 00:00:00 2001
+From: baKon <mike.ski83@gmail.com>
+Date: Sun, 4 Oct 2026 15:44:01 -0500
+Subject: [PATCH 3/4] three ranks: pad the checkpoint, exactly, where the
+ geometry does not divide
+
+Radiance refuses a head count the world does not divide, by name, and
+three is such a world for Qwen3.8-Flash-Next (24 q / 2 kv / GDN 16, 48).
+Replication answers four ranks, not three. The answer at three is the
+one tcclaviger's vLLM applies at load time: pad to 36 / 3 / 18 / 54 with
+zero weights placed where a zero contributes nothing, so the padded model
+computes what the original does. Radiance has no load-time pad, so this is
+an offline tool and a document.
+
+- tools/pad_tp.py: numpy-only, streams one tensor at a time, handles the
+  Flash-Next fused q+gate head blocks and the GDN in_proj row orders,
+  rewrites config.json. --sparse reflinks the original shards and writes
+  only the padded tensors into shards that sort first, which the
+  checkpoint reader's first-wins emplace then shadows: 6.6 GB of new
+  bytes for a 336 GiB checkpoint.
+- tools/pad_verify.py: every tensor read back -- untouched ones
+  byte-identical, padded ones the source in place and zeros elsewhere.
+- docs/TP3.md: what is padded and why each pad is exact, the tool, what
+  the engine gained at three ranks, the serve line, measurements on three
+  R9700s against the shipped two-rank container.
+- README: the three-rank row and the document.
+---
+ README.md           |   2 +
+ docs/TP3.md         | 124 +++++++++++++++++++++++++++
+ tools/pad_tp.py     | 205 ++++++++++++++++++++++++++++++++++++++++++++
+ tools/pad_verify.py |  96 +++++++++++++++++++++
+ 4 files changed, 427 insertions(+)
+ create mode 100644 docs/TP3.md
+ create mode 100755 tools/pad_tp.py
+ create mode 100755 tools/pad_verify.py
+
+diff --git a/README.md b/README.md
+index be91114..e340ce6 100644
+--- a/README.md
++++ b/README.md
+@@ -83,6 +83,7 @@ prefix-cache tiers:
+ |---|---|
+ | Qwen3.8-Flash-Next | `--tp 2 --tp-wire wht6 --max-num-seqs 8 --max-model-len 200000 --placement expert_tiered --host-pool-mib 12288 --gpu-headroom-mib 96 --expert-vs-cache-ratio 0.82 --kv-cache-dtype fp8 --num-speculative-tokens 3 --max-num-batched-tokens 2048` |
+ | Qwen3.8-Flash-Next, four ranks | `--tp 4 --max-num-seqs 8 --max-model-len 200000 --placement expert_tiered --host-pool-mib 12288 --gpu-headroom-mib 96 --expert-vs-cache-ratio 0.82 --kv-cache-dtype fp8 --num-speculative-tokens 3 --max-num-batched-tokens 2048` |
++| Qwen3.8-Flash-Next, three ranks (the checkpoint padded first, [`docs/TP3.md`](docs/TP3.md)) | `--tp 3 --max-num-seqs 8 --max-model-len 200000 --placement expert_tiered --host-pool-mib 8192 --gpu-headroom-mib 96 --expert-vs-cache-ratio 0.82 --kv-cache-dtype fp8 --num-speculative-tokens 3 --max-num-batched-tokens 2048` |
+ | Qwen3.8-27B FP8, Qwen3.6-35B-A3B | `--tp 2 --max-num-seqs 32 --max-model-len 200000 --kv-cache-dtype fp8` |
+ | Qwen3.8-27B bf16 | `--tp 2 --max-num-seqs 8 --max-model-len 200000 --kv-cache-dtype fp8` |
+ | MiniCPM5-2B FP8 and bf16 | `--tp 2 --max-num-seqs 32 --max-model-len 131072 --kv-cache-dtype fp8 --gpu-headroom-mib 160 --max-num-batched-tokens 512` |
+@@ -155,6 +156,7 @@ ctest --test-dir build -L oot          # rebuilds every bundled plugin out of tr
+ | [`docs/DOCKER.md`](docs/DOCKER.md) | the image and the compose files |
+ | [`docs/PLUGIN.md`](docs/PLUGIN.md) | writing a kernel library, architecture or quantiser plugin, including one for another AMD card |
+ | [`docs/ARCHITECTURES.md`](docs/ARCHITECTURES.md) | the supported model families and their geometry |
++| [`docs/TP3.md`](docs/TP3.md) | padding a checkpoint, exactly, to a world its head counts do not divide; three ranks |
+ | [`docs/OPS.md`](docs/OPS.md), [`docs/KERNELS.md`](docs/KERNELS.md) | the op vocabulary, and what `rad-kbench` last measured |
+ | [`spec.md`](spec.md) | the design |
+ 
+diff --git a/docs/TP3.md b/docs/TP3.md
+new file mode 100644
+index 0000000..cc4a872
+--- /dev/null
++++ b/docs/TP3.md
+@@ -0,0 +1,124 @@
++# Three ranks: padding a checkpoint to a world its geometry does not divide
++
++Radiance shards by dividing: `n_head`, `n_head_kv`, the GDN head counts and the vocabulary each
++split evenly across the world, and a count that does not divide is **refused at declare, by name**
++(`share.cpp`, `rad_arch.h`). Four ranks got through for Qwen3.8-Flash-Next by replicating the two
++KV heads in rank pairs (1.0.7). Three ranks cannot: 24 query heads, 2 KV heads, 16 GDN K heads and
++48 GDN V heads have no even share in 3, and replication needs a world that is a multiple of the
++head count. The engine is right to refuse. What this document describes is how to **change the
++checkpoint** so there is nothing to refuse, exactly, and what the engine gained so that the padded
++checkpoint then serves at three ranks.
++
++The regime is tcclaviger's `vllm/config/tp_padding.py`, which pads the same model to the same
++shape at load time inside vLLM. Radiance has no load-time pad -- a container is served as it was
++converted -- so the pad is done once, offline, before `rad-convert`.
++
++## 1. What is padded, and why it is exact
++
++Every padded weight gains **zeros**, placed where a zero contributes nothing to the forward pass:
++
++| block | tensor | gains | exact because |
++|---|---|---|---|
++| attention | `k_proj`, `v_proj` | zero **rows** (new KV heads) | a zero KV head stores zeros and is read only by zero query heads |
++| attention | `q_proj` (fused q+gate on Flash-Next: 512-row head blocks) | zero rows so every KV group has the new ratio | a zero query head attends uniformly, and its `o_proj` column is zero, so its output is 0 |
++| attention | `o_proj` | zero **columns** in the same head order | the zero heads' outputs are multiplied by zero |
++| GDN | `in_proj_qkvz`, `in_proj_ba` | zero rows per the fused layout (new K and V heads) | a zero head carries a zero state |
++| GDN | `conv1d` | zero channels | zero input, zero output |
++| GDN | `A_log`, `dt_bias` | zero heads | a zero head decays nothing |
++| GDN | `out_proj` | zero columns | the zero heads are multiplied by zero |
++
++Norms, embeddings, the lm_head, the router and the experts are untouched: their only width is
++`n_embd`. The experts stay at the model's own 640 and the plugin slices them by parity across the
++ranks (1.0.8: at three ranks the five 128-wide blocks go 2, 2, 1), so the +20 % expert bytes of a
++640 → 768 pad are not paid.
++
++For Qwen3.8-Flash-Next the pad is **24 → 36 query heads, 2 → 3 KV heads, GDN 16 → 18 K heads and
++48 → 54 V heads** -- head_dim 256 for attention and 128 for GDN are unchanged, so every rank at
++three declares 12 query heads, 1 KV head and gqa 12: **the same per-rank attention geometry the
++two-rank serve declares**, and the same kernels resolve. Dummies go **last**, as the vLLM pad does,
++so rank 2 carries them.
++
++The cost is the dummies' arithmetic: 12 of 36 query heads and 2 of 18 GDN heads are zeros on the
++last rank, so three ranks do 1.5× the attention work of two for 1.5× the cards.
++
++## 2. The tool
++
++`tools/pad_tp.py` (Python, numpy only; no torch) rewrites a Hugging Face safetensors checkpoint:
++
++```sh
++tools/pad_tp.py SRC DST --heads 36 --kv-heads 3 --gdn-k 18 --gdn-v 54 --sparse
++tools/pad_verify.py SRC DST
++```
++
++It streams one tensor at a time (a 336 GiB checkpoint pads in a few GB of RAM), reads bf16 as raw
++u16 (no arithmetic happens), rewrites `config.json` with the new counts and an explicit `head_dim`,
++and handles the fused layouts: the Flash-Next `q_proj` that carries the attention gate beside each
++query head, and the GDN `in_proj_qkvz` / `in_proj_ba` row order.
++
++`--sparse` is for checkpoints larger than the free disk. Instead of copying, it **reflinks** every
++original shard (btrfs, XFS; `cp --reflink`) and writes only the padded tensors into new shards named
++`model-00000-of-NNNNN-tp3pad-*.safetensors`. Radiance's reader lists the index's shards sorted by
++name and keeps the **first** tensor of a name (`checkpoint.cpp`, `emplace`), so the new shards
++shadow the originals by sorting first. Flash-Next: 340 tensors, 6.6 GB of new bytes, the 131
++original shards shared.
++
++`tools/pad_verify.py` reads both checkpoints back and checks every tensor: an untouched tensor is
++byte-identical, a padded one is the source in its place and zeros everywhere else. Run it before
++`rad-convert`; a pad that passes it cannot change what the model computes.
++
++Padding proved on Llama-3.2-3B (24/8 heads, gqa 3 → 36/9, gqa 4): a 28-layer numpy forward on the
++padded weights gives the same argmax as the original with max |Δlogit| 2.1e-5 (fp32 summation
++order), and on the engine TP1 on the padded checkpoint produces the same text as TP1 on the
++original at temperature 0.
++
++## 3. What the engine gained for three ranks
++
++- **libr4d: `all_reduce` and `all_gather` at world 3.** `ar_oneshot_3rank_exact` is the wide
++  one-shot family's template at 3; `ar_gather_3rank` the same for the gather the vocab-parallel
++  sampler declares. Both share the wide family's instance (scratch, `[block][source]` flags, seq
++  counters). There is no two-shot at 3: it shards the message `world` ways and a residual width
++  such as 2560 does not divide by 3. `wht6` is a two-rank wire; three ranks take the exact one, as
++  four do. Selftest: `--case ar_oneshot_3rank_exact` and `--case ar_gather_3rank`, bit-exact against
++  the host sum / concatenation on three gfx1201 cards, with the two-rank controls unchanged.
++- **The vocabulary at a world that does not divide it.** 248 320 rows do not divide by 3 and
++  `share.cpp` refuses a row shard without a declared span. `qwen4exp` now declares the rank's span
++  for `token_embd` and `output`, and the split rule (`rad_arch.h` `shard_extent` / `shard_begin`,
++  restated in `core/engine.cpp`) keeps the even share whenever the world divides the vocabulary and
++  otherwise rounds the per-rank count up to a **128-row block** -- a block-scaled fp8 head refuses a
++  cut inside a tile. At three the ranks take 82 816, 82 816 and 82 688; two and four ranks divide
++  248 320 evenly and are untouched.
++- Everything else three ranks need was already there by 1.0.8: the width split of the experts at
++  any world up to the block count, the uneven tile share of the plain bf16 (protected) experts, the
++  N-rank gather's placement.
++
++## 4. Serving
++
++```sh
++tools/pad_tp.py ~/models/Qwen3.8-Flash-Next ~/models/Qwen3.8-Flash-Next-tp3pad \
++    --heads 36 --kv-heads 3 --gdn-k 18 --gdn-v 54 --sparse
++tools/pad_verify.py ~/models/Qwen3.8-Flash-Next ~/models/Qwen3.8-Flash-Next-tp3pad
++build/bin/rad-convert ~/models/Qwen3.8-Flash-Next-tp3pad -o qfn-tp3pad.rad \
++    --recipe data/recipes/qwen4exp-w4nl64-i8-hc8m.recipe
++radiance --model qfn-tp3pad.rad --tp 3 --tp-wire exact --max-num-seqs 8 --max-model-len 200000 \
++    --placement expert_tiered --host-pool-mib 8192 --gpu-headroom-mib 96 \
++    --expert-vs-cache-ratio 0.82 --kv-cache-dtype fp8 --num-speculative-tokens 3 \
++    --max-num-batched-tokens 2048
++```
++
++Measured on three Radeon AI PRO R9700 (gfx1201, PCIe Gen5 x16, Threadripper PRO 9955WX), the
++uncensored Flash-Next fine-tune padded as above and converted with the shipped recipe
++(`qwen4exp-w4nl64-i8-hc8m`, here without Hessians: nearest into the codebook), this branch over
++1.0.8; the two-rank column is the shipped `qwen3.8-next-flash-fp8-iq4r-moe.rad` on the same box:
++
++| | three ranks, padded | two ranks, shipped container |
++|---|---|---|
++| READY from cold | 45 s | 35 s |
++| 1 / 4 / 8 streams, aggregate t/s | 173.5 / 332.2 / 410.9 | 156 / 320 / 404 |
++| 4 streams at 100 K context, per stream | 41.8 | 41.2 |
++| warm-prefix TTFT, 60 K prompt, second time | 0.3 s (cold 8.2 s) | — |
++| HumanEval / GSM8K | 0.854 / 0.915 | 0.854 / 0.940 |
++
++The GSM8K gap is the Hessians the shipped container was quantised against and this one was not;
++the GPTQ'd conversion of the same padded checkpoint is the comparison that closes it. Hi-vocab
++tokens (CJK, Cyrillic -- rank 2's lm_head shard, the three-rank gather) decode correctly; no engine
++warnings; every band the run issued resolved to a device kernel.
+diff --git a/tools/pad_tp.py b/tools/pad_tp.py
+new file mode 100755
+index 0000000..02e176a
+--- /dev/null
++++ b/tools/pad_tp.py
+@@ -0,0 +1,205 @@
++#!/usr/bin/env python3
++"""pad_tp.py — pad a Llama/Qwen-style HF safetensors checkpoint to a geometry that divides by a
++tensor-parallel world size, with ZERO weights, so the padded model computes exactly what the
++original does.
++
++    pad_tp.py SRC DST --heads 36 --kv-heads 9 [--ff 8448] [--gdn-k 18 --gdn-v 54]
++
++What is padded and why it is exact (fp32-accumulated, zero terms add nothing):
++  attention   k_proj / v_proj gain zero ROWS (new kv heads); q_proj gains zero rows so every kv
++              group has the new ratio gqa' = heads'/kv_heads' -- a group that existed keeps its real
++              q heads first, then zero q heads; a new group is all zero. o_proj gains zero COLUMNS
++              in the same head order. A zero q head attends uniformly, but its o_proj column is
++              zero, so it contributes 0; a zero kv head stores zeros, read only by zero q heads.
++  mlp         gate_proj / up_proj gain zero rows, down_proj zero columns: silu(0)*0 = 0.
++  gdn         (Qwen3-Next, --gdn-k/--gdn-v) in_proj_qkvz / in_proj_ba gain zero rows per the
++              fused layout, conv1d zero channels, A_log / dt_bias zero heads, out_proj zero columns.
++Everything with n_embd as its only width (norms, embeddings, lm_head) is untouched. config.json is
++rewritten with the new counts and an explicit head_dim. Dummies go LAST, as Rob's vLLM tp_padding
++does, so rank w-1 carries them.
++
++bf16 is handled as raw u16 (no arithmetic happens here), so numpy alone suffices.
++"""
++import argparse, json, os, re, shutil, struct, sys
++import numpy as np
++
++DT = {"BF16": (np.uint16, 2), "F16": (np.float16, 2), "F32": (np.float32, 4), "I64": (np.int64, 8),
++      "I32": (np.int32, 4), "U8": (np.uint8, 1), "BOOL": (np.bool_, 1), "F8_E4M3": (np.uint8, 1)}
++
++def st_read(path):
++    """-> (header dict with tensor meta, raw bytes mmap). Tiny safetensors reader."""
++    with open(path, "rb") as f:
++        n = struct.unpack("<Q", f.read(8))[0]
++        hdr = json.loads(f.read(n))
++    data = np.memmap(path, dtype=np.uint8, mode="r", offset=8 + n)
++    return hdr, data
++
++def st_tensor(hdr, data, name):
++    m = hdr[name]; a, b = m["data_offsets"]; dt, _ = DT[m["dtype"]]
++    return np.frombuffer(data[a:b], dtype=dt).reshape(m["shape"])
++
++def st_write_stream(path, meta, items):
++    """items: iterable of (name, dtype_str, fn) where fn() returns the ndarray. ONE tensor is live at
++    a time (the 12:42 version held a whole 4.7 GB shard and was memcg-OOM-killed beside the daily):
++    the header needs every shape and byte count first, so the pass is made twice -- shapes are
++    cheap to compute from the source header, so items carry a `shape_of()` too."""
++    hdr = {}; off = 0; order = []
++    for name, dts, shape, nbytes, fn in items:
++        hdr[name] = {"dtype": dts, "shape": list(shape), "data_offsets": [off, off + nbytes]}
++        off += nbytes; order.append((name, fn))
++    if meta: hdr["__metadata__"] = meta
++    h = json.dumps(hdr, separators=(",", ":")).encode(); h += b" " * ((8 - len(h) % 8) % 8)
++    with open(path, "wb") as f:
++        f.write(struct.pack("<Q", len(h))); f.write(h)
++        for name, fn in order:
++            arr = np.ascontiguousarray(fn()); f.write(arr.tobytes()); del arr
++
++def head_map(n_head, n_kv, n_head2, n_kv2):
++    """For every NEW q-head slot, the OLD q head index or -1 (zero). Group g' (< n_kv) keeps its real
++    heads first, then zeros; group g' >= n_kv is all zero."""
++    gqa, gqa2 = n_head // n_kv, n_head2 // n_kv2
++    assert n_head % n_kv == 0 and n_head2 % n_kv2 == 0 and gqa2 >= gqa and n_kv2 >= n_kv, "ratio/kv must not shrink"
++    out = []
++    for g in range(n_kv2):
++        for j in range(gqa2):
++            out.append(g * gqa + j if (g < n_kv and j < gqa) else -1)
++    return out
++
++def take_rows(w, idx, hd):
++    """rows of w grouped by hd per head: new row block i = old block idx[i], or zeros."""
++    out = np.zeros((len(idx) * hd,) + w.shape[1:], dtype=w.dtype)
++    for i, o in enumerate(idx):
++        if o >= 0: out[i * hd:(i + 1) * hd] = w[o * hd:(o + 1) * hd]
++    return out
++
++def take_cols(w, idx, hd):
++    out = np.zeros(w.shape[:1] + (len(idx) * hd,) + w.shape[2:], dtype=w.dtype)
++    for i, o in enumerate(idx):
++        if o >= 0: out[:, i * hd:(i + 1) * hd] = w[:, o * hd:(o + 1) * hd]
++    return out
++
++def pad_rows(w, n2):
++    out = np.zeros((n2,) + w.shape[1:], dtype=w.dtype); out[:w.shape[0]] = w; return out
++
++def pad_cols(w, n2):
++    out = np.zeros(w.shape[:1] + (n2,) + w.shape[2:], dtype=w.dtype); out[:, :w.shape[1]] = w; return out
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("src"); ap.add_argument("dst")
++    ap.add_argument("--heads", type=int, required=True); ap.add_argument("--kv-heads", type=int, required=True)
++    ap.add_argument("--ff", type=int, default=0, help="new intermediate_size for DENSE mlp (0 = unchanged; MoE experts are never padded)")
++    ap.add_argument("--gdn-k", type=int, default=0); ap.add_argument("--gdn-v", type=int, default=0)
++    ap.add_argument("--sparse", action="store_true",
++                    help="write ONLY the padded tensors, into new shards named to sort first; reflink every original "
++                         "shard into dst unchanged. Radiance lists shards from the index, sorted by name, and keeps the "
++                         "first tensor of a name (core/format/checkpoint.cpp emplace), so the padded copy shadows the "
++                         "original. Costs the padded bytes only -- the 336 GB QFN source is not copied.")
++    a = ap.parse_args()
++    cfg_all = json.load(open(os.path.join(a.src, "config.json")))
++    cfg = cfg_all["text_config"] if "text_config" in cfg_all else cfg_all      # Qwen3.8-Flash-Next nests it
++    n_head, n_kv = cfg["num_attention_heads"], cfg.get("num_key_value_heads", cfg["num_attention_heads"])
++    n_embd = cfg["hidden_size"]; hd = cfg.get("head_dim") or n_embd // n_head
++    n_ff = cfg.get("intermediate_size", 0); n_ff2 = a.ff or n_ff      # MoE-only models (QFN) have none
++    qmap = head_map(n_head, n_kv, a.heads, a.kv_heads)
++    kmap = list(range(n_kv)) + [-1] * (a.kv_heads - n_kv)
++    gk, gv = cfg.get("linear_num_key_heads"), cfg.get("linear_num_value_heads")
++    gkd, gvd = cfg.get("linear_key_head_dim"), cfg.get("linear_value_head_dim")
++    gk2, gv2 = a.gdn_k or gk, a.gdn_v or gv
++    print(f"attention {n_head}/{n_kv} (gqa {n_head//n_kv}) @ {hd} -> {a.heads}/{a.kv_heads} (gqa {a.heads//a.kv_heads}); "
++          f"dense ff {n_ff} -> {n_ff2}" + (f"; gdn K {gk}->{gk2} V {gv}->{gv2}" if gk else ""), flush=True)
++    os.makedirs(a.dst, exist_ok=True)
++    idx_path = os.path.join(a.src, "model.safetensors.index.json")
++    files = sorted(set(json.load(open(idx_path))["weight_map"].values())) if os.path.exists(idx_path) else ["model.safetensors"]
++
++    def parts(w_, sizes, news, axis=0):
++        """pad each consecutive segment of `sizes` along `axis` to `news` (zeros after the real rows)."""
++        o = 0; outs = []
++        for sz, s2 in zip(sizes, news):
++            seg = np.take(w_, range(o, o + sz), axis=axis); o += sz
++            pad = [(0, 0)] * w_.ndim; pad[axis] = (0, s2 - sz); outs.append(np.pad(seg, pad))
++        assert o == w_.shape[axis], f"segments {sizes} do not cover axis {axis} of shape {w_.shape}"
++        return np.concatenate(outs, axis=axis)
++
++    def plan(name, shape):
++        """-> (kind, transform) for a tensor, by name and SOURCE shape. None = untouched."""
++        if re.search(r"self_attn\.q_proj\.(weight|bias)$", name):
++            # Qwen3-Next gated attention fuses q and its gate: rows = n_head * 2 * hd, per head [q | gate].
++            # A plain q_proj has n_head * hd rows. Either way one head is one block of rows.
++            blk = shape[0] // n_head
++            assert blk in (hd, 2 * hd), f"{name}: {shape[0]} rows is neither {n_head}*{hd} nor {n_head}*{2*hd}"
++            return "q", lambda w: take_rows(w, qmap, blk)
++        if re.search(r"self_attn\.[kv]_proj\.(weight|bias)$", name):   return "kv", lambda w: take_rows(w, kmap, hd)
++        if re.search(r"self_attn\.o_proj\.weight$", name):             return "o",  lambda w: take_cols(w, qmap, hd)
++        if n_ff2 != n_ff and re.search(r"mlp\.(gate|up)_proj\.weight$", name): return "ff", lambda w: pad_rows(w, n_ff2)
++        if n_ff2 != n_ff and re.search(r"mlp\.down_proj\.weight$", name):      return "ff", lambda w: pad_cols(w, n_ff2)
++        if gk and re.search(r"linear_attn\.", name) and (gk2 != gk or gv2 != gv):
++            # Qwen3-Next GDN, both spellings. Fused: in_proj_qkvz rows [q gk*gkd][k gk*gkd][v gv*gvd][z gv*gvd],
++            # in_proj_ba [b gv][a gv]. Separate (Qwen3.8-Flash-Next): in_proj_qkv [q][k][v], in_proj_z [z],
++            # in_proj_a / in_proj_b [gv] each. conv1d channels = q,k,v. A_log / dt_bias per v head.
++            # out_proj columns = gv*gvd. norm is per gvd and untouched.
++            qkv_s, qkv_n = [gk*gkd, gk*gkd, gv*gvd], [gk2*gkd, gk2*gkd, gv2*gvd]
++            if re.search(r"in_proj_qkvz\.weight$", name): return "gdn", lambda w: parts(w, qkv_s + [gv*gvd], qkv_n + [gv2*gvd])
++            if re.search(r"in_proj_qkv\.weight$", name):  return "gdn", lambda w: parts(w, qkv_s, qkv_n)
++            if re.search(r"in_proj_z\.weight$", name):    return "gdn", lambda w: pad_rows(w, gv2 * gvd)
++            if re.search(r"in_proj_ba\.weight$", name):   return "gdn", lambda w: parts(w, [gv, gv], [gv2, gv2])
++            if re.search(r"in_proj_[ab]\.weight$", name): return "gdn", lambda w: pad_rows(w, gv2)
++            if re.search(r"conv1d\.(weight|bias)$", name): return "gdn", lambda w: parts(w, qkv_s, qkv_n)
++            if re.search(r"(A_log|dt_bias)$", name):       return "gdn", lambda w: pad_rows(w, gv2)
++            if re.search(r"out_proj\.weight$", name):      return "gdn", lambda w: pad_cols(w, gv2 * gvd)
++        return None, None
++
++    weight_map = {}; total = 0; touched = {}; sparse_items = []; sparse_bytes = 0
++    for fn in files:
++        hdr, data = st_read(os.path.join(a.src, fn)); meta = hdr.pop("__metadata__", None); items = []
++        for name in hdr:
++            dts = hdr[name]["dtype"]; esz = DT[dts][1]; src_shape = tuple(hdr[name]["shape"])
++            kind, tf = plan(name, src_shape)
++            if kind:
++                shape = tf(np.zeros(src_shape, dtype=np.uint8)).shape      # from the source shape alone; cheap
++                touched[kind] = touched.get(kind, 0) + 1
++            else:
++                shape = src_shape
++            nbytes = int(np.prod(shape)) * esz; total += nbytes
++            item = (name, dts, shape, nbytes, (lambda h=hdr, d=data, n=name, t=tf: t(st_tensor(h, d, n)) if t else st_tensor(h, d, n)))
++            if a.sparse:
++                if kind: sparse_items.append(item); sparse_bytes += nbytes
++                weight_map[name] = fn                 # overridden below for padded names
++            else:
++                items.append(item); weight_map[name] = fn
++        if a.sparse:
++            dstf = os.path.join(a.dst, fn)
++            if not os.path.exists(dstf):
++                r = os.system(f"cp --reflink=always '{os.path.join(a.src, fn)}' '{dstf}' 2>/dev/null") or 0
++                if r: os.link(os.path.join(a.src, fn), dstf)      # not btrfs/xfs: hard link, still no copy
++        else:
++            st_write_stream(os.path.join(a.dst, fn), meta, items); print(f"  wrote {fn} ({len(items)} tensors)", flush=True)
++    if a.sparse:
++        # new shards, ~2 GB each, named to sort BEFORE every original ("model-00000-…" < "model-00001-…")
++        CH = 2 << 30; chunks = [[]]; acc = 0
++        for it in sparse_items:
++            if acc + it[3] > CH and chunks[-1]: chunks.append([]); acc = 0
++            chunks[-1].append(it); acc += it[3]
++        for k, ch in enumerate(chunks):
++            fn = f"model-00000-of-{len(files):05d}-tp3pad-{k:03d}.safetensors"
++            st_write_stream(os.path.join(a.dst, fn), {"tp3pad": "zero-padded heads; shadows the originals by name order"}, ch)
++            for it in ch: weight_map[it[0]] = fn
++            print(f"  wrote {fn} ({len(ch)} tensors, {sum(i[3] for i in ch)/1e9:.2f} GB)", flush=True)
++        print(f"sparse: {len(sparse_items)} padded tensors, {sparse_bytes/1e9:.2f} GB new; {len(files)} shards reflinked", flush=True)
++    if len(files) > 1 or a.sparse:
++        json.dump({"metadata": {"total_size": total}, "weight_map": weight_map},
++                  open(os.path.join(a.dst, "model.safetensors.index.json"), "w"), indent=2)
++    cfg["num_attention_heads"], cfg["num_key_value_heads"], cfg["head_dim"] = a.heads, a.kv_heads, hd
++    if n_ff: cfg["intermediate_size"] = n_ff2
++    if gk: cfg["linear_num_key_heads"], cfg["linear_num_value_heads"] = gk2, gv2
++    cfg_all["_tp_padding"] = {"from": {"heads": n_head, "kv_heads": n_kv, "ff": n_ff, "gdn_k": gk, "gdn_v": gv},
++                              "to": {"heads": a.heads, "kv_heads": a.kv_heads, "ff": n_ff2, "gdn_k": gk2, "gdn_v": gv2},
++                              "zero_weights": True, "dummies": "last", "sparse": bool(a.sparse)}
++    json.dump(cfg_all, open(os.path.join(a.dst, "config.json"), "w"), indent=2)
++    for f in os.listdir(a.src):
++        if (f.endswith(".json") and f not in ("config.json", "model.safetensors.index.json")) or f.endswith((".txt", ".model", ".jinja", ".md")):
++            shutil.copy2(os.path.join(a.src, f), os.path.join(a.dst, f))
++    print(f"padded tensors by kind: {touched}; total {total/1e9:.2f} GB -> {a.dst}", flush=True)
++
++if __name__ == "__main__":
++    main()
+diff --git a/tools/pad_verify.py b/tools/pad_verify.py
+new file mode 100755
+index 0000000..219031a
+--- /dev/null
++++ b/tools/pad_verify.py
+@@ -0,0 +1,96 @@
++#!/usr/bin/env python3
++"""pad_verify.py — prove a pad_tp.py output is exactly the source plus zeros.
++
++    pad_verify.py SRC PADDED
++
++Re-derives the head/row maps from PADDED/config.json `_tp_padding`, then for EVERY tensor in the
++padded index checks, streaming one tensor at a time:
++  untouched tensors  byte-identical to the source
++  padded tensors     every real row/column block equals the source block it came from, and every
++                     other element is exactly zero
++Exit 0 only if all of it holds. This is the correctness gate for checkpoints no reference forward
++exists for (Qwen3.8-Flash-Next).
++"""
++import json, os, re, struct, sys
++import numpy as np
++import importlib.util
++spec = importlib.util.spec_from_file_location("padtp", os.path.join(os.path.dirname(os.path.abspath(__file__)), "pad_tp.py"))
++padtp = importlib.util.module_from_spec(spec); spec.loader.exec_module(padtp)
++
++def load(d):
++    cfg_all = json.load(open(os.path.join(d, "config.json")))
++    ip = os.path.join(d, "model.safetensors.index.json")
++    wm = json.load(open(ip))["weight_map"] if os.path.exists(ip) else None
++    files = sorted(set(wm.values())) if wm else ["model.safetensors"]
++    hdrs = {}
++    for fn in files:
++        h, data = padtp.st_read(os.path.join(d, fn)); h.pop("__metadata__", None)
++        for k in h: hdrs.setdefault(k, (h, data, fn))      # first by name order = what the engine reads
++    return cfg_all, hdrs, wm
++
++def main():
++    src, dst = sys.argv[1], sys.argv[2]
++    cfg_all, S, _ = load(src); cfgp_all, P, wmp = load(dst)
++    tp = cfgp_all["_tp_padding"]; f, t = tp["from"], tp["to"]
++    cfg = cfg_all.get("text_config", cfg_all)
++    n_head, n_kv, hd = f["heads"], f["kv_heads"], cfg.get("head_dim") or cfg["hidden_size"] // f["heads"]
++    qmap = padtp.head_map(n_head, n_kv, t["heads"], t["kv_heads"]); kmap = list(range(n_kv)) + [-1] * (t["kv_heads"] - n_kv)
++    gk, gv, gk2, gv2 = f["gdn_k"], f["gdn_v"], t["gdn_k"], t["gdn_v"]
++    gkd, gvd = cfg.get("linear_key_head_dim"), cfg.get("linear_value_head_dim")
++    bad = 0; n_pad = 0; n_same = 0; zero_bytes = 0
++
++    def blocks_rows(new, old, idx, blk):
++        """new rows in blocks of blk follow idx into old; -1 blocks must be zero."""
++        ok = new.shape[0] == len(idx) * blk
++        for i, o in enumerate(idx):
++            seg = new[i*blk:(i+1)*blk]
++            ok &= bool(np.array_equal(seg, old[o*blk:(o+1)*blk])) if o >= 0 else not seg.any()
++        return ok
++    def blocks_cols(new, old, idx, blk):
++        ok = new.shape[1] == len(idx) * blk
++        for i, o in enumerate(idx):
++            seg = new[:, i*blk:(i+1)*blk]
++            ok &= bool(np.array_equal(seg, old[:, o*blk:(o+1)*blk])) if o >= 0 else not seg.any()
++        return ok
++    def segs_rows(new, old, sizes, news):
++        o = n = 0; ok = new.shape[0] == sum(news)
++        for sz, s2 in zip(sizes, news):
++            ok &= bool(np.array_equal(new[n:n+sz], old[o:o+sz])) and not new[n+sz:n+s2].any(); o += sz; n += s2
++        return ok and o == old.shape[0]
++    def pad_rows_ok(new, old, n2): return new.shape[0] == n2 and np.array_equal(new[:old.shape[0]], old) and not new[old.shape[0]:].any()
++    def pad_cols_ok(new, old, n2): return new.shape[1] == n2 and np.array_equal(new[:, :old.shape[1]], old) and not new[:, old.shape[1]:].any()
++
++    for name in sorted(S):
++        if name not in P: print("MISSING in padded:", name); bad += 1; continue
++        hs, ds, _ = S[name]; hp, dp, fnp = P[name]
++        a = padtp.st_tensor(hs, ds, name); b = padtp.st_tensor(hp, dp, name)
++        if wmp and wmp.get(name) != fnp: print("INDEX/ORDER mismatch:", name, wmp.get(name), fnp); bad += 1
++        ok = None
++        if re.search(r"self_attn\.q_proj\.(weight|bias)$", name):   ok = blocks_rows(b, a, qmap, a.shape[0] // n_head)
++        elif re.search(r"self_attn\.[kv]_proj\.(weight|bias)$", name): ok = blocks_rows(b, a, kmap, hd)
++        elif re.search(r"self_attn\.o_proj\.weight$", name):          ok = blocks_cols(b, a, qmap, hd)
++        elif f["ff"] and f["ff"] != t["ff"] and re.search(r"mlp\.(gate|up)_proj\.weight$", name): ok = pad_rows_ok(b, a, t["ff"])
++        elif f["ff"] and f["ff"] != t["ff"] and re.search(r"mlp\.down_proj\.weight$", name):      ok = pad_cols_ok(b, a, t["ff"])
++        elif gk and (gk2 != gk or gv2 != gv) and re.search(r"linear_attn\.", name):
++            qs, qn = [gk*gkd, gk*gkd, gv*gvd], [gk2*gkd, gk2*gkd, gv2*gvd]
++            if re.search(r"in_proj_qkvz\.weight$", name):  ok = segs_rows(b, a, qs + [gv*gvd], qn + [gv2*gvd])
++            elif re.search(r"in_proj_qkv\.weight$", name): ok = segs_rows(b, a, qs, qn)
++            elif re.search(r"in_proj_z\.weight$", name):   ok = pad_rows_ok(b, a, gv2 * gvd)
++            elif re.search(r"in_proj_ba\.weight$", name):  ok = segs_rows(b, a, [gv, gv], [gv2, gv2])
++            elif re.search(r"in_proj_[ab]\.weight$", name): ok = pad_rows_ok(b, a, gv2)
++            elif re.search(r"conv1d\.(weight|bias)$", name): ok = segs_rows(b, a, qs, qn)
++            elif re.search(r"(A_log|dt_bias)$", name):     ok = pad_rows_ok(b, a, gv2)
++            elif re.search(r"out_proj\.weight$", name):    ok = pad_cols_ok(b, a, gv2 * gvd)
++        if ok is None:
++            same = a.shape == b.shape and np.array_equal(a, b); n_same += 1
++            if not same: print("CHANGED but should be untouched:", name, a.shape, b.shape); bad += 1
++        else:
++            n_pad += 1; zero_bytes += b.nbytes - a.nbytes
++            if not ok: print("PAD MISMATCH:", name, a.shape, "->", b.shape); bad += 1
++    extra = set(P) - set(S)
++    if extra: print("EXTRA tensors in padded:", sorted(extra)[:5]); bad += 1
++    print(f"verified: {n_same} untouched identical, {n_pad} padded exact (+{zero_bytes/1e9:.2f} GB of zeros), {bad} problems")
++    sys.exit(1 if bad else 0)
++
++if __name__ == "__main__":
++    main()
+-- 
+2.55.0
+
+
+From 2830579b37ab1241f347f785ff1f945c30c792d3 Mon Sep 17 00:00:00 2001
+From: baKon <mike.ski83@gmail.com>
+Date: Sun, 4 Oct 2026 16:23:22 -0500
+Subject: [PATCH 4/4] qwen4exp: the plugin owns the expert width split;
+ geom_from does not refuse it first
+
+geom_from divides n_ff by the world before the plugin's own split runs,
+and 640 does not divide by 3. The plugin cuts the routed experts' width by
+whole fp8 blocks and parity at any world up to the block count (1.0.8),
+so the refusal is answered before it is asked. geom_from gains
+arch_splits_ff (default off): with it, a width the world does not divide
+is left whole in g.n_ff for the plugin to slice; a width that divides is
+unaffected, and every other plugin keeps the refusal because for them
+g.n_ff is the per-rank width. qwen4exp opts in.
+---
+ arch/common/rad_arch.h             | 13 +++++++++++--
+ arch/qwen4exp_fp8/qwen4exp_fp8.cpp |  5 ++++-
+ 2 files changed, 15 insertions(+), 3 deletions(-)
+
+diff --git a/arch/common/rad_arch.h b/arch/common/rad_arch.h
+index 23193c8..2370e0f 100644
+--- a/arch/common/rad_arch.h
++++ b/arch/common/rad_arch.h
+@@ -717,8 +717,13 @@ inline long long meta_int2(const RadModelMeta* m, const char* gguf_key, const ch
+     return v == sentinel ? dflt : v;
+ }
+ 
++/* `arch_splits_ff`: the plugin divides the feed-forward width across the ranks ITSELF (qwen4exp:
++ * the routed experts' width is cut by whole fp8 blocks, by parity, at any world up to the block
++ * count). With it set, a width the world does not divide is left whole in g.n_ff and the plugin
++ * takes its slice from there; without it the refusal stands, because for every other plugin g.n_ff
++ * IS the per-rank width. A width that does divide is unaffected either way. */
+ inline int geom_from(Geom& g, const RadModelMeta* m, const RadBuildCtx* c,
+-                     const char* dtype, uint32_t act_dtype) {
++                     const char* dtype, uint32_t act_dtype, bool arch_splits_ff = false) {
+     if (!m || !c) return RAD_E_INVAL;
+     if (c->is_draft) {
+         /* A drafter declared into this plugin would need a second set of per-rank handles and a
+@@ -814,7 +819,11 @@ inline int geom_from(Geom& g, const RadModelMeta* m, const RadBuildCtx* c,
+     } else {
+         g.kv_off = 0;   /* a split rank reads the rows the plain row-shard already gives it */
+     }
+-    if ((s = divide_or_fail(g.n_ff_all,      g.world, "n_ff",      &g.n_ff))      < 0) return s;
++    if (arch_splits_ff && g.world > 1 && g.n_ff_all % g.world != 0) {
++        g.n_ff = g.n_ff_all;   /* the plugin slices it (see the parameter's comment) */
++    } else if ((s = divide_or_fail(g.n_ff_all, g.world, "n_ff", &g.n_ff)) < 0) {
++        return s;
++    }
+     /* THE VOCABULARY IS SPLIT. r4d_sample_topk_f32 takes a vocabulary offset and packs its
+      * candidates as (u32 GLOBAL id, f32 logit) pairs, and the all-gather places every rank's
+      * pairs for one sampled position side by side, which is the layout sample_merge_topk reads.
+diff --git a/arch/qwen4exp_fp8/qwen4exp_fp8.cpp b/arch/qwen4exp_fp8/qwen4exp_fp8.cpp
+index aa2670e..76b3cbf 100644
+--- a/arch/qwen4exp_fp8/qwen4exp_fp8.cpp
++++ b/arch/qwen4exp_fp8/qwen4exp_fp8.cpp
+@@ -318,7 +318,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
+     m.nm = Names(ctx->scope ? ctx->scope : "");
+     Names& nm = m.nm;
+ 
+-    RAD_ARCH_TRY(geom_from(m.g, meta, ctx, "bf16", RAD_BF16));
++    /* arch_splits_ff: the routed experts' width (640 = five fp8 blocks) is split by the plugin
++     * below, by whole blocks and parity, at any world up to the block count -- three ranks included,
++     * which 640 does not divide. geom_from must not refuse what the plugin then answers. */
++    RAD_ARCH_TRY(geom_from(m.g, meta, ctx, "bf16", RAD_BF16, /*arch_splits_ff=*/true));
+     Geom& g = m.g;
+ 
+     /* Qwen4-Exp's norms are all `x_hat * (1 + w)` -- `Qwen3NextRMSNorm.forward` is
+-- 
+2.55.0
+

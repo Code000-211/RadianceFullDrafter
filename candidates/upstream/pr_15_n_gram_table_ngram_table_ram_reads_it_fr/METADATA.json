@@ -1,0 +1,92 @@
+{
+  "pr_id": 15,
+  "title": "n-gram table: --ngram-table ram reads it from a locked copy in RAM",
+  "author": "keptn42",
+  "url": "https://codeberg.org/StillDeadcode/radiance/pulls/15",
+  "status": "READY_TO_TEST",
+  "modified_files": [
+    "abi/rad_builder.h",
+    "arch/common/rad_arch.h",
+    "arch/common/rad_block_ple.h",
+    "core/config.cpp",
+    "core/engine_bringup.cpp",
+    "core/rad_core.h",
+    "docs/DOCKER.md",
+    "docs/GUIDE.md",
+    "docs/OPS.md",
+    "libavx/avx_check.cpp",
+    "libavx/avx_check_rows.cpp",
+    "libavx/avx_gemm.cpp",
+    "libavx/avx_ngram.cpp",
+    "libavx/avx_registry.cpp",
+    "libavx/avx_rows.h",
+    "libref/ref_registry.cpp",
+    "tests/CMakeLists.txt",
+    "tests/config_test.cpp",
+    "libavx/README.md"
+  ],
+  "safety_audit": {
+    "passed": true,
+    "violations": []
+  },
+  "jev_evaluation": {
+    "subsystem": {
+      "type": "choice",
+      "choice": "general",
+      "confidence": 0.97,
+      "probabilities": {
+        "serving": 0.0,
+        "tooling": 0.0,
+        "gdn": 0.0,
+        "interconnect": 0.0,
+        "drafter": 0.03,
+        "gemm": 0.0,
+        "qsa": 0.0,
+        "general": 0.97,
+        "moe": 0.0
+      }
+    },
+    "violates_rdna4_limits": {
+      "type": "noul",
+      "noul": 0.07
+    },
+    "feasibility": {
+      "type": "score",
+      "score": 2.39,
+      "confidence": 0.38,
+      "legend": {
+        "0": "Unfeasible / contradicts hardware laws / CUDA-only",
+        "1": "High risk or complex external dependency",
+        "2": "Moderate feasibility / experimental",
+        "3": "Feasible / standard ROCm HIP implementation",
+        "4": "Immediate high-value quick win"
+      },
+      "probabilities": {
+        "0": 0.03,
+        "1": 0.1,
+        "2": 0.4,
+        "3": 0.41,
+        "4": 0.06
+      }
+    },
+    "performance_roi": {
+      "type": "score",
+      "score": 2.3,
+      "confidence": 0.37,
+      "legend": {
+        "0": "Zero or negative performance impact (docs, tool, placebo)",
+        "1": "Marginal gain (<2%) or monitoring/stability utility",
+        "2": "Solid architectural gain (2-5%)",
+        "3": "High-impact gain (5-15%)",
+        "4": "Breakthrough gain (>15%)"
+      },
+      "probabilities": {
+        "0": 0.05,
+        "1": 0.22,
+        "2": 0.15,
+        "3": 0.56,
+        "4": 0.02
+      }
+    }
+  }
+}

@@ -1,0 +1,157 @@
+From 7cb15b22c38575cbeaf03483af0033c128332620 Mon Sep 17 00:00:00 2001
+From: baKon <mike.ski83@gmail.com>
+Date: Wed, 7 Oct 2026 17:55:36 -0500
+Subject: [PATCH] engine: a collective with no device kernel for a message size
+ refuses at startup
+
+--tp 3 --tp-wire wht6 declares the lossy all-reduce beside the exact one, and no row implements it
+at three ranks. Declare reported that as "host-only ops: all_reduce ... Not a hole" because the host
+rows resolve at any world size, the server booted and answered /health, and the first prefill above
+--tp-wire-min-kb stopped the process inside rad_issue (#46). A collective carries no weights, so
+bind_ops keeps it on the device and the issue path never switches domain per band: a host kernel
+does not cover it.
+
+On a device backend a collective's device miss is now a hole in the miss report and refuses the
+configuration at declare, naming the band and, when the wire is lossy, --tp-wire exact. Every layer
+issues one over the step's residual stream and its bands run up to the largest step, so the first
+chunk that selects it always lands there. The host backend (CPU-only serving) is untouched. Which
+world sizes a wire covers stays the kernel libraries' answer: this reads what declare resolved.
+
+The guide already said --tp 8 --tp-wire wht6 stops at startup; it now does, and so does --tp 3.
+---
+ README.md               |  4 +--
+ core/config.cpp         |  2 +-
+ core/engine_bringup.cpp | 58 ++++++++++++++++++++++++++++++++++++++++-
+ docs/GUIDE.md           |  5 ++--
+ 4 files changed, 63 insertions(+), 6 deletions(-)
+
+diff --git a/README.md b/README.md
+index 2ad063a..0620838 100644
+--- a/README.md
++++ b/README.md
+@@ -101,8 +101,8 @@ of it, on decode and verify steps; a prefill chunk runs the unfused chain. That
+ all-reduce is one-shot up to 1 MiB a message and two-shot above that, which sends half the bytes
+ on a prefill chunk; both produce the same bits. The row above runs exact.
+ `--tp-wire wht6` at four ranks selects a different lossy wire, tiered int8 over the two-shot,
+-above `--tp-wire-min-kb`. Eight ranks have no lossy wire, so `--tp 8 --tp-wire wht6` stops at
+-startup naming the all-reduce. Four ranks is a capacity configuration; its per-step rate against
++above `--tp-wire-min-kb`. Three and eight ranks have no lossy wire, so `--tp 3` or `--tp 8` with
++`--tp-wire wht6` stops at startup naming the all-reduce. Four ranks is a capacity configuration; its per-step rate against
+ `--tp 2` on the same cards has not been measured. The
+ tiering flags are the tp2 recipe carried over. Above two ranks each rank still owns a **slice of
+ every expert's width** — each parity's 128-column blocks are cut contiguously over the ranks and the
+diff --git a/core/config.cpp b/core/config.cpp
+index 6997a40..4a72337 100644
+--- a/core/config.cpp
++++ b/core/config.cpp
+@@ -47,7 +47,7 @@ static const Flag g_flags[] = {
+     { "--tp",                 "N",      "tensor-parallel ranks" },
+     { "--tp-wire",            "MODE",   "cross-rank all-reduce payload: exact (default) or wht6, a\n"
+                                         "lossy wire: rotated 6-bit at 2 ranks, tiered int8 at 4,\n"
+-                                        "none at 8" },
++                                        "none at 3 or 8 (refused at startup)" },
+     { "--tp-wire-min-kb",     "N",      "smallest all-reduce, in KiB, the lossy wire is used for" },
+     { "--p2p",                "MODE",   "how the collectives reach the other cards: auto (default)\n"
+                                         "asks the driver, on requires peer access and stops without\n"
+diff --git a/core/engine_bringup.cpp b/core/engine_bringup.cpp
+index 10c1caf..33d2f91 100644
+--- a/core/engine_bringup.cpp
++++ b/core/engine_bringup.cpp
+@@ -50,6 +50,37 @@
+ namespace rad {
+ 
+ /* ================================================================== the miss report */
++/* THE HOLES A STEP CANNOT AVOID: a cross-rank collective with no DEVICE kernel for a message size.
++ *
++ * Every other hole is a band a request MIGHT land in -- whether the configured step ever reaches it
++ * is a question about the plugin's shapes this cannot answer, so it stays a report and a failure at
++ * issue. A collective is different. Its ranged key is the message, every layer issues one over the
++ * step's whole residual stream, and its bands run up to the largest step the engine builds: the
++ * first prefill chunk that selects it reaches the hole. Booting anyway serves /health, takes the
++ * first request and stops the process inside it (#46: --tp 3 --tp-wire wht6, where the blocks
++ * declare the lossy all-reduce beside the exact one and no row implements it at three ranks).
++ *
++ * A HOST KERNEL DOES NOT COVER IT, which is why this is not miss_report's no_host test. The host
++ * rows for a collective resolve at any world size, but the op carries no weights, so bind_ops keeps
++ * it on the device and the issue path does not change domain per band -- miss_report's "host-only,
++ * not a hole" is the wrong sentence for it. On the host backend (CPU-only serving) the device domain
++ * is host memory and every op runs its host kernel, so there it is not a hole and this is empty.
++ *
++ * Which world sizes a wire has kernels for is the kernel libraries' business and not a list in the
++ * core: this reads what declare resolved, so a library that adds a kernel closes the hole with no
++ * change here. */
++static bool device_collective(const std::string& op) {
++    return !device_is_host() && (op == "all_reduce" || op == "all_gather");
++}
++
++static std::vector<std::string> collective_holes(const Program& p) {
++    std::vector<std::string> out;
++    for (const Program::Miss& m : p.misses)
++        if (m.domain != RAD_DOMAIN_HOST && device_collective(m.op)) out.push_back(m.line());
++    return out;
++}
++
++
+ /* WHAT DID NOT RESOLVE, in the three shapes the three answers want.
+  *
+  * A DEVICE miss WITH NO HOST KERNEL EITHER is a hole. The band exists, a request can land in it,
+@@ -98,7 +129,9 @@ static MissReport miss_report(const Program& p) {
+     std::vector<std::string> host_only_ops;
+     for (const Program::Miss& m : p.misses) {
+         if (m.domain != RAD_DOMAIN_HOST) {
+-            if (no_host.count(std::make_pair(m.op, m.span))) r.device.push_back(m.line());
++            /* A collective runs on the device whatever the host has (collective_holes). */
++            if (no_host.count(std::make_pair(m.op, m.span)) || device_collective(m.op))
++                r.device.push_back(m.line());
+             else if (std::find(host_only_ops.begin(), host_only_ops.end(), m.op) ==
+                      host_only_ops.end()) host_only_ops.push_back(m.op);
+             continue;
+@@ -993,6 +1026,29 @@ int Engine::declare() {
+             if (!rep[i].host.empty()) RAD_INFO("%s", rep[i].host.c_str());
+         }
+     }
++    /* A HOLE IN A COLLECTIVE REFUSES THE CONFIGURATION (see collective_holes). Reported once when
++     * every rank has the same holes, which is the case whenever the ranks agree on the wire. */
++    {
++        std::vector<std::string> first;
++        size_t n_ranks = 0;
++        for (auto& r : ranks_) {
++            std::vector<std::string> h = collective_holes(r->program);
++            if (h.empty()) continue;
++            if (!n_ranks++) first = std::move(h);
++        }
++        if (n_ranks) {
++            /* The miss report above already listed every band; one is enough to read here. */
++            RAD_ERR("%zu of %zu rank(s): a cross-rank collective has no device kernel for a message "
++                    "size every prefill issues (%zu band(s), listed above), so this configuration "
++                    "would serve its first request and stop inside it -- refused. The first:",
++                    n_ranks, ranks_.size(), first.size());
++            RAD_ERR("    %s", first[0].c_str());
++            if (cfg_.tp > 1 && !cfg_.tp_wire_exact)
++                RAD_ERR("--tp-wire wht6 asks for a lossy wire the loaded kernel libraries do not "
++                        "implement at --tp %d; --tp-wire exact serves it", cfg_.tp);
++            return RAD_E_NOKERNEL;
++        }
++    }
+     /* A CHECKPOINT WEIGHT THAT IS NOT SERVED AS IT STANDS was declared as plain and nothing can
+      * load it: every one is named, with the remedy, whatever declare made of the rest. */
+     if (ckpt_src_) {
+diff --git a/docs/GUIDE.md b/docs/GUIDE.md
+index 5d75d9f..c5eec30 100644
+--- a/docs/GUIDE.md
++++ b/docs/GUIDE.md
+@@ -792,8 +792,9 @@ which is why it is a named flag and not a heuristic.
+ single-sequence decode exact and compresses prefill, which is where the win is.
+ 
+ At four ranks `wht6` selects a different lossy wire with the same floor: tiered int8 over a
+-two-shot all-reduce, both hops quantised. Eight ranks have no lossy wire, and `--tp 8 --tp-wire
+-wht6` stops at startup naming the all-reduce it found no kernel for. The exact wire at four and
++two-shot all-reduce, both hops quantised. Three and eight ranks have no lossy wire, and `--tp 3`
++or `--tp 8` with `--tp-wire wht6` stops at startup naming the all-reduce it found no kernel for,
++rather than booting and stopping inside the first prefill. The exact wire at four and
+ eight ranks is one-shot up to 1 MiB a message and two-shot above it, which sends
+ 2·(ranks−1)/ranks of the message per rank instead of (ranks−1) times it; the two produce the same
+ bits.
+-- 
+2.55.0
+

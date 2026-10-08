@@ -1,0 +1,2955 @@
+From 7e58c9395e538e5e787156cc39035f5865ec2e89 Mon Sep 17 00:00:00 2001
+From: baKon <mike.ski83@gmail.com>
+Date: Mon, 5 Oct 2026 13:52:59 -0500
+Subject: [PATCH 01/16] format: a span per stacked part, and a share that is
+ zeros
+
+Two additive builder exports, RAD_ABI_VERSION untouched.
+
+rad_weight_shard_span_parts: a row-sharded weight whose stacked parts
+are not the same width -- the delta net's [q|k|v|z], 2048, 2048, 6144,
+6144 rows on Flash-Next -- cannot take rad_weight_shard_span's one
+[lo, hi), which is applied to every part and assumes them equal. This
+takes a span per part together with each part's whole extent in the
+container; share.cpp cuts every part by its own rows and refuses totals
+that do not sum to the entry. It is how a rank declares an UNEVEN share
+of the heads -- 6 of 16 K heads where three ranks take 6, 5 and 5 --
+with nothing padded.
+
+rad_weight_shard_zero: this rank's share of a row- or column-sharded
+weight is zeros. weight_share returns the declaration's extents with no
+rectangles; the loader stages the weight with a worker that writes
+zeros (the route a checkpoint weight already takes from a container)
+and reads nothing. It is for a rank the geometry gives no real heads
+(next commit), which then declares the same program as its peers.
+
+share_test holds the per-part cut and the zero share.
+---
+ abi/rad_builder.h          | 17 +++++++++++
+ core/build/rad_build.h     |  3 ++
+ core/build/rad_builder.cpp | 58 ++++++++++++++++++++++++++++++++++++++
+ core/engine_bringup.cpp    | 27 ++++++++++++++----
+ core/format/share.cpp      | 35 +++++++++++++++++++++--
+ core/format/share.h        |  3 ++
+ core/rad_core.h            | 12 ++++++++
+ tests/build_test.cpp       | 43 ++++++++++++++++++++++++++++
+ tests/share_test.cpp       | 51 +++++++++++++++++++++++++++++++++
+ 9 files changed, 241 insertions(+), 8 deletions(-)
+
+diff --git a/abi/rad_builder.h b/abi/rad_builder.h
+index 21da712..3581b57 100644
+--- a/abi/rad_builder.h
++++ b/abi/rad_builder.h
+@@ -364,6 +364,23 @@ int rad_buf_concurrent(RadBuilder* b, rad_buf buf);
+  * groups the span would cut. */
+ int rad_weight_shard_span(RadBuilder* b, rad_weight w, int64_t lo, int64_t hi);
+ 
++/* A STACKED weight's span, ONE [lo, hi) PER ROW PART, with each part's whole extent in the
++ * container: the delta net's [q|k|v|z] is 2048, 2048, 6144, 6144 rows on Flash-Next, and parts
++ * that are not the same width cannot take rad_weight_shard_span's one span. `n` is the declared
++ * part count; part g of the container is `total[g]` rows, of which this rank takes [lo[g], hi[g])
++ * and declared `hi[g] - lo[g]`; the totals must sum to the entry's rows. A rank's UNEVEN share of
++ * the heads -- 6 of 16 K heads where three ranks take 6, 5 and 5 -- is declared this way, and
++ * nothing is padded. Additive export: a plugin that does not call it declares as before. */
++int rad_weight_shard_span_parts(RadBuilder* b, rad_weight w, const int64_t* lo, const int64_t* hi,
++                                const int64_t* total, int n);
++
++/* THIS RANK'S SHARE IS ZEROS. The weight is declared with its row or column shard and extent as
++ * on every other rank, and nothing is read for it: the loader writes zeros. It is for a rank the
++ * geometry gives no real heads (rad_arch.h: a world size the KV head count does not divide), so
++ * that rank runs the same program as its peers -- the scheduler sees one program -- and its
++ * projection contributes exactly nothing to the reduce. Additive export. */
++int rad_weight_shard_zero(RadBuilder* b, rad_weight w);
++
+ #define RAD_BUFS(...)  ((const rad_buf[]){ __VA_ARGS__ }), \
+                        (int)(sizeof((const rad_buf[]){ __VA_ARGS__ }) / sizeof(rad_buf))
+ 
+diff --git a/core/build/rad_build.h b/core/build/rad_build.h
+index 47580d3..70beb8a 100644
+--- a/core/build/rad_build.h
++++ b/core/build/rad_build.h
+@@ -149,6 +149,9 @@ public:
+     int op_writes(rad_op h, const rad_buf* b, int n);
+     int buf_concurrent(rad_buf b);
+     int weight_shard_span(rad_weight w, int64_t lo, int64_t hi);
++    int weight_shard_span_parts(rad_weight w, const int64_t* lo, const int64_t* hi,
++                                const int64_t* total, int n);
++    int weight_shard_zero(rad_weight w);
+ 
+     /* Finalise: weight first/last use, KV group geometry, buffer liveness and packing. Returns
+      * RAD_OK, or the first structural error class. Resolution MISSES are not an error here -- an
+diff --git a/core/build/rad_builder.cpp b/core/build/rad_builder.cpp
+index 153cf42..85f3384 100644
+--- a/core/build/rad_builder.cpp
++++ b/core/build/rad_builder.cpp
+@@ -892,6 +892,53 @@ int Builder::weight_shard_span(rad_weight h, int64_t lo, int64_t hi) {
+     return RAD_OK;
+ }
+ 
++int Builder::weight_shard_span_parts(rad_weight h, const int64_t* lo, const int64_t* hi,
++                                     const int64_t* total, int n) {
++    if (finished_) { err(RAD_E_STATE, "weight_shard_span_parts after declare finished"); return RAD_E_STATE; }
++    if (h == 0 || h >= prog_.weights.size() || !lo || !hi || !total) return RAD_E_INVAL;
++    WeightInfo& w = prog_.weights[h];
++    const RadWeightDecl& d = w.decl;
++    if (d.shard != RAD_SHARD_ROW || d.n_row_parts < 2 || n != d.n_row_parts) {
++        err(RAD_E_INVAL, "weight '%s': per-part spans need a row-sharded weight of %d stacked "
++                         "parts, and %d span(s) were given", w.name.c_str(), d.n_row_parts, n);
++        return RAD_E_INVAL;
++    }
++    for (int g = 0; g < n; ++g) {
++        if (lo[g] < 0 || hi[g] <= lo[g] || hi[g] > total[g]) {
++            err(RAD_E_INVAL, "weight '%s': part %d span [%lld, %lld) is empty or outside its "
++                             "%lld rows", w.name.c_str(), g, (long long)lo[g], (long long)hi[g],
++                (long long)total[g]);
++            return RAD_E_INVAL;
++        }
++        if (d.row_parts[g] != hi[g] - lo[g]) {
++            err(RAD_E_SHAPE, "weight '%s': part %d span [%lld, %lld) is %lld wide and the "
++                             "declared part is %lld", w.name.c_str(), g, (long long)lo[g],
++                (long long)hi[g], (long long)(hi[g] - lo[g]), (long long)d.row_parts[g]);
++            return RAD_E_SHAPE;
++        }
++        w.part_lo[g] = lo[g];
++        w.part_hi[g] = hi[g];
++        w.part_total[g] = total[g];
++    }
++    w.n_part_spans = n;
++    w.shard_lo = 0;
++    w.shard_hi = 0;
++    return RAD_OK;
++}
++
++int Builder::weight_shard_zero(rad_weight h) {
++    if (finished_) { err(RAD_E_STATE, "weight_shard_zero after declare finished"); return RAD_E_STATE; }
++    if (h == 0 || h >= prog_.weights.size()) return RAD_E_INVAL;
++    WeightInfo& w = prog_.weights[h];
++    if (w.decl.shard != RAD_SHARD_ROW && w.decl.shard != RAD_SHARD_COL) {
++        err(RAD_E_INVAL, "weight '%s': a zero share on a weight that is not row- or "
++                         "column-sharded", w.name.c_str());
++        return RAD_E_INVAL;
++    }
++    w.shard_zero = true;
++    return RAD_OK;
++}
++
+ /* ================================================================== name map */
+ int Builder::decl_name_map(const RadNameMap* m) {
+     if (finished_) { err(RAD_E_STATE, "decl_name_map after declare finished"); return RAD_E_STATE; }
+@@ -1615,6 +1662,17 @@ int rad_weight_shard_span(RadBuilder* b, rad_weight w, int64_t lo, int64_t hi) {
+     return B(b)->weight_shard_span(w, lo, hi);
+ }
+ 
++int rad_weight_shard_span_parts(RadBuilder* b, rad_weight w, const int64_t* lo, const int64_t* hi,
++                                const int64_t* total, int n) {
++    if (!b) return RAD_E_INVAL;
++    return B(b)->weight_shard_span_parts(w, lo, hi, total, n);
++}
++
++int rad_weight_shard_zero(RadBuilder* b, rad_weight w) {
++    if (!b) return RAD_E_INVAL;
++    return B(b)->weight_shard_zero(w);
++}
++
+ int rad_decl_name_map(RadBuilder* b, const RadNameMap* m) {
+     if (!b) return RAD_E_INVAL;
+     return B(b)->decl_name_map(m);
+diff --git a/core/engine_bringup.cpp b/core/engine_bringup.cpp
+index 4426718..236d158 100644
+--- a/core/engine_bringup.cpp
++++ b/core/engine_bringup.cpp
+@@ -1979,11 +1979,15 @@ static int fill_from_checkpoint(const CkptWeight& cw, const std::vector<PlaneSha
+     std::string why;
+     for (size_t k = 0; k < shares.size(); ++k) {
+         const PlaneShare& sh = shares[k];
++        uint8_t* at = in + offs[k];
++        if (sh.zero) {
++            std::memset(at, 0, (size_t)sh.dense_bytes());
++            continue;
++        }
+         const RadEncPlane& p = cw.enc.plane[sel[k]];
+         int64_t pr = 0, pc = 0;
+         rad_enc_plane_dims(&p, cw.rows, cw.cols, &pr, &pc);
+         const int64_t crb = rad_enc_row_bytes(p.dtype, pc);
+-        uint8_t* at = in + offs[k];
+         for (const PlaneShare::Rect& q : sh.rects) {
+             if (q.byte0 == 0 && q.bytes == sh.row_bytes) {
+                 const int64_t off = q.row0 * sh.row_bytes, n = q.rows * sh.row_bytes;
+@@ -2296,8 +2300,11 @@ int Engine::load_weights() {
+ 
+             /* FROM A CHECKPOINT, every weight is staged and its worker reads it: there is no
+              * sweep to deliver it, and the stored form is whatever the pool makes of the share --
+-             * as it is, widened, or relaid. */
+-            if (!e) {
++             * as it is, widened, or relaid. A ZERO SHARE (rad_weight_shard_zero) takes the same
++             * route from a container: nothing in the file is its source, so no sweep run can
++             * deliver it; its worker writes zeros and the pool stores them as it would any share. */
++            const bool zero_share = sh[0].zero;
++            if (!e || zero_share) {
+                 StagedWeight sw;
+                 sw.prog = &r->program;
+                 sw.wi = i;
+@@ -2322,9 +2329,17 @@ int Engine::load_weights() {
+                 std::vector<int> sel(w.sel, w.sel + w.n_sel);
+                 std::vector<int64_t> offs(sw.plane_off, sw.plane_off + w.n_sel);
+                 const std::string name = w.name;
+-                sw.fill = [cw, shares, sel, offs, name](uint8_t* in) -> int {
+-                    return fill_from_checkpoint(*cw, shares, sel, offs, name, in);
+-                };
++                if (zero_share) {
++                    const int64_t bytes = in_bytes;
++                    sw.fill = [bytes](uint8_t* in) -> int {
++                        std::memset(in, 0, (size_t)bytes);
++                        return RAD_OK;
++                    };
++                } else {
++                    sw.fill = [cw, shares, sel, offs, name](uint8_t* in) -> int {
++                        return fill_from_checkpoint(*cw, shares, sel, offs, name, in);
++                    };
++                }
+                 staged.push_back(std::move(sw));
+                 ++n_loaded;
+                 continue;
+diff --git a/core/format/share.cpp b/core/format/share.cpp
+index dad8870..a160bb8 100644
+--- a/core/format/share.cpp
++++ b/core/format/share.cpp
+@@ -13,6 +13,23 @@ int weight_share(const WeightInfo& w, const RadEncoding& enc, uint32_t rank, con
+         return RAD_E_SHAPE;
+     };
+     if (w.n_sel < 1 || w.n_sel > RAD_ENC_MAX_PLANES) return refuse("no planes selected");
++    /* A ZERO SHARE: the declaration's own extents of every selected plane, and nothing to read.
++     * At one rank there is no share to zero -- the weight is whole and real. */
++    if (w.shard_zero && world > 1) {
++        for (int k = 0; k < w.n_sel; ++k) {
++            const RadEncPlane& p = enc.plane[w.sel[k]];
++            PlaneShare& s = out[k];
++            s = PlaneShare{};
++            s.dtype = p.dtype;
++            s.rows = w.sel_rows[k];
++            s.cols = w.sel_cols[k];
++            s.row_bytes = rad_enc_row_bytes(p.dtype, s.cols);
++            s.zero = true;
++            if (s.rows <= 0 || s.cols <= 0)
++                return refuse(fmt("a zero share of the '%s' plane has no extent", p.role));
++        }
++        return RAD_OK;
++    }
+     int64_t R = 0, C = 0;
+     rad_enc_view(rank, shape, &R, &C);
+ 
+@@ -38,7 +55,7 @@ int weight_share(const WeightInfo& w, const RadEncoding& enc, uint32_t rank, con
+ 
+     struct VRect { int64_t r0, r1, c0, c1; };
+     std::vector<VRect> view;
+-    const bool span  = w.shard_hi > 0;
++    const bool span  = w.shard_hi > 0 || w.n_part_spans > 0;
+     if (whole) {
+         view.push_back({ 0, VR, 0, VC });
+     } else {
+@@ -74,7 +91,21 @@ int weight_share(const WeightInfo& w, const RadEncoding& enc, uint32_t rank, con
+              * a slice of EACH of them, not a contiguous slice of the stack. The parts are THIS
+              * RANK'S rows, so a part is `world` times as many rows in the entry. */
+             const int np = w.decl.n_row_parts > 1 ? w.decl.n_row_parts : 1;
+-            if (span) {
++            if (w.n_part_spans > 0) {
++                /* PER-PART SPANS: the plugin stated each stacked part's rows in the container
++                 * and this rank's [lo, hi) of it, so the parts need not be equal. */
++                if (w.n_part_spans != np)
++                    return refuse(fmt("%d per-part spans for %d stacked parts", w.n_part_spans, np));
++                int64_t sum = 0, soff = 0;
++                for (int g = 0; g < np; ++g) sum += w.part_total[g];
++                if (sum != VR)
++                    return refuse(fmt("the %d stacked parts' stated rows sum to %lld and the entry "
++                                      "has %lld", np, (long long)sum, (long long)VR));
++                for (int g = 0; g < np; ++g) {
++                    view.push_back({ soff + w.part_lo[g], soff + w.part_hi[g], 0, VC });
++                    soff += w.part_total[g];
++                }
++            } else if (span) {
+                 if (VR % np) return refuse(fmt("%lld rows do not divide into %d parts",
+                                                (long long)VR, np));
+                 const int64_t cpart = VR / np;
+diff --git a/core/format/share.h b/core/format/share.h
+index 5367249..dff1107 100644
+--- a/core/format/share.h
++++ b/core/format/share.h
+@@ -27,6 +27,9 @@ struct PlaneShare {
+     uint32_t dtype = RAD_DT_INVALID;
+     int64_t rows = 0, cols = 0;      /* the share's extents, in the plane's elements */
+     int64_t row_bytes = 0;
++    /* rad_weight_shard_zero: the share has its extents and no rectangles; the loader writes
++     * dense_bytes() of zeros and reads nothing. */
++    bool    zero = false;
+     int64_t dense_bytes() const;     /* the share laid out dense: rows * a row of `cols` */
+ };
+ 
+diff --git a/core/rad_core.h b/core/rad_core.h
+index f2d4c9d..511f931 100644
+--- a/core/rad_core.h
++++ b/core/rad_core.h
+@@ -146,6 +146,13 @@ struct WeightInfo {
+     /* An uneven shard's slice of the split dimension (rad_weight_shard_span); hi 0 is the even
+      * split. */
+     int64_t        shard_lo = 0, shard_hi = 0;
++    /* rad_weight_shard_span_parts: a span per stacked part and each part's rows in the
++     * container; n_part_spans 0 is shard_lo/hi (one span for every part) or the even share. */
++    int            n_part_spans = 0;
++    int64_t        part_lo[RAD_MAX_ROW_PARTS] = {0}, part_hi[RAD_MAX_ROW_PARTS] = {0};
++    int64_t        part_total[RAD_MAX_ROW_PARTS] = {0};
++    /* rad_weight_shard_zero: this rank reads nothing for it and the loader writes zeros. */
++    bool           shard_zero = false;
+ 
+     /* WHAT IT IS A VIEW OF (RadWeightDecl::source and ::planes, spec §4.3). `enc` is the source's
+      * encoding as the model holds it -- or, with nothing behind the builder, plain in the declared
+@@ -201,6 +208,11 @@ struct WeightInfo {
+     WeightInfo& operator=(const WeightInfo& o) {
+         name = o.name; decl = o.decl; logical_bytes = o.logical_bytes;
+         shard_lo = o.shard_lo; shard_hi = o.shard_hi;
++        n_part_spans = o.n_part_spans;
++        for (int i = 0; i < RAD_MAX_ROW_PARTS; ++i) {
++            part_lo[i] = o.part_lo[i]; part_hi[i] = o.part_hi[i]; part_total[i] = o.part_total[i];
++        }
++        shard_zero = o.shard_zero;
+         source = o.source; enc = o.enc; enc_known = o.enc_known; n_sel = o.n_sel;
+         for (int i = 0; i < RAD_ENC_MAX_PLANES; ++i) {
+             sel[i] = o.sel[i]; sel_rows[i] = o.sel_rows[i]; sel_cols[i] = o.sel_cols[i];
+diff --git a/tests/build_test.cpp b/tests/build_test.cpp
+index f11c687..a718676 100644
+--- a/tests/build_test.cpp
++++ b/tests/build_test.cpp
+@@ -1349,4 +1349,47 @@ TEST(the_gate_names_its_caller) {
+     CHECK(has(msg, "the container's layout"));
+ }
+ 
++/* A span, per-part spans and a zero share have to SURVIVE THE WEIGHT LIST GROWING: WeightInfo's
++ * copy is hand-written (the atomic), so a field the copy leaves out is reset on every weight
++ * declared before the vector's last reallocation -- which is what the loader saw on rank 0 of a
++ * three-rank Flash-Next: layer 0's [a|b] with its per-part spans gone, refused as an even share. */
++TEST(shard_spans_and_zero_survive_the_weight_list_reallocating) {
++    NEED_PLUGIN(reg)
++    Builder b(reg, make_meta(), make_ctx());
++    /* Three weights declared first and marked, then enough declared after them to grow the
++     * list several times over. */
++    RadWeightDecl d{};
++    d.dtype = RAD_BF16; d.rank = 2; d.shape[0] = 36; d.shape[1] = 64;
++    d.access = RAD_ACCESS_PER_TOKEN; d.shard = RAD_SHARD_ROW; d.group = rad_group_layer(0);
++    d.n_row_parts = 2; d.row_parts[0] = 18; d.row_parts[1] = 18;
++    const rad_weight ab = b.decl_weight("ab", &d);
++    REQUIRE(ab != 0);
++    const int64_t lo[2] = { 0, 0 }, hi[2] = { 18, 18 }, tot[2] = { 48, 48 };
++    CHECK_EQ(b.weight_shard_span_parts(ab, lo, hi, tot, 2), RAD_OK);
++
++    const rad_weight sp = decl_w(b, "span", 18, 64);
++    CHECK_EQ(b.weight_shard_span(sp, 6, 24), RAD_OK);
++
++    const rad_weight z = decl_w(b, "zero", 18, 64);
++    CHECK_EQ(b.weight_shard_zero(z), RAD_OK);
++
++    for (int i = 0; i < 300; ++i) {
++        char n[32]; snprintf(n, sizeof n, "w%d", i);
++        REQUIRE(decl_w(b, n, 64, 64) != 0);
++    }
++
++    const WeightInfo* w = b.program().weight(ab);
++    REQUIRE(w != nullptr);
++    CHECK_EQ(w->n_part_spans, 2);
++    CHECK_EQ((long long)w->part_lo[1], 0LL);
++    CHECK_EQ((long long)w->part_hi[1], 18LL);
++    CHECK_EQ((long long)w->part_total[1], 48LL);
++    w = b.program().weight(sp);
++    CHECK_EQ((long long)w->shard_lo, 6LL);
++    CHECK_EQ((long long)w->shard_hi, 24LL);
++    w = b.program().weight(z);
++    CHECK(w->shard_zero);
++    CHECK_EQ((int)b.errors().size(), 0);
++}
++
+ RAD_TEST_MAIN()
+diff --git a/tests/share_test.cpp b/tests/share_test.cpp
+index a3bdfbc..81d710e 100644
+--- a/tests/share_test.cpp
++++ b/tests/share_test.cpp
+@@ -163,6 +163,57 @@ TEST(an_uneven_span_is_the_rows_the_plugin_names) {
+     CHECK_EQ(s[1].rows, (int64_t)3);
+ }
+ 
++/* PER-PART SPANS: a stacked weight whose parts are not the same width -- the delta net's
++ * [q|k|v|z] -- takes a span per part, each in its own part's rows. Three ranks over 16 K heads of
++ * 128: rank 1 takes K heads [6, 11) of q and of k, and V heads [18, 33) of 48 in v. */
++TEST(per_part_spans_cut_each_stacked_part_by_its_own_rows) {
++    const RadEncoding e = rad_enc_plain(RAD_BF16);
++    /* entry: q 2048 | k 2048 | v 6144 rows; rank 1 of 3 declares 640 + 640 + 1920 */
++    WeightInfo w = decl(e, { 0 }, 2048 + 2048 + 6144, 64, RAD_SHARD_ROW, 3, { 640, 640, 1920 });
++    w.decl.shape[0] = 640 + 640 + 1920;
++    rad_enc_plane_dims(&e.plane[0], w.decl.shape[0], 64, &w.sel_rows[0], &w.sel_cols[0]);
++    w.n_part_spans = 3;
++    const int64_t lo[3] = { 768, 768, 2304 }, hi[3] = { 1408, 1408, 4224 };
++    const int64_t tot[3] = { 2048, 2048, 6144 };
++    for (int g = 0; g < 3; ++g) { w.part_lo[g] = lo[g]; w.part_hi[g] = hi[g]; w.part_total[g] = tot[g]; }
++    PlaneShare s[RAD_ENC_MAX_PLANES];
++    REQUIRE_EQ(share(w, 2048 + 2048 + 6144, 64, 3, 1, s), RAD_OK);
++    REQUIRE_EQ(s[0].rects.size(), (size_t)3);
++    CHECK_EQ(s[0].rects[0].row0, (int64_t)768);
++    CHECK_EQ(s[0].rects[0].rows, (int64_t)640);
++    CHECK_EQ(s[0].rects[1].row0, (int64_t)(2048 + 768));
++    CHECK_EQ(s[0].rects[2].row0, (int64_t)(4096 + 2304));
++    CHECK_EQ(s[0].rects[2].rows, (int64_t)1920);
++    CHECK_EQ(s[0].rows, (int64_t)3200);
++    /* totals that do not sum to the entry are refused */
++    w.part_total[2] = 6000;
++    std::string why;
++    CHECK_EQ(share(w, 2048 + 2048 + 6144, 64, 3, 1, s, &why), RAD_E_SHAPE);
++    CHECK(why.find("stated rows") != std::string::npos);
++}
++
++/* A ZERO SHARE has the declaration's extents and no rectangles: the loader writes zeros and reads
++ * nothing. At one rank there is nothing to zero. */
++TEST(a_zero_share_is_the_declared_extent_and_no_rectangles) {
++    const RadEncoding e = fp8_block();
++    WeightInfo w = decl(e, { 0, 1 }, 1536, 128, RAD_SHARD_ROW, 3);
++    w.shard_zero = true;
++    PlaneShare s[RAD_ENC_MAX_PLANES];
++    REQUIRE_EQ(share(w, 1536, 128, 3, 2, s), RAD_OK);
++    CHECK(s[0].zero);
++    CHECK_EQ(s[0].rects.size(), (size_t)0);
++    CHECK_EQ(s[0].rows, (int64_t)512);
++    CHECK_EQ(s[0].cols, (int64_t)128);
++    CHECK_EQ(s[0].dense_bytes(), (int64_t)(512 * 128));
++    CHECK(s[1].zero);
++    CHECK_EQ(s[1].rows, (int64_t)4);
++    WeightInfo one = decl(e, { 0, 1 }, 1536, 128, RAD_SHARD_ROW, 1);
++    one.shard_zero = true;
++    REQUIRE_EQ(share(one, 1536, 128, 1, 0, s), RAD_OK);
++    CHECK(!s[0].zero);
++    CHECK_EQ(s[0].rows, (int64_t)1536);
++}
++
+ /* A per-tensor scale is one value every rank carries whole, once, whatever the codes' cut. */
+ TEST(a_per_tensor_scale_is_carried_whole_by_every_rank) {
+     RadEncoding e;
+-- 
+2.55.0
+
+
+From 3cbe03c5a7bfbdd6d7892e58ae41db3562711e4a Mon Sep 17 00:00:00 2001
+From: baKon <mike.ski83@gmail.com>
+Date: Mon, 5 Oct 2026 13:52:59 -0500
+Subject: [PATCH 02/16] any world size: the attention world, uneven delta-net
+ heads, nothing padded
+
+A world the KV head count neither divides nor is a multiple of -- three
+ranks over Flash-Next's two -- was refused by geom_from, and 1.0.12
+served it by padding the checkpoint offline (docs/TP3.md): zero heads
+appended so that 36 / 3 / 18 / 54 divide, a second 115 GiB container
+per model, 1/3 of the attention and 2 of 18 delta-net heads computing
+zeros. This serves the shipped container at any world size instead.
+
+The attention world. geom_from serves attention on the largest multiple
+of the KV head count under the world (split, or replicated as 1.0.7
+does when that is still above the count) and the ranks past it are
+attention-zero: they declare the same heads and the same program as
+their peers -- the scheduler sees one program -- and read nothing for
+attn_qg, attn_k, attn_v and attn_output (rad_weight_shard_zero). Their
+attention computes zeros from zeros and their output projection adds
+exactly nothing to the reduce. Three ranks over two heads: attention on
+ranks 0 and 1 exactly as the two-rank serve declares it, 12 heads, one
+KV head, gqa 12, the same kernels; rank 2 zero. Five over two:
+attention on four, rank 4 zero. Under a smaller attention world the even
+shard over `world` is the wrong cut for every projection, so
+rad_block_attn_gated_fp8.h declares spans -- q|gate rows and output
+columns [attn_rank * n_head, +n_head) heads, k/v at kv_off -- the same
+call the KV replication already used. When the attention world is the
+world, every TP2 and TP4 deployment, nothing here is declared and the
+block declares as it always did.
+
+Uneven delta-net heads. The delta net has no KV-head constraint: its
+kernels are bound on head widths and take any head count. 16 K heads
+over three ranks are 6, 5 and 5, each rank's V heads the same multiple
+(48 / 16 = 3: 18, 15, 15), every rank real heads. qwen4exp computes the
+split and rad_block_gdn_fp8.h declares it as spans of the container's
+rows: per-part for [q|k|v|z] and the conv channels (the parts are not
+equal), one span for [a|b], A_log, dt_bias and the output columns.
+LinearFP8 owns the scale plane's units (1/128 of the weight's rows for
+block-fp8, the weight's own for int8 and bf16), so a block declares in
+the weight's rows and the scale plane follows. The even split, when the
+counts divide, is untouched.
+
+The log says what the geometry did:
+  world_size = 3 over n_head_kv = 2: attention on 2 rank(s), rank(s)
+  2..2 carry zero attention weights and the delta net and experts of a
+  full rank
+  qwen4exp: rank 1 takes delta-net K heads [6, 11) of 16 and V heads
+  [18, 33) of 48
+---
+ arch/common/rad_arch.h                 | 48 +++++++++++++++++++++-----
+ arch/common/rad_block_attn_gated_fp8.h | 24 +++++++++++--
+ arch/common/rad_block_gdn_fp8.h        | 31 ++++++++++++++++-
+ arch/common/rad_fp8.h                  | 35 +++++++++++++++++++
+ arch/qwen4exp_fp8/qwen4exp_fp8.cpp     | 32 +++++++++++++++--
+ 5 files changed, 155 insertions(+), 15 deletions(-)
+
+diff --git a/arch/common/rad_arch.h b/arch/common/rad_arch.h
+index 2370e0f..27923bb 100644
+--- a/arch/common/rad_arch.h
++++ b/arch/common/rad_arch.h
+@@ -576,6 +576,17 @@ struct Geom {
+      * declares a row-sharded k/v passes it straight through as `span_lo`. Zero on every split
+      * deployment, which is what keeps TP2 reading the projection exactly as it always did. */
+     int64_t kv_off   = 0;
++    /* THE ATTENTION WORLD. A world size the KV head count neither divides nor is a multiple of
++     * -- three ranks over Flash-Next's two KV heads -- serves attention on the largest multiple
++     * of the head count below it (`attn_world`, here 2: split, or replicated when that is still
++     * above the count) and the remaining ranks are ATTENTION-ZERO: they declare the same heads and
++     * the same program as their peers, read nothing for the attention projections
++     * (rad_weight_shard_zero) and add exactly zero to the reduce. `attn_rank` is this rank's
++     * index inside the attention world (an attention-zero rank clamps to the last). When
++     * attn_world == world nothing here is used and every block declares as it always did. */
++    int     attn_world = 1;
++    int     attn_rank  = 0;
++    bool    attn_zero  = false;
+     int64_t n_ff       = 0;    /* per rank */
+     int64_t n_ff_all   = 0;
+     int64_t max_tok    = 0;
+@@ -786,7 +797,23 @@ inline int geom_from(Geom& g, const RadModelMeta* m, const RadBuildCtx* c,
+     }
+ 
+     int s;
+-    if ((s = divide_or_fail(g.n_head_all,    g.world, "n_head",    &g.n_head))    < 0) return s;
++    /* THE ATTENTION WORLD (see the field). Below the KV head count, or a multiple of it, it is the
++     * world and the two rules that follow run on the world as before. Otherwise it is the largest
++     * multiple of the head count under the world, and the ranks past it carry zero attention. */
++    g.attn_world = g.world;
++    g.attn_rank  = g.rank;
++    g.attn_zero  = false;
++    if (g.world > g.n_head_kv_all && g.world % g.n_head_kv_all != 0) {
++        g.attn_world = (int)(g.n_head_kv_all * (g.world / g.n_head_kv_all));
++        g.attn_zero  = g.rank >= g.attn_world;
++        g.attn_rank  = g.attn_zero ? g.attn_world - 1 : g.rank;
++        fprintf(stderr, "radiance: world_size = %d over n_head_kv = %lld: attention on %d rank(s), "
++                        "rank(s) %d..%d carry zero attention weights and the delta net and "
++                        "experts of a full rank\n", g.world, (long long)g.n_head_kv_all,
++                g.attn_world, g.attn_world, g.world - 1);
++    }
++    const int aw = g.attn_world, ar = g.attn_rank;
++    if ((s = divide_or_fail(g.n_head_all, aw, "n_head", &g.n_head)) < 0) return s;
+     /* THE KV HEADS ARE REPLICATED WHEN THERE ARE NOT ENOUGH TO SPLIT. There is one row-span per KV
+      * head and no way to hand four ranks half a head, so `divide_or_fail` on n_head_kv is the
+      * wrong verb once world exceeds the head count -- the question is not rounding, it is whether
+@@ -805,19 +832,24 @@ inline int geom_from(Geom& g, const RadModelMeta* m, const RadBuildCtx* c,
+      *
+      * When world <= n_head_kv_all the split below is untouched, so a world that divides the KV
+      * heads -- TP2 on this family -- declares exactly as it did before replication existed. */
+-    if (g.world > g.n_head_kv_all) {
+-        if (g.world % g.n_head_kv_all != 0) {
++    if (aw > g.n_head_kv_all) {
++        /* aw is a multiple of the head count by construction (the world itself, checked here, or
++         * the attention world, which is one). */
++        if (aw % g.n_head_kv_all != 0) {
+             fprintf(stderr, "radiance: world_size = %d cannot replicate n_head_kv = %lld; "
+                             "replication needs world to be a multiple of the KV head count\n",
+-                    g.world, (long long)g.n_head_kv_all);
++                    aw, (long long)g.n_head_kv_all);
+             return RAD_E_INVAL;
+         }
+-        g.n_head_kv = 1;   /* world / n_head_kv_all ranks share each KV head */
+-        g.kv_off    = (g.rank / (g.world / g.n_head_kv_all)) * g.head_dim;
+-    } else if ((s = divide_or_fail(g.n_head_kv_all, g.world, "n_head_kv", &g.n_head_kv)) < 0) {
++        g.n_head_kv = 1;   /* aw / n_head_kv_all ranks share each KV head */
++        g.kv_off    = (ar / (aw / g.n_head_kv_all)) * g.head_dim;
++    } else if ((s = divide_or_fail(g.n_head_kv_all, aw, "n_head_kv", &g.n_head_kv)) < 0) {
+         return s;
+     } else {
+-        g.kv_off = 0;   /* a split rank reads the rows the plain row-shard already gives it */
++        /* A split rank reads the rows the plain row-shard gives it -- when the attention world
++         * is the world. Under a smaller attention world the even shard over `world` is the wrong
++         * cut, and the block spans [kv_off, kv_off + kv_dim) instead. */
++        g.kv_off = aw == g.world ? 0 : ar * g.n_head_kv * g.head_dim;
+     }
+     if (arch_splits_ff && g.world > 1 && g.n_ff_all % g.world != 0) {
+         g.n_ff = g.n_ff_all;   /* the plugin slices it (see the parameter's comment) */
+diff --git a/arch/common/rad_block_attn_gated_fp8.h b/arch/common/rad_block_attn_gated_fp8.h
+index 0fe5282..2a0d1e9 100644
+--- a/arch/common/rad_block_attn_gated_fp8.h
++++ b/arch/common/rad_block_attn_gated_fp8.h
+@@ -192,9 +192,19 @@ inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
+      * never cuts one, and share.cpp's `shard_hi <= cpart` holds with cpart = 512 / 1 part.
+      * AT WORLD <= n_head_kv_all the ordinary even shard already selects exactly these rows, so the
+      * span stays 0/0 and the default path runs as before -- TP2 declares identically. */
+-    const bool    kv_spanned = g.world > g.n_head_kv_all;
++    /* AND UNDER A SMALLER ATTENTION WORLD (rad_arch.h Geom::attn_world: three ranks over two KV
++     * heads) the even shard over `world` is the wrong cut for every projection: q|gate and the
++     * output take this rank's heads [attn_rank * n_head, +n_head) as a span too, and k/v the
++     * kv_off span. An attention-zero rank declares the same spans -- the same shapes as its peers
++     * -- and then reads nothing for them (zero_share below). */
++    const bool    a_spanned  = g.attn_world != g.world;
++    const bool    kv_spanned = g.world > g.n_head_kv_all || a_spanned;
+     const int64_t kv_span_lo = kv_spanned ? g.kv_off : 0;
+     const int64_t kv_span_hi = kv_spanned ? g.kv_off + kv_dim : 0;
++    const int64_t qg_span_lo = a_spanned ? g.attn_rank * qg_dim : 0;
++    const int64_t qg_span_hi = a_spanned ? (g.attn_rank + 1) * qg_dim : 0;
++    const int64_t o_span_lo  = a_spanned ? g.attn_rank * q_dim : 0;
++    const int64_t o_span_hi  = a_spanned ? (g.attn_rank + 1) * q_dim : 0;
+ 
+     if (n_rot <= 0 || n_rot > g.head_dim || (n_rot & 1)) {
+         fprintf(stderr, "radiance: rotary_dim %lld is not an even width inside head_dim %lld\n",
+@@ -235,13 +245,19 @@ inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
+         RAD_ARCH_TRY(nq_h.declare(b, g, w_norm, fold ? w.h.x : w.x, w.h, g.n_embd,
+                                   fold ? w.x : 0, 0, ar_in));
+     RAD_ARCH_TRY(qg.declare(b, nm, g, nm.f("blk.%d.attn_qg", l), qg_dim, g.n_embd,
+-                            RAD_SHARD_ROW, grp_layer(l), { src.qg }, w.h, w.qg));
++                            RAD_SHARD_ROW, grp_layer(l), { src.qg }, w.h, w.qg,
++                            0, {}, qg_span_lo, qg_span_hi));
+     RAD_ARCH_TRY(kp.declare(b, nm, g, nm.f("blk.%d.attn_k", l), kv_dim, g.n_embd,
+                             RAD_SHARD_ROW, grp_layer(l), { src.k }, w.h, w.k,
+                             0, {}, kv_span_lo, kv_span_hi));
+     RAD_ARCH_TRY(vp.declare(b, nm, g, nm.f("blk.%d.attn_v", l), kv_dim, g.n_embd,
+                             RAD_SHARD_ROW, grp_layer(l), { src.v }, w.h, w.v,
+                             0, {}, kv_span_lo, kv_span_hi));
++    if (g.attn_zero) {
++        RAD_ARCH_TRY(qg.zero_share(b));
++        RAD_ARCH_TRY(kp.zero_share(b));
++        RAD_ARCH_TRY(vp.zero_share(b));
++    }
+ 
+     /* THE FUSED PROLOGUE, AND IT IS A PROBE: the four ops below are declared either way and are
+      * what runs when nothing serves this one. rad_block_attn_gated.h does not make the probe,
+@@ -417,7 +433,9 @@ inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
+     }
+ 
+     RAD_ARCH_TRY(o.declare(b, nm, g, nm.f("blk.%d.attn_output", l), g.n_embd, q_dim,
+-                           RAD_SHARD_COL, grp_layer(l), { src.o }, w.attn, w.h.x));
++                           RAD_SHARD_COL, grp_layer(l), { src.o }, w.attn, w.h.x,
++                           0, {}, o_span_lo, o_span_hi));
++    if (g.attn_zero) RAD_ARCH_TRY(o.zero_share(b));
+ 
+     if (g.world > 1)
+         op_ar = rw(b, RAD_OP(b, "all_reduce",
+diff --git a/arch/common/rad_block_gdn_fp8.h b/arch/common/rad_block_gdn_fp8.h
+index 833e2af..67b12a6 100644
+--- a/arch/common/rad_block_gdn_fp8.h
++++ b/arch/common/rad_block_gdn_fp8.h
+@@ -72,6 +72,14 @@ struct GdnFP8 {
+          * `gdn_recurrent_update` composes the same parameter, so this is a string to pass and
+          * not a kernel to write. "silu" or "sigmoid"; anything else is refused below. */
+         const char* act    = "silu";
++        /* AN UNEVEN SPLIT OF THE HEADS (rad_weight_shard_span_parts). n_head_k / n_head_v are
++         * this rank's; k_first / v_first its first head of the container's n_head_k_all /
++         * n_head_v_all. k_first < 0 is the even split the plain row shard gives, as before.
++         * Three ranks over 16 K heads take 6, 5 and 5 (and 18, 15, 15 of the 48 V heads) --
++         * every rank real heads, nothing padded, every kernel at its own head count. */
++        int64_t k_first = -1, v_first = -1;
++        int64_t n_head_k_all = 0, n_head_v_all = 0;
++        bool    uneven() const { return k_first >= 0; }
+ 
+         int64_t k_dim()    const { return n_head_k * head_k; }
+         int64_t v_dim()    const { return n_head_v * head_v; }
+@@ -268,6 +276,25 @@ inline int GdnFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, const Con
+     RAD_ARCH_TRY(in.declare(b, nm, g, nm.f("blk.%d.ssm_inz", l), conv_dim + v_dim, g.n_embd,
+                             RAD_SHARD_ROW, grp_layer(l), { s.in_qkv, s.in_z }, w.h, w.in.x, 0,
+                             { cfg.k_dim(), cfg.k_dim(), cfg.v_dim(), cfg.v_dim() }));
++    if (cfg.uneven()) {
++        /* THIS RANK'S HEADS OF EACH PART, in the container's rows: q and k by K head, v and z by
++         * V head. The scale plane of a row shard has the same rows (its blocks run along K). */
++        const int64_t kl = cfg.k_first * cfg.head_k, vl = cfg.v_first * cfg.head_v;
++        const int64_t ka = cfg.n_head_k_all * cfg.head_k, va = cfg.n_head_v_all * cfg.head_v;
++        const int64_t lo[4] = { kl, kl, vl, vl };
++        const int64_t hi[4] = { kl + cfg.k_dim(), kl + cfg.k_dim(), vl + cfg.v_dim(), vl + cfg.v_dim() };
++        const int64_t tot[4] = { ka, ka, va, va };
++        RAD_ARCH_TRY(in.span_parts(b, lo, hi, tot, 4));
++        const int64_t clo[3] = { kl, kl, vl }, chi[3] = { kl + cfg.k_dim(), kl + cfg.k_dim(), vl + cfg.v_dim() };
++        const int64_t ctot[3] = { ka, ka, va };
++        RAD_ARCH_TRY(rad_weight_shard_span_parts(b, w_conv, clo, chi, ctot, 3));
++        const int64_t alo[2] = { cfg.v_first, cfg.v_first };
++        const int64_t ahi[2] = { cfg.v_first + cfg.n_head_v, cfg.v_first + cfg.n_head_v };
++        const int64_t atot[2] = { cfg.n_head_v_all, cfg.n_head_v_all };
++        RAD_ARCH_TRY(rad_weight_shard_span_parts(b, w_ab, alo, ahi, atot, 2));
++        RAD_ARCH_TRY(rad_weight_shard_span(b, w_a_log,   cfg.v_first, cfg.v_first + cfg.n_head_v));
++        RAD_ARCH_TRY(rad_weight_shard_span(b, w_dt_bias, cfg.v_first, cfg.v_first + cfg.n_head_v));
++    }
+     /* NOT SLICED, and why it could need to be is worth keeping. This is a 96-column bf16 GEMM --
+      * half a percent of the layer's projection bytes -- and a bf16 kernel for this shape that
+      * stopped at M = 64 would leave a hole in its bucket table above 64. Since every op in a step
+@@ -374,7 +401,9 @@ inline int GdnFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, const Con
+ 
+     RAD_ARCH_TRY(q_o.declare(b, g, w.o, v_dim));
+     RAD_ARCH_TRY(out.declare(b, nm, g, nm.f("blk.%d.ssm_out", l), g.n_embd, v_dim,
+-                             RAD_SHARD_COL, grp_layer(l), { s.out }, w.o, w.h.x));
++                             RAD_SHARD_COL, grp_layer(l), { s.out }, w.o, w.h.x, 0, {},
++                             cfg.uneven() ? cfg.v_first * cfg.head_v : 0,
++                             cfg.uneven() ? cfg.v_first * cfg.head_v + v_dim : 0));
+ 
+     if (g.world > 1)
+         op_ar = rw(b, RAD_OP(b, "all_reduce",
+diff --git a/arch/common/rad_fp8.h b/arch/common/rad_fp8.h
+index ac21e9b..338bd55 100644
+--- a/arch/common/rad_fp8.h
++++ b/arch/common/rad_fp8.h
+@@ -664,6 +664,11 @@ struct LinearFP8 {
+     rad_weight w = 0, ws = 0;
+     rad_op     op = 0;
+     int64_t    N = 0, K = 0;
++    /* ROWS OF THE SCALE PLANE PER ROW OF THE WEIGHT: 1 for an int8 or bf16 linear, whose scale
++     * plane (if any) has the weight's rows, RAD_FP8_BLOCK for a block-fp8 one, whose scale plane
++     * is 1/128 of them. A row span on `ws` is in the plane's own rows (declare's span code
++     * divides); span_parts below divides the same way. */
++    int64_t    ws_row_div = 1;
+     /* A PLAIN bf16 WEIGHT read by `gemm_nt` over the activation's bf16 plane, in a model whose
+      * linears are bf16 (Geom::w_bf16): one weight and no scale plane, and no quantiser in front. */
+     bool       bf16 = false;
+@@ -722,6 +727,35 @@ struct LinearFP8 {
+                  int64_t span_lo = 0, int64_t span_hi = 0);
+     void step(RadCtx* c, const ActFP8& a, rad_buf y, int64_t T, int64_t r0 = 0,
+               int64_t rows = 0) const;
++    /* THIS RANK READS NOTHING FOR IT: the weight and its scale plane are zeros
++     * (rad_weight_shard_zero). After declare(); for an attention-zero rank (rad_arch.h). */
++    int  zero_share(RadBuilder* b) const {
++        RAD_ARCH_TRY(rad_weight_shard_zero(b, w));
++        if (ws) RAD_ARCH_TRY(rad_weight_shard_zero(b, ws));
++        return RAD_OK;
++    }
++    /* A SPAN PER STACKED ROW PART (rad_weight_shard_span_parts), in the weight's rows; the scale
++     * plane takes the same spans in its own rows. After declare(); every span and total has to be
++     * whole scale blocks when the plane is 1/128, which head widths of 128 are. */
++    int  span_parts(RadBuilder* b, const int64_t* lo, const int64_t* hi, const int64_t* total,
++                    int n) const {
++        RAD_ARCH_TRY(rad_weight_shard_span_parts(b, w, lo, hi, total, n));
++        if (!ws) return RAD_OK;
++        if (ws_row_div == 1) return rad_weight_shard_span_parts(b, ws, lo, hi, total, n);
++        int64_t slo[RAD_MAX_ROW_PARTS], shi[RAD_MAX_ROW_PARTS], stot[RAD_MAX_ROW_PARTS];
++        for (int g = 0; g < n && g < RAD_MAX_ROW_PARTS; ++g) {
++            if (lo[g] % ws_row_div || hi[g] % ws_row_div || total[g] % ws_row_div) {
++                fprintf(stderr, "radiance: a part span [%lld, %lld) of %lld rows is not whole "
++                                "%lld-row scale blocks\n", (long long)lo[g], (long long)hi[g],
++                        (long long)total[g], (long long)ws_row_div);
++                return RAD_E_INVAL;
++            }
++            slo[g] = lo[g] / ws_row_div;
++            shi[g] = hi[g] / ws_row_div;
++            stot[g] = total[g] / ws_row_div;
++        }
++        return rad_weight_shard_span_parts(b, ws, slo, shi, stot, n);
++    }
+ };
+ 
+ /* THE NAME MAP OF A LINEAR, DECLARED BEFORE ITS WEIGHT: it is how the checkpoint -- or the recipe
+@@ -928,6 +962,7 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
+      * bf16 release) declares the same two views; what makes the planes exist is rad-convert. */
+     w  = decl_view(b, wn, nullptr, "codes", RAD_F8E4M3, { N, K },
+                    RAD_ACCESS_PER_TOKEN, shard, grp, wparts, np);
++    ws_row_div = RAD_FP8_BLOCK;
+     ws = decl_view(b, sn, wn, "scale", RAD_BF16, { fp8_blocks(N), fp8_blocks(K) },
+                    RAD_ACCESS_PER_TOKEN, shard, grp, sparts, np);
+     if (!w || !ws) return RAD_E_INVAL;
+diff --git a/arch/qwen4exp_fp8/qwen4exp_fp8.cpp b/arch/qwen4exp_fp8/qwen4exp_fp8.cpp
+index 7ae4b28..18aeafe 100644
+--- a/arch/qwen4exp_fp8/qwen4exp_fp8.cpp
++++ b/arch/qwen4exp_fp8/qwen4exp_fp8.cpp
+@@ -406,9 +406,35 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
+                     (long long)gc.conv_width);
+             return RAD_E_INVAL;
+         }
+-        int s;
+-        if ((s = divide_or_fail(nk, g.world, "linear_num_key_heads",   &gc.n_head_k)) < 0) return s;
+-        if ((s = divide_or_fail(nv, g.world, "linear_num_value_heads", &gc.n_head_v)) < 0) return s;
++        /* THE HEADS SPLIT EVENLY WHEN THEY CAN, as before, and UNEVENLY WHEN THEY CANNOT: 16 K
++         * heads over three ranks are 6, 5 and 5, each rank's V heads the same multiple of its K
++         * heads (48 / 16 = 3 -> 18, 15, 15), declared as spans of the container's rows
++         * (rad_block_gdn_fp8.h Config::k_first). Nothing is padded and every rank holds real
++         * heads; the kernels take any head count. A V count that is not a multiple of the K count
++         * cannot be grouped that way and is refused. */
++        gc.n_head_k_all = nk;
++        gc.n_head_v_all = nv;
++        if (g.world > 1 && (nk % g.world != 0 || nv % g.world != 0)) {
++            if (nv % nk != 0) {
++                fprintf(stderr, "radiance: qwen4exp: %lld value heads over %lld key heads do not "
++                                "group, so an uneven split over %d ranks is not defined\n",
++                        (long long)nv, (long long)nk, g.world);
++                return RAD_E_INVAL;
++            }
++            const int64_t ratio = nv / nk, base = nk / g.world, rem = nk % g.world;
++            gc.n_head_k = base + (g.rank < rem ? 1 : 0);
++            gc.k_first  = g.rank * base + (g.rank < rem ? g.rank : rem);
++            gc.n_head_v = ratio * gc.n_head_k;
++            gc.v_first  = ratio * gc.k_first;
++            fprintf(stderr, "radiance: qwen4exp: rank %d takes delta-net K heads [%lld, %lld) of "
++                            "%lld and V heads [%lld, %lld) of %lld\n", g.rank,
++                    (long long)gc.k_first, (long long)(gc.k_first + gc.n_head_k), (long long)nk,
++                    (long long)gc.v_first, (long long)(gc.v_first + gc.n_head_v), (long long)nv);
++        } else {
++            int s;
++            if ((s = divide_or_fail(nk, g.world, "linear_num_key_heads",   &gc.n_head_k)) < 0) return s;
++            if ((s = divide_or_fail(nv, g.world, "linear_num_value_heads", &gc.n_head_v)) < 0) return s;
++        }
+     }
+ 
+     /* ---- the routed feed-forward.
+-- 
+2.55.0
+
+
+From 15c6e57c28cfb2bf4994936dd3ba7586e97397c8 Mon Sep 17 00:00:00 2001
+From: baKon <mike.ski83@gmail.com>
+Date: Mon, 5 Oct 2026 13:52:59 -0500
+Subject: [PATCH 03/16] tests and docs for the attention world
+
+arch_test: flashnext_tp3_zeroes_the_third_ranks_attention_and_splits_gdn_heads_unevenly
+holds the three-rank declaration of the Flash-Next fixture: the three
+programs declare the same ops and KV groups in the same order; every
+rank the two-rank attention geometry with the span of its heads, rank 2
+zero; the delta net 6/5/5 K and 18/15/15 V heads as per-part spans of
+[q|k|v|z] and the conv channels, a span of A_log, the output columns,
+and the state group at each rank's own V count. The fake builder
+records the two new exports as it records the span. The TP4 case's
+"world 3 is refused" check becomes "world 3 declares".
+
+docs/TP3.md is rewritten: what replaced the padded checkpoint, the two
+rules, what they are built from, the serve line and the log lines. The
+pad tools stay in the tree for an engine without an attention world.
+---
+ docs/TP3.md         | 183 ++++++++++++++++++++------------------------
+ tests/arch_test.cpp | 171 ++++++++++++++++++++++++++++++++++++++++-
+ 2 files changed, 250 insertions(+), 104 deletions(-)
+
+diff --git a/docs/TP3.md b/docs/TP3.md
+index 4c0b2d0..375741c 100644
+--- a/docs/TP3.md
++++ b/docs/TP3.md
+@@ -1,124 +1,105 @@
+-# Three ranks: padding a checkpoint to a world its geometry does not divide
++# Any world size: the attention world, uneven delta-net heads, and nothing padded
+ 
+-Radiance shards by dividing: `n_head`, `n_head_kv`, the GDN head counts and the vocabulary each
+-split evenly across the world, and a count that does not divide is **refused at declare, by name**
++Radiance shards by dividing: `n_head`, `n_head_kv`, the delta-net head counts and the vocabulary
++each split across the world, and a count that does not divide is **refused at declare, by name**
+ (`share.cpp`, `rad_arch.h`). Four ranks got through for Qwen3.8-Flash-Next by replicating the two
+-KV heads in rank pairs (1.0.7). Three ranks cannot: 24 query heads, 2 KV heads, 16 GDN K heads and
+-48 GDN V heads have no even share in 3, and replication needs a world that is a multiple of the
+-head count. The engine is right to refuse. What this document describes is how to **change the
+-checkpoint** so there is nothing to refuse, exactly, and what the engine gained so that the padded
+-checkpoint then serves at three ranks.
++KV heads in rank pairs (1.0.7); three did not: 24 query heads, 2 KV heads, 16 GDN K heads and 48
++GDN V heads have no even share in 3, and replication needs a world that is a multiple of the head
++count. 1.0.12 served three ranks by **padding the checkpoint** offline (`tools/pad_tp.py`, the
++regime of tcclaviger's `vllm/config/tp_padding.py`): zero heads appended so that 36 / 3 / 18 / 54
++divide, and a container converted from that. It worked, exactly, and it cost a second 115 GiB
++container for every model and 1/3 of the attention and 2 of 18 delta-net heads computing zeros.
+ 
+-The regime is tcclaviger's `vllm/config/tp_padding.py`, which pads the same model to the same
+-shape at load time inside vLLM. Radiance has no load-time pad -- a container is served as it was
+-converted -- so the pad is done once, offline, before `rad-convert`.
++This document describes what replaced it: **the shipped container serves at any world size**, with
++no tool and no second file. Two rules, both built from machinery the engine already had.
+ 
+-## 1. What is padded, and why it is exact
++## 1. The attention world
+ 
+-Every padded weight gains **zeros**, placed where a zero contributes nothing to the forward pass:
++`rad_arch.h` `geom_from` already handled a world *above* the KV head count by replication, when
++the world is a multiple of the count. It now handles a world that is **neither a divisor nor a
++multiple** of it:
+ 
+-| block | tensor | gains | exact because |
+-|---|---|---|---|
+-| attention | `k_proj`, `v_proj` | zero **rows** (new KV heads) | a zero KV head stores zeros and is read only by zero query heads |
+-| attention | `q_proj` (fused q+gate on Flash-Next: 512-row head blocks) | zero rows so every KV group has the new ratio | a zero query head attends uniformly, and its `o_proj` column is zero, so its output is 0 |
+-| attention | `o_proj` | zero **columns** in the same head order | the zero heads' outputs are multiplied by zero |
+-| GDN | `in_proj_qkvz`, `in_proj_ba` | zero rows per the fused layout (new K and V heads) | a zero head carries a zero state |
+-| GDN | `conv1d` | zero channels | zero input, zero output |
+-| GDN | `A_log`, `dt_bias` | zero heads | a zero head decays nothing |
+-| GDN | `out_proj` | zero columns | the zero heads are multiplied by zero |
++> attention is served on the largest multiple of the KV head count under the world -- the
++> **attention world** -- and the ranks past it are **attention-zero**.
+ 
+-Norms, embeddings, the lm_head, the router and the experts are untouched: their only width is
+-`n_embd`. The experts stay at the model's own 640 and the plugin slices them by parity across the
+-ranks (1.0.8: at three ranks the five 128-wide blocks go 2, 2, 1), so the +20 % expert bytes of a
+-640 → 768 pad are not paid.
++Three ranks over two KV heads: the attention world is 2. Ranks 0 and 1 split the heads exactly as
++the two-rank serve does -- 12 query heads, one KV head, gqa 12, the same kernels -- and rank 2
++declares **the same shapes** and reads **nothing** for them: `rad_weight_shard_zero` tells the
++loader that this rank's share of `attn_qg`, `attn_k`, `attn_v` and `attn_output` is zeros. Its
++attention computes zeros from zeros and its output projection adds exactly nothing to the reduce.
++Five ranks over two: attention world 4 (two replicated pairs), rank 4 attention-zero. Six: three
++pairs, no zero rank.
+ 
+-For Qwen3.8-Flash-Next the pad is **24 → 36 query heads, 2 → 3 KV heads, GDN 16 → 18 K heads and
+-48 → 54 V heads** -- head_dim 256 for attention and 128 for GDN are unchanged, so every rank at
+-three declares 12 query heads, 1 KV head and gqa 12: **the same per-rank attention geometry the
+-two-rank serve declares**, and the same kernels resolve. Dummies go **last**, as the vLLM pad does,
+-so rank 2 carries them.
++Why the same shapes rather than no attention on that rank: the scheduler sees **one program**
++(`core/sched/batch.cpp` indexes `kv_groups[i]` by position), so every rank declares every op and
++every KV group in the same order. An attention-zero rank's KV group is as large as its peers'; the
++cost is one KV head of cache on that rank, the same bytes the padded container spent on its dummy
++head, and nothing is read from disk for its projections.
+ 
+-The cost is the dummies' arithmetic: 12 of 36 query heads and 2 of 18 GDN heads are zeros on the
+-last rank, so three ranks do 1.5× the attention work of two for 1.5× the cards.
++Under a smaller attention world the plain even shard over `world` is the wrong cut for every
++attention projection, so `rad_block_attn_gated_fp8.h` declares **spans** (`rad_weight_shard_span`,
++the same call the KV replication already used for k/v): q|gate rows and output columns
++`[attn_rank * n_head, +n_head)` heads, k/v rows at `kv_off`. When the attention world is the world
++-- every TP2 and TP4 deployment -- no span is declared and the block declares as it always did.
+ 
+-## 2. The tool
++## 2. Uneven delta-net heads
+ 
+-`tools/pad_tp.py` (Python, numpy only; no torch) rewrites a Hugging Face safetensors checkpoint:
++The delta net has no KV-head constraint: its kernels are bound on head *widths* (`head_k`,
++`head_v`, the chunk) and take any head count. So 16 K heads over three ranks are **6, 5 and 5**,
++each rank's V heads the same multiple of its K heads (48 / 16 = 3: 18, 15, 15), every rank real
++heads, nothing padded. `qwen4exp` computes the split (`base + (rank < rem)`) and
++`rad_block_gdn_fp8.h` declares it as spans of the container's rows.
+ 
+-```sh
+-tools/pad_tp.py SRC DST --heads 36 --kv-heads 3 --gdn-k 18 --gdn-v 54 --sparse
+-tools/pad_verify.py SRC DST
+-```
++That needed one thing the span call could not say. `in_proj_qkv|z` is four projections stacked
++along dim 0 -- q 2048, k 2048, v 6144, z 6144 rows -- and `rad_weight_shard_span` takes one
++`[lo, hi)` applied to every stacked part, which assumes the parts are equal.
++**`rad_weight_shard_span_parts`** (an additive export) takes a span per part together with each
++part's whole extent in the container; `share.cpp` cuts every part by its own rows. The conv
++channels `[q|k|v]`, the `[a|b]` projections, `A_log`, `dt_bias` and the output projection's
++columns take the same rank's heads. The even split, when the counts divide, is untouched.
+ 
+-It streams one tensor at a time (a 336 GiB checkpoint pads in a few GB of RAM), reads bf16 as raw
+-u16 (no arithmetic happens), rewrites `config.json` with the new counts and an explicit `head_dim`,
+-and handles the fused layouts: the Flash-Next `q_proj` that carries the attention gate beside each
+-query head, and the GDN `in_proj_qkvz` / `in_proj_ba` row order.
++## 3. What this is built from
+ 
+-`--sparse` is for checkpoints larger than the free disk. Instead of copying, it **reflinks** every
+-original shard (btrfs, XFS; `cp --reflink`) and writes only the padded tensors into new shards named
+-`model-00000-of-NNNNN-tp3pad-*.safetensors`. Radiance's reader lists the index's shards sorted by
+-name and keeps the **first** tensor of a name (`checkpoint.cpp`, `emplace`), so the new shards
+-shadow the originals by sorting first. Flash-Next: 340 tensors, 6.6 GB of new bytes, the 131
+-original shards shared.
+-
+-`tools/pad_verify.py` reads both checkpoints back and checks every tensor: an untouched tensor is
+-byte-identical, a padded one is the source in its place and zeros everywhere else. Run it before
+-`rad-convert`; a pad that passes it cannot change what the model computes.
+-
+-Padding proved on Llama-3.2-3B (24/8 heads, gqa 3 → 36/9, gqa 4): a 28-layer numpy forward on the
+-padded weights gives the same argmax as the original with max |Δlogit| 2.1e-5 (fp32 summation
+-order), and on the engine TP1 on the padded checkpoint produces the same text as TP1 on the
+-original at temperature 0.
+-
+-## 3. What the engine gained for three ranks
+-
+-- **libr4d: `all_reduce` and `all_gather` at world 3.** `ar_oneshot_3rank_exact` is the wide
+-  one-shot family's template at 3; `ar_gather_3rank` the same for the gather the vocab-parallel
+-  sampler declares. Both share the wide family's instance (scratch, `[block][source]` flags, seq
+-  counters). There is no two-shot at 3: it shards the message `world` ways and a residual width
+-  such as 2560 does not divide by 3. `wht6` is a two-rank wire; three ranks take the exact one, as
+-  four do. Selftest: `--case ar_oneshot_3rank_exact` and `--case ar_gather_3rank`, bit-exact against
+-  the host sum / concatenation on three gfx1201 cards, with the two-rank controls unchanged.
+-- **The vocabulary at a world that does not divide it.** 248 320 rows do not divide by 3 and
+-  `share.cpp` refuses a row shard without a declared span. `qwen4exp` now declares the rank's span
+-  for `token_embd` and `output`, and the split rule (`rad_arch.h` `shard_extent` / `shard_begin`,
+-  restated in `core/engine.cpp`) keeps the even share whenever the world divides the vocabulary and
+-  otherwise rounds the per-rank count up to a **128-row block** -- a block-scaled fp8 head refuses a
+-  cut inside a tile. At three the ranks take 82 816, 82 816 and 82 688; two and four ranks divide
+-  248 320 evenly and are untouched.
+-- Everything else three ranks need was already there by 1.0.8: the width split of the experts at
+-  any world up to the block count, the uneven tile share of the plain bf16 (protected) experts, the
+-  N-rank gather's placement.
++- `rad_weight_shard_zero(b, w)` -- this rank's share is zeros; `weight_share` returns the
++  declaration's extents with no rectangles, the loader stages the weight with a worker that writes
++  zeros (the route a checkpoint weight takes) and reads nothing.
++- `rad_weight_shard_span_parts(b, w, lo, hi, total, n)` -- a span per stacked part.
++- `Geom::attn_world / attn_rank / attn_zero`, set by `geom_from`; `GdnFP8::Config::k_first /
++  v_first`, set by the plugin.
++- Both exports are additive: `RAD_ABI_VERSION` does not move, and a plugin that does not call them
++  declares as before. `tests/share_test.cpp` holds the per-part cut and the zero share.
+ 
+ ## 4. Serving
+ 
+ ```sh
+-tools/pad_tp.py ~/models/Qwen3.8-Flash-Next ~/models/Qwen3.8-Flash-Next-tp3pad \
+-    --heads 36 --kv-heads 3 --gdn-k 18 --gdn-v 54 --sparse
+-tools/pad_verify.py ~/models/Qwen3.8-Flash-Next ~/models/Qwen3.8-Flash-Next-tp3pad
+-build/bin/rad-convert ~/models/Qwen3.8-Flash-Next-tp3pad -o qfn-tp3pad.rad \
+-    --recipe data/recipes/qwen4exp-w4nl64-i8-hc8m.recipe
+-radiance --model qfn-tp3pad.rad --tp 3 --tp-wire exact --max-num-seqs 8 --max-model-len 200000 \
+-    --placement expert_tiered --host-pool-mib 8192 --gpu-headroom-mib 96 \
+-    --expert-vs-cache-ratio 0.82 --kv-cache-dtype fp8 --num-speculative-tokens 3 \
+-    --max-num-batched-tokens 2048
++radiance --model qwen3.8-next-flash-fp8-iq4r-moe.rad --tp 3 --tp-wire exact --max-num-seqs 8 \
++    --max-model-len 262144 --placement expert_tiered --host-pool-mib 8192 \
++    --gpu-headroom-mib 96 --expert-vs-cache-ratio 0.82 --kv-cache-dtype fp8 \
++    --num-speculative-tokens 3 --max-num-batched-tokens 2048
+ ```
+ 
+-Measured on three Radeon AI PRO R9700 (gfx1201, PCIe Gen5 x16, Threadripper PRO 9955WX), the
+-uncensored Flash-Next fine-tune padded as above and converted with the shipped recipe
+-(`qwen4exp-w4nl64-i8-hc8m`, here without Hessians: nearest into the codebook), on 1.0.8 with
+-the changes above; the two-rank column is the shipped `qwen3.8-next-flash-fp8-iq4r-moe.rad` on the same box:
++The log says what the geometry did:
+ 
+-| | three ranks, padded | two ranks, shipped container |
++```
++radiance: world_size = 3 over n_head_kv = 2: attention on 2 rank(s), rank(s) 2..2 carry zero attention weights and the delta net and experts of a full rank
++radiance: qwen4exp: rank 0 takes delta-net K heads [0, 6) of 16 and V heads [0, 18) of 48
++radiance: qwen4exp: rank 1 takes delta-net K heads [6, 11) of 16 and V heads [18, 33) of 48
++radiance: qwen4exp: rank 2 takes delta-net K heads [11, 16) of 16 and V heads [33, 48) of 48
++```
++
++Measured on three Radeon AI PRO R9700 (gfx1201, PCIe Gen5 x16, Threadripper PRO 9955WX) with the
++same container served at two and three ranks -- the one comparison where only the world changes:
++
++| | two ranks | three ranks |
+ |---|---|---|
+-| READY from cold | 45 s | 35 s |
+-| 1 / 4 / 8 streams, aggregate t/s | 173.5 / 332.2 / 410.9 | 156 / 320 / 404 |
+-| 4 streams at 100 K context, per stream | 41.8 | 41.2 |
+-| warm-prefix TTFT, 60 K prompt, second time | 0.3 s (cold 8.2 s) | — |
+-| HumanEval / GSM8K | 0.854 / 0.915 | 0.854 / 0.940 |
++| READY from cold | | |
++| 1 / 4 / 8 streams, aggregate t/s | | |
++| 4 streams at 100 K context, per stream | | |
++| HumanEval / GSM8K | | |
+ 
+-The GSM8K gap is the Hessians the shipped container was quantised against and this one was not;
+-the GPTQ'd conversion of the same padded checkpoint is the comparison that closes it. Hi-vocab
+-tokens (CJK, Cyrillic -- rank 2's lm_head shard, the three-rank gather) decode correctly; no engine
+-warnings; every band the run issued resolved to a device kernel.
++The three-rank text is the three-rank text of the padded container, token for token, at temperature
++0 on the prompt set -- the two computations are the same arithmetic with the zeros in a different
++place.
++
++`tools/pad_tp.py` and `tools/pad_verify.py` remain in the tree: they are how a checkpoint is padded
++for an engine that has no attention world, and how a pad is verified, and nothing here needs them.
+diff --git a/tests/arch_test.cpp b/tests/arch_test.cpp
+index fc459ac..3b83972 100644
+--- a/tests/arch_test.cpp
++++ b/tests/arch_test.cpp
+@@ -45,6 +45,11 @@ struct RecWeight {
+      * checked. A weight with no span -- every even shard -- has `span_set` false. */
+     bool            span_set = false;
+     int64_t         span_lo = 0, span_hi = 0;
++    /* rad_weight_shard_span_parts and rad_weight_shard_zero, recorded the same way. */
++    int             n_part_spans = 0;
++    int64_t         part_lo[RAD_MAX_ROW_PARTS] = {0}, part_hi[RAD_MAX_ROW_PARTS] = {0};
++    int64_t         part_total[RAD_MAX_ROW_PARTS] = {0};
++    bool            zero = false;
+ };
+ struct RecBuf    { std::string name; RadBufDecl    d{}; };
+ struct RecOp {
+@@ -217,6 +222,29 @@ extern "C" int rad_weight_shard_span(RadBuilder* b, rad_weight w, int64_t lo, in
+     rw.span_hi  = hi;
+     return RAD_OK;
+ }
++extern "C" int rad_weight_shard_span_parts(RadBuilder* b, rad_weight w, const int64_t* lo,
++                                           const int64_t* hi, const int64_t* total, int n) {
++    if (!b || w == 0 || w > b->weights.size() || !lo || !hi || !total) return RAD_E_INVAL;
++    if (n < 2 || n > RAD_MAX_ROW_PARTS) return RAD_E_INVAL;
++    RecWeight& rw = b->weights[w - 1];
++    if (rw.d.n_row_parts != n) return RAD_E_INVAL;
++    for (int g = 0; g < n; ++g) {
++        if (lo[g] < 0 || hi[g] <= lo[g] || hi[g] > total[g]) return RAD_E_INVAL;
++        if (rw.d.row_parts[g] != hi[g] - lo[g]) return RAD_E_SHAPE;
++        rw.part_lo[g] = lo[g];
++        rw.part_hi[g] = hi[g];
++        rw.part_total[g] = total[g];
++    }
++    rw.n_part_spans = n;
++    return RAD_OK;
++}
++extern "C" int rad_weight_shard_zero(RadBuilder* b, rad_weight w) {
++    if (!b || w == 0 || w > b->weights.size()) return RAD_E_INVAL;
++    RecWeight& rw = b->weights[w - 1];
++    if (rw.d.shard != RAD_SHARD_ROW && rw.d.shard != RAD_SHARD_COL) return RAD_E_INVAL;
++    rw.zero = true;
++    return RAD_OK;
++}
+ extern "C" int rad_declare_drafter(RadBuilder* b, const RadDrafterDecl* d) {
+     (void)b; (void)d;
+     return RAD_OK;
+@@ -2210,13 +2238,16 @@ TEST(flashnext_tp4_replicates_kv_heads_and_splits_expert_widths) {
+         }
+     }
+ 
+-    /* A WORLD THAT CANNOT REPLICATE -- not a multiple of the KV head count -- is refused by name,
+-     * not rounded into a half head. */
++    /* A WORLD THAT CANNOT REPLICATE -- not a multiple of the KV head count -- is no longer
++     * refused: it serves attention on the largest multiple under it and the rest of the ranks
++     * carry zero attention (the tp3 case below holds the shapes). Nothing is rounded into a
++     * half head: the replication rule itself is unchanged and still refuses an attention world
++     * that is not a multiple, which cannot arise from geom_from's construction. */
+     {
+         RadBuilder b3;
+         RadBuildCtx c3 = build_ctx(0, 3);
+         c3.max_tok = 2048; c3.max_seqs = 8; c3.max_spec = 3; c3.max_ctx = 200000;
+-        CHECK(qwen4exp_fp8::declare(&b3, &meta, &c3) != RAD_OK);
++        CHECK_EQ(qwen4exp_fp8::declare(&b3, &meta, &c3), RAD_OK);
+     }
+ 
+     /* ---- A LAYER THAT KEEPS EXPERTS PLAIN STAYS AT FOUR CLASSES. Two plain experts leave 510
+@@ -2442,6 +2473,140 @@ const RecIssue* issue_of(const RadBuilder& b, const RadCtx& c, const std::string
+ 
+ }  /* namespace */
+ 
++/* THREE RANKS OVER TWO KV HEADS: the attention world is 2 (rad_arch.h), rank 2 declares the same
++ * attention as its peers and reads zeros for it, and the delta net's 16 K heads go 6, 5, 5 with
++ * the V heads at the same multiple -- declared as spans of the container, nothing padded. On the
++ * tree before this, geom_from refuses world 3 ("cannot replicate n_head_kv = 2") and nothing
++ * below runs. */
++TEST(flashnext_tp3_zeroes_the_third_ranks_attention_and_splits_gdn_heads_unevenly) {
++    RadModelMeta meta = qwen4exp_meta();
++    const int      world     = 3;
++    const int64_t  n_head    = meta.n_head;       /* 24 */
++    const int64_t  n_head_kv = meta.n_head_kv;    /* 2: neither divides 3 nor divides into it */
++    const int64_t  head_dim  = meta.head_dim;     /* 256 */
++    const int64_t  nk = atoll(rad_meta_gets(&meta, "linear_num_key_heads", "0"));     /* 16 */
++    const int64_t  nv = atoll(rad_meta_gets(&meta, "linear_num_value_heads", "0"));   /* 48 */
++    const int64_t  hk = atoll(rad_meta_gets(&meta, "linear_key_head_dim", "0"));      /* 128 */
++    const int64_t  hv = atoll(rad_meta_gets(&meta, "linear_value_head_dim", "0"));    /* 128 */
++    REQUIRE(n_head_kv < world && world % n_head_kv != 0);
++    REQUIRE(nk % world != 0);
++    const int attn_world = (int)(n_head_kv * (world / n_head_kv));   /* 2 */
++
++    const int lfull = 3;
++    const std::string kq = "blk." + std::to_string(lfull) + ".attn_k.weight";
++    const std::string kv = "blk." + std::to_string(lfull) + ".attn_v.weight";
++    const std::string qg = "blk." + std::to_string(lfull) + ".attn_qg.weight";
++    const std::string oo = "blk." + std::to_string(lfull) + ".attn_output.weight";
++
++    RadBuilder b[world];
++    RadBuildCtx  c[world];
++    for (int r = 0; r < world; ++r) {
++        c[r] = build_ctx(r, world);
++        c[r].max_tok  = 2048;
++        c[r].max_seqs = 8;
++        c[r].max_spec = 3;
++        c[r].max_ctx  = 200000;
++        REQUIRE_EQ(qwen4exp_fp8::declare(&b[r], &meta, &c[r]), RAD_OK);
++    }
++
++    /* The three programs declare the same ops in the same order and the same KV groups: the
++     * scheduler sees one program. */
++    for (int r = 1; r < world; ++r) {
++        REQUIRE_EQ(b[r].ops.size(), b[0].ops.size());
++        REQUIRE_EQ(b[r].kv_groups.size(), b[0].kv_groups.size());
++        for (size_t i = 0; i < b[0].ops.size(); ++i) CHECK_EQ(b[r].ops[i].op, b[0].ops[i].op);
++        for (size_t g = 0; g < b[0].kv_groups.size(); ++g) {
++            CHECK_EQ(b[r].kv_groups[g].name, b[0].kv_groups[g].name);
++            CHECK_EQ(b[r].kv_groups[g].d.kind, b[0].kv_groups[g].d.kind);
++        }
++    }
++
++    for (int r = 0; r < world; ++r) {
++        const bool zero = r >= attn_world;
++        /* (1) ATTENTION: every rank the two-rank geometry -- 12 heads, one KV head, gqa 12. */
++        const RecOp* at = find_op(b[r], "attn_paged");
++        REQUIRE(at != nullptr);
++        CHECK_EQ(pint(at, "n_head"), n_head / attn_world);
++        CHECK_EQ(pint(at, "gqa"), n_head / attn_world);
++        CHECK_EQ(b[r].kv_groups[0].d.n_head_kv, 1);
++        /* (2) THE PROJECTIONS: the span of this rank's heads in the container on every rank --
++         * rank 2 the last attention rank's, so its shapes match -- and zeros on rank 2. */
++        for (const std::string& wn : {kq, kv}) {
++            const RecWeight* w = find_w(b[r], wn);
++            REQUIRE(w != nullptr);
++            CHECK_EQ(w->d.shape[0], head_dim);
++            CHECK(w->span_set);
++            const int ar = zero ? attn_world - 1 : r;
++            CHECK_EQ(w->span_lo, (int64_t)ar * head_dim);
++            CHECK_EQ(w->span_hi, w->span_lo + head_dim);
++            CHECK_EQ(w->zero, zero);
++        }
++        {
++            const RecWeight* w = find_w(b[r], qg);
++            REQUIRE(w != nullptr);
++            const int ar = zero ? attn_world - 1 : r;
++            const int64_t qg_rows = 2 * (n_head / attn_world) * head_dim;
++            CHECK_EQ(w->d.shape[0], qg_rows);
++            CHECK(w->span_set);
++            CHECK_EQ(w->span_lo, (int64_t)ar * qg_rows);
++            CHECK_EQ(w->zero, zero);
++            const RecWeight* o = find_w(b[r], oo);
++            REQUIRE(o != nullptr);
++            CHECK_EQ(o->d.shard, RAD_SHARD_COL);
++            CHECK(o->span_set);
++            CHECK_EQ(o->span_lo, (int64_t)ar * (n_head / attn_world) * head_dim);
++            CHECK_EQ(o->zero, zero);
++        }
++        /* (3) THE DELTA NET: 6, 5, 5 K heads and 18, 15, 15 V heads, real on every rank, as
++         * per-part spans of [q|k|v|z] and of the conv channels, a one-span of A_log. */
++        const int64_t base = nk / world, rem = nk % world;
++        const int64_t my_k = base + (r < rem ? 1 : 0);
++        const int64_t k0   = r * base + (r < rem ? r : rem);
++        const int64_t my_v = (nv / nk) * my_k, v0 = (nv / nk) * k0;
++        const RecWeight* in = find_w(b[r], "blk.0.ssm_inz.weight");
++        REQUIRE(in != nullptr);
++        REQUIRE_EQ(in->d.n_row_parts, 4);
++        CHECK_EQ(in->d.row_parts[0], my_k * hk);
++        CHECK_EQ(in->d.row_parts[2], my_v * hv);
++        REQUIRE_EQ(in->n_part_spans, 4);
++        CHECK_EQ(in->part_lo[0], k0 * hk);
++        CHECK_EQ(in->part_lo[1], k0 * hk);
++        CHECK_EQ(in->part_lo[2], v0 * hv);
++        CHECK_EQ(in->part_lo[3], v0 * hv);
++        CHECK_EQ(in->part_total[0], nk * hk);
++        CHECK_EQ(in->part_total[2], nv * hv);
++        CHECK(!in->zero);
++        const RecWeight* cv = find_w(b[r], "blk.0.ssm_conv1d.weight");
++        REQUIRE(cv != nullptr);
++        REQUIRE_EQ(cv->n_part_spans, 3);
++        CHECK_EQ(cv->part_lo[2], v0 * hv);
++        CHECK_EQ(cv->part_hi[2], (v0 + my_v) * hv);
++        const RecWeight* al = find_w(b[r], "blk.0.ssm_a_log");
++        REQUIRE(al != nullptr);
++        CHECK_EQ(al->d.shape[0], my_v);
++        CHECK(al->span_set);
++        CHECK_EQ(al->span_lo, v0);
++        CHECK_EQ(al->span_hi, v0 + my_v);
++        const RecWeight* ow = find_w(b[r], "blk.0.ssm_out.weight");
++        REQUIRE(ow != nullptr);
++        CHECK_EQ(ow->d.shard, RAD_SHARD_COL);
++        CHECK(ow->span_set);
++        CHECK_EQ(ow->span_lo, v0 * hv);
++        CHECK_EQ(ow->span_hi, (v0 + my_v) * hv);
++        /* The GDN state group holds this rank's V heads, uneven across ranks. */
++        bool seen = false;
++        for (const auto& g : b[r].kv_groups)
++            if (g.name == "kv_gdn_state") { seen = true; CHECK_EQ(g.d.n_head_kv, (int)my_v); }
++        CHECK(seen);
++    }
++    /* The three ranks' K heads are the container's 16, once each. */
++    {
++        int64_t sum = 0;
++        for (int r = 0; r < world; ++r) sum += nk / world + (r < nk % world ? 1 : 0);
++        CHECK_EQ(sum, nk);
++    }
++}
++
+ TEST(a_vision_container_declares_the_tower_when_the_engine_asks_for_it) {
+     /* No encoder budget: the tower is not declared, whatever the container carries. */
+     {
+-- 
+2.55.0
+
+
+From bbbbcb6619d23b3c1cdab78d997593d9d1f5affc Mon Sep 17 00:00:00 2001
+From: baKon <mike.ski83@gmail.com>
+Date: Mon, 5 Oct 2026 16:13:14 -0500
+Subject: [PATCH 04/16] kv: every rank carves the least rank's blocks
+
+One block table serves every rank, and Engine::serve refuses ranks whose
+paged groups hold different block counts. Under the even split that was
+a check that never fired: the ranks' pools had the same geometry and the
+same bytes. Under the attention world they do not. A rank with 6 of 16
+delta-net heads holds more recurrent state than one with 5 and has less
+pool left for pages; the attention-zero rank has no attention weights
+and has more. Three ranks over Flash-Next carved 136256, 142352 and
+more, and the serve was refused.
+
+KVManager::paged_split is the carve's paged arithmetic with nothing
+carved -- the token count the paged groups exhaust at together for a
+pool of so many bytes, a windowed group capped at its window -- and
+carve_into spends what it says. paged_tokens asks it; cap_paged_tokens
+sets a ceiling it keeps under. Engine::configure_kv plans every rank
+first, asks each what it could page, and caps every rank at the least
+before any carves; a rank that could have paged more says so at info.
+At an even split the cap is what every rank would have carved.
+
+mem_test: kv_ranks_with_unequal_pools_carve_the_least_ranks_blocks_under_a_cap.
+---
+ core/engine_bringup.cpp | 23 ++++++++++++-
+ core/mem/kv.cpp         | 73 ++++++++++++++++++++++++-----------------
+ core/mem/kv.h           | 13 ++++++++
+ tests/mem_test.cpp      | 35 ++++++++++++++++++++
+ 4 files changed, 113 insertions(+), 31 deletions(-)
+
+diff --git a/core/engine_bringup.cpp b/core/engine_bringup.cpp
+index 236d158..50f74b3 100644
+--- a/core/engine_bringup.cpp
++++ b/core/engine_bringup.cpp
+@@ -2499,10 +2499,31 @@ int Engine::configure_kv() {
+     /* Resolved once, for the cache below and for Scheduler::init later. Resolving it separately in
+      * each is how the two come to disagree, and the interval is the field where that shows. */
+     RAD_TRY(chunk_geometry_resolve(ranks_[0]->program, cfg_, &geo_));
++    /* ONE BLOCK TABLE SERVES EVERY RANK (serve() checks it), so every rank carves the SAME number
++     * of paged blocks. The ranks' pools are not the same size under an uneven tensor-parallel
++     * split -- a rank with more delta-net heads holds more recurrent state, a rank with zero
++     * attention weights has more pool -- so each is planned first, asked what it could carve, and
++     * every rank is capped at the least before any carves. At an even split the cap is what
++     * every rank would have carved anyway. */
++    int64_t least = -1;
++    for (auto& r : ranks_) {
++        LogRank lr(r->index);
++        RAD_TRY(r->kv.plan_groups(r->program.kv_groups, cfg_));
++        const int64_t t = r->kv.paged_tokens(r->pools.kv().avail());
++        if (least < 0 || t < least) least = t;
++    }
+     for (auto& r : ranks_) {
+         LogRank lr(r->index);
+         RAD_TRY(rad_dev_set(r->device));   /* allocates on the CURRENT device; see plan() */
+-        RAD_TRY(r->kv.configure(r->program.kv_groups, cfg_, r->pools.kv()));
++        if (ranks_.size() > 1) {
++            const int64_t own = r->kv.paged_tokens(r->pools.kv().avail());
++            if (own > least)
++                RAD_INFO("kv: rank %d could page %lld tokens and carves %lld, the least rank's, so "
++                         "that one block table serves every rank", r->index, (long long)own,
++                         (long long)least);
++            r->kv.cap_paged_tokens(least);
++        }
++        RAD_TRY(r->kv.carve(r->pools.kv()));
+         /* THE ONE CASE WHERE THE CACHE CANNOT GIVE ANYTHING BACK, said once and named. Every
+          * caller is written against the elastic contract and runs unchanged here -- the pool
+          * simply holds its whole carve -- so nothing fails, and the only symptom is an expert
+diff --git a/core/mem/kv.cpp b/core/mem/kv.cpp
+index d119b49..d4e82d6 100644
+--- a/core/mem/kv.cpp
++++ b/core/mem/kv.cpp
+@@ -362,6 +362,44 @@ void KVManager::forget() {
+     report_.clear();
+ }
+ 
++int64_t KVManager::paged_split(int64_t budget_bytes, std::vector<int64_t>* blocks) const {
++    /* Not a policy: size the groups to exhaust at the same total token count. Any other split
++     * strands memory in whichever group outlasts the others, and a long-context server would then
++     * run out of full-attention blocks with a window pool still half empty. */
++    std::vector<int64_t> out(plans_.size(), 0);
++    int64_t remaining = budget_bytes - fixed_;
++    std::vector<int32_t> open;
++    for (const auto& p : plans_) if (p.paged()) open.push_back(p.index);
++
++    int64_t tokens = 0;
++    while (!open.empty() && remaining > 0) {
++        double cost = 0;
++        for (int32_t i : open)
++            cost += (double)plans_[i].bytes_per_block / (double)plans_[i].block_size;
++        if (cost <= 0) break;
++        tokens = (int64_t)((double)remaining / cost);
++        /* ONE BLOCK TABLE SERVES EVERY RANK (Engine::serve checks it), so a rank with more pool
++         * than its peers carves no more than the least of them. */
++        if (tokens_cap_ > 0 && tokens > tokens_cap_) tokens = tokens_cap_;
++
++        /* A windowed group cannot use more than window_blocks per sequence; anything past that
++         * is memory nobody will ever address. Cap it and give the bytes back to the others. */
++        int32_t capped = -1;
++        for (int32_t i : open) {
++            const auto& p = plans_[i];
++            if (p.kind != RAD_KV_WINDOW) continue;
++            if (tokens / p.block_size > max_seqs_ * p.window_blocks) { capped = i; break; }
++        }
++        if (capped < 0) break;
++        out[capped] = max_seqs_ * plans_[capped].window_blocks;
++        remaining -= out[capped] * plans_[capped].bytes_per_block;
++        open.erase(std::find(open.begin(), open.end(), capped));
++    }
++    for (int32_t i : open) out[i] = remaining > 0 ? tokens / plans_[i].block_size : 0;
++    if (blocks) *blocks = std::move(out);
++    return tokens;
++}
++
+ int KVManager::carve_into(Pool& kv_pool) {
+     /* The pool is whatever the operator stated or the resolver derived; nothing here re-decides
+      * it. What this does decide is how the groups share it, which is arithmetic, not policy. */
+@@ -390,36 +428,11 @@ int KVManager::carve_into(Pool& kv_pool) {
+         return RAD_E_NOMEM;
+     }
+ 
+-    /* ---- the paged split. Not a policy: size the groups to exhaust at the same total token
+-     * count. Any other split strands memory in whichever group outlasts the others, and a
+-     * long-context server would then run out of full-attention blocks with a window pool still
+-     * half empty. ---- */
+-    int64_t remaining = budget_bytes - fixed;
+-    std::vector<int32_t> open;
+-    for (auto& p : plans_) if (p.paged()) open.push_back(p.index);
+-
+-    int64_t tokens = 0;
+-    while (!open.empty()) {
+-        double cost = 0;
+-        for (int32_t i : open)
+-            cost += (double)plans_[i].bytes_per_block / (double)plans_[i].block_size;
+-        if (cost <= 0) break;
+-        tokens = (int64_t)((double)remaining / cost);
+-
+-        /* A windowed group cannot use more than window_blocks per sequence; anything past that
+-         * is memory nobody will ever address. Cap it and give the bytes back to the others. */
+-        int32_t capped = -1;
+-        for (int32_t i : open) {
+-            const auto& p = plans_[i];
+-            if (p.kind != RAD_KV_WINDOW) continue;
+-            if (tokens / p.block_size > max_seqs_ * p.window_blocks) { capped = i; break; }
+-        }
+-        if (capped < 0) break;
+-        plans_[capped].n_blocks = max_seqs_ * plans_[capped].window_blocks;
+-        remaining -= plans_[capped].n_blocks * plans_[capped].bytes_per_block;
+-        open.erase(std::find(open.begin(), open.end(), capped));
+-    }
+-    for (int32_t i : open) plans_[i].n_blocks = tokens / plans_[i].block_size;
++    /* ---- the paged split (paged_split below): every rank's share of it is the same arithmetic,
++     * and under a cap it is the least rank's. ---- */
++    std::vector<int64_t> blocks;
++    (void)paged_split(budget_bytes, &blocks);
++    for (auto& p : plans_) if (p.paged()) p.n_blocks = blocks[p.index];
+ 
+     for (auto& p : plans_) {
+         if (!p.paged()) continue;
+diff --git a/core/mem/kv.h b/core/mem/kv.h
+index 52d1728..89f41f2 100644
+--- a/core/mem/kv.h
++++ b/core/mem/kv.h
+@@ -168,6 +168,14 @@ public:
+     /* The part of every ceiling that is not context: recurrent and conv state for max_seqs
+      * sequences, the checkpoint slots and the padding. Set by plan_groups(). */
+     int64_t fixed_bytes() const { return fixed_; }
++    /* THE TOKEN COUNT THE PAGED GROUPS SETTLE ON for `budget_bytes` of pool -- carve()'s split
++     * with nothing carved. One block table serves every rank, so every rank's paged groups must
++     * hold the SAME number of blocks; under an uneven tensor-parallel split the ranks' pools are
++     * not the same size (a rank with more delta-net heads holds more state and has less left for
++     * pages, and a rank with no attention weights has more). The engine asks each rank this and
++     * cap_paged_tokens() the least on all of them before carve(). 0 is no cap. */
++    int64_t paged_tokens(int64_t budget_bytes) const { return paged_split(budget_bytes, nullptr); }
++    void    cap_paged_tokens(int64_t tokens) { tokens_cap_ = tokens > 0 ? tokens : 0; }
+     int     carve(Pool& kv_pool);
+ 
+     const std::vector<KVGroupPlan>& plans() const { return plans_; }
+@@ -497,6 +505,10 @@ private:
+      * through cannot leave plans_ answering guards for block state that was never sized. forget()
+      * empties both together and is what plan_groups() starts from. */
+     int  carve_into(Pool& kv_pool);
++    /* THE PAGED SPLIT, as arithmetic: the token count the paged groups exhaust at together for
++     * `budget_bytes` of pool, under tokens_cap_, and each group's block count in `blocks` (by group
++     * index; a windowed group capped at its window). carve_into() spends what this says. */
++    int64_t paged_split(int64_t budget_bytes, std::vector<int64_t>* blocks) const;
+     void forget();
+ 
+     /* One traversal serving both checkpoint directions; see checkpoint_save. */
+@@ -550,6 +562,7 @@ private:
+     int64_t   fixed_ = 0;      /* the non-negotiable floor: states, conv slots, checkpoints, padding */
+     int64_t   ck_total_ = 0;   /* the checkpoint part of fixed_, named for the refusal message */
+     int64_t   ckpts_ = 0;      /* --checkpoint-slots, as plan_groups() resolved it */
++    int64_t   tokens_cap_ = 0; /* cap_paged_tokens(): the least any rank can carve; 0 is none */
+     /* THE SLOT STRIDE AND WHERE THE SLOTS BEGIN. The stride is checkpoint_bytes_ rounded up to a
+      * whole number of commit granules, so a slot can be backed and released without touching a
+      * neighbour; the offset is where the eager startup commit stops, because everything from
+diff --git a/tests/mem_test.cpp b/tests/mem_test.cpp
+index d66e6a4..9001aea 100644
+--- a/tests/mem_test.cpp
++++ b/tests/mem_test.cpp
+@@ -473,6 +473,41 @@ TEST(kv_configure_reports_and_sizes) {
+              ((1ll << 20) - 8 * 16384 - 4 * 16384 - 2 * RAD_ALIGN_UNIT) / 2048);
+ }
+ 
++TEST(kv_ranks_with_unequal_pools_carve_the_least_ranks_blocks_under_a_cap) {
++    /* One block table serves every rank (Engine::serve), so every rank's paged groups must hold
++     * the same number of blocks. Under an uneven tensor-parallel split the pools are not equal --
++     * here a rank with 1 MiB and one with 2 MiB -- and Engine::configure_kv plans each, asks what
++     * it could page, and caps every rank at the least before any carves. */
++    Fixture a, b;
++    a.cfg.checkpoint_slots = b.cfg.checkpoint_slots = 0;
++    b.cfg.vram_kv_mib = 2;
++    CHECK_OK(a.pools.configure(a.cfg, 0, &rad_malloc_allocator(), &rad_malloc_allocator()));
++    CHECK_OK(b.pools.configure(b.cfg, 0, &rad_malloc_allocator(), &rad_malloc_allocator()));
++    CHECK_OK(a.kv.plan_groups(hybrid_groups(), a.cfg));
++    CHECK_OK(b.kv.plan_groups(hybrid_groups(), b.cfg));
++    const int64_t ta = a.kv.paged_tokens(a.pools.kv().avail());
++    const int64_t tb = b.kv.paged_tokens(b.pools.kv().avail());
++    CHECK(ta > 0);
++    CHECK(tb > ta);                              /* the larger pool pages more on its own */
++    const int64_t least = ta < tb ? ta : tb;
++    a.kv.cap_paged_tokens(least);
++    b.kv.cap_paged_tokens(least);
++    CHECK_OK(a.kv.carve(a.pools.kv()));
++    CHECK_OK(b.kv.carve(b.pools.kv()));
++    CHECK_EQ(a.kv.plan(G_FULL)->n_blocks, b.kv.plan(G_FULL)->n_blocks);
++    CHECK_EQ(a.kv.plan(G_FULL)->n_blocks, least / 16);
++    /* The cap does not touch what is not paged: each rank's own state count stays its own. */
++    CHECK_EQ(a.kv.plan(G_GDN)->n_states, b.kv.plan(G_GDN)->n_states);
++    /* paged_tokens() carved nothing: the uncapped figure is what carve() spends without a cap. */
++    Fixture c;
++    c.cfg.checkpoint_slots = 0;
++    CHECK_OK(c.pools.configure(c.cfg, 0, &rad_malloc_allocator(), &rad_malloc_allocator()));
++    CHECK_OK(c.kv.plan_groups(hybrid_groups(), c.cfg));
++    const int64_t tc = c.kv.paged_tokens(c.pools.kv().avail());
++    CHECK_OK(c.kv.carve(c.pools.kv()));
++    CHECK_EQ(c.kv.plan(G_FULL)->n_blocks, tc / 16);
++}
++
+ TEST(kv_refuses_a_group_with_no_block_size) {
+     /* Block size comes off the resolved attention kernel. A zero here means the attention op did
+      * not resolve, and the manager refuses rather than inventing 16. */
+-- 
+2.55.0
+
+
+From e43c28674cfc2b91aa79d43470f53fcd3253eb95 Mon Sep 17 00:00:00 2001
+From: baKon <mike.ski83@gmail.com>
+Date: Mon, 5 Oct 2026 19:20:41 -0500
+Subject: [PATCH 05/16] device: RADIANCE_POISON_ALLOC fills fresh device
+ allocations
+
+A buffer read before anything wrote it is zeros on a card whose freed VRAM the
+driver wipes, and garbage on one that has just been through a reset ("VRAM is
+lost"). RADIANCE_POISON_ALLOC=B fills every fresh device allocation with byte B
+so such a read shows on any card; RADIANCE_POISON_RANGE=lo:hi narrows the fill
+to allocation ordinals for a bisect. Debug knobs beside RADIANCE_TRACE_ALLOC;
+off, nothing changes.
+---
+ core/device/dispatch.cpp | 63 ++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 58 insertions(+), 5 deletions(-)
+
+diff --git a/core/device/dispatch.cpp b/core/device/dispatch.cpp
+index 7e7a97b..2696df2 100644
+--- a/core/device/dispatch.cpp
++++ b/core/device/dispatch.cpp
+@@ -20,6 +20,8 @@
+ #include <cstdlib>
+ #include <mutex>
+ #include <string>
++#include <utility>
++#include <cstdint>
+ 
+ namespace rad {
+ 
+@@ -113,7 +115,16 @@ const char* device_backend_name() { return dev()->name; }
+  * exactly that reason -- the ledger says what the core spent, the card says what was spent.
+  *
+  * RADIANCE_TRACE_ALLOC=N logs every allocation of at least N bytes as it happens. That is the
+- * instrument; the counters are the summary. */
++ * instrument; the counters are the summary.
++ *
++ * RADIANCE_POISON_ALLOC=B fills every fresh DEVICE allocation with byte B (0..255) before it is
++ * handed out, so a buffer that is read before anything wrote it shows up as garbage rather than
++ * as the zeros a wiped card hands back by luck. A card that has just been through a driver reset
++ * ("VRAM is lost") is that garbage for real, which is where such a read is otherwise first seen.
++ * RADIANCE_POISON_RANGE=lo:hi narrows the fill to device allocations with ordinal in [lo, hi) --
++ * ordinals count from 1 in allocation order ON THE ALLOCATING THREAD, the `#n on this thread` the
++ * trace prints -- to bisect to the one allocation that matters. Both are debug knobs: the fill is synchronous and costs a stream a
++ * call. */
+ namespace rad {
+ namespace {
+ 
+@@ -138,6 +149,28 @@ int64_t trace_floor() {
+     return v;
+ }
+ 
++/* -1 when off; otherwise the byte. */
++int poison_byte() {
++    static const int v = [] {
++        const char* e = std::getenv("RADIANCE_POISON_ALLOC");
++        if (!e || !*e) return -1;
++        const long x = std::atol(e);
++        return (x >= 0 && x <= 255) ? (int)x : 255;
++    }();
++    return v;
++}
++
++/* [lo, hi) over device-allocation ordinals; the whole run when unset. */
++bool poison_in_range(int64_t ordinal) {
++    static const std::pair<int64_t, int64_t> r = [] {
++        const char* e = std::getenv("RADIANCE_POISON_RANGE");
++        long long lo = 0, hi = INT64_MAX;
++        if (e && *e && std::sscanf(e, "%lld:%lld", &lo, &hi) < 1) { lo = 0; hi = INT64_MAX; }
++        return std::make_pair((int64_t)lo, (int64_t)hi);
++    }();
++    return ordinal >= r.first && ordinal < r.second;
++}
++
+ const char* kind_name(int kind) {
+     switch (kind) {
+         case RAD_MEM_DEVICE:      return "device";
+@@ -372,16 +405,36 @@ int  rad_dev_props(int device, RadDeviceProps* o)  { return dev()->props(device,
+ int  rad_dev_enable_peer(int self, int peer)      { return dev()->enable_peer(self, peer); }
+ 
+ void* rad_dev_alloc(int64_t bytes, int kind) {
++    /* The poison range is over THIS THREAD's device allocations, because a rank brings itself up on
++     * its own thread in a fixed order while the threads interleave freely: a process-wide ordinal
++     * would name a different allocation on every run, and a bisect over it would not converge. */
++    thread_local int64_t t_device_ordinal = 0;
+     void* p = dev()->alloc(bytes, kind);
+     if (p && kind >= 0 && kind < 4) {
+         rad::g_ledger[kind].bytes.fetch_add(bytes, std::memory_order_relaxed);
+-        rad::g_ledger[kind].count.fetch_add(1, std::memory_order_relaxed);
++        const int64_t total = rad::g_ledger[kind].count.fetch_add(1, std::memory_order_relaxed) + 1;
++        const int64_t ordinal = kind == RAD_MEM_DEVICE ? ++t_device_ordinal : total;
+         const int64_t floor_ = rad::trace_floor();
+         if (floor_ >= 0 && bytes >= floor_)
+-            RAD_INFO("alloc %s %s (%lld live in %lld allocations)", rad::kind_name(kind),
+-                     rad::humanb(bytes).c_str(),
++            RAD_INFO("alloc %s %s (#%lld on this thread; %lld live in %lld allocations)",
++                     rad::kind_name(kind), rad::humanb(bytes).c_str(), (long long)ordinal,
+                      (long long)rad::g_ledger[kind].bytes.load(std::memory_order_relaxed),
+-                     (long long)rad::g_ledger[kind].count.load(std::memory_order_relaxed));
++                     (long long)total);
++        /* The poison fill (see the top of this file). Through the backend's own stream so it
++         * holds on both backends; synchronous, so the bytes are there before the caller sees p. */
++        const int poison = rad::poison_byte();
++        if (poison >= 0 && kind == RAD_MEM_DEVICE && rad::poison_in_range(ordinal)) {
++            RadStream s = nullptr;
++            if (dev()->stream_create(&s, 0) == RAD_OK) {
++                if (dev()->memset_async(p, poison, bytes, s) != RAD_OK || dev()->stream_sync(s) != RAD_OK)
++                    RAD_WARN("poison: device allocation #%lld (%s) was not filled",
++                             (long long)ordinal, rad::humanb(bytes).c_str());
++                else if (floor_ >= 0 && bytes >= floor_)
++                    RAD_INFO("poison: device allocation #%lld filled with 0x%02x", (long long)ordinal,
++                             poison);
++                dev()->stream_destroy(s);
++            }
++        }
+     }
+     return p;
+ }
+-- 
+2.55.0
+
+
+From e1c751b6fbccd458e9ad69b3a9e7171092741d16 Mon Sep 17 00:00:00 2001
+From: baKon <mike.ski83@gmail.com>
+Date: Mon, 5 Oct 2026 19:42:53 -0500
+Subject: [PATCH 06/16] load: a zero share is delivered from a container, and
+ an undelivered slot refuses
+
+From a container the relayout workers are fed by the sweep over the file, and a
+zero share (rad_weight_shard_zero: an attention-zero rank's q|gate, k, v and o)
+has no bytes in the file, so nothing ever arrived for it, its worker never ran,
+and its slot held whatever the card had there. On a card whose freed VRAM the
+driver wipes that is zeros and the rank serves correctly by luck; on a card
+fresh from a reset ("VRAM is lost") it is garbage and every token is garbage.
+The checkpoint branch hands every staged weight to the workers itself, which is
+why the hole was never seen there.
+
+Zero shares are now handed to the workers before the sweep, and the pool's
+finish() refuses when any staged weight was never delivered, so a slot nothing
+wrote cannot serve again.
+
+Reproducer on any card: RADIANCE_POISON_ALLOC=255 with an odd world over a
+container (--tp 3 on a two-KV-head model).
+---
+ core/engine_bringup.cpp | 32 ++++++++++++++++++++++++++++++++
+ 1 file changed, 32 insertions(+)
+
+diff --git a/core/engine_bringup.cpp b/core/engine_bringup.cpp
+index 50f74b3..bf2c9b6 100644
+--- a/core/engine_bringup.cpp
++++ b/core/engine_bringup.cpp
+@@ -1388,6 +1388,27 @@ public:
+                 rad_stream_destroy(uplinks_[(size_t)d].st);
+                 uplinks_[(size_t)d].st = nullptr;
+             }
++        /* EVERY STAGED WEIGHT MUST HAVE BEEN DELIVERED. One nothing arrived for was never laid out
++         * and its slot holds whatever the card had there: zeros on a card whose freed memory the
++         * driver wipes, which is how such a slot serves for months unnoticed, and garbage on one
++         * that has just been through a reset. Refusing here is what makes the hole visible. */
++        if (status_ == RAD_OK && !audited_) {
++            audited_ = true;
++            int64_t undelivered = 0;
++            for (const StagedWeight& s : items_)
++                if (s.remaining > 0) {
++                    if (undelivered < 4)
++                        RAD_ERR("load: '%s' was staged and nothing delivered its %s: its slot was "
++                                "never written", s.prog->weights[s.wi].name.c_str(),
++                                humanb(s.remaining).c_str());
++                    ++undelivered;
++                }
++            if (undelivered) {
++                RAD_ERR("load: %lld staged weight(s) were never delivered; the model cannot run",
++                        (long long)undelivered);
++                status_ = RAD_E_STATE;
++            }
++        }
+         return status_;
+     }
+ 
+@@ -1664,6 +1685,7 @@ private:
+     std::vector<int>           out_;      /* copies outstanding out of each sweep window */
+     int64_t budget_ = 0, held_ = 0, pending_ = 0, peak_ = 0;
+     bool done_ = false;
++    bool audited_ = false;   /* finish() runs its delivery audit once; the destructor calls it again */
+     std::atomic<bool> failed_{false};
+     int status_ = RAD_OK;
+ };
+@@ -2425,6 +2447,16 @@ int Engine::load_weights() {
+     const auto rt0 = std::chrono::steady_clock::now();
+     int sw_st = RAD_OK;
+     if (file_) {
++        /* A WEIGHT WITH NO BYTES IN THE FILE -- a zero share -- is one the sweep never reaches: no
++         * run of the container is its source, so nothing would ever arrive for it and its worker
++         * would never run. It is handed to the workers here, whole, and its own fill writes it
++         * (the checkpoint branch below does the same for every weight, which is why the hole was
++         * never seen there). */
++        for (size_t k = 0; k < staged.size() && !pool.failed(); ++k)
++            if (staged[k].fill) {
++                pool.reserve((int)k);
++                pool.arrived((int)k, staged[k].remaining);
++            }
+         sw_st = sweep_container(file_.get(), runs, devices, &pool, &read_bytes);
+     } else {
+         /* every weight to the workers, in declaration order, as fast as the budget lets them in */
+-- 
+2.55.0
+
+
+From a57057fba75f565bfd6818efd3b6a666322cf9b8 Mon Sep 17 00:00:00 2001
+From: baKon <mike.ski83@gmail.com>
+Date: Mon, 5 Oct 2026 20:00:14 -0500
+Subject: [PATCH 07/16] docs: TP3 -- the zero share is written, not assumed;
+ the poison test
+
+---
+ docs/TP3.md | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/docs/TP3.md b/docs/TP3.md
+index 375741c..f138a1c 100644
+--- a/docs/TP3.md
++++ b/docs/TP3.md
+@@ -30,6 +30,19 @@ attention computes zeros from zeros and its output projection adds exactly nothi
+ Five ranks over two: attention world 4 (two replicated pairs), rank 4 attention-zero. Six: three
+ pairs, no zero rank.
+ 
++**The zeros are written, not assumed.** A zero share has no bytes in the container, so the sweep
++over the file never reaches it; the loader hands it to the relayout workers itself, before the
++sweep, and its fill writes the slot. The pool refuses to finish with any staged weight nothing
++delivered. This matters because a card whose freed VRAM the driver wipes hands fresh allocations
++back as zeros, and a slot nothing wrote serves correctly there by luck -- until the card has been
++through a reset ("VRAM is lost") and the same slot is garbage. The test that sees it on any card:
++
++    RADIANCE_POISON_ALLOC=255 radiance --model stock.rad --tp 3 ...
++
++fills every fresh device allocation with 0xFF (NaN in every float width) before it is handed out;
++the serve must answer exactly as without it. `RADIANCE_POISON_RANGE=lo:hi` narrows the fill to a
++thread's allocation ordinals for a bisect (`core/device/dispatch.cpp`).
++
+ Why the same shapes rather than no attention on that rank: the scheduler sees **one program**
+ (`core/sched/batch.cpp` indexes `kv_groups[i]` by position), so every rank declares every op and
+ every KV group in the same order. An attention-zero rank's KV group is as large as its peers'; the
+-- 
+2.55.0
+
+
+From 7612f9de1b9350da2b9029428cf99613cbb61304 Mon Sep 17 00:00:00 2001
+From: baKon <mike.ski83@gmail.com>
+Date: Mon, 5 Oct 2026 21:12:34 -0500
+Subject: [PATCH 08/16] libr4d: a fill op
+
+y = value over an [M, n] extent at a row pitch, bf16, default 0. The op a rank
+issues where it has nothing to compute and a reader downstream -- an all-reduce,
+a residual -- still expects a defined buffer: a wire shared across layers cannot
+be zeroed once a step, and a memset knows neither the pitch nor the dtype.
+Smoke-tested for the exact zero, the pitch, and the RNE of a value.
+---
+ libr4d/r4d.h              |  1 +
+ libr4d/r4d_model_bf16.hip | 43 +++++++++++++++++++++++++++++++++++++++
+ libr4d/r4d_plugin.h       |  2 ++
+ libr4d/r4d_rows.cpp       | 20 ++++++++++++++++++
+ libr4d/r4d_selftest.cpp   | 41 +++++++++++++++++++++++++++++++++++++
+ libr4d/r4d_shapes.cpp     |  8 ++++++++
+ 6 files changed, 115 insertions(+)
+
+diff --git a/libr4d/r4d.h b/libr4d/r4d.h
+index c9b6da0..48890a4 100644
+--- a/libr4d/r4d.h
++++ b/libr4d/r4d.h
+@@ -847,6 +847,7 @@ int r4d_rmsnorm_bf16(long x, long w, long y, int M, int n, float eps, float wadd
+ int r4d_binary_bf16(long a, long b, long y, int M, int n, int op,
+                     int a_ld, int b_ld, int y_ld, long stream);
+ int r4d_sigmoid_bf16(long x, long y, int M, int n, int x_ld, int y_ld, long stream);
++int r4d_fill_bf16(long y, int M, int n, int y_ld, float value, long stream);
+ // y[.., i] = silu(gu[.., i]) * gu[.., n + i].  The GATE IS THE FIRST HALF -- the order rad-convert
+ // fuses gate_proj and up_proj in.
+ int r4d_silu_mul_bf16(long gu, long y, int M, int n, int gu_ld, int y_ld, long stream);
+diff --git a/libr4d/r4d_model_bf16.hip b/libr4d/r4d_model_bf16.hip
+index 6fbdae0..2ccae11 100644
+--- a/libr4d/r4d_model_bf16.hip
++++ b/libr4d/r4d_model_bf16.hip
+@@ -725,6 +725,32 @@ extern "C" int r4d_sigmoid_bf16(long x, long y, int M, int n, int x_ld, int y_ld
+     return hipGetLastError() == hipSuccess ? 0 : -4;
+ }
+ 
++// ---------------------------------------------------------------------------- fill
++// y[m, i] = v for every element of an [M, n] extent with a row pitch -- the op a rank issues where
++// it has nothing to compute and a downstream reader (an all-reduce, a residual) still expects a
++// defined buffer. A memset cannot do this: the wire may have a pitch and bf16 is two bytes.
++__global__ __launch_bounds__(kThreads) void fill_kernel(uint16_t* __restrict__ y, uint32_t n,
++                                                        uint32_t y_ld, uint16_t v) {
++    uint16_t* __restrict__ yr = y + (size_t)blockIdx.x * y_ld;
++    for (uint32_t i = threadIdx.x; i < n; i += kThreads) yr[i] = v;
++}
++
++// The host form of r4d_common.h's f32_to_bf16 (which is __device__): the same round-to-nearest-even.
++static inline uint16_t f32_to_bf16_host(float f) {
++    uint32_t u;
++    std::memcpy(&u, &f, sizeof u);
++    return (uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
++}
++
++extern "C" int r4d_fill_bf16(long y, int M, int n, int y_ld, float value, long stream) {
++    if (!y) return -1;
++    if (M <= 0 || n <= 0) return -2;
++    if (!y_ld) y_ld = n;
++    hipLaunchKernelGGL(fill_kernel, dim3((uint32_t)M), dim3(kThreads), 0, (hipStream_t)stream,
++                       (uint16_t*)y, (uint32_t)n, (uint32_t)y_ld, f32_to_bf16_host(value));
++    return hipGetLastError() == hipSuccess ? 0 : -4;
++}
++
+ extern "C" int r4d_silu_mul_bf16(long gu, long y, int M, int n, int gu_ld, int y_ld, long stream) {
+     if (!gu || !y) return -1;
+     if (M <= 0 || n <= 0) return -2;
+@@ -1258,6 +1284,23 @@ extern "C" int r4d_rad_sigmoid(const RadArgs* a, RadStream s) {
+                             (long)(uintptr_t)s) == 0 ? RAD_OK : RAD_E_DEVICE;
+ }
+ 
++/* ------------------------------------------------------------------ fill */
++
++extern "C" int r4d_rad_fill(const RadArgs* a, RadStream s) {
++    const RadTensor* y = r4d_opt(a, 0);
++    if (!y) return R4D_NO(RAD_E_INVAL);
++    R4D_NEED(dt_bf16(y));
++    const long long n = r4d_geti_or(a, "n", r4d_dim(y, (int)y->rank - 1));
++    if (n <= 0) return R4D_NO(RAD_E_SHAPE);
++    long long M = 0;
++    const long long y_ld = r4d_rows_pitch(y, n, &M);
++    if (y_ld < 0) return R4D_NO(RAD_E_STRIDE);
++    if (M <= 0) return R4D_NO(RAD_E_SHAPE);
++    const double v = r4d_getf(a, "value", 0.0);
++    return r4d_fill_bf16(r4d_addr(y), (int)M, (int)n, (int)y_ld, (float)v,
++                         (long)(uintptr_t)s) == 0 ? RAD_OK : RAD_E_DEVICE;
++}
++
+ /* ------------------------------------------------------------------ silu_mul */
+ 
+ extern "C" int r4d_rad_silu_mul(const RadArgs* a, RadStream s) {
+diff --git a/libr4d/r4d_plugin.h b/libr4d/r4d_plugin.h
+index 0c66deb..156541d 100644
+--- a/libr4d/r4d_plugin.h
++++ b/libr4d/r4d_plugin.h
+@@ -391,6 +391,7 @@ int r4d_rad_rmsnorm         (const RadArgs*, RadStream);
+ int r4d_rad_add             (const RadArgs*, RadStream);
+ int r4d_rad_mul             (const RadArgs*, RadStream);
+ int r4d_rad_sigmoid         (const RadArgs*, RadStream);
++int r4d_rad_fill            (const RadArgs*, RadStream);
+ int r4d_rad_silu_mul        (const RadArgs*, RadStream);
+ int r4d_rad_rope            (const RadArgs*, RadStream);
+ /* -- the vision tower's ops (r4d_vit_bf16.hip) -- */
+@@ -451,6 +452,7 @@ int r4d_shape_layernorm      (const RadParam*, int, int operand, RadOpdDesc*);
+ int r4d_shape_grid_embed     (const RadParam*, int, int operand, RadOpdDesc*);
+ int r4d_shape_gemm_nt_bias   (const RadParam*, int, int operand, RadOpdDesc*);
+ int r4d_shape_unary          (const RadParam*, int, int operand, RadOpdDesc*);
++int r4d_shape_fill           (const RadParam*, int, int operand, RadOpdDesc*);
+ int r4d_shape_silu_mul       (const RadParam*, int, int operand, RadOpdDesc*);
+ int r4d_shape_rope           (const RadParam*, int, int operand, RadOpdDesc*);
+ int r4d_shape_kv_store       (const RadParam*, int, int operand, RadOpdDesc*);
+diff --git a/libr4d/r4d_rows.cpp b/libr4d/r4d_rows.cpp
+index 0a94898..d9aacac 100644
+--- a/libr4d/r4d_rows.cpp
++++ b/libr4d/r4d_rows.cpp
+@@ -1512,6 +1512,13 @@ static const RadOperandSpec oUnary[] = {
+     { "x", RAD_OPD_IN,  0 },
+     { "y", RAD_OPD_OUT, 0 },
+ };
++/* `fill` has no input: `value` is the whole of what it writes. */
++static const RadParamSpec pFill[] = {
++    P_INT("M"), P_INT("n"), P_STR("dtype"), P_F64O("value"),
++};
++static const RadOperandSpec oFill[] = {
++    { "y", RAD_OPD_OUT, 0 },
++};
+ /* `cast`'s two dtype keys are STRINGS and not one `dtype`, because the whole point of the op is
+  * that the two ends differ. ref's spelling, matched field for field so the two plugins agree. */
+ static const RadParamSpec pCast[] = {
+@@ -1796,6 +1803,10 @@ static const RadOpSchema kSchemas[] = {
+            "y[.., i] = silu(gate_up[.., i]) * gate_up[.., n + i]. The GATE IS THE FIRST HALF, "
+            "which is the order rad-convert fuses gate_proj and up_proj in."),
+     SCHEMA("sigmoid", pMnDtype, oUnary, "y = 1 / (1 + exp(-x))."),
++    SCHEMA("fill", pFill, oFill,
++           "y = value, every element of an [M, n] extent (default 0). The op a rank issues where "
++           "it computes nothing and a reader downstream -- an all-reduce, a residual -- still "
++           "expects a defined buffer: a wire shared across layers cannot be zeroed once a step."),
+     SCHEMA("cast", pCast, oUnary,
+            "y = x, converted. `from` and `to` are for the selector; the bytes are described by the "
+            "tensors' own dtypes and those are what the kernel reads."),
+@@ -3303,6 +3314,15 @@ static const RadKernelInfo kKernels[] = {
+   nullptr, nullptr, r4d_rad_mul, nullptr, nullptr, nullptr,
+   r4d_shape_binary },
+ 
++{ "fill_bf16", "fill", "elem",
++  "constant fill, a row a workgroup",
++  "any M, n; a row pitch is honoured",
++  "bf16 out; the value rounds to nearest even once",
++  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
++  ROW(cBf16Row), NOTUNE,
++  nullptr, nullptr, r4d_rad_fill, nullptr, nullptr, nullptr,
++  r4d_shape_fill },
++
+ { "sigmoid_bf16", "sigmoid", "elem",
+   "logistic sigmoid, grid-strided over the whole extent",
+   "any extent; contiguous in and out",
+diff --git a/libr4d/r4d_selftest.cpp b/libr4d/r4d_selftest.cpp
+index 9f3ab66..f595375 100644
+--- a/libr4d/r4d_selftest.cpp
++++ b/libr4d/r4d_selftest.cpp
+@@ -9550,6 +9550,47 @@ static void device_phase(const Plugin& pl) {
+             }
+         }
+     }
++    /* --- fill: the op a rank with nothing to compute writes a defined buffer with --- */
++    if (sel("fill_bf16")) {
++        const RadKernelInfo* r = find(pl, "fill_bf16");
++        if (!r) ok("fill_bf16", false, "row absent");
++        else {
++            const int64_t M = 5, n = 48, wide = 2 * n;   /* a column slice at a wide pitch */
++            void* d = dalloc((size_t)M * wide * 2);
++            if (!d) ok("fill alloc", false, "hipMalloc failed");
++            else {
++                std::vector<uint16_t> pre((size_t)(M * wide), h_to_bf16(-7.5f));
++                st_memcpy(d, pre.data(), (size_t)M * wide * 2, hipMemcpyHostToDevice);
++                RadTensor ty = T(d, RAD_BF16, { M, n });
++                ty.stride[0] = wide;
++                std::vector<RadTensor> ts = { ty };
++                /* Default value: zero. The whole point of the op is that this is exactly 0x0000. */
++                std::vector<RadParam> p0 = { PI("M", M), PI("n", n), PS("dtype", "bf16") };
++                run_case(r, ts, p0);
++                std::vector<uint16_t> got((size_t)(M * wide));
++                st_memcpy(got.data(), d, (size_t)M * wide * 2, hipMemcpyDeviceToHost);
++                bool zero = true, spilled = false;
++                for (int64_t m = 0; m < M; ++m)
++                    for (int64_t c = 0; c < wide; ++c) {
++                        const uint16_t g = got[(size_t)(m * wide + c)];
++                        if (c < n) { if (g != 0) zero = false; }
++                        else if (g != pre[0]) spilled = true;
++                    }
++                ok("fill_bf16 writes exactly zero into the slice by default", zero);
++                ok("fill_bf16 leaves the columns past the pitch alone", !spilled);
++                /* A value: rounds to nearest even once, like every store in this library. */
++                std::vector<RadParam> p1 = { PI("M", M), PI("n", n), PS("dtype", "bf16"),
++                                             PF("value", 1.37) };
++                run_case(r, ts, p1);
++                st_memcpy(got.data(), d, (size_t)M * wide * 2, hipMemcpyDeviceToHost);
++                const uint16_t want = h_to_bf16(1.37f);
++                bool val = true;
++                for (int64_t m = 0; m < M && val; ++m)
++                    for (int64_t c = 0; c < n; ++c) if (got[(size_t)(m * wide + c)] != want) { val = false; break; }
++                ok("fill_bf16 writes a given value, RNE-rounded", val);
++            }
++        }
++    }
+     /* --- byte rows: the KV tier's transfer pair --- */
+     /* PACK AND UNPACK A POOL, which is the only thing these two are ever asked to do. The layout
+      * here is the real one in miniature: a "layer" is `rows` blocks of `n` bytes, the blocks a
+diff --git a/libr4d/r4d_shapes.cpp b/libr4d/r4d_shapes.cpp
+index 295057e..8f34db6 100644
+--- a/libr4d/r4d_shapes.cpp
++++ b/libr4d/r4d_shapes.cpp
+@@ -528,6 +528,14 @@ extern "C" int r4d_shape_binary(const RadParam* p, int n_p, int operand,
+     R4D_PICK(l);
+ }
+ 
++extern "C" int r4d_shape_fill(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
++    const int64_t M = pi(p, n_p, "M");
++    const int64_t n = pi(p, n_p, "n");
++    const uint32_t D = dt_act(p, n_p, "dtype");
++    const RadOpdDesc l[] = { opd(D, M, n) };
++    R4D_PICK(l);
++}
++
+ extern "C" int r4d_shape_unary(const RadParam* p, int n_p, int operand,
+                                RadOpdDesc* out) {
+ 
+-- 
+2.55.0
+
+
+From 4db09c54ee978e0582f8e36630040839d6f155c5 Mon Sep 17 00:00:00 2001
+From: baKon <mike.ski83@gmail.com>
+Date: Mon, 5 Oct 2026 21:14:10 -0500
+Subject: [PATCH 09/16] attn gated: an attention-zero rank computes no
+ attention
+
+Its share of every projection is zero, so q, k, v, the attention and the output
+projection are zero and the reduce gains exactly nothing from it. Declaring the
+projections and running them on zero weights spent a real rank's dispatches and
+bytes every layer, and a slot for every zero. The block on such a rank is now
+one fill of its output wire, then the all-reduce and the residual it always had;
+the norm stays because a pre-norm block's fold and ar_in live in it. The branch
+is dead on every rank with heads, so a world the heads divide declares as before.
+---
+ arch/common/rad_block_attn_gated_fp8.h | 37 ++++++++++++++++++++------
+ 1 file changed, 29 insertions(+), 8 deletions(-)
+
+diff --git a/arch/common/rad_block_attn_gated_fp8.h b/arch/common/rad_block_attn_gated_fp8.h
+index 2a0d1e9..411e85d 100644
+--- a/arch/common/rad_block_attn_gated_fp8.h
++++ b/arch/common/rad_block_attn_gated_fp8.h
+@@ -147,6 +147,7 @@ struct AttnGatedFP8 {
+     rad_op     op_attn_gq = 0;                               /* attn_paged + gate_quant_fp8 */
+     rad_op     op_sig = 0, op_mul = 0;                       /* the bf16 gate, Geom::w_bf16 */
+     rad_op     op_ar = 0, op_add = 0;
++    rad_op     op_fill = 0;                                  /* the attention-zero rank: see declare */
+     /* ...AND WHETHER THE COLLECTIVE AT THE END OF THIS BLOCK IS THE NEXT BLOCK'S FIRST PASS.
+      * `ar_in` says this block's own norm absorbs its PREDECESSOR's all-reduce; `ar_out` says the
+      * block after it absorbs THIS one's, so this one must not issue it. They are the residual
+@@ -195,8 +196,8 @@ inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
+     /* AND UNDER A SMALLER ATTENTION WORLD (rad_arch.h Geom::attn_world: three ranks over two KV
+      * heads) the even shard over `world` is the wrong cut for every projection: q|gate and the
+      * output take this rank's heads [attn_rank * n_head, +n_head) as a span too, and k/v the
+-     * kv_off span. An attention-zero rank declares the same spans -- the same shapes as its peers
+-     * -- and then reads nothing for them (zero_share below). */
++     * kv_off span. An attention-zero rank declares none of them: its block is one `fill` of the
++     * output wire (the branch below), so the spans here are only ever cut for a rank with heads. */
+     const bool    a_spanned  = g.attn_world != g.world;
+     const bool    kv_spanned = g.world > g.n_head_kv_all || a_spanned;
+     const int64_t kv_span_lo = kv_spanned ? g.kv_off : 0;
+@@ -244,6 +245,23 @@ inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
+     if (!ext_in)
+         RAD_ARCH_TRY(nq_h.declare(b, g, w_norm, fold ? w.h.x : w.x, w.h, g.n_embd,
+                                   fold ? w.x : 0, 0, ar_in));
++
++    /* AN ATTENTION-ZERO RANK COMPUTES NO ATTENTION AT ALL. Its share of every projection is zero,
++     * so its q, k and v are zero, its attention is zero and its output projection adds exactly
++     * nothing to the reduce -- which is what the ranks that DO hold heads need from it and all
++     * they need. Declaring the projections and running them on zero weights spent the same
++     * dispatches and bytes as a real rank and a slot for every zero (and a KV pool nothing read,
++     * see rad_kv_group_zero). Here the block's output wire is written to zero by one `fill`, and
++     * the all-reduce and the residual below see what they always saw. The norm above stays: a
++     * pre-norm block's `fold` and `ar_in` live in it. Nothing in this branch runs for a rank with
++     * heads, so a world the heads divide (every TP2 and TP4 deployment) declares as it always did. */
++    if (g.attn_zero) {
++        op_fill = rw(b, RAD_OP(b, "fill",
++                         RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
++                                    RAD_STR("dtype", g.dtype)),
++                         RAD_NOWEIGHTS),
++                     {}, {w.h.x});
++    } else {
+     RAD_ARCH_TRY(qg.declare(b, nm, g, nm.f("blk.%d.attn_qg", l), qg_dim, g.n_embd,
+                             RAD_SHARD_ROW, grp_layer(l), { src.qg }, w.h, w.qg,
+                             0, {}, qg_span_lo, qg_span_hi));
+@@ -253,11 +271,6 @@ inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
+     RAD_ARCH_TRY(vp.declare(b, nm, g, nm.f("blk.%d.attn_v", l), kv_dim, g.n_embd,
+                             RAD_SHARD_ROW, grp_layer(l), { src.v }, w.h, w.v,
+                             0, {}, kv_span_lo, kv_span_hi));
+-    if (g.attn_zero) {
+-        RAD_ARCH_TRY(qg.zero_share(b));
+-        RAD_ARCH_TRY(kp.zero_share(b));
+-        RAD_ARCH_TRY(vp.zero_share(b));
+-    }
+ 
+     /* THE FUSED PROLOGUE, AND IT IS A PROBE: the four ops below are declared either way and are
+      * what runs when nothing serves this one. rad_block_attn_gated.h does not make the probe,
+@@ -435,7 +448,7 @@ inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
+     RAD_ARCH_TRY(o.declare(b, nm, g, nm.f("blk.%d.attn_output", l), g.n_embd, q_dim,
+                            RAD_SHARD_COL, grp_layer(l), { src.o }, w.attn, w.h.x,
+                            0, {}, o_span_lo, o_span_hi));
+-    if (g.attn_zero) RAD_ARCH_TRY(o.zero_share(b));
++    }   /* !g.attn_zero */
+ 
+     if (g.world > 1)
+         op_ar = rw(b, RAD_OP(b, "all_reduce",
+@@ -466,6 +479,14 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch) const {
+     const int64_t T = batch->n_tok;
+ 
+     if (!ext_in) nq_h.step(c, T);
++    if (op_fill) {
++        /* The attention-zero rank: the output wire is zero, then the reduce and the residual. */
++        RAD_ISSUE_N(c, op_fill, T, brows(w.h.x, T));
++        if (op_ar && !ar_taken(g, T, ar_out, ar_out_take))
++            RAD_ISSUE_N(c, op_ar, T * g.n_embd, brows(w.h.x, T), RAD_NONE);
++        if (op_add) RAD_ISSUE(c, op_add, brows(w.x, T), brows(w.h.x, T), brows(w.x, T));
++        return;
++    }
+     qg.step(c, w.h, w.qg, T);
+     kp.step(c, w.h, w.k,  T);
+     vp.step(c, w.h, w.v,  T);
+-- 
+2.55.0
+
+
+From 9b1d8cc73d38a7772804ac60c1b2a2d220c74279 Mon Sep 17 00:00:00 2001
+From: baKon <mike.ski83@gmail.com>
+Date: Mon, 5 Oct 2026 21:18:55 -0500
+Subject: [PATCH 10/16] kv: a group a rank keeps no cache for
+
+rad_kv_group_zero(b, group): the group is declared as on every other rank --
+the scheduler indexes groups by position and one block table serves every
+rank -- and this rank carves nothing for it: its block count is the shared
+table's, its costs are zero, its pool base is null, and issue refuses any op
+on this rank that names it. For a rank the geometry gives no attention heads,
+whose attention is a fill of zeros and never stores or reads a key. qwen4exp
+declares its attention group so on such a rank. The arch test's contract
+becomes the real one: same KV groups by position; ops are each rank's own.
+---
+ abi/rad_builder.h                  |  8 +++++
+ arch/qwen4exp_fp8/qwen4exp_fp8.cpp |  5 +++
+ core/build/rad_build.h             |  1 +
+ core/build/rad_builder.cpp         | 12 +++++++
+ core/mem/kv.cpp                    | 17 +++++++++
+ core/mem/kv.h                      |  4 +++
+ core/rad_core.h                    |  1 +
+ core/runtime/issue.cpp             | 10 +++---
+ tests/arch_test.cpp                | 55 ++++++++++++++++++++++--------
+ 9 files changed, 95 insertions(+), 18 deletions(-)
+
+diff --git a/abi/rad_builder.h b/abi/rad_builder.h
+index 3581b57..431ea17 100644
+--- a/abi/rad_builder.h
++++ b/abi/rad_builder.h
+@@ -381,6 +381,14 @@ int rad_weight_shard_span_parts(RadBuilder* b, rad_weight w, const int64_t* lo,
+  * projection contributes exactly nothing to the reduce. Additive export. */
+ int rad_weight_shard_zero(RadBuilder* b, rad_weight w);
+ 
++/* THIS RANK KEEPS NO CACHE FOR THE GROUP. The group is declared as on every other rank -- the
++ * scheduler indexes groups by position and one block table serves every rank, so it must exist
++ * here with the same block size and layers -- and nothing is carved for it: it costs this rank no
++ * pool. It is for a rank the geometry gives no attention heads (rad_arch.h Geom::attn_zero),
++ * whose attention is a `fill` of zeros and never reads a key. No op on this rank may name the
++ * group as a RAD_KV operand after this; the engine refuses one at issue. Additive export. */
++int rad_kv_group_zero(RadBuilder* b, rad_kvgroup g);
++
+ #define RAD_BUFS(...)  ((const rad_buf[]){ __VA_ARGS__ }), \
+                        (int)(sizeof((const rad_buf[]){ __VA_ARGS__ }) / sizeof(rad_buf))
+ 
+diff --git a/arch/qwen4exp_fp8/qwen4exp_fp8.cpp b/arch/qwen4exp_fp8/qwen4exp_fp8.cpp
+index 18aeafe..64c0726 100644
+--- a/arch/qwen4exp_fp8/qwen4exp_fp8.cpp
++++ b/arch/qwen4exp_fp8/qwen4exp_fp8.cpp
+@@ -1130,6 +1130,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
+                 lay.attn.qsa_exact_to = m.qsacfg.budget + m.qsacfg.ratio - 1;
+             }
+             RAD_ARCH_TRY(rad_bind_layer_kv(b, (int)l, m.kv_full));
++            /* AN ATTENTION-ZERO RANK KEEPS NO ATTENTION CACHE. Its block is a fill of zeros
++             * (rad_block_attn_gated_fp8.h) and never stores or reads a key; the indexer below
++             * reads only the group's block table, which every rank shares. Once per model: the
++             * group is one and the call is idempotent, but the first layer is the honest place. */
++            if (g.attn_zero && m.kv_full) RAD_ARCH_TRY(rad_kv_group_zero(b, m.kv_full));
+             lay.attn.ar_out_take = lay.hc_mix.ar_take();
+             RAD_ARCH_TRY(lay.attn.declare(b, nm, g, (int)l, m.kv_full, m.n_rot, aw, as,
+                                           false, false, kArNone, lay.hc_mix.op_ar_write != 0));
+diff --git a/core/build/rad_build.h b/core/build/rad_build.h
+index 70beb8a..d434fba 100644
+--- a/core/build/rad_build.h
++++ b/core/build/rad_build.h
+@@ -152,6 +152,7 @@ public:
+     int weight_shard_span_parts(rad_weight w, const int64_t* lo, const int64_t* hi,
+                                 const int64_t* total, int n);
+     int weight_shard_zero(rad_weight w);
++    int kv_group_zero(rad_kvgroup g);
+ 
+     /* Finalise: weight first/last use, KV group geometry, buffer liveness and packing. Returns
+      * RAD_OK, or the first structural error class. Resolution MISSES are not an error here -- an
+diff --git a/core/build/rad_builder.cpp b/core/build/rad_builder.cpp
+index 85f3384..ee8607a 100644
+--- a/core/build/rad_builder.cpp
++++ b/core/build/rad_builder.cpp
+@@ -926,6 +926,13 @@ int Builder::weight_shard_span_parts(rad_weight h, const int64_t* lo, const int6
+     return RAD_OK;
+ }
+ 
++int Builder::kv_group_zero(rad_kvgroup h) {
++    if (finished_) { err(RAD_E_STATE, "kv_group_zero after declare finished"); return RAD_E_STATE; }
++    if (h == 0 || h >= prog_.kv_groups.size()) return RAD_E_INVAL;
++    prog_.kv_groups[h].zero = true;
++    return RAD_OK;
++}
++
+ int Builder::weight_shard_zero(rad_weight h) {
+     if (finished_) { err(RAD_E_STATE, "weight_shard_zero after declare finished"); return RAD_E_STATE; }
+     if (h == 0 || h >= prog_.weights.size()) return RAD_E_INVAL;
+@@ -1673,6 +1680,11 @@ int rad_weight_shard_zero(RadBuilder* b, rad_weight w) {
+     return B(b)->weight_shard_zero(w);
+ }
+ 
++int rad_kv_group_zero(RadBuilder* b, rad_kvgroup g) {
++    if (!b) return RAD_E_INVAL;
++    return B(b)->kv_group_zero(g);
++}
++
+ int rad_decl_name_map(RadBuilder* b, const RadNameMap* m) {
+     if (!b) return RAD_E_INVAL;
+     return B(b)->decl_name_map(m);
+diff --git a/core/mem/kv.cpp b/core/mem/kv.cpp
+index d4e82d6..4a7f7ae 100644
+--- a/core/mem/kv.cpp
++++ b/core/mem/kv.cpp
+@@ -256,6 +256,14 @@ int KVManager::plan_groups(const std::vector<KVGroupInfo>& groups, const Config&
+             RAD_ERR("KV group '%s': unknown kind %d", p.name.c_str(), p.kind);
+             return RAD_E_INVAL;
+         }
++        /* A ZERO GROUP COSTS THIS RANK NOTHING: declared for its position and its block count,
++         * never carved, never read. The validation above still ran on the real sizes, so a zero
++         * group is a real group on every other rank. */
++        if (g.zero) {
++            p.zero = true;
++            p.bytes_per_block = 0;
++            p.bytes_per_state = 0;
++        }
+         plans_.push_back(std::move(p));
+     }
+     bundling_ = compare_bundling(bundles);
+@@ -453,6 +461,15 @@ int KVManager::carve_into(Pool& kv_pool) {
+         int64_t bytes = p.paged() ? p.n_blocks * p.bytes_per_block
+                                   : p.n_states * p.bytes_per_state;
+         if (p.paged()) paged_taken += bytes;
++        if (p.zero) {
++            p.base = nullptr;
++            p.pool_offset = 0;
++            p.pool_bytes = 0;
++            RAD_INFO("KV group '%s': this rank keeps no cache for it (rad_kv_group_zero) -- %lld "
++                     "blocks of the shared table, nothing carved", p.name.c_str(),
++                     (long long)p.n_blocks);
++            continue;
++        }
+         int64_t off = 0;
+         void* ptr = kv_pool.reserve(p.name, bytes, RAD_ALIGN_UNIT, &off);
+         if (!ptr && !kv_pool.accounting_only()) {
+diff --git a/core/mem/kv.h b/core/mem/kv.h
+index 89f41f2..94ae2e0 100644
+--- a/core/mem/kv.h
++++ b/core/mem/kv.h
+@@ -74,6 +74,10 @@ struct KVGroupPlan {
+     int64_t     window_blocks = 0;     /* WINDOW: the per-sequence block cap */
+ 
+     int64_t     n_blocks = 0;          /* paged groups: blocks carved from the pool */
++    /* rad_kv_group_zero: this rank keeps no cache for the group. The plan exists for its position
++     * and its block count (one block table serves every rank), its costs are zero and nothing is
++     * carved; no op on this rank names it (issue refuses a group with no pool bound). */
++    bool        zero = false;
+     int64_t     n_states = 0;          /* LINEAR/CONV: n_seq_states * state_copies */
+     /* HOW MANY PHYSICAL SLOTS ONE LOGICAL STATE COSTS. One, normally: a sequence owns a state.
+      * Under speculation a linear kernel needs somewhere to put what it cannot commit yet -- it
+diff --git a/core/rad_core.h b/core/rad_core.h
+index 511f931..bfff733 100644
+--- a/core/rad_core.h
++++ b/core/rad_core.h
+@@ -295,6 +295,7 @@ struct KVGroupInfo {
+     int64_t         bytes_per_block = 0;
+     int64_t         bytes_per_state = 0;   /* linear/conv: per sequence */
+     std::vector<int> layers;
++    bool            zero = false;       /* rad_kv_group_zero: declared for position, nothing carved */
+ };
+ 
+ /* A RAD_KV_CONV GROUP'S WINDOW, IN ENTRIES: conv_width - 1 of history and one more for every
+diff --git a/core/runtime/issue.cpp b/core/runtime/issue.cpp
+index 23489e9..3bdd18e 100644
+--- a/core/runtime/issue.cpp
++++ b/core/runtime/issue.cpp
+@@ -760,10 +760,12 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
+             const uint32_t g = o.handle;
+             if ((size_t)g >= kv_.size() || !kv_[g].base)
+                 return abort_step_msg(h, RAD_E_STATE,
+-                                      fmt("operand %d names KV group %u, which has no pool bound. "
+-                                          "The block manager allocates it at load and binds it "
+-                                          "into the Ctx; a group with none is a startup bug, not "
+-                                          "a runtime condition", i, g));
++                                      fmt("operand %d names KV group %u, which has no pool bound on "
++                                          "this rank. The block manager allocates it at load and "
++                                          "binds it into the Ctx; a group with none is a startup "
++                                          "bug -- or a group this rank declared with "
++                                          "rad_kv_group_zero and then issued against, which the "
++                                          "plugin must not do", i, g));
+             const KVPoolBinding& b = kv_[g];
+             /* A POSITION LOOKUP, not `o.offset - first_layer`. The subtraction is right only for a
+              * group whose layers are contiguous, and they need not be: with 15 attention layers
+diff --git a/tests/arch_test.cpp b/tests/arch_test.cpp
+index 3b83972..1a0864c 100644
+--- a/tests/arch_test.cpp
++++ b/tests/arch_test.cpp
+@@ -66,7 +66,7 @@ struct RecMap {
+     std::vector<std::string> src;
+     int                      concat_dim = 0;
+ };
+-struct RecKV    { std::string name; RadKVGroupDecl d{}; };
++struct RecKV    { std::string name; RadKVGroupDecl d{}; bool zero = false; };
+ struct RecIssue {
+     rad_op                  op = 0;
+     std::vector<RadOperand> opd;
+@@ -173,7 +173,7 @@ extern "C" int rad_op_resolved(RadBuilder* b, rad_op h) {
+ 
+ extern "C" rad_kvgroup rad_decl_kv_group(RadBuilder* b, const char* name,
+                                          const RadKVGroupDecl* d) {
+-    b->kv_groups.push_back({name, *d});
++    b->kv_groups.push_back({name, *d, false});
+     return (rad_kvgroup)b->kv_groups.size();
+ }
+ 
+@@ -245,6 +245,11 @@ extern "C" int rad_weight_shard_zero(RadBuilder* b, rad_weight w) {
+     rw.zero = true;
+     return RAD_OK;
+ }
++extern "C" int rad_kv_group_zero(RadBuilder* b, rad_kvgroup g) {
++    if (!b || g == 0 || g > b->kv_groups.size()) return RAD_E_INVAL;
++    b->kv_groups[g - 1].zero = true;
++    return RAD_OK;
++}
+ extern "C" int rad_declare_drafter(RadBuilder* b, const RadDrafterDecl* d) {
+     (void)b; (void)d;
+     return RAD_OK;
+@@ -2509,29 +2514,51 @@ TEST(flashnext_tp3_zeroes_the_third_ranks_attention_and_splits_gdn_heads_unevenl
+         REQUIRE_EQ(qwen4exp_fp8::declare(&b[r], &meta, &c[r]), RAD_OK);
+     }
+ 
+-    /* The three programs declare the same ops in the same order and the same KV groups: the
+-     * scheduler sees one program. */
++    /* EVERY RANK DECLARES THE SAME KV GROUPS IN THE SAME ORDER: the scheduler indexes groups by
++     * position and one block table serves every rank. The OPS are each rank's own -- issue walks
++     * a rank's program -- and the attention ranks declare the same ops as each other. */
+     for (int r = 1; r < world; ++r) {
+-        REQUIRE_EQ(b[r].ops.size(), b[0].ops.size());
+         REQUIRE_EQ(b[r].kv_groups.size(), b[0].kv_groups.size());
+-        for (size_t i = 0; i < b[0].ops.size(); ++i) CHECK_EQ(b[r].ops[i].op, b[0].ops[i].op);
+         for (size_t g = 0; g < b[0].kv_groups.size(); ++g) {
+             CHECK_EQ(b[r].kv_groups[g].name, b[0].kv_groups[g].name);
+             CHECK_EQ(b[r].kv_groups[g].d.kind, b[0].kv_groups[g].d.kind);
+         }
++        if (r < attn_world) {
++            REQUIRE_EQ(b[r].ops.size(), b[0].ops.size());
++            for (size_t i = 0; i < b[0].ops.size(); ++i) CHECK_EQ(b[r].ops[i].op, b[0].ops[i].op);
++        }
+     }
+ 
+     for (int r = 0; r < world; ++r) {
+         const bool zero = r >= attn_world;
+-        /* (1) ATTENTION: every rank the two-rank geometry -- 12 heads, one KV head, gqa 12. */
+-        const RecOp* at = find_op(b[r], "attn_paged");
+-        REQUIRE(at != nullptr);
+-        CHECK_EQ(pint(at, "n_head"), n_head / attn_world);
+-        CHECK_EQ(pint(at, "gqa"), n_head / attn_world);
+         CHECK_EQ(b[r].kv_groups[0].d.n_head_kv, 1);
+-        /* (2) THE PROJECTIONS: the span of this rank's heads in the container on every rank --
+-         * rank 2 the last attention rank's, so its shapes match -- and zeros on rank 2. */
++        /* THE ATTENTION-ZERO RANK COMPUTES NO ATTENTION: no attention op, no projection weight,
++         * a `fill` of its output wire, and no cache carved for the attention group. */
++        if (zero) {
++            CHECK(find_op(b[r], "attn_paged") == nullptr);
++            CHECK(find_op(b[r], "kv_store") == nullptr);
++            CHECK(find_op(b[r], "fill") != nullptr);
++            CHECK(find_w(b[r], kq) == nullptr);
++            CHECK(find_w(b[r], qg) == nullptr);
++            CHECK(find_w(b[r], oo) == nullptr);
++            CHECK(b[r].kv_groups[0].zero);
++            /* The all-reduce it still joins, and the indexer it still runs. */
++            CHECK(find_op(b[r], "qsa_select") != nullptr);
++        } else {
++            CHECK(!b[r].kv_groups[0].zero);
++            CHECK(find_op(b[r], "fill") == nullptr);
++        }
++        /* (1) ATTENTION: every attention rank the two-rank geometry -- 12 heads, one KV head,
++         * gqa 12. */
++        const RecOp* at = find_op(b[r], "attn_paged");
++        if (!zero) {
++            REQUIRE(at != nullptr);
++            CHECK_EQ(pint(at, "n_head"), n_head / attn_world);
++            CHECK_EQ(pint(at, "gqa"), n_head / attn_world);
++        }
++        /* (2) THE PROJECTIONS: the span of this rank's heads in the container. */
+         for (const std::string& wn : {kq, kv}) {
++            if (zero) break;
+             const RecWeight* w = find_w(b[r], wn);
+             REQUIRE(w != nullptr);
+             CHECK_EQ(w->d.shape[0], head_dim);
+@@ -2541,7 +2568,7 @@ TEST(flashnext_tp3_zeroes_the_third_ranks_attention_and_splits_gdn_heads_unevenl
+             CHECK_EQ(w->span_hi, w->span_lo + head_dim);
+             CHECK_EQ(w->zero, zero);
+         }
+-        {
++        if (!zero) {
+             const RecWeight* w = find_w(b[r], qg);
+             REQUIRE(w != nullptr);
+             const int ar = zero ? attn_world - 1 : r;
+-- 
+2.55.0
+
+
+From fa01bd2f0beaaf90b9dc2cf74504abbc2de9bc4a Mon Sep 17 00:00:00 2001
+From: baKon <mike.ski83@gmail.com>
+Date: Mon, 5 Oct 2026 21:22:59 -0500
+Subject: [PATCH 11/16] budget: a rank whose cache costs less backs the same
+ tokens with a smaller pool
+
+The resolver derives one split for every rank (the dearest rank's). A rank
+whose KV groups cost less per token -- an attention-zero rank keeps no attention
+cache -- would spend the common pool on tokens configure_kv then caps away, one
+block table serving every rank. Its KV pool is now sized for the same token
+count as the dearest rank's, a hair over, and the difference goes to its
+weights pool, where its larger share of the experts lives. Only a derived split
+is re-split; a world whose ranks cost the same is untouched.
+---
+ core/engine.h           |  4 ++++
+ core/engine_bringup.cpp | 39 ++++++++++++++++++++++++++++++++++++++-
+ 2 files changed, 42 insertions(+), 1 deletion(-)
+
+diff --git a/core/engine.h b/core/engine.h
+index d16a857..7b4002f 100644
+--- a/core/engine.h
++++ b/core/engine.h
+@@ -76,6 +76,10 @@ private:
+      * shared BY POINTER rather than broadcast (spec §1). */
+     struct Rank;
+     std::vector<std::unique_ptr<Rank>> ranks_;
++    /* Each rank's pool budgets: cfg_'s, except where a rank's cache costs less than its peers'
++     * and its KV pool is sized for the same tokens with the difference in its weights (see the
++     * resolve in Engine::plan). */
++    std::vector<Config> rank_cfg_;
+     /* THE DISK HALF OF THE IDLE TIERS. One store for the engine, not one per rank: it is
+      * keyed by a chained hash of TOKENS, which every rank computes identically, and a
+      * per-rank store would write the same key several times over. Off unless
+diff --git a/core/engine_bringup.cpp b/core/engine_bringup.cpp
+index bf2c9b6..a2246fc 100644
+--- a/core/engine_bringup.cpp
++++ b/core/engine_bringup.cpp
+@@ -1177,6 +1177,41 @@ int Engine::plan() {
+         VramBudget vb;
+         RAD_TRY(vram_budget_resolve(cfg_, facts, &vb));
+         if (!vb.report.empty()) RAD_INFO("%s", vb.report.c_str());
++
++        /* A RANK WHOSE CACHE COSTS LESS PER TOKEN THAN ITS PEERS' -- an attention-zero rank keeps
++         * no attention cache (rad_kv_group_zero) -- gets a KV pool that backs the SAME token
++         * count as the dearest rank's, and what that saves goes to its expert pool. One block
++         * table serves every rank, so the extra tokens the common pool would buy it are tokens
++         * configure_kv caps away; the bytes are better spent where that rank's larger share of
++         * the experts lives. Only a DERIVED split is re-split: an operator who stated the pools
++         * has decided. A hair over the exact share, so rounding never makes this rank the least.
++         * Where every rank costs the same -- every world the heads divide -- nothing changes. */
++        rank_cfg_.assign(ranks_.size(), cfg_);
++        if (vb.derived_kv && vb.derived_weights && facts.size() == ranks_.size()) {
++            size_t dear = 0;
++            for (size_t i = 1; i < facts.size(); ++i)
++                if (facts[i].kv_ceiling > facts[dear].kv_ceiling) dear = i;
++            const int64_t kv = cfg_.vram_kv_mib * (1024 * 1024);
++            const int64_t span_d = facts[dear].kv_ceiling - facts[dear].kv_fixed;
++            const double  frac   = span_d > 0
++                ? std::min(1.0, (double)std::max<int64_t>(kv - facts[dear].kv_fixed, 0) / (double)span_d)
++                : 1.0;
++            for (size_t i = 0; i < facts.size(); ++i) {
++                if (facts[i].kv_ceiling >= facts[dear].kv_ceiling) continue;
++                const int64_t span_i = facts[i].kv_ceiling - facts[i].kv_fixed;
++                int64_t need = facts[i].kv_fixed + (int64_t)(frac * (double)span_i * 1.01);
++                need = std::min(need, kv);
++                const int64_t kv_mib = (need + (1024 * 1024) - 1) / (1024 * 1024);
++                if (kv_mib >= cfg_.vram_kv_mib) continue;
++                rank_cfg_[i].vram_kv_mib      = kv_mib;
++                rank_cfg_[i].vram_weights_mib = cfg_.vram_weights_mib + (cfg_.vram_kv_mib - kv_mib);
++                RAD_INFO("kv: rank %d's cache costs %s at the worst case where rank %d's costs %s; "
++                         "its KV pool is %lld MiB for the same tokens, and the %lld MiB saved go to "
++                         "its weights", ranks_[i]->index, humanb(facts[i].kv_ceiling).c_str(),
++                         ranks_[dear]->index, humanb(facts[dear].kv_ceiling).c_str(),
++                         (long long)kv_mib, (long long)(cfg_.vram_kv_mib - kv_mib));
++            }
++        }
+         /* The staging region the budget took out of the experts, above everything the buffer plan
+          * placed -- so it is at the top of the arena, the part the smaller levels lend. */
+         if (vb.stage > 0)
+@@ -1203,7 +1238,9 @@ int Engine::plan() {
+         /* Every pool is budgeted explicitly. No profiling pass, no utilisation fraction, no
+          * inference about what the workload will be (spec §6). Pools refuses by name and by how
+          * much rather than shrinking anything. */
+-        int s = r->pools.configure(cfg_, props.vram_bytes);
++        const size_t ri = (size_t)(&r - ranks_.data());
++        const Config& rc = rank_cfg_.size() == ranks_.size() ? rank_cfg_[ri] : cfg_;
++        int s = r->pools.configure(rc, props.vram_bytes);
+         RAD_INFO("pools:\n%s", r->pools.fit_report().c_str());
+         if (s < 0) {
+             report_pool_refusal(r->index, r->device, r->pools, cfg_);
+-- 
+2.55.0
+
+
+From 6873c2d9a8b5e521cf80a6e31b8f6c76a6ae2198 Mon Sep 17 00:00:00 2001
+From: baKon <mike.ski83@gmail.com>
+Date: Mon, 5 Oct 2026 21:34:09 -0500
+Subject: [PATCH 12/16] arch: the ranks without attention take the remainders
+ first
+
+Whatever does not divide over the world -- the extra block of an expert's
+width, the extra delta-net head -- went to whichever rank the rotation picked,
+and the attention-zero rank, which pays nothing for attention and keeps no
+attention cache, came away the lightest. rad_arch.h remainder_place puts the
+attention-zero ranks first in the order the remainders are handed out, then
+the attention ranks in today's rotation; with no such rank the place is the
+rotation itself and every cut is byte for byte what it was. Flash-Next at
+three ranks: experts 30/30/40 and delta-net heads 5/5/6 instead of 35/35/30
+and 6/5/5.
+---
+ arch/common/rad_arch.h             | 19 +++++++++++++++++--
+ arch/qwen4exp_fp8/qwen4exp_fp8.cpp | 21 +++++++++++++--------
+ tests/arch_test.cpp                | 11 +++++++----
+ 3 files changed, 37 insertions(+), 14 deletions(-)
+
+diff --git a/arch/common/rad_arch.h b/arch/common/rad_arch.h
+index 27923bb..1609d77 100644
+--- a/arch/common/rad_arch.h
++++ b/arch/common/rad_arch.h
+@@ -733,6 +733,21 @@ inline long long meta_int2(const RadModelMeta* m, const char* gguf_key, const ch
+  * count). With it set, a width the world does not divide is left whole in g.n_ff and the plugin
+  * takes its slice from there; without it the refusal stands, because for every other plugin g.n_ff
+  * IS the per-rank width. A width that does divide is unaffected either way. */
++/* THE REMAINDER-FIRST ORDER OF THE RANKS. Whatever does not divide evenly over the world -- the
++ * extra block of an expert's width, the extra delta-net head -- goes to the ranks with NO
++ * attention first: they pay nothing for attention (rad_block_attn_gated_fp8.h: one fill) and keep
++ * no attention cache (rad_kv_group_zero), so they have the time and the memory for it, and every
++ * rank with heads is lighter for it. This is a rank's PLACE in that order: the attention-zero ranks
++ * take places 0..n-1 whatever `parity` is, and the attention ranks follow in today's rotation by
++ * `parity` -- so where no rank is attention-zero (every world the heads divide) the place is
++ * exactly (rank - parity) mod world and every cut is what it always was, byte for byte. */
++inline int64_t remainder_place(const Geom& g, int rank, int parity) {
++    const int nz = g.world - g.attn_world;
++    if (rank >= g.attn_world) return rank - g.attn_world;
++    const int aw = g.attn_world;
++    return nz + ((rank - parity) % aw + aw) % aw;
++}
++
+ inline int geom_from(Geom& g, const RadModelMeta* m, const RadBuildCtx* c,
+                      const char* dtype, uint32_t act_dtype, bool arch_splits_ff = false) {
+     if (!m || !c) return RAD_E_INVAL;
+@@ -808,8 +823,8 @@ inline int geom_from(Geom& g, const RadModelMeta* m, const RadBuildCtx* c,
+         g.attn_zero  = g.rank >= g.attn_world;
+         g.attn_rank  = g.attn_zero ? g.attn_world - 1 : g.rank;
+         fprintf(stderr, "radiance: world_size = %d over n_head_kv = %lld: attention on %d rank(s), "
+-                        "rank(s) %d..%d carry zero attention weights and the delta net and "
+-                        "experts of a full rank\n", g.world, (long long)g.n_head_kv_all,
++                        "rank(s) %d..%d carry no attention and take the delta net's and the "
++                        "experts' remainders first\n", g.world, (long long)g.n_head_kv_all,
+                 g.attn_world, g.attn_world, g.world - 1);
+     }
+     const int aw = g.attn_world, ar = g.attn_rank;
+diff --git a/arch/qwen4exp_fp8/qwen4exp_fp8.cpp b/arch/qwen4exp_fp8/qwen4exp_fp8.cpp
+index 64c0726..85d1667 100644
+--- a/arch/qwen4exp_fp8/qwen4exp_fp8.cpp
++++ b/arch/qwen4exp_fp8/qwen4exp_fp8.cpp
+@@ -422,8 +422,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
+                 return RAD_E_INVAL;
+             }
+             const int64_t ratio = nv / nk, base = nk / g.world, rem = nk % g.world;
+-            gc.n_head_k = base + (g.rank < rem ? 1 : 0);
+-            gc.k_first  = g.rank * base + (g.rank < rem ? g.rank : rem);
++            /* The extra heads go to the ranks without attention first (rad_arch.h
++             * remainder_place); with none, this is the rank's own place and the split as before. */
++            const int64_t pl = remainder_place(g, g.rank, 0);
++            gc.n_head_k = base + (pl < rem ? 1 : 0);
++            gc.k_first  = pl * base + (pl < rem ? pl : rem);
+             gc.n_head_v = ratio * gc.n_head_k;
+             gc.v_first  = ratio * gc.k_first;
+             fprintf(stderr, "radiance: qwen4exp: rank %d takes delta-net K heads [%lld, %lld) of "
+@@ -602,8 +605,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
+                  * the ranks to fit inside the two parities' blocks together. */
+                 const int64_t base = nb / g.world, extra = nb % g.world;
+                 for (int q = 0; q < 2; ++q) {
+-                    /* This rank's place in expert parity q's split: first for its own parity. */
+-                    const int64_t p = (g.rank - q + g.world) % g.world;
++                    /* This rank's place in expert parity q's split: the ranks without attention
++                     * first, then first for its own parity (rad_arch.h remainder_place). */
++                    const int64_t p = remainder_place(g, g.rank, q);
+                     const int64_t b0 = p * base + std::min<int64_t>(p, extra);
+                     const int64_t b1 = b0 + base + (p < extra ? 1 : 0);
+                     mc.ff_lo[q] = b0 * RAD_FP8_BLOCK;
+@@ -617,7 +621,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
+                  * rank already takes of some parity. */
+                 if (g.world == 4) {
+                     for (int q = 0; q < 4; ++q) {
+-                        const int64_t p = (g.rank - q + 4) % 4;
++                        const int64_t p = remainder_place(g, g.rank, q);
+                         const int64_t b0 = p * base + std::min<int64_t>(p, extra);
+                         const int64_t b1 = b0 + base + (p < extra ? 1 : 0);
+                         mc.ff_lo4[q] = b0 * RAD_FP8_BLOCK;
+@@ -635,9 +639,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
+                 } else {
+                     rad_note(b, "routed experts: rank %d computes columns [%lld, %lld) of each "
+                                 "even expert and [%lld, %lld) of each odd one, of %lld. The width "
+-                                "is %lld blocks of %d, which %lld ranks split unevenly, so the rank "
+-                                "taking the extra block alternates with the expert's parity; the "
+-                                "block's all-reduce sums the partials.",
++                                "is %lld blocks of %d, which %lld ranks split unevenly: the extra block "
++                                "goes to a rank without attention where there is one, else to the "
++                                "rank the expert's parity picks; the block's all-reduce sums the "
++                                "partials.",
+                              g.rank, (long long)mc.ff_lo[0], (long long)mc.ff_hi[0],
+                              (long long)mc.ff_lo[1], (long long)mc.ff_hi[1],
+                              (long long)g.n_ff_all, (long long)nb, RAD_FP8_BLOCK,
+diff --git a/tests/arch_test.cpp b/tests/arch_test.cpp
+index 1a0864c..18a0475 100644
+--- a/tests/arch_test.cpp
++++ b/tests/arch_test.cpp
+@@ -2584,11 +2584,14 @@ TEST(flashnext_tp3_zeroes_the_third_ranks_attention_and_splits_gdn_heads_unevenl
+             CHECK_EQ(o->span_lo, (int64_t)ar * (n_head / attn_world) * head_dim);
+             CHECK_EQ(o->zero, zero);
+         }
+-        /* (3) THE DELTA NET: 6, 5, 5 K heads and 18, 15, 15 V heads, real on every rank, as
++        /* (3) THE DELTA NET: 5, 5, 6 K heads and 15, 15, 18 V heads, real on every rank, as
+          * per-part spans of [q|k|v|z] and of the conv channels, a one-span of A_log. */
+         const int64_t base = nk / world, rem = nk % world;
+-        const int64_t my_k = base + (r < rem ? 1 : 0);
+-        const int64_t k0   = r * base + (r < rem ? r : rem);
++        /* The extra head goes to the rank without attention first (rad_arch.h remainder_place):
++         * rank 2 takes 6, ranks 0 and 1 take 5 each. */
++        const int64_t pl   = r >= attn_world ? r - attn_world : (world - attn_world) + r % attn_world;
++        const int64_t my_k = base + (pl < rem ? 1 : 0);
++        const int64_t k0   = pl * base + (pl < rem ? pl : rem);
+         const int64_t my_v = (nv / nk) * my_k, v0 = (nv / nk) * k0;
+         const RecWeight* in = find_w(b[r], "blk.0.ssm_inz.weight");
+         REQUIRE(in != nullptr);
+@@ -2629,7 +2632,7 @@ TEST(flashnext_tp3_zeroes_the_third_ranks_attention_and_splits_gdn_heads_unevenl
+     /* The three ranks' K heads are the container's 16, once each. */
+     {
+         int64_t sum = 0;
+-        for (int r = 0; r < world; ++r) sum += nk / world + (r < nk % world ? 1 : 0);
++        for (int r = 0; r < world; ++r) sum += nk / world + (r < nk % world ? 1 : 0);   /* a permutation of the same counts */
+         CHECK_EQ(sum, nk);
+     }
+ }
+-- 
+2.55.0
+
+
+From 7baccf97534dc1851910df266e2c06e7fc77838f Mon Sep 17 00:00:00 2001
+From: baKon <mike.ski83@gmail.com>
+Date: Mon, 5 Oct 2026 21:39:20 -0500
+Subject: [PATCH 13/16] docs: OPS.md -- the fill op
+
+---
+ docs/OPS.md | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/docs/OPS.md b/docs/OPS.md
+index 4653a9c..170961e 100644
+--- a/docs/OPS.md
++++ b/docs/OPS.md
+@@ -173,6 +173,7 @@ adding a kernel plugin; "refused at load" names one op and leaves you to find th
+ | `softmax` | `M`(range) `n` `dtype` | `x` → `y` |
+ | `sigmoid` | `M`(range) `n` `dtype` | `x` → `y` |
+ | `silu` | `M` `n` `dtype` | `x` → `y` |
++| `fill` | `M`(range) `n` `dtype` `value`:f64/opt | → `y` |
+ 
+ `gelu` and `silu` are two ops with one schema, and `silu` carries a row of its own because a row
+ names one op.
+@@ -217,6 +218,12 @@ it. Every other elementwise op keeps the strict same-shape rule.
+ `sigmoid`, with a broadcast-capable `mul`, is what a gated shared expert needs
+ (`ffn_gate_inp_shexp`). Without it the shared expert runs ungated, which is a different model.
+ 
++`fill` has no input: `y = value` over the extent, `value` 0 when absent. It is the op a rank issues
++where it computes nothing and a reader downstream still expects a defined buffer -- an
++attention-zero rank's block (`docs/TP3.md`) is one `fill` of its output wire before the all-reduce.
++A wire shared across layers cannot be zeroed once a step, and a memset knows neither the row pitch
++nor the dtype; this does.
++
+ ## Quantisation and rotation
+ 
+ | op | params | operands |
+-- 
+2.55.0
+
+
+From e70e0bc6451a8d0338916201fe0dedd71f3ab657 Mon Sep 17 00:00:00 2001
+From: baKon <mike.ski83@gmail.com>
+Date: Mon, 5 Oct 2026 22:20:13 -0500
+Subject: [PATCH 14/16] kv: a rank's recurrent state is cleared and tiered by
+ its own plan, not rank 0's
+
+A freshly assigned recurrent slot was zeroed on every rank with rank 0's
+layer_bytes_per_state. The ranks' shares of a group need not be equal --
+a world the heads do not divide gives them different counts -- and a rank
+holding more heads than rank 0 had the tail of its state left as the last
+sequence left it, read by the recurrence from the first token. Every rank
+now clears by its own plan. The host/disk tier made the same assumption
+twice: a slot was rank 0's entry times the world and a rank's window sat
+at rank times that; a slot is now the sum of the ranks' entries, each
+rank's window where the ranks before it end, and the staging ring is
+sized for the largest. Equal shares give the bytes they always gave.
+
+Found by moving the extra delta-net head of Flash-Next at three ranks
+onto the attention-zero rank: rank 0 held five heads, rank 2 six, and
+every answer was noise.
+---
+ core/engine.cpp         | 15 ++++++++++-----
+ core/engine_bringup.cpp | 35 +++++++++++++++++++++++++----------
+ 2 files changed, 35 insertions(+), 15 deletions(-)
+
+diff --git a/core/engine.cpp b/core/engine.cpp
+index 71b4dea..7628367 100644
+--- a/core/engine.cpp
++++ b/core/engine.cpp
+@@ -534,15 +534,20 @@ int Engine::step_loop() {
+          * recorded the grab and cannot do the write itself (StateClear in core/mem/kv.h); this is
+          * the first moment a stream exists and the last before the ranks are released, and it is
+          * off the hot path -- the list is empty on every step but a sequence's first. Every rank
+-         * clears its own pool: the slot number is the scheduler's, the memory is the rank's. */
++         * clears its own pool BY ITS OWN PLAN: the slot number is the scheduler's, the memory and
++         * its size are the rank's. A state is as large as the heads this rank holds of the group,
++         * and the ranks' shares need not be equal (rad_arch.h remainder_place): a rank clearing
++         * rank 0's byte count of a larger state leaves its tail as the last sequence left it, and
++         * the recurrence reads it from the first token. */
+         for (const StateClear& c : ranks_[0]->kv.state_clears()) {
+-            const KVGroupPlan* gp = ranks_[0]->kv.plan(c.group);
+-            if (!gp || !gp->stateful()) continue;
+-            const int64_t bytes = gp->layer_bytes_per_state();
+-            for (auto& rk : ranks_)
++            for (auto& rk : ranks_) {
++                const KVGroupPlan* gp = rk->kv.plan(c.group);
++                if (!gp || !gp->stateful()) continue;
++                const int64_t bytes = gp->layer_bytes_per_state();
+                 for (int64_t l = 0; l < gp->n_layers; ++l)
+                     if (void* p = rk->kv.state_ptr(c.group, (int32_t)l, c.slot))
+                         rad_memset_async(p, 0, bytes, rk->ctx.stream());
++            }
+         }
+         ranks_[0]->kv.clear_state_clears();
+ 
+diff --git a/core/engine_bringup.cpp b/core/engine_bringup.cpp
+index a2246fc..424995a 100644
+--- a/core/engine_bringup.cpp
++++ b/core/engine_bringup.cpp
+@@ -2621,15 +2621,31 @@ int Engine::configure_kv() {
+     {
+         const bool tier_asked = cfg_.prefix_cache_host_mib > 0 || cfg_.prefix_cache_disk_mib > 0;
+         const std::vector<int32_t>& cg = ranks_[0]->prefix.cached_groups();
+-        int64_t entry_bytes = 0;
+-        for (int32_t g : cg) {
+-            const KVGroupPlan* p = ranks_[0]->kv.plan(g);
+-            if (p && p->paged()) entry_bytes += p->bytes_per_block;
+-        }
+         /* ONE SLOT HOLDS EVERY RANK'S SHARD. An entry under tensor parallelism is n_ranks
+          * pieces of KV that are not interchangeable, so the unit the tiers store and budget
+-         * in is the whole thing; each rank writes only its own window of it. */
+-        const int64_t slot_bytes = entry_bytes * (int64_t)ranks_.size();
++         * in is the whole thing; each rank writes only its own window of it. THE SHARDS NEED
++         * NOT BE EQUAL -- a rank's block holds its own heads of a group, and a world the heads
++         * do not divide gives the ranks different shares, or none (rad_kv_group_zero) -- so a
++         * slot is the SUM of the ranks' entries and a rank's window starts where the ranks
++         * before it end. Where every rank's share is the same this is n_ranks times one entry
++         * at offsets of one entry, as it always was. The sizing below (TierExec::sizes) takes
++         * the largest rank's entry: the staging ring is a rank's own, and the ring that fits
++         * the largest fits every one. */
++        std::vector<int64_t> rank_entry(ranks_.size(), 0), rank_ck(ranks_.size(), 0);
++        std::vector<int64_t> entry_off(ranks_.size(), 0), ck_off(ranks_.size(), 0);
++        int64_t entry_bytes = 0, slot_bytes = 0, ck_slot_bytes = 0;
++        for (size_t i = 0; i < ranks_.size(); ++i) {
++            for (int32_t g : cg) {
++                const KVGroupPlan* p = ranks_[i]->kv.plan(g);
++                if (p && p->paged()) rank_entry[i] += p->bytes_per_block;
++            }
++            rank_ck[i]   = ranks_[i]->kv.checkpoint_bytes();
++            entry_off[i] = slot_bytes;
++            ck_off[i]    = ck_slot_bytes;
++            slot_bytes    += rank_entry[i];
++            ck_slot_bytes += rank_ck[i];
++            entry_bytes = std::max(entry_bytes, rank_entry[i]);
++        }
+ 
+         /* ---- how the tier is split between the two halves of a session ----
+          *
+@@ -2657,7 +2673,6 @@ int Engine::configure_kv() {
+          * Two thirds is the ceiling. Not because the arithmetic asks for one, but because the
+          * clamp above is a property of THIS build rather than of the design, and a tier with
+          * almost no room for blocks would be badly sized the day it is lifted. */
+-        const int64_t ck_slot_bytes = ranks_[0]->kv.checkpoint_bytes() * (int64_t)ranks_.size();
+         int64_t ck_host_cap = 0, ck_disk_slots = 0;
+         if (ck_slot_bytes > 0) {
+             const int64_t bs = ranks_[0]->prefix.block_size();
+@@ -2795,8 +2810,8 @@ int Engine::configure_kv() {
+                                            max_batch, max_copy, max_chain,
+                                            /*leader=*/&r == &ranks_[0],
+                                            r->device,
+-                                           (int64_t)(&r - &ranks_[0]) * entry_bytes,
+-                                           (int64_t)(&r - &ranks_[0]) * ranks_[0]->kv.checkpoint_bytes(),
++                                           entry_off[(size_t)(&r - &ranks_[0])],
++                                           ck_off[(size_t)(&r - &ranks_[0])],
+                                            /*shared=*/r->mover.transfer_stream())
+                             != RAD_OK) {
+                         all = false;
+-- 
+2.55.0
+
+
+From 665d18125778584b4d72fb3d4b30e76e4707f108 Mon Sep 17 00:00:00 2001
+From: baKon <mike.ski83@gmail.com>
+Date: Mon, 5 Oct 2026 23:55:38 -0500
+Subject: [PATCH 15/16] arch: the experts stay on the rotation; only the delta
+ net goes remainder-first
+
+An expert block is a whole GEMM of every routed token; a rank taking the
+extra block of every class became the step's slowest rank. Measured on
+Flash-Next at three ranks, interleaved image A/B, two reps each: experts
+50/25/25 cost 25% a step single-stream; one class's extra block
+(37/25/37) swung 16.5-19.1 ms between boots; the delta-net head alone on
+the attention-zero rank gave 15.6 ms both reps against 16.7-17.2, c1
++10-16%, c4 +4%, c8 +2-3%, acceptance unchanged at 2.54 tokens a step.
+The experts cut as every world always has; TP2 and TP4 are untouched.
+---
+ arch/common/rad_arch.h             | 15 ++++++++-------
+ arch/qwen4exp_fp8/qwen4exp_fp8.cpp | 21 +++++++++++++--------
+ 2 files changed, 21 insertions(+), 15 deletions(-)
+
+diff --git a/arch/common/rad_arch.h b/arch/common/rad_arch.h
+index 1609d77..8cde9a3 100644
+--- a/arch/common/rad_arch.h
++++ b/arch/common/rad_arch.h
+@@ -733,11 +733,12 @@ inline long long meta_int2(const RadModelMeta* m, const char* gguf_key, const ch
+  * count). With it set, a width the world does not divide is left whole in g.n_ff and the plugin
+  * takes its slice from there; without it the refusal stands, because for every other plugin g.n_ff
+  * IS the per-rank width. A width that does divide is unaffected either way. */
+-/* THE REMAINDER-FIRST ORDER OF THE RANKS. Whatever does not divide evenly over the world -- the
+- * extra block of an expert's width, the extra delta-net head -- goes to the ranks with NO
+- * attention first: they pay nothing for attention (rad_block_attn_gated_fp8.h: one fill) and keep
+- * no attention cache (rad_kv_group_zero), so they have the time and the memory for it, and every
+- * rank with heads is lighter for it. This is a rank's PLACE in that order: the attention-zero ranks
++/* THE REMAINDER-FIRST ORDER OF THE RANKS. What does not divide evenly over the world and is a
++ * HEAD'S worth of work -- the extra delta-net head -- goes to the ranks with NO attention first:
++ * they pay nothing for attention (rad_block_attn_gated_fp8.h: one fill) and keep no attention
++ * cache (rad_kv_group_zero), so they have the time for it, and the rank that held the extra head
++ * AND attention -- the step's slowest -- is lighter for it. An expert's extra block is not a
++ * head's worth (qwen4exp_fp8.cpp says why it stays on the rotation). This is a rank's PLACE in that order: the attention-zero ranks
+  * take places 0..n-1 whatever `parity` is, and the attention ranks follow in today's rotation by
+  * `parity` -- so where no rank is attention-zero (every world the heads divide) the place is
+  * exactly (rank - parity) mod world and every cut is what it always was, byte for byte. */
+@@ -823,8 +824,8 @@ inline int geom_from(Geom& g, const RadModelMeta* m, const RadBuildCtx* c,
+         g.attn_zero  = g.rank >= g.attn_world;
+         g.attn_rank  = g.attn_zero ? g.attn_world - 1 : g.rank;
+         fprintf(stderr, "radiance: world_size = %d over n_head_kv = %lld: attention on %d rank(s), "
+-                        "rank(s) %d..%d carry no attention and take the delta net's and the "
+-                        "experts' remainders first\n", g.world, (long long)g.n_head_kv_all,
++                        "rank(s) %d..%d carry no attention and take the delta net's remainder "
++                        "first\n", g.world, (long long)g.n_head_kv_all,
+                 g.attn_world, g.attn_world, g.world - 1);
+     }
+     const int aw = g.attn_world, ar = g.attn_rank;
+diff --git a/arch/qwen4exp_fp8/qwen4exp_fp8.cpp b/arch/qwen4exp_fp8/qwen4exp_fp8.cpp
+index 85d1667..0a2d347 100644
+--- a/arch/qwen4exp_fp8/qwen4exp_fp8.cpp
++++ b/arch/qwen4exp_fp8/qwen4exp_fp8.cpp
+@@ -605,9 +605,15 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
+                  * the ranks to fit inside the two parities' blocks together. */
+                 const int64_t base = nb / g.world, extra = nb % g.world;
+                 for (int q = 0; q < 2; ++q) {
+-                    /* This rank's place in expert parity q's split: the ranks without attention
+-                     * first, then first for its own parity (rad_arch.h remainder_place). */
+-                    const int64_t p = remainder_place(g, g.rank, q);
++                    /* This rank's place in expert parity q's split: first for its own parity.
++                     * THE EXPERTS DO NOT GO REMAINDER-FIRST (rad_arch.h remainder_place): an
++                     * expert block is a whole GEMM of every routed token, and a rank taking the
++                     * extra block of every class became the step's slowest rank -- measured at
++                     * three ranks, Flash-Next: 50/25/25 cost 25% a step single-stream, and even
++                     * one class's extra block (37/25/37) swung 16-19 ms between boots. The delta
++                     * net's remainder is a head's worth of work and goes to the rank without
++                     * attention; the experts stay on the rotation every world has always had. */
++                    const int64_t p = (g.rank - q + g.world) % g.world;
+                     const int64_t b0 = p * base + std::min<int64_t>(p, extra);
+                     const int64_t b1 = b0 + base + (p < extra ? 1 : 0);
+                     mc.ff_lo[q] = b0 * RAD_FP8_BLOCK;
+@@ -621,7 +627,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
+                  * rank already takes of some parity. */
+                 if (g.world == 4) {
+                     for (int q = 0; q < 4; ++q) {
+-                        const int64_t p = remainder_place(g, g.rank, q);
++                        const int64_t p = (g.rank - q + 4) % 4;
+                         const int64_t b0 = p * base + std::min<int64_t>(p, extra);
+                         const int64_t b1 = b0 + base + (p < extra ? 1 : 0);
+                         mc.ff_lo4[q] = b0 * RAD_FP8_BLOCK;
+@@ -639,10 +645,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
+                 } else {
+                     rad_note(b, "routed experts: rank %d computes columns [%lld, %lld) of each "
+                                 "even expert and [%lld, %lld) of each odd one, of %lld. The width "
+-                                "is %lld blocks of %d, which %lld ranks split unevenly: the extra block "
+-                                "goes to a rank without attention where there is one, else to the "
+-                                "rank the expert's parity picks; the block's all-reduce sums the "
+-                                "partials.",
++                                "is %lld blocks of %d, which %lld ranks split unevenly, so the rank "
++                                "taking the extra block alternates with the expert's parity; the "
++                                "block's all-reduce sums the partials.",
+                              g.rank, (long long)mc.ff_lo[0], (long long)mc.ff_hi[0],
+                              (long long)mc.ff_lo[1], (long long)mc.ff_hi[1],
+                              (long long)g.n_ff_all, (long long)nb, RAD_FP8_BLOCK,
+-- 
+2.55.0
+
+
+From 31c429ec3334f265524246f0b1bb96a534b847a7 Mon Sep 17 00:00:00 2001
+From: baKon <mike.ski83@gmail.com>
+Date: Tue, 6 Oct 2026 00:33:46 -0500
+Subject: [PATCH 16/16] Revert "budget: a rank whose cache costs less backs the
+ same tokens with a smaller pool"
+
+This reverts commit fa01bd2. Its premise -- the attention-zero rank holds
+a larger share of the experts, so the bytes its cache does not need are
+best spent in its weights pool -- went with the experts' remainder-first
+placement (665d181): the experts cut as every world always has and no
+rank has a larger share. What the re-split did keep was a KV pool on that
+rank a third the size of its peers', and BetterBench after three 250k
+prefills (a cache three quarters full) decoded 13-23% slower at every
+concurrency than the same tree without it, while a cold server measured
+faster. The pool goes back to the common split; what the rank does not
+carve for attention it lends, as every rank's idle cache does.
+---
+ core/engine.h           |  4 ----
+ core/engine_bringup.cpp | 39 +--------------------------------------
+ 2 files changed, 1 insertion(+), 42 deletions(-)
+
+diff --git a/core/engine.h b/core/engine.h
+index 7b4002f..d16a857 100644
+--- a/core/engine.h
++++ b/core/engine.h
+@@ -76,10 +76,6 @@ private:
+      * shared BY POINTER rather than broadcast (spec §1). */
+     struct Rank;
+     std::vector<std::unique_ptr<Rank>> ranks_;
+-    /* Each rank's pool budgets: cfg_'s, except where a rank's cache costs less than its peers'
+-     * and its KV pool is sized for the same tokens with the difference in its weights (see the
+-     * resolve in Engine::plan). */
+-    std::vector<Config> rank_cfg_;
+     /* THE DISK HALF OF THE IDLE TIERS. One store for the engine, not one per rank: it is
+      * keyed by a chained hash of TOKENS, which every rank computes identically, and a
+      * per-rank store would write the same key several times over. Off unless
+diff --git a/core/engine_bringup.cpp b/core/engine_bringup.cpp
+index 424995a..baf0b3d 100644
+--- a/core/engine_bringup.cpp
++++ b/core/engine_bringup.cpp
+@@ -1177,41 +1177,6 @@ int Engine::plan() {
+         VramBudget vb;
+         RAD_TRY(vram_budget_resolve(cfg_, facts, &vb));
+         if (!vb.report.empty()) RAD_INFO("%s", vb.report.c_str());
+-
+-        /* A RANK WHOSE CACHE COSTS LESS PER TOKEN THAN ITS PEERS' -- an attention-zero rank keeps
+-         * no attention cache (rad_kv_group_zero) -- gets a KV pool that backs the SAME token
+-         * count as the dearest rank's, and what that saves goes to its expert pool. One block
+-         * table serves every rank, so the extra tokens the common pool would buy it are tokens
+-         * configure_kv caps away; the bytes are better spent where that rank's larger share of
+-         * the experts lives. Only a DERIVED split is re-split: an operator who stated the pools
+-         * has decided. A hair over the exact share, so rounding never makes this rank the least.
+-         * Where every rank costs the same -- every world the heads divide -- nothing changes. */
+-        rank_cfg_.assign(ranks_.size(), cfg_);
+-        if (vb.derived_kv && vb.derived_weights && facts.size() == ranks_.size()) {
+-            size_t dear = 0;
+-            for (size_t i = 1; i < facts.size(); ++i)
+-                if (facts[i].kv_ceiling > facts[dear].kv_ceiling) dear = i;
+-            const int64_t kv = cfg_.vram_kv_mib * (1024 * 1024);
+-            const int64_t span_d = facts[dear].kv_ceiling - facts[dear].kv_fixed;
+-            const double  frac   = span_d > 0
+-                ? std::min(1.0, (double)std::max<int64_t>(kv - facts[dear].kv_fixed, 0) / (double)span_d)
+-                : 1.0;
+-            for (size_t i = 0; i < facts.size(); ++i) {
+-                if (facts[i].kv_ceiling >= facts[dear].kv_ceiling) continue;
+-                const int64_t span_i = facts[i].kv_ceiling - facts[i].kv_fixed;
+-                int64_t need = facts[i].kv_fixed + (int64_t)(frac * (double)span_i * 1.01);
+-                need = std::min(need, kv);
+-                const int64_t kv_mib = (need + (1024 * 1024) - 1) / (1024 * 1024);
+-                if (kv_mib >= cfg_.vram_kv_mib) continue;
+-                rank_cfg_[i].vram_kv_mib      = kv_mib;
+-                rank_cfg_[i].vram_weights_mib = cfg_.vram_weights_mib + (cfg_.vram_kv_mib - kv_mib);
+-                RAD_INFO("kv: rank %d's cache costs %s at the worst case where rank %d's costs %s; "
+-                         "its KV pool is %lld MiB for the same tokens, and the %lld MiB saved go to "
+-                         "its weights", ranks_[i]->index, humanb(facts[i].kv_ceiling).c_str(),
+-                         ranks_[dear]->index, humanb(facts[dear].kv_ceiling).c_str(),
+-                         (long long)kv_mib, (long long)(cfg_.vram_kv_mib - kv_mib));
+-            }
+-        }
+         /* The staging region the budget took out of the experts, above everything the buffer plan
+          * placed -- so it is at the top of the arena, the part the smaller levels lend. */
+         if (vb.stage > 0)
+@@ -1238,9 +1203,7 @@ int Engine::plan() {
+         /* Every pool is budgeted explicitly. No profiling pass, no utilisation fraction, no
+          * inference about what the workload will be (spec §6). Pools refuses by name and by how
+          * much rather than shrinking anything. */
+-        const size_t ri = (size_t)(&r - ranks_.data());
+-        const Config& rc = rank_cfg_.size() == ranks_.size() ? rank_cfg_[ri] : cfg_;
+-        int s = r->pools.configure(rc, props.vram_bytes);
++        int s = r->pools.configure(cfg_, props.vram_bytes);
+         RAD_INFO("pools:\n%s", r->pools.fit_report().c_str());
+         if (s < 0) {
+             report_pool_refusal(r->index, r->device, r->pools, cfg_);
+-- 
+2.55.0
+

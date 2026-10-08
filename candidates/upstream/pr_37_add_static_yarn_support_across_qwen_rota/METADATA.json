@@ -1,0 +1,110 @@
+{
+  "pr_id": 37,
+  "title": "Add static YaRN support across Qwen rotary paths",
+  "author": "hazyumps",
+  "url": "https://codeberg.org/StillDeadcode/radiance/pulls/37",
+  "status": "QUEUED_LOW_PRIORITY",
+  "modified_files": [
+    "abi/rad_yarn.h",
+    "arch/common/rad_arch.h",
+    "arch/common/rad_block_dflash2.h",
+    "arch/qwen35_bf16/qwen35_bf16.cpp",
+    "arch/qwen35_fp8/qwen35_fp8.cpp",
+    "docs/OPS.md",
+    "docs/YARN.md",
+    "libavx/avx_attn.cpp",
+    "libavx/avx_cases.cpp",
+    "libavx/avx_registry.cpp",
+    "libr4d/r4d_model_bf16.hip",
+    "libr4d/r4d_qk_norm_rope_gate.hip",
+    "libr4d/r4d_rows.cpp",
+    "libr4d/r4d_selftest.cpp",
+    "libref/ref_attn.cpp",
+    "libref/ref_registry.cpp",
+    "tests/arch_test.cpp",
+    "tests/data/generate_yarn_reference.py",
+    "tests/data/yarn_reference.json",
+    "tests/data/yarn_reference_rocm.json",
+    "tests/ref_test.cpp",
+    "tests/yarn_test.cpp",
+    "arch/common/rad_qsa.h",
+    "arch/qwen4exp_fp8/qwen4exp_fp8.cpp",
+    "docs/OPS.md",
+    "docs/YARN.md",
+    "libr4d/r4d_qsa_block_key_bf16.hip",
+    "libr4d/r4d_rows.cpp",
+    "libr4d/r4d_selftest.cpp",
+    "tests/arch_test.cpp",
+    "abi/rad_yarn.h",
+    "arch/common/rad_arch.h",
+    "docs/YARN-VALIDATION.md",
+    "docs/YARN.md",
+    "libavx/avx_cases.cpp",
+    "tests/ref_test.cpp",
+    "tests/yarn_test.cpp"
+  ],
+  "safety_audit": {
+    "passed": true,
+    "violations": []
+  },
+  "jev_evaluation": {
+    "subsystem": {
+      "type": "choice",
+      "choice": "general",
+      "confidence": 0.73,
+      "probabilities": {
+        "general": 0.76,
+        "interconnect": 0.0,
+        "gemm": 0.0,
+        "drafter": 0.0,
+        "tooling": 0.0,
+        "serving": 0.01,
+        "gdn": 0.0,
+        "qsa": 0.23,
+        "moe": 0.0
+      }
+    },
+    "violates_rdna4_limits": {
+      "type": "noul",
+      "noul": 0.11
+    },
+    "feasibility": {
+      "type": "score",
+      "score": 2.69,
+      "confidence": 0.72,
+      "legend": {
+        "0": "Unfeasible / contradicts hardware laws / CUDA-only",
+        "1": "High risk or complex external dependency",
+        "2": "Moderate feasibility / experimental",
+        "3": "Feasible / standard ROCm HIP implementation",
+        "4": "Immediate high-value quick win"
+      },
+      "probabilities": {
+        "0": 0.01,
+        "1": 0.07,
+        "2": 0.15,
+        "3": 0.76,
+        "4": 0.01
+      }
+    },
+    "performance_roi": {
+      "type": "score",
+      "score": 0.76,
+      "confidence": 0.38,
+      "legend": {
+        "0": "Zero or negative performance impact (docs, tool, placebo)",
+        "1": "Marginal gain (<2%) or monitoring/stability utility",
+        "2": "Solid architectural gain (2-5%)",
+        "3": "High-impact gain (5-15%)",
+        "4": "Breakthrough gain (>15%)"
+      },
+      "probabilities": {
+        "0": 0.44,
+        "1": 0.43,
+        "2": 0.07,
+        "3": 0.06,
+        "4": 0.0
+      }
+    }
+  }
+}

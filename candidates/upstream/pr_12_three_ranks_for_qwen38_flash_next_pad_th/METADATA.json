@@ -1,0 +1,90 @@
+{
+  "pr_id": 12,
+  "title": "Three ranks for Qwen3.8-Flash-Next: pad the checkpoint, exactly; all-reduce, all-gather, the vocab and expert-width splits at world 3",
+  "author": "bakon",
+  "url": "https://codeberg.org/StillDeadcode/radiance/pulls/12",
+  "status": "READY_TO_TEST",
+  "modified_files": [
+    "docs/OPS.md",
+    "libr4d/r4d.h",
+    "libr4d/r4d_ar_entry.hip",
+    "libr4d/r4d_ar_gather_Nrank.hip",
+    "libr4d/r4d_ar_oneshot_Nrank_exact.hip",
+    "libr4d/r4d_plugin.h",
+    "libr4d/r4d_rows.cpp",
+    "libr4d/r4d_selftest.cpp",
+    "arch/common/rad_arch.h",
+    "arch/qwen4exp_fp8/qwen4exp_fp8.cpp",
+    "core/engine.cpp",
+    "README.md",
+    "docs/TP3.md",
+    "tools/pad_tp.py",
+    "tools/pad_verify.py",
+    "arch/common/rad_arch.h",
+    "arch/qwen4exp_fp8/qwen4exp_fp8.cpp"
+  ],
+  "safety_audit": {
+    "passed": true,
+    "violations": []
+  },
+  "jev_evaluation": {
+    "subsystem": {
+      "type": "choice",
+      "choice": "interconnect",
+      "confidence": 0.87,
+      "probabilities": {
+        "moe": 0.01,
+        "gdn": 0.0,
+        "drafter": 0.0,
+        "serving": 0.0,
+        "qsa": 0.0,
+        "tooling": 0.0,
+        "interconnect": 0.88,
+        "gemm": 0.0,
+        "general": 0.11
+      }
+    },
+    "violates_rdna4_limits": {
+      "type": "noul",
+      "noul": 0.19
+    },
+    "feasibility": {
+      "type": "score",
+      "score": 1.61,
+      "confidence": 0.39,
+      "legend": {
+        "0": "Unfeasible / contradicts hardware laws / CUDA-only",
+        "1": "High risk or complex external dependency",
+        "2": "Moderate feasibility / experimental",
+        "3": "Feasible / standard ROCm HIP implementation",
+        "4": "Immediate high-value quick win"
+      },
+      "probabilities": {
+        "0": 0.14,
+        "1": 0.29,
+        "2": 0.41,
+        "3": 0.16,
+        "4": 0.0
+      }
+    },
+    "performance_roi": {
+      "type": "score",
+      "score": 1.11,
+      "confidence": 0.06,
+      "legend": {
+        "0": "Zero or negative performance impact (docs, tool, placebo)",
+        "1": "Marginal gain (<2%) or monitoring/stability utility",
+        "2": "Solid architectural gain (2-5%)",
+        "3": "High-impact gain (5-15%)",
+        "4": "Breakthrough gain (>15%)"
+      },
+      "probabilities": {
+        "0": 0.47,
+        "1": 0.2,
+        "2": 0.12,
+        "3": 0.15,
+        "4": 0.06
+      }
+    }
+  }
+}

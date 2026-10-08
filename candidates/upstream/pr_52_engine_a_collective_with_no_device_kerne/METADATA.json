@@ -1,0 +1,77 @@
+{
+  "pr_id": 52,
+  "title": "engine: a collective with no device kernel for a message size refuses at startup (#46)",
+  "author": "bakon",
+  "url": "https://codeberg.org/StillDeadcode/radiance/pulls/52",
+  "status": "READY_TO_TEST",
+  "modified_files": [
+    "README.md",
+    "core/config.cpp",
+    "core/engine_bringup.cpp",
+    "docs/GUIDE.md"
+  ],
+  "safety_audit": {
+    "passed": true,
+    "violations": []
+  },
+  "jev_evaluation": {
+    "subsystem": {
+      "type": "choice",
+      "choice": "interconnect",
+      "confidence": 0.46,
+      "probabilities": {
+        "moe": 0.0,
+        "qsa": 0.0,
+        "general": 0.48,
+        "interconnect": 0.52,
+        "gemm": 0.0,
+        "tooling": 0.0,
+        "drafter": 0.0,
+        "gdn": 0.0,
+        "serving": 0.0
+      }
+    },
+    "violates_rdna4_limits": {
+      "type": "noul",
+      "noul": 0.09
+    },
+    "feasibility": {
+      "type": "score",
+      "score": 2.68,
+      "confidence": 0.55,
+      "legend": {
+        "0": "Unfeasible / contradicts hardware laws / CUDA-only",
+        "1": "High risk or complex external dependency",
+        "2": "Moderate feasibility / experimental",
+        "3": "Feasible / standard ROCm HIP implementation",
+        "4": "Immediate high-value quick win"
+      },
+      "probabilities": {
+        "0": 0.03,
+        "1": 0.09,
+        "2": 0.16,
+        "3": 0.61,
+        "4": 0.11
+      }
+    },
+    "performance_roi": {
+      "type": "score",
+      "score": 0.73,
+      "confidence": 0.74,
+      "legend": {
+        "0": "Zero or negative performance impact (docs, tool, placebo)",
+        "1": "Marginal gain (<2%) or monitoring/stability utility",
+        "2": "Solid architectural gain (2-5%)",
+        "3": "High-impact gain (5-15%)",
+        "4": "Breakthrough gain (>15%)"
+      },
+      "probabilities": {
+        "0": 0.29,
+        "1": 0.7,
+        "2": 0.0,
+        "3": 0.01,
+        "4": 0.0
+      }
+    }
+  }
+}

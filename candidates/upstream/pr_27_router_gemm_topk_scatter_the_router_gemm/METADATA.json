@@ -1,0 +1,80 @@
+{
+  "pr_id": 27,
+  "title": "router_gemm_topk_scatter: the router GEMM, its selection and its sort in one launch",
+  "author": "keptn42",
+  "url": "https://codeberg.org/StillDeadcode/radiance/pulls/27",
+  "status": "READY_TO_TEST",
+  "modified_files": [
+    "arch/common/rad_block_moe_fp8.h",
+    "docs/OPS.md",
+    "libr4d/r4d_moe.hip",
+    "libr4d/r4d_plugin.h",
+    "libr4d/r4d_rows.cpp",
+    "libr4d/r4d_selftest.cpp",
+    "libr4d/r4d_shapes.cpp"
+  ],
+  "safety_audit": {
+    "passed": true,
+    "violations": []
+  },
+  "jev_evaluation": {
+    "subsystem": {
+      "type": "choice",
+      "choice": "moe",
+      "confidence": 1.0,
+      "probabilities": {
+        "general": 0.0,
+        "gdn": 0.0,
+        "drafter": 0.0,
+        "moe": 1.0,
+        "qsa": 0.0,
+        "gemm": 0.0,
+        "serving": 0.0,
+        "tooling": 0.0,
+        "interconnect": 0.0
+      }
+    },
+    "violates_rdna4_limits": {
+      "type": "noul",
+      "noul": 0.13
+    },
+    "feasibility": {
+      "type": "score",
+      "score": 2.21,
+      "confidence": 0.28,
+      "legend": {
+        "0": "Unfeasible / contradicts hardware laws / CUDA-only",
+        "1": "High risk or complex external dependency",
+        "2": "Moderate feasibility / experimental",
+        "3": "Feasible / standard ROCm HIP implementation",
+        "4": "Immediate high-value quick win"
+      },
+      "probabilities": {
+        "0": 0.11,
+        "1": 0.14,
+        "2": 0.22,
+        "3": 0.5,
+        "4": 0.03
+      }
+    },
+    "performance_roi": {
+      "type": "score",
+      "score": 1.88,
+      "confidence": 0.53,
+      "legend": {
+        "0": "Zero or negative performance impact (docs, tool, placebo)",
+        "1": "Marginal gain (<2%) or monitoring/stability utility",
+        "2": "Solid architectural gain (2-5%)",
+        "3": "High-impact gain (5-15%)",
+        "4": "Breakthrough gain (>15%)"
+      },
+      "probabilities": {
+        "0": 0.04,
+        "1": 0.27,
+        "2": 0.48,
+        "3": 0.21,
+        "4": 0.0
+      }
+    }
+  }
+}

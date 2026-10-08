@@ -1,0 +1,79 @@
+{
+  "pr_id": 25,
+  "title": "moe_gemm_q decode form: weight loads without serial waits, and the run search in one round trip",
+  "author": "keptn42",
+  "url": "https://codeberg.org/StillDeadcode/radiance/pulls/25",
+  "status": "READY_TO_TEST",
+  "modified_files": [
+    "libr4d/r4d.h",
+    "libr4d/r4d_moe.hip",
+    "libr4d/r4d_selftest.cpp",
+    "libr4d/r4d.h",
+    "libr4d/r4d_moe.hip",
+    "libr4d/r4d_selftest.cpp"
+  ],
+  "safety_audit": {
+    "passed": true,
+    "violations": []
+  },
+  "jev_evaluation": {
+    "subsystem": {
+      "type": "choice",
+      "choice": "moe",
+      "confidence": 0.94,
+      "probabilities": {
+        "moe": 0.95,
+        "qsa": 0.0,
+        "general": 0.0,
+        "interconnect": 0.0,
+        "gemm": 0.05,
+        "tooling": 0.0,
+        "drafter": 0.0,
+        "serving": 0.0,
+        "gdn": 0.0
+      }
+    },
+    "violates_rdna4_limits": {
+      "type": "noul",
+      "noul": 0.22
+    },
+    "feasibility": {
+      "type": "score",
+      "score": 2.48,
+      "confidence": 0.5,
+      "legend": {
+        "0": "Unfeasible / contradicts hardware laws / CUDA-only",
+        "1": "High risk or complex external dependency",
+        "2": "Moderate feasibility / experimental",
+        "3": "Feasible / standard ROCm HIP implementation",
+        "4": "Immediate high-value quick win"
+      },
+      "probabilities": {
+        "0": 0.02,
+        "1": 0.11,
+        "2": 0.28,
+        "3": 0.55,
+        "4": 0.04
+      }
+    },
+    "performance_roi": {
+      "type": "score",
+      "score": 3.1,
+      "confidence": 0.56,
+      "legend": {
+        "0": "Zero or negative performance impact (docs, tool, placebo)",
+        "1": "Marginal gain (<2%) or monitoring/stability utility",
+        "2": "Solid architectural gain (2-5%)",
+        "3": "High-impact gain (5-15%)",
+        "4": "Breakthrough gain (>15%)"
+      },
+      "probabilities": {
+        "0": 0.04,
+        "1": 0.02,
+        "2": 0.06,
+        "3": 0.57,
+        "4": 0.31
+      }
+    }
+  }
+}

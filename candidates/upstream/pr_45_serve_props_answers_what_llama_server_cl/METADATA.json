@@ -1,0 +1,78 @@
+{
+  "pr_id": 45,
+  "title": "serve: /props answers what llama-server clients read",
+  "author": "bakon",
+  "url": "https://codeberg.org/StillDeadcode/radiance/pulls/45",
+  "status": "SERVING_ENDPOINT",
+  "modified_files": [
+    "core/server/admin.cpp",
+    "core/server/server.cpp",
+    "core/server/server.h",
+    "docs/GUIDE.md",
+    "tests/server_test.cpp"
+  ],
+  "safety_audit": {
+    "passed": true,
+    "violations": []
+  },
+  "jev_evaluation": {
+    "subsystem": {
+      "type": "choice",
+      "choice": "serving",
+      "confidence": 1.0,
+      "probabilities": {
+        "interconnect": 0.0,
+        "serving": 1.0,
+        "general": 0.0,
+        "qsa": 0.0,
+        "moe": 0.0,
+        "gemm": 0.0,
+        "tooling": 0.0,
+        "drafter": 0.0,
+        "gdn": 0.0
+      }
+    },
+    "violates_rdna4_limits": {
+      "type": "noul",
+      "noul": 0.05
+    },
+    "feasibility": {
+      "type": "score",
+      "score": 2.79,
+      "confidence": 0.43,
+      "legend": {
+        "0": "Unfeasible / contradicts hardware laws / CUDA-only",
+        "1": "High risk or complex external dependency",
+        "2": "Moderate feasibility / experimental",
+        "3": "Feasible / standard ROCm HIP implementation",
+        "4": "Immediate high-value quick win"
+      },
+      "probabilities": {
+        "0": 0.06,
+        "1": 0.08,
+        "2": 0.11,
+        "3": 0.52,
+        "4": 0.23
+      }
+    },
+    "performance_roi": {
+      "type": "score",
+      "score": 0.08,
+      "confidence": 0.94,
+      "legend": {
+        "0": "Zero or negative performance impact (docs, tool, placebo)",
+        "1": "Marginal gain (<2%) or monitoring/stability utility",
+        "2": "Solid architectural gain (2-5%)",
+        "3": "High-impact gain (5-15%)",
+        "4": "Breakthrough gain (>15%)"
+      },
+      "probabilities": {
+        "0": 0.94,
+        "1": 0.05,
+        "2": 0.01,
+        "3": 0.0,
+        "4": 0.0
+      }
+    }
+  }
+}

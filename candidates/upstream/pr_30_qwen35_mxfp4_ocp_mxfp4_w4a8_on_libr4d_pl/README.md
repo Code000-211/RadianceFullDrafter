@@ -1,0 +1,202 @@
+# Upstream PR #30: qwen35_mxfp4 (OCP-MXFP4 W4A8 on libr4d) plus general serving features: draft refill, lookup draft, adaptive verify length, f16 delta-net state, int4 logits rows, E4M3 embedding and codebooks
+
+**Author**: @slydlake  
+**Upstream URL**: https://codeberg.org/StillDeadcode/radiance/pulls/30  
+**Status**: `READY_TO_TEST`  
+**Candidate Directory**: `candidates/upstream/pr_30_qwen35_mxfp4_ocp_mxfp4_w4a8_on_libr4d_pl`  
+
+---
+
+## 1. TypeSafe AI (Jev System One) Evaluation
+- **Target Subsystem**: `drafter`
+- **RDNA4 Hardware Violation Risk**: `0.15` (lower is safer)
+- **Feasibility Score**: `2.51 / 4.00`
+- **Expected Performance ROI**: `2.46 / 4.00`
+
+---
+
+## 2. Deterministic Safety Audit
+- **Safety Gate Result**: `PASS`
+- Zero dangerous anti-patterns detected.
+
+---
+
+## 3. Modified Files (155)
+- `core/device/aql.cpp`
+- `core/engine.cpp`
+- `core/runtime/ctx.cpp`
+- `core/runtime/ctx.h`
+- `core/server/dashboard.cpp`
+- `core/server/liveview.h`
+- `docs/GUIDE.md`
+- `core/server/adapters.h`
+- `core/server/iface.h`
+- `core/server/oai.cpp`
+- `core/server/oai.h`
+- `core/server/server.cpp`
+- `core/text/tokenizer.cpp`
+- `core/text/tokenizer.h`
+- `arch/qwen35_fp8/qwen35_fp8.cpp`
+- `docs/GUIDE.md`
+- `core/engine.cpp`
+- `core/sched/adaptive_k.cpp`
+- `core/sched/adaptive_k.h`
+- `core/sched/metrics.h`
+- `core/sched/scheduler.cpp`
+- `core/sched/scheduler.h`
+- `docs/GUIDE.md`
+- `tests/sched_test.cpp`
+- `core/engine.cpp`
+- `core/sched/lookup_draft.cpp`
+- `core/sched/lookup_draft.h`
+- `core/sched/metrics.h`
+- `core/sched/scheduler.cpp`
+- `core/sched/scheduler.h`
+- `core/server/adapters.h`
+- `core/server/iface.h`
+- `core/server/metrics.cpp`
+- `core/server/metrics.h`
+- `docs/GUIDE.md`
+- `tests/data/lookup/copy-answer.ids`
+- `tests/data/lookup/copy-prompt.ids`
+- `tests/lookup_draft_test.cpp`
+- `tests/sched_test.cpp`
+- `tools/CMakeLists.txt`
+- `tools/rad_tokenize.cpp`
+- `core/engine.cpp`
+- `core/mem/prefix.cpp`
+- `core/mem/prefix.h`
+- `core/sched/mem_iface.h`
+- `core/sched/metrics.h`
+- `core/sched/scheduler.cpp`
+- `core/sched/scheduler.h`
+- `core/server/adapters.h`
+- `core/server/iface.h`
+- `core/server/metrics.cpp`
+- `core/server/metrics.h`
+- `docs/GUIDE.md`
+- `tests/mem_test.cpp`
+- `tests/sched_test.cpp`
+- `docs/GUIDE.md`
+- `docs/KERNELS.md`
+- `libr4d/README.md`
+- `libr4d/r4d.h`
+- `libr4d/r4d_fp8_layout.cpp`
+- `libr4d/r4d_fp8_lm.h`
+- `libr4d/r4d_gemm_fp8a16_nt_m1.hip`
+- `libr4d/r4d_plugin.h`
+- `libr4d/r4d_rows.cpp`
+- `libr4d/r4d_selftest.cpp`
+- `arch/common/rad_block_dflash2.h`
+- `arch/qwen35_fp8/qwen35_fp8.cpp`
+- `docs/KERNELS.md`
+- `docs/OPS.md`
+- `libavx/avx_cases.cpp`
+- `libavx/avx_isa.h`
+- `libavx/avx_registry.cpp`
+- `libavx/avx_sample.cpp`
+- `libr4d/r4d.h`
+- `libr4d/r4d_dflash_select_bf16.hip`
+- `libr4d/r4d_fp8_layout.cpp`
+- `libr4d/r4d_plugin.h`
+- `libr4d/r4d_rows.cpp`
+- `libr4d/r4d_selftest.cpp`
+- `libr4d/r4d_shapes.cpp`
+- `libref/ref_ops.h`
+- `libref/ref_quant.cpp`
+- `libref/ref_registry.cpp`
+- `libref/ref_shapes.cpp`
+- `tests/ref_test.cpp`
+- `arch/common/rad_block_dflash2.h`
+- `arch/qwen35_fp8/qwen35_fp8.cpp`
+- `arch/common/rad_block_mlp_fp8.h`
+- `arch/common/rad_fp8.h`
+- `arch/qwen35_fp8/qwen35_fp8.cpp`
+- `arch/qwen35_mxfp4/CMakeLists.txt`
+- `arch/qwen35_mxfp4/qwen35_mxfp4.cpp`
+- `core/format/checkpoint.cpp`
+- `core/format/checkpoint.h`
+- `libr4d/CMakeLists.txt`
+- `libr4d/r4d.h`
+- `libr4d/r4d_args.h`
+- `libr4d/r4d_gemm_args.h`
+- `libr4d/r4d_gemm_mxfp4a8_decode.hip`
+- `libr4d/r4d_gemm_mxfp4a8_nt_m64.hip`
+- `libr4d/r4d_gemm_mxfp4a8_tiled.hip`
+- `libr4d/r4d_plugin.h`
+- `libr4d/r4d_rows.cpp`
+- `libr4d/r4d_selftest.cpp`
+- `tools/opshapes.h`
+- `arch/common/rad_block_attn_gated_fp8.h`
+- `arch/qwen35_fp8/qwen35_fp8.cpp`
+- `arch/common/rad_fp8.h`
+- `arch/qwen35_fp8/qwen35_fp8.cpp`
+- `docs/GUIDE.md`
+- `docs/OPS.md`
+- `libavx/avx_gemm.cpp`
+- `libavx/avx_quant.cpp`
+- `libavx/avx_registry.cpp`
+- `libr4d/r4d.h`
+- `libr4d/r4d_fused_quant_fp8.hip`
+- `libr4d/r4d_gemm_mxfp4a8_tiled.hip`
+- `libr4d/r4d_rows.cpp`
+- `libr4d/r4d_selftest.cpp`
+- `libref/ref_gemm.cpp`
+- `libref/ref_gemm.h`
+- `libref/ref_quant.cpp`
+- `libref/ref_registry.cpp`
+- `tests/ref_test.cpp`
+- `arch/common/rad_block_dflash2.h`
+- `arch/common/rad_fp8.h`
+- `docs/GUIDE.md`
+- `libr4d/r4d.h`
+- `libr4d/r4d_gemm_mxfp4a8_decode.hip`
+- `libr4d/r4d_gemm_mxfp4a8_tiled.hip`
+- `libr4d/r4d_plugin.h`
+- `libr4d/r4d_rows.cpp`
+- `libr4d/r4d_selftest.cpp`
+- `tests/r4d_bands_test.cpp`
+- `arch/common/rad_block_dflash2.h`
+- `arch/common/rad_block_mlp_fp8.h`
+- `arch/common/rad_fp8.h`
+- `docs/GUIDE.md`
+- `docs/OPS.md`
+- `libr4d/CMakeLists.txt`
+- `libr4d/r4d_gemm_mxfp4a8_gated.hip`
+- `libr4d/r4d_plugin.h`
+- `libr4d/r4d_rows.cpp`
+- `libr4d/r4d_selftest.cpp`
+- `data/recipes/q38-27b-mxfp4-df2.recipe`
+- `data/recipes/q38-27b-mxfp4-df2h4.recipe`
+- `data/recipes/q38-27b-mxfp4-df2h4l4.recipe`
+- `data/recipes/q38-27b-mxfp4-df2h4l4a.recipe`
+- `data/recipes/q38-27b-mxfp4-df2h4l4am.recipe`
+- `data/recipes/q38-27b-mxfp4-df2h4l4ame.recipe`
+- `data/recipes/q38-27b-mxfp4-df2h4l4ames.recipe`
+- `data/recipes/q38-27b-mxfp4-df2h8.recipe`
+- `data/recipes/q38-27b-mxfp4-df2mx.recipe`
+- `data/recipes/q38-27b-mxfp4-df2mxf.recipe`
+- `data/recipes/q38-27b-mxfp4.recipe`
+
+---
+
+## 4. Verification & Testing Instructions
+To test this patch cleanly in an isolated worktree:
+```bash
+# 1. Create isolated worktree from golden baseline
+bash scripts/create_worktree.sh test_upstream_pr_30
+
+# 2. Enter worktree and apply patch
+cd worktrees/test_upstream_pr_30
+git apply ../../candidates/upstream/pr_30_qwen35_mxfp4_ocp_mxfp4_w4a8_on_libr4d_pl/pr.patch
+
+# 3. Build HIP kernels
+ninja -C build_hip
+
+# 4. Run Epistemic and ISA Gate Checks
+bash scripts/verify_ground_truth.sh
+bash scripts/verify_rdna4_invariants.sh build_hip
+
+# 5. Run Parity & Benchmark Gate (when authorized)
+bash scripts/gate_check.sh
+```

@@ -1,0 +1,286 @@
+From 65045f88ee1384217ff25f08b051b6fce3fc6386 Mon Sep 17 00:00:00 2001
+From: baKon <mike.ski83@gmail.com>
+Date: Mon, 5 Oct 2026 11:21:35 -0500
+Subject: [PATCH] server: a request log at the info level
+
+docker logs answered nothing about traffic: the only lines the server
+wrote on a request were the kernel recordings, and a refusal left no
+trace at all, so a client reporting "rejected" could not be matched to
+anything. Two lines per request now, at info: one when it is admitted
+(id, endpoint, peer, model, message and tool counts, prompt tokens, n,
+max_tokens) and one from record() when it ends (finish reason, prompt
+tokens and what the prefix cache spared, generated and reasoning
+tokens, time to first token, decode rate, wall). Every refusal logs its
+status, type and message with the peer -- 4xx at info, 5xx as a
+warning. The debug level adds the last user message's opening, one
+bounded line, so a log line can be matched to what was typed; the
+daily's info level never prints prompt text.
+
+HttpRequest carries the peer (httplib's remote_addr:port; empty
+in-process), OaiRequest carries what the parse already walked past
+(message and tool counts, the last user message) and the peer.
+
+(cherry picked from commit 067facd47e2b0c0afeefe79166e77f01c33d588f)
+---
+ core/server/http.cpp   |  1 +
+ core/server/http.h     |  1 +
+ core/server/oai.cpp    | 19 +++++++++++
+ core/server/oai.h      |  8 +++++
+ core/server/server.cpp | 71 ++++++++++++++++++++++++++++++++++++------
+ core/server/server.h   |  6 +++-
+ 6 files changed, 96 insertions(+), 10 deletions(-)
+
+diff --git a/core/server/http.cpp b/core/server/http.cpp
+index 2427425..fe05b1a 100644
+--- a/core/server/http.cpp
++++ b/core/server/http.cpp
+@@ -382,6 +382,7 @@ int HttpTransport::serve(const Router& router, const TransportOptions& o) {
+         req.method = hreq.method;
+         req.path = hreq.path;
+         req.body = std::move(body);
++        req.peer = hreq.remote_addr + ":" + std::to_string(hreq.remote_port);
+         for (auto& h : hreq.headers) req.headers[h.first] = h.second;
+         for (auto& p : hreq.params) req.query[p.first] = p.second;
+         req.closed = [&hreq] { return hreq.is_connection_closed(); };
+diff --git a/core/server/http.h b/core/server/http.h
+index e3e27dc..1a7a6f6 100644
+--- a/core/server/http.h
++++ b/core/server/http.h
+@@ -31,6 +31,7 @@ struct HttpRequest {
+     std::map<std::string, std::string, CiLess> headers;
+     std::map<std::string, std::string> query;
+     std::map<std::string, std::string> params;           /* from a ":name" route segment */
++    std::string peer;                                    /* "addr:port"; empty in-process */
+ 
+     /* True once the peer is gone. The transport supplies it; in-process it is absent and the
+      * waiting paths simply never see a drop. A dropped connection is a cancellation (spec §14),
+diff --git a/core/server/oai.cpp b/core/server/oai.cpp
+index c0b96c2..7f624d4 100644
+--- a/core/server/oai.cpp
++++ b/core/server/oai.cpp
+@@ -1273,6 +1273,24 @@ int parse_chat_request(const std::string& body, const OaiDeps& d, const OaiLimit
+     auto mit = b.find("messages");
+     if (mit == b.end()) { *err = err_bad("messages", "is required"); return RAD_E_INVAL; }
+     json messages = *mit;
++    if (messages.is_array()) {
++        out->n_messages = (int)messages.size();
++        for (auto it = messages.rbegin(); it != messages.rend(); ++it) {
++            if (!it->is_object() || !it->contains("role") || it->at("role") != "user") continue;
++            const auto cit = it->find("content");
++            if (cit == it->end()) break;
++            std::string t;
++            if (cit->is_string()) t = cit->get<std::string>();
++            else if (cit->is_array())
++                for (const auto& part : *cit)
++                    if (part.is_object() && part.value("type", "") == "text")
++                        t += part.value("text", "");
++            for (char& c : t) if (c == '\n' || c == '\r' || c == '\t') c = ' ';
++            if (t.size() > 160) { t.resize(157); t += "..."; }
++            out->last_user = std::move(t);
++            break;
++        }
++    }
+ 
+     /* tools and tool_choice. */
+     json tools = json::array();
+@@ -1290,6 +1308,7 @@ int parse_chat_request(const std::string& body, const OaiDeps& d, const OaiLimit
+             }
+         }
+         tools = *tit;
++        out->n_tools = (int)tools.size();
+     }
+ 
+     /* FORCING A CALL IS REFUSED, and not because the grammar is out of reach -- the template
+diff --git a/core/server/oai.h b/core/server/oai.h
+index 52a0904..498d6ab 100644
+--- a/core/server/oai.h
++++ b/core/server/oai.h
+@@ -88,6 +88,14 @@ struct OaiRequest {
+     bool want_logprobs = false;
+ 
+     bool tools_present = false;
++    /* FOR THE REQUEST LOG, counted while the parse walks the body anyway: the messages and tools
++     * a chat request carried, and the last user message's opening (one line, bounded) that the
++     * debug level prints so a log line can be matched to what was typed. Completion requests
++     * leave them at zero and empty. */
++    int         n_messages = 0;
++    int         n_tools = 0;
++    std::string last_user;
++    std::string peer;             /* the handler sets it from the transport; "" in-process */
+     bool parse_tools = false;
+     /* The reply parser this request's render produced. Per request and not per server: it is the
+      * model's format bound to the tools THIS call sent, so two concurrent requests against the
+diff --git a/core/server/server.cpp b/core/server/server.cpp
+index 5e54216..e4f4bbb 100644
+--- a/core/server/server.cpp
++++ b/core/server/server.cpp
+@@ -1,4 +1,6 @@
+ #include "server.h"
++
++#include <cstdio>
+ #include "json_partial.h"
+ #include "rad_internal.h"
+ 
+@@ -248,13 +250,39 @@ void Server::sweep_abandoned() {
+ 
+ /* ------------------------------------------------------------------ errors */
+ 
+-HttpResponse Server::error_response(const ApiError& e) {
++HttpResponse Server::error_response(const ApiError& e, const std::string& peer) {
+     metrics_.observe_http(e.status);
++    /* A refusal is the line the operator is looking for when a client says "rejected": the
++     * status, the type, the message, and who asked. 4xx is the client's doing and said at info;
++     * 5xx is ours and said as a warning. */
++    if (e.status >= 500)
++        RAD_WARN("req %s%s%s -> %d %s: %s", peer.empty() ? "" : "from ", peer.c_str(),
++                 peer.empty() ? "refused" : "", e.status, e.type.c_str(), e.message.c_str());
++    else
++        RAD_INFO("req %s%s%s -> %d %s: %s", peer.empty() ? "" : "from ", peer.c_str(),
++                 peer.empty() ? "refused" : "", e.status, e.type.c_str(), e.message.c_str());
+     HttpResponse r = HttpResponse::json_body(e.status, e.dump());
+     if (e.status == 429) r.set_header("Retry-After", std::to_string(opt_.retry_after_s));
+     return r;
+ }
+ 
++/* ------------------------------------------------------------------ the request log */
++
++void Server::log_admitted(const OaiRequest& r) const {
++    int64_t n_prompt = 0;
++    for (const auto& p : r.prompts) n_prompt += (int64_t)p.tokens.size();
++    const char* kind = r.endpoint == Endpoint::Chat ? "chat" : "completion";
++    if (r.endpoint == Endpoint::Chat)
++        RAD_INFO("req %s %s%s from %s model=%s msgs=%d tools=%d prompt=%lld tok n=%d max_tokens=%lld",
++                 r.id.c_str(), kind, r.stream ? " stream" : "", r.peer.c_str(), r.model.c_str(),
++                 r.n_messages, r.n_tools, (long long)n_prompt, r.n, (long long)r.max_tokens);
++    else
++        RAD_INFO("req %s %s%s from %s model=%s prompts=%zu prompt=%lld tok n=%d max_tokens=%lld",
++                 r.id.c_str(), kind, r.stream ? " stream" : "", r.peer.c_str(), r.model.c_str(),
++                 r.prompts.size(), (long long)n_prompt, r.n, (long long)r.max_tokens);
++    if (!r.last_user.empty()) RAD_DEBUG("req %s last user: %s", r.id.c_str(), r.last_user.c_str());
++}
++
+ /* ------------------------------------------------------------------ submission */
+ 
+ int Server::submit_all(const OaiRequest& r, std::vector<Generation>* gens, ApiError* err) {
+@@ -529,6 +557,23 @@ void Server::record(const OaiRequest& r, const std::vector<Generation>& gens, Fi
+     }
+     metrics_.observe_request(n_prompt, n_gen, ttft, tpot, e2e, decode,
+                              r.n, r.max_tokens, to_reason(overall));
++
++    /* THE OTHER HALF OF THE REQUEST LOG. The same figures /metrics aggregates, for this one
++     * request: how it ended, what the prefix cache spared, the reasoning share when the parser
++     * knows it, time to first token, the decode rate after it, and the whole. */
++    const TimingsOut t = timings_of(gens);
++    const UsageOut u = usage_of(r, gens);
++    const double rate = (decode > 0.0 && n_gen > 1) ? (double)(n_gen - 1) / decode : -1.0;
++    char reason[32] = "";
++    if (u.reasoning >= 0) std::snprintf(reason, sizeof reason, " reason=%lld", (long long)u.reasoning);
++    char ttft_s[32] = "ttft=-";
++    if (ttft >= 0) std::snprintf(ttft_s, sizeof ttft_s, "ttft=%.2fs", ttft);
++    char rate_s[32] = "";
++    if (rate > 0) std::snprintf(rate_s, sizeof rate_s, " %.1f tok/s", rate);
++    RAD_INFO("req %s %s finish=%s prompt=%lld (cache %lld) gen=%lld%s %s%s %.2fs",
++             r.id.c_str(), r.peer.empty() ? "done" : r.peer.c_str(), finish_reason_oai(overall),
++             (long long)n_prompt, (long long)(t.valid ? t.cache_n : 0), (long long)n_gen, reason,
++             ttft_s, rate_s, e2e);
+ }
+ 
+ /* ------------------------------------------------------------------ non-streaming */
+@@ -609,7 +654,11 @@ HttpResponse Server::blocking_completion(const HttpRequest& req, OaiRequest& r)
+         } else {
+             c.text = r.echo ? r.prompts[g.prompt_index].text + g.text : g.text;
+         }
++        /* The request's outcome for record() and /metrics: a failure or a cancellation over
++         * anything, else a tool call over a plain stop -- the same promotion the streaming path
++         * makes, so a blocking tool call is not counted as "stop". */
+         if (c.finish == Finish::Error || c.finish == Finish::Cancelled) overall = c.finish;
++        else if (c.finish == Finish::ToolCalls && overall == Finish::Stop) overall = c.finish;
+         choices.push_back(std::move(c));
+     }
+ 
+@@ -825,37 +874,41 @@ HttpResponse Server::streaming_completion(const HttpRequest& req, OaiRequest& r)
+ 
+ HttpResponse Server::handle_chat(const HttpRequest& req) {
+     if (!deps_.sched || !deps_.tok)
+-        return error_response(err_not_implemented("the server has no engine attached"));
++        return error_response(err_not_implemented("the server has no engine attached"), req.peer);
+ 
+     OaiRequest r;
+     ApiError err;
+-    if (parse_chat_request(req.body, odeps_, lim_, &r, &err) < 0) return error_response(err);
++    if (parse_chat_request(req.body, odeps_, lim_, &r, &err) < 0) return error_response(err, req.peer);
++    r.peer = req.peer;
+ 
+     sweep_abandoned();
+     if (!admit(r.n_choices())) {
+         metrics_.observe_rejected();
+         return error_response(err_overloaded(
+             "the admission queue is full; retry after " + std::to_string(opt_.retry_after_s) +
+-            "s. The server refuses rather than queueing without bound"));
++            "s. The server refuses rather than queueing without bound"), req.peer);
+     }
++    log_admitted(r);
+     return r.stream ? streaming_completion(req, r) : blocking_completion(req, r);
+ }
+ 
+ HttpResponse Server::handle_completion(const HttpRequest& req) {
+     if (!deps_.sched || !deps_.tok)
+-        return error_response(err_not_implemented("the server has no engine attached"));
++        return error_response(err_not_implemented("the server has no engine attached"), req.peer);
+ 
+     OaiRequest r;
+     ApiError err;
+-    if (parse_completion_request(req.body, odeps_, lim_, &r, &err) < 0) return error_response(err);
++    if (parse_completion_request(req.body, odeps_, lim_, &r, &err) < 0) return error_response(err, req.peer);
++    r.peer = req.peer;
+ 
+     sweep_abandoned();
+     if (!admit(r.n_choices())) {
+         metrics_.observe_rejected();
+         return error_response(err_overloaded(
+             "the admission queue is full; retry after " + std::to_string(opt_.retry_after_s) +
+-            "s. The server refuses rather than queueing without bound"));
++            "s. The server refuses rather than queueing without bound"), req.peer);
+     }
++    log_admitted(r);
+     return r.stream ? streaming_completion(req, r) : blocking_completion(req, r);
+ }
+ 
+@@ -868,7 +921,7 @@ HttpResponse Server::handle_embeddings(const HttpRequest& req) {
+ 
+     OaiRequest r;
+     ApiError err;
+-    if (parse_embeddings_request(req.body, odeps_, lim_, &r, &err) < 0) return error_response(err);
++    if (parse_embeddings_request(req.body, odeps_, lim_, &r, &err) < 0) return error_response(err, req.peer);
+ 
+     std::vector<std::vector<float>> vecs;
+     UsageOut u;
+@@ -898,7 +951,7 @@ HttpResponse Server::handle_models(const HttpRequest& req) {
+         e.type = "not_found_error";
+         e.param = "model";
+         e.message = "no such model: " + id;
+-        return error_response(e);
++        return error_response(e, req.peer);
+     }
+     metrics_.observe_http(200);
+     return HttpResponse::json_body(200, models_body(opt_.model_id, started_at_));
+diff --git a/core/server/server.h b/core/server/server.h
+index a578915..ef9f07a 100644
+--- a/core/server/server.h
++++ b/core/server/server.h
+@@ -189,7 +189,11 @@ private:
+     HttpResponse handle_stats(const HttpRequest& req);
+     HttpResponse handle_graph(const HttpRequest& req);
+ 
+-    HttpResponse error_response(const ApiError& e);
++    HttpResponse error_response(const ApiError& e, const std::string& peer = std::string());
++    /* THE REQUEST LOG. One line when a request is admitted and one from record() when it ends,
++     * at the info level, so `docker logs` answers "who asked what, how long, how did it end"
++     * without the engine's own levels. The debug level adds the last user message's opening. */
++    void log_admitted(const OaiRequest& r) const;
+ 
+     /* Admission. Returns false when the queue is full; the caller answers 429. */
+     bool  admit(int64_t n);
+-- 
+2.55.0
+

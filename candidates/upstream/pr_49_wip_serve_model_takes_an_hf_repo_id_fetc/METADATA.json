@@ -1,0 +1,75 @@
+{
+  "pr_id": 49,
+  "title": "WIP: serve: --model takes an HF repo id, fetched to $RADIANCE_HOME/hf via hfget.sh",
+  "author": "redxherring",
+  "url": "https://codeberg.org/StillDeadcode/radiance/pulls/49",
+  "status": "SERVING_ENDPOINT",
+  "modified_files": [
+    "core/main.cpp",
+    "scripts/hfget.sh"
+  ],
+  "safety_audit": {
+    "passed": true,
+    "violations": []
+  },
+  "jev_evaluation": {
+    "subsystem": {
+      "type": "choice",
+      "choice": "serving",
+      "confidence": 1.0,
+      "probabilities": {
+        "tooling": 0.0,
+        "interconnect": 0.0,
+        "serving": 1.0,
+        "gemm": 0.0,
+        "general": 0.0,
+        "qsa": 0.0,
+        "drafter": 0.0,
+        "gdn": 0.0,
+        "moe": 0.0
+      }
+    },
+    "violates_rdna4_limits": {
+      "type": "noul",
+      "noul": 0.09
+    },
+    "feasibility": {
+      "type": "score",
+      "score": 1.97,
+      "confidence": 0.16,
+      "legend": {
+        "0": "Unfeasible / contradicts hardware laws / CUDA-only",
+        "1": "High risk or complex external dependency",
+        "2": "Moderate feasibility / experimental",
+        "3": "Feasible / standard ROCm HIP implementation",
+        "4": "Immediate high-value quick win"
+      },
+      "probabilities": {
+        "0": 0.02,
+        "1": 0.36,
+        "2": 0.27,
+        "3": 0.33,
+        "4": 0.02
+      }
+    },
+    "performance_roi": {
+      "type": "score",
+      "score": 0.41,
+      "confidence": 0.66,
+      "legend": {
+        "0": "Zero or negative performance impact (docs, tool, placebo)",
+        "1": "Marginal gain (<2%) or monitoring/stability utility",
+        "2": "Solid architectural gain (2-5%)",
+        "3": "High-impact gain (5-15%)",
+        "4": "Breakthrough gain (>15%)"
+      },
+      "probabilities": {
+        "0": 0.66,
+        "1": 0.29,
+        "2": 0.03,
+        "3": 0.02,
+        "4": 0.0
+      }
+    }
+  }
+}

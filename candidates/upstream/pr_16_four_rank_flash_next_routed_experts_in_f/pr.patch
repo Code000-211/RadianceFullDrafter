@@ -1,0 +1,2864 @@
+From 610bcd114877600e3ea3f46626334df5375809ef Mon Sep 17 00:00:00 2001
+From: keptn42 <keptn42@noreply.codeberg.org>
+Date: Mon, 5 Oct 2026 11:53:51 +0200
+Subject: [PATCH 1/5] four-rank Flash-Next: the shared and plain experts'
+ remainders go to ranks 2 and 3
+
+At four ranks the routed parity split leaves ranks 0 and 1 widest, and the
+shared expert's extra block and the plain bf16 experts' extra tiles were cut
+from rank 0 as well. Both remainders now go to the ranks the routed split
+leaves narrowest. One and two ranks declare byte for byte as before.
+---
+ arch/common/rad_block_moe_fp8.h    | 24 ++++++++++++------
+ arch/qwen4exp_fp8/qwen4exp_fp8.cpp | 38 +++++++++++++++++++++++++---
+ docs/ARCHITECTURES.md              | 11 ++++----
+ tests/arch_test.cpp                | 40 +++++++++++++++++++-----------
+ 4 files changed, 82 insertions(+), 31 deletions(-)
+
+diff --git a/arch/common/rad_block_moe_fp8.h b/arch/common/rad_block_moe_fp8.h
+index 481b74c..fce97f5 100644
+--- a/arch/common/rad_block_moe_fp8.h
++++ b/arch/common/rad_block_moe_fp8.h
+@@ -183,6 +183,12 @@ struct MoeFP8 {
+          * The arm's stages run behind the routed ones on the same queue (see pass()): a routed
+          * GEMM's tail leaves compute units idle, and the arm fills them. */
+         int64_t shared_lo = 0, shared_hi = 0;
++        /* THIS RANK'S PLACE WHERE THE PLAIN EXPERTS' 64-WIDE TILES DO NOT DIVIDE over the ranks:
++         * the first places take one tile more. -1 is the rank's own index. A permutation of the
++         * ranks, the same on every rank, so every tile still has exactly one owner; the
++         * architecture sets it above two ranks to keep the extra tiles off the ranks that already
++         * take the routed experts' extra blocks. */
++        int64_t extra_place = -1;
+         int     norm_topk    = 1;   /* renormalise the kept routing weights to sum to one */
+         /* THE EXPERT WEIGHT AT FOUR BITS rather than E4M3, which for Qwen3.8-Flash-Next is the
+          * difference between a model that fits two cards and one that does not (the registry row
+@@ -1072,11 +1078,12 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
+             /* ONE SLICE A RANK, and it does not have to be the same size on every rank: an uneven
+              * share of the 64-wide tiles is still whole tiles, and an uneven share is the only
+              * kind available when the width does not divide -- this family's 640 columns are ten
+-             * tiles, which four ranks take as 3, 3, 2, 2. Every tile has exactly one owner, each
+-             * rank writes its own columns of gate/up and reads its own of down, and the block's
+-             * all-reduce sums the partials exactly as it does for the quantised experts and for
+-             * the shared arm. The even case keeps the even-split declaration verbatim -- no span
+-             * at all -- so a rank count that divides declares exactly as it did before. */
++             * tiles, which four ranks take as 2, 2, 3, 3 (Config::extra_place puts ranks 2 and 3
++             * first, the ranks without a routed extra block). Every tile has exactly one owner,
++             * each rank writes its own columns of gate/up and reads its own of down, and the
++             * block's all-reduce sums the partials exactly as it does for the quantised experts
++             * and for the shared arm. The even case keeps the even-split declaration verbatim --
++             * no span at all -- so a rank count that divides declares exactly as it did before. */
+             psh_row = RAD_SHARD_ROW;
+             psh_col = RAD_SHARD_COL;
+             pparts  = 2;
+@@ -1088,8 +1095,11 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
+                 return RAD_E_INVAL;
+             } else {
+                 const int64_t nt = full / 64, base = nt / g.world, extra = nt % g.world;
+-                const int64_t t0 = (int64_t)g.rank * base + std::min<int64_t>(g.rank, extra);
+-                const int64_t t1 = t0 + base + ((int64_t)g.rank < extra ? 1 : 0);
++                /* Cut by the rank's place (Config::extra_place), not necessarily its index. */
++                const int64_t pr = c.extra_place >= 0 ? c.extra_place : (int64_t)g.rank;
++                if (pr >= g.world) return RAD_E_INVAL;
++                const int64_t t0 = pr * base + std::min<int64_t>(pr, extra);
++                const int64_t t1 = t0 + base + (pr < extra ? 1 : 0);
+                 plo = t0 * 64;
+                 phi = t1 * 64;
+                 wp  = phi - plo;
+diff --git a/arch/qwen4exp_fp8/qwen4exp_fp8.cpp b/arch/qwen4exp_fp8/qwen4exp_fp8.cpp
+index 393a7b3..bd0477d 100644
+--- a/arch/qwen4exp_fp8/qwen4exp_fp8.cpp
++++ b/arch/qwen4exp_fp8/qwen4exp_fp8.cpp
+@@ -292,6 +292,28 @@ static int64_t ngram_table_rows(int64_t base, int64_t heads, int64_t divisor) {
+     return divisor > 1 ? ((total + divisor - 1) / divisor) * divisor : total;
+ }
+ 
++/* A RANK'S PLACE WHEN A WIDTH THAT DOES NOT DIVIDE IS CUT OVER THE RANKS, the first places taking
++ * one unit more: the ranks in order of how many 128-column blocks of an even/odd pair of routed
++ * experts declare()'s parity split gives each, fewest first, by rank among equals. At four ranks
++ * and five blocks that is ranks 2, 3, 0, 1 -- ranks 0 and 1 hold the routed extra blocks, and
++ * cutting the shared expert and the plain experts from rank 0 as well stacks their extra columns on
++ * the ranks every block's all-reduce already waits for. Where the routed width divides it is the
++ * rank; declare() asks only above two ranks. */
++static int64_t narrow_place(int64_t n_ff_all, int world, int rank) {
++    const int64_t nb = n_ff_all / RAD_FP8_BLOCK;
++    if (n_ff_all % RAD_FP8_BLOCK || nb < world || nb % world == 0) return rank;
++    auto blocks = [&](int r) {
++        int64_t n = 0;
++        for (int q = 0; q < 2; ++q)
++            n += nb / world + ((r - q + world) % world < nb % world ? 1 : 0);
++        return n;
++    };
++    int64_t place = 0;
++    for (int r = 0; r < world; ++r)
++        if (blocks(r) < blocks(rank) || (blocks(r) == blocks(rank) && r < rank)) ++place;
++    return place;
++}
++
+ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
+     if (!b || !meta || !ctx) return RAD_E_INVAL;
+     if (ctx->rank < 0 || ctx->rank >= MAX_RANKS) return RAD_E_INVAL;
+@@ -405,9 +427,15 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
+         mc.n_ff_exp    = g.n_ff;
+         mc.n_ff_shared = meta_int2(meta, "qwen4exp.expert_shared_feed_forward_length",
+                                    "shared_expert_intermediate_size", 0);
++        /* This rank's place where a remainder is handed out: the rank itself at one or two ranks,
++         * and above that the narrow ranks first (narrow_place). The plain experts' tile split in
++         * MoeFP8 takes the same place. */
++        const int64_t place = g.world > 2 ? narrow_place(g.n_ff_all, g.world, g.rank) : g.rank;
++        mc.extra_place = g.world > 2 ? place : -1;
+         /* THE SHARED ARM IS SPLIT BY WHOLE fp8 SCALE BLOCKS: evenly when its width halves into
+          * them, and otherwise as evenly as whole blocks allow -- this family's 640 columns are
+-         * five blocks, three on rank 0 and two on rank 1. See MoeFP8::Config::shared_lo. */
++         * five blocks, three on rank 0 and two on rank 1; at four ranks two on rank 2 and one on
++         * each of the others. See MoeFP8::Config::shared_lo. */
+         if (mc.n_ff_shared > 0 && g.world > 1 && (mc.n_ff_shared / g.world) % RAD_FP8_BLOCK == 0) {
+             int s;
+             if ((s = divide_or_fail(mc.n_ff_shared, g.world,
+@@ -423,8 +451,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
+             }
+             const int64_t nb = mc.n_ff_shared / RAD_FP8_BLOCK;
+             const int64_t base = nb / g.world, extra = nb % g.world;
+-            const int64_t b0 = (int64_t)g.rank * base + std::min<int64_t>(g.rank, extra);
+-            const int64_t b1 = b0 + base + ((int64_t)g.rank < extra ? 1 : 0);
++            const int64_t b0 = place * base + std::min<int64_t>(place, extra);
++            const int64_t b1 = b0 + base + (place < extra ? 1 : 0);
+             mc.shared_lo   = b0 * RAD_FP8_BLOCK;
+             mc.shared_hi   = b1 * RAD_FP8_BLOCK;
+             mc.n_ff_shared = mc.shared_hi - mc.shared_lo;
+@@ -496,7 +524,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
+          * go, so ranks 0 and 1 compute three blocks of every even/odd pair of experts and ranks 2
+          * and 3 compute two, and the all-reduce has ranks 2 and 3 wait for the other two. Equal
+          * shares need the extra block rotated over four places -- the expert's number mod 4, four
+-         * slice tables where moe_gemm_q takes two.
++         * slice tables where moe_gemm_q takes two. What can move without them does: the shared
++         * expert's extra block and the plain experts' extra tiles go to ranks 2 and 3
++         * (narrow_place), so ranks 0 and 1 take one shared block and two plain tiles.
+          *
+          * WHY NOT EXPERT PARALLELISM, which splits the EXPERTS: rank r owns [r*E/W, (r+1)*E/W)
+          * whole. The bytes a rank reads are the same on average either way, but which rank a
+diff --git a/docs/ARCHITECTURES.md b/docs/ARCHITECTURES.md
+index 57ea101..63bd9bc 100644
+--- a/docs/ARCHITECTURES.md
++++ b/docs/ARCHITECTURES.md
+@@ -305,14 +305,15 @@ rank 2, `[4, 5)` on rank 3, and each rank's place on the odd parity shifts by on
+ fat block there instead of rank 0 — so no rank takes the extra block of both parities. A world
+ above the block count is refused at declare, by name: a rank with an empty slice computes nothing
+ and still joins the all-reduce. The shared expert's 640 columns split as evenly as whole blocks
+-allow: five blocks over four ranks is rank 0 `[0, 256)` and one block each on ranks 1, 2 and 3.
++allow: five blocks over four ranks is rank 2 `[0, 256)` and one block each on ranks 3, 0 and 1.
+ 
+ **At four ranks the shares are not equal.** Parity gives the extra block only two places to go, so
+ ranks 0 and 1 compute three blocks of every even/odd pair of routed experts and ranks 2 and 3
+-compute two; the shared expert's extra block is rank 0's, and the protected bf16 experts' ten
+-64-wide tiles go 3, 3, 2, 2. Ranks 2 and 3 wait for the other two at every block's all-reduce.
+-Equal shares need the extra block rotated by the expert's number mod 4: four slice tables where
+-`moe_gemm_q` takes two.
++compute two. What does not divide elsewhere is cut from the other end: the shared expert's extra
++block is rank 2's, and the protected bf16 experts' ten 64-wide tiles go 2, 2, 3, 3. That takes one
++shared block off rank 0, the slowest rank, and leaves ranks 0 and 1 still a routed block per
++even/odd pair ahead of ranks 2 and 3 at every block's all-reduce. Equal shares need the extra block
++rotated by the expert's number mod 4: four slice tables where `moe_gemm_q` takes two.
+ Expert parallelism — whole experts a rank — is what this replaced, and why it stays replaced: the
+ recipe protects its bf16 experts in pairs precisely so each rank's quantised count stays even, and
+ sharding experts by rank breaks that parity property the weight tables rest on.
+diff --git a/tests/arch_test.cpp b/tests/arch_test.cpp
+index 39b05b4..39bd200 100644
+--- a/tests/arch_test.cpp
++++ b/tests/arch_test.cpp
+@@ -2022,20 +2022,29 @@ TEST(flashnext_tp4_replicates_kv_heads_and_splits_expert_widths) {
+         CHECK_EQ(join(op_names(b[r])), join(op_names(b[0])));
+     }
+ 
+-    /* THE SHARED ARM IS SPLIT BY WHOLE BLOCKS AND IS UNEVEN AT FOUR: 640 is five blocks of 128, so
+-     * the rank taking the extra block is rank 0 -- [0,256) [256,384) [384,512) [512,640) in the
+-     * model's column numbering, the same rule that gives rank 0 three of five blocks at two ranks
+-     * (qwen4exp_fp8.cpp's uneven-block branch). This is the one world-4 span that is NOT a KV head. */
++    /* THE SHARED ARM IS SPLIT BY WHOLE BLOCKS AND IS UNEVEN AT FOUR: 640 is five blocks of 128, and
++     * the rank taking the extra block is rank 2, the first rank the routed split gives no extra
++     * block (qwen4exp_fp8.cpp's narrow_place) -- ranks 2, 3, 0, 1 cut [0,256) [256,384) [384,512)
++     * [512,640) in the model's column numbering. At two ranks rank 0 still takes three of five.
++     * This is the one world-4 span that is NOT a KV head. */
++    const int64_t sh_lo[] = { 384, 512, 0,   256 };
++    const int64_t sh_hi[] = { 512, 640, 256, 384 };
+     for (int r = 0; r < world; ++r) {
+         const RecWeight* sg = find_w(b[r], "blk.0.ffn_gate_up_shexp.weight");
+         REQUIRE(sg != nullptr);
+         CHECK(sg->span_set);
+-        const int64_t want_lo[] = { 0,   256, 384, 512 };
+-        const int64_t want_hi[] = { 256, 384, 512, 640 };
+-        CHECK_EQ(sg->span_lo, want_lo[r]);
+-        CHECK_EQ(sg->span_hi, want_hi[r]);
+-        CHECK_EQ(sg->d.shape[0], 2 * (want_hi[r] - want_lo[r]));   /* gate's rows and up's */
+-        if (r) CHECK_EQ(sg->span_lo, find_w(b[r - 1], "blk.0.ffn_gate_up_shexp.weight")->span_hi);
++        CHECK_EQ(sg->span_lo, sh_lo[r]);
++        CHECK_EQ(sg->span_hi, sh_hi[r]);
++        CHECK_EQ(sg->d.shape[0], 2 * (sh_hi[r] - sh_lo[r]));   /* gate's rows and up's */
++    }
++    /* Every block of the shared expert has exactly one owner, read off the declared spans. */
++    for (int64_t i = 0; i < 640; i += 128) {
++        int owners = 0;
++        for (int r = 0; r < world; ++r) {
++            const RecWeight* sg = find_w(b[r], "blk.0.ffn_gate_up_shexp.weight");
++            owners += sg->span_lo <= i && i < sg->span_hi;
++        }
++        CHECK_EQ(owners, 1);
+     }
+ 
+     /* AT TWO, THE OLD DECLARATION: the KV heads split, so the even shard already selects the right
+@@ -2089,17 +2098,18 @@ TEST(flashnext_tp4_replicates_kv_heads_and_splits_expert_widths) {
+      * it refused the model on the ranks where that number was wrong -- two of four, which then
+      * never arrived at the all-reduce's rendezvous and took the whole launch down with it.
+      *
+-     * Ten tiles over four ranks is 3, 3, 2, 2: an UNEVEN share, still whole tiles, every tile owned
+-     * once. Ranks 0 and 1 compute 192 columns of every protected expert, ranks 2 and 3 compute 128.
+-     * Two protected experts so the even-count rule the parity tables need holds, as the production
++     * Ten tiles over four ranks is 2, 2, 3, 3: an UNEVEN share, still whole tiles, every tile owned
++     * once. Ranks 2 and 3 compute 192 columns of every protected expert and ranks 0 and 1 compute
++     * 128, because ranks 0 and 1 take the routed experts' extra blocks (narrow_place). Two
++     * protected experts so the even-count rule the parity tables need holds, as the production
+      * recipe's pairs make it hold. */
+     {
+         const RadEncoding w4p = [] { RadEncoding e = rad_enc_affine(RAD_I4, RAD_BF16, 1, 128);
+                                      rad_enc_copy_str(e.transform, "fwht128"); return e; }();
+         const RadEncoding plain = rad_enc_plain(RAD_BF16);
+         /* [lo, hi) of the plain expert's columns, per rank -- literal, for the reason given above. */
+-        const int64_t p_lo[4] = { 0, 192, 384, 512 };
+-        const int64_t p_hi[4] = { 192, 384, 512, 640 };
++        const int64_t p_lo[4] = { 384, 512, 0,   192 };
++        const int64_t p_hi[4] = { 512, 640, 192, 384 };
+         for (int r = 0; r < world; ++r) {
+             RadBuilder bp;
+             bp.encs = { { "blk.1.ffn_gate_up_exps.3.weight", plain },
+-- 
+2.55.0
+
+
+From b681c525a254c3c4eeab6a76193dabb66c82ea6d Mon Sep 17 00:00:00 2001
+From: keptn42 <keptn42@noreply.codeberg.org>
+Date: Mon, 5 Oct 2026 11:54:32 +0200
+Subject: [PATCH 2/5] moe_gemm_q_mod4: the quantised grouped GEMM over four
+ classes of experts
+
+moe_gemm_q over four tables instead of two: expert e is entry e / 4 of class
+e % 4. A separate op, because the declaration divides a table op's weights
+over its table operands by count. The arguments are repacked to fit four
+classes in 256 bytes; moe_gemm_q's arithmetic is unchanged. Where weights
+do not divide evenly over the tables, the first tables take one more each
+(510 experts: 128/128/127/127). libref and libavx serve the op.
+---
+ core/build/rad_builder.cpp |  29 +++---
+ docs/OPS.md                |  22 ++++-
+ libavx/avx_cases.cpp       |  11 +++
+ libavx/avx_isa.h           |   1 +
+ libavx/avx_moe.cpp         |  58 +++++++----
+ libavx/avx_registry.cpp    |  17 ++++
+ libr4d/r4d_layout.cpp      |  93 +++++++++++++++---
+ libr4d/r4d_moe.hip         | 193 ++++++++++++++++++++++++-------------
+ libr4d/r4d_plugin.h        |   9 ++
+ libr4d/r4d_rows.cpp        |  55 +++++++++++
+ libr4d/r4d_selftest.cpp    |  64 ++++++++++++
+ libr4d/r4d_shapes.cpp      |  43 +++++++++
+ libref/ref_moe.cpp         |  59 ++++++++----
+ libref/ref_ops.h           |   2 +
+ libref/ref_registry.cpp    |  21 ++++
+ libref/ref_shapes.cpp      |  38 ++++++++
+ tests/ref_test.cpp         |  56 ++++++++++-
+ 17 files changed, 634 insertions(+), 137 deletions(-)
+
+diff --git a/core/build/rad_builder.cpp b/core/build/rad_builder.cpp
+index bec46cb..3d63b4e 100644
+--- a/core/build/rad_builder.cpp
++++ b/core/build/rad_builder.cpp
+@@ -685,20 +685,25 @@ rad_op Builder::decl_op(const char* opname, const RadParam* p, int n_p,
+      * say how the list divides. The rule is EQUAL DIVISION: whatever is left after the fixed
+      * weight positions have taken one each is split evenly across the table positions, in
+      * declaration order. That is exactly right for the case tables exist for -- `moe_gemm_q`'s
+-     * codes and scale planes are one of each per expert, always the same count -- and a division
+-     * that does not come out whole is refused here rather than silently mis-grouped, which is the
+-     * only failure the rule can have. */
+-    int per_tab = 0;
++     * codes and scale planes are one of each per expert, always the same count.
++     *
++     * WHERE IT DOES NOT COME OUT WHOLE, THE FIRST POSITIONS TAKE ONE MORE. A grouped GEMM whose
++     * experts are classes by number mod C -- `moe_gemm_q_mod4` -- gives its first `n % C` classes
++     * one expert more than the rest, and its tables are each class's codes then its scales, so
++     * that is exactly the first `2 * (n % C)` positions. Any other grouping is still refused, at
++     * issue, by the run checks: a table that is not one contiguous run of one shape. A list
++     * shorter than the tables is refused here. */
++    int per_tab = 0, tab_extra = 0;
+     if (n_tab > 0) {
+         const int rest = n_w - w_max;
+-        if (rest <= 0 || rest % n_tab != 0) {
++        if (rest < n_tab) {
+             err(RAD_E_SCHEMA,
+                 "op '%s': %d weight operands declared; the schema has %d fixed weight operands and "
+-                "%d weight TABLE operands, so %d must divide evenly among the tables and it does "
+-                "not. A table takes one weight per expert and every table of one op takes the same "
+-                "number", opname, n_w, w_max, n_tab, rest);
++                "%d weight TABLE operands, so %d leaves a table empty. A table takes one weight "
++                "per expert", opname, n_w, w_max, n_tab, rest);
+         } else {
+             per_tab = rest / n_tab;
++            tab_extra = rest % n_tab;
+         }
+     } else if (n_w < w_req || n_w > w_max) {
+         err(RAD_E_SCHEMA, "op '%s': %d weight operands declared, but the schema has %d (%d "
+@@ -727,14 +732,16 @@ rad_op Builder::decl_op(const char* opname, const RadParam* p, int n_p,
+     oi.weights.assign(w, w + n_w);
+     /* The many-to-one map from declared weight to schema operand position, built here so the
+      * layout pass, the converter and the issue path all read one answer. A fixed weight position
+-     * takes one; a table position takes `per_tab` in a row. */
++     * takes one; a table position takes `per_tab` in a row, and the first `tab_extra` of them one
++     * more. */
+     oi.weight_opd.assign((size_t)n_w, -1);
+     {
+-        int wi = 0;
++        int wi = 0, ti = 0;
+         for (int k = 0; sc->operands && k < sc->n_operands && wi < n_w; ++k) {
+             const int role = sc->operands[k].role;
+             if (role == RAD_OPD_WTAB) {
+-                for (int j = 0; j < per_tab && wi < n_w; ++j) oi.weight_opd[(size_t)wi++] = k;
++                const int run = per_tab + (ti++ < tab_extra ? 1 : 0);
++                for (int j = 0; j < run && wi < n_w; ++j) oi.weight_opd[(size_t)wi++] = k;
+             } else if (role == RAD_OPD_WEIGHT) {
+                 oi.weight_opd[(size_t)wi++] = k;
+             }
+diff --git a/docs/OPS.md b/docs/OPS.md
+index 650f285..a9bde97 100644
+--- a/docs/OPS.md
++++ b/docs/OPS.md
+@@ -127,9 +127,12 @@ hand it.
+ 
+ **How the declaration divides.** An op may carry several table operands — `moe_gemm_q` has four,
+ the codes and the scale planes of its even experts and of its odd ones. Whatever is left after the fixed weight positions have taken one each
+-is split EVENLY across the table positions, in declaration order, and a division that does not come
+-out whole is refused at declare. That is exactly right for the case tables exist for: every table of
+-one MoE op takes one weight per expert.
++is split EVENLY across the table positions, in declaration order, and where it does not come out
++whole the first positions take one more each: `moe_gemm_q_mod4`'s first `n_expert % 4` classes hold
++one expert more than the rest, and their codes and scales are its first table positions. A list too
++short to give every table an entry is refused at declare, and a run that is not one contiguous,
++same-shaped table is refused at issue. That is exactly right for the case tables exist for: every
++table of one MoE op takes one weight per expert of its class.
+ 
+ ## What the loader enforces
+ 
+@@ -553,6 +556,7 @@ every other rank waits out inside the block's all-reduce.
+ | op | params | operands |
+ |---|---|---|
+ | `moe_gemm_q` | `M`(range) `N` `K` `n_expert` `top_k` `group` `a_order` `dtype` `N_odd`/opt `K_odd`/opt `parts`/opt | `a`, `a_scale`?, `w`wt, `w_scale`wt, `sorted_tok`, `expert_offset`, `w_odd`wt, `w_odd_scale`wt → `y` |
++| `moe_gemm_q_mod4` | `M`(range) `N` `K` `n_expert` `top_k` `group` `a_order` `dtype` `N_1`/opt `K_1`/opt `N_2`/opt `K_2`/opt `N_3`/opt `K_3`/opt `parts`/opt | `a`, `a_scale`?, `w`wt, `w_scale`wt, `sorted_tok`, `expert_offset`, `w_1`wt, `w_1_scale`wt, `w_2`wt, `w_2_scale`wt, `w_3`wt, `w_3_scale`wt → `y` |
+ | `scale_rows` | `M`(range) `n` `act` `dtype` | `x`, `s`, `add`? → `y` |
+ 
+ The `wt` suffix is the table form and `w` alone is an ordinary weight operand; `moe_gemm`'s row
+@@ -571,6 +575,18 @@ columns of each output part and writes zeros after them, so the gated quantiser
+ one layout for every row. Under the equal-division rule above the op's weight list is the even
+ class's codes, its scales, then the odd class's codes and scales.
+ 
++**`moe_gemm_q_mod4` is the same GEMM over four classes, by the expert's number mod 4.**
++`w`/`w_scale` hold class 0 at `[N, K]` and `w_q`/`w_q_scale` class `q` at `[N_q, K_q]` (defaulting
++to `N`, `K`); expert `e` is entry `e / 4` of class `e % 4`, so class `q` holds `ceil((n_expert - q) /
++4)` of them. Four ranks splitting a five-block expert cannot share the extra block evenly over two
++classes -- whichever two ranks take it carry three blocks of every even/odd pair against the other
++two's two -- and over four they can: rank `r` takes two blocks of class `r` and one of each other,
++five of every four experts on every rank. It is a separate op and not a parameter on `moe_gemm_q`
++because the declaration divides a table op's weights over its table operands by count alone: the
++operand list is the class count. Everything else -- `parts`, the zero fill of a narrower class, `a_order`
++-- is `moe_gemm_q`'s, and the weight list is class 0's codes and scales, then class 1's, 2's and
++3's.
++
+ ### `a_order`: which rows a grouped GEMM's activation has
+ 
+ A routed block runs two `moe_gemm_q` ops and **they disagree about what a row of `a` is**, which is
+diff --git a/libavx/avx_cases.cpp b/libavx/avx_cases.cpp
+index ad74553..0bb671c 100644
+--- a/libavx/avx_cases.cpp
++++ b/libavx/avx_cases.cpp
+@@ -250,6 +250,17 @@ std::vector<Case> build_cases() {
+         add("moe_gemm_q", { HI("M", 9), HI("N", 64), HI("K", 256), HI("K_odd", 128),
+                             HI("n_expert", 8), HI("top_k", 2), HI("group", 128),
+                             HS("a_order", "sorted"), HS("dtype", "w8a8") });
++        /* Four classes at three widths -- a four-rank slice of a five-block expert is two blocks
++         * of one class and one of each other -- over ten experts, so classes 2 and 3 hold one
++         * fewer than 0 and 1: the gate/up pair and the down projection. */
++        add("moe_gemm_q_mod4", { HI("M", 9), HI("N", 128), HI("K", 128), HI("N_1", 256),
++                                 HI("N_2", 128), HI("N_3", 128), HI("parts", 2),
++                                 HI("n_expert", 10), HI("top_k", 2), HI("group", 128),
++                                 HS("a_order", "token"), HS("dtype", "w8a8") });
++        add("moe_gemm_q_mod4", { HI("M", 9), HI("N", 64), HI("K", 128), HI("K_1", 128),
++                                 HI("K_2", 256), HI("K_3", 128), HI("n_expert", 10),
++                                 HI("top_k", 2), HI("group", 128), HS("a_order", "sorted"),
++                                 HS("dtype", "w8a8") });
+     }
+     add("moe_scatter", { HI("M", 9), HI("n_expert", 8), HI("top_k", 2), HI("expert_base", 0) });
+ 
+diff --git a/libavx/avx_isa.h b/libavx/avx_isa.h
+index 3cb2090..90304d8 100644
+--- a/libavx/avx_isa.h
++++ b/libavx/avx_isa.h
+@@ -104,6 +104,7 @@ int         avx_isa_force(int level);
+     /* ---- mixture of experts */                                                                 \
+     X(router_topk)          X(moe_scatter)          X(moe_gemm)             X(moe_gemm_q)         \
+     X(moe_gather)           X(row_topk)             X(row_topk_merge)       X(logit_rerank)     \
++    X(moe_gemm_q_mod4)                                                                            \
+     /* ---- gated delta net */                                                                    \
+     X(gdn_conv_prep)        X(gdn_conv_update)      X(gdn_kkt_solve)        X(gdn_chunk_scan)     \
+     X(gdn_recurrent_update) X(gdn_conv_recurrent_update)                X(gdn_gated_rmsnorm)  \
+diff --git a/libavx/avx_moe.cpp b/libavx/avx_moe.cpp
+index 7366022..aad45cb 100644
+--- a/libavx/avx_moe.cpp
++++ b/libavx/avx_moe.cpp
+@@ -294,8 +294,8 @@ AVX_KERNEL(moe_scatter) {
+  * whose meaning changes with its extent is exactly the shape a checker cannot see: if both
+  * implementations gather they agree with each other, and a harness that sizes the operand the way
+  * the gather wants never exercises the other reading. */
+-static int moe_gemm_impl(const RadArgs* a, bool quant) {
+-    const int n_opd = quant ? 9 : 5;
++static int moe_gemm_impl(const RadArgs* a, bool quant, int ncls = 2) {
++    const int n_opd = quant ? (ncls == 4 ? 13 : 9) : 5;
+     if (!rad_args_have(a, n_opd)) return RAD_E_INVAL;
+     const RadTensor* A = &a->t[0];
+     const RadTensor* as_ = quant ? rad_arg_in(a, 1) : nullptr;
+@@ -303,12 +303,18 @@ static int moe_gemm_impl(const RadArgs* a, bool quant) {
+     const RadTensor* ws_ = quant ? rad_arg_in(a, 3) : nullptr;
+     const RadTensor* sorted = &a->t[quant ? 4 : 2];
+     const RadTensor* off = &a->t[quant ? 5 : 3];
+-    const RadTensor* Y = &a->t[quant ? 8 : 4];
++    const RadTensor* Y = &a->t[quant ? (ncls == 4 ? 12 : 8) : 4];
+     /* THE QUANTISED ARM'S EXPERTS ARE TWO TABLES BY PARITY, expert e at entry e / 2 of class
+-     * e % 2; the plain arm's are one. */
++     * e % 2 -- or for `moe_gemm_q_mod4` four, entry e / 4 of class e % 4; the plain arm's are
++     * one. */
+     const bool two = quant;
++    const int  nc  = quant ? ncls : 1;
+     const RadTensor* W1 = two ? &a->t[6] : W;
+     const RadTensor* ws1_ = two ? rad_arg_in(a, 7) : nullptr;
++    const RadTensor* Wq[4]  = { W, W1, quant && nc == 4 ? &a->t[8] : W,
++                                quant && nc == 4 ? &a->t[10] : W };
++    const RadTensor* wsq[4] = { ws_, ws1_, quant && nc == 4 ? rad_arg_in(a, 9) : nullptr,
++                                quant && nc == 4 ? rad_arg_in(a, 11) : nullptr };
+ 
+     const char* ord = p_str(a, "a_order", "token");
+     const bool sorted_a = ord && std::strcmp(ord, "sorted") == 0;
+@@ -316,19 +322,28 @@ static int moe_gemm_impl(const RadArgs* a, bool quant) {
+ 
+     const int64_t N0 = p_int(a, "N", W->rank >= 3 ? W->shape[1] : 0);
+     const int64_t K0 = p_int(a, "K", W->rank >= 3 ? W->shape[2] : 0);
+-    const int64_t N1 = two ? p_int(a, "N_odd", N0) : N0;
+-    const int64_t K1 = two ? p_int(a, "K_odd", K0) : K0;
++    /* Each class's geometry, defaulting to class 0's: N_odd/K_odd at two, N_q/K_q at four. */
++    static const char* const kN4[4] = { "N", "N_1", "N_2", "N_3" };
++    static const char* const kK4[4] = { "K", "K_1", "K_2", "K_3" };
++    int64_t Nq[4] = { N0, N0, N0, N0 }, Kq[4] = { K0, K0, K0, K0 };
++    for (int q = 1; q < nc; ++q) {
++        Nq[q] = p_int(a, nc == 4 ? kN4[q] : "N_odd", N0);
++        Kq[q] = p_int(a, nc == 4 ? kK4[q] : "K_odd", K0);
++    }
+     const int64_t parts = two ? p_int(a, "parts", 1) : 1;
+     const int64_t n_expert = p_int(a, "n_expert", W->rank >= 3 ? W->shape[0] : 0);
+     const int64_t top_k = p_int(a, "top_k", 1);
+-    if (N0 <= 0 || K0 <= 0 || N1 <= 0 || K1 <= 0 || parts <= 0 || n_expert <= 0 || top_k <= 0)
+-        return RAD_E_SHAPE;
+-    if (N0 % parts || N1 % parts) return RAD_E_SHAPE;
+-    /* The output is the wider class's width, the activation the longer class's K. */
+-    const int64_t N = N0 > N1 ? N0 : N1, K = K0 > K1 ? K0 : K1;
+-    const int64_t ne0 = two ? (n_expert + 1) / 2 : n_expert, ne1 = two ? n_expert / 2 : 0;
+-    if (W->rank < 3 || W->shape[0] < ne0) return RAD_E_SHAPE;
+-    if (two && (W1->rank < 3 || W1->shape[0] < ne1)) return RAD_E_SHAPE;
++    if (parts <= 0 || n_expert <= 0 || top_k <= 0) return RAD_E_SHAPE;
++    /* The output is the widest class's width, the activation the longest class's K; class q
++     * holds ceil((n - q) / nc) experts. */
++    int64_t N = 0, K = 0;
++    for (int q = 0; q < nc; ++q) {
++        if (Nq[q] <= 0 || Kq[q] <= 0 || Nq[q] % parts) return RAD_E_SHAPE;
++        if (Nq[q] > N) N = Nq[q];
++        if (Kq[q] > K) K = Kq[q];
++        const int64_t neq = (n_expert + nc - 1 - q) / nc;
++        if (neq > 0 && (Wq[q]->rank < 3 || Wq[q]->shape[0] < neq)) return RAD_E_SHAPE;
++    }
+     const int64_t T = numel(Y) / N;
+     if (T <= 0 || numel(sorted) < T || numel(off) < n_expert + 1) return RAD_E_SHAPE;
+ 
+@@ -371,11 +386,11 @@ static int moe_gemm_impl(const RadArgs* a, bool quant) {
+      * be read as a table at all, which is refused BEFORE any parallel region because an OpenMP
+      * body cannot return. */
+     for (int64_t e = 0; e < n_expert; ++e) {
+-        const bool odd = two && (e & 1);
+-        const RadTensor* tw = odd ? W1 : W;
+-        const RadTensor* ts = odd ? ws1_ : ws_;
+-        const int64_t ix = two ? e / 2 : e;
+-        const int64_t n = odd ? N1 : N0, k = odd ? K1 : K0;
++        const int q = (int)(e % nc);
++        const RadTensor* tw = Wq[q];
++        const RadTensor* ts = wsq[q];
++        const int64_t ix = e / nc;
++        const int64_t n = Nq[q], k = Kq[q];
+         we[e] = expert_entry(tw, ix);
+         if (!we[e].data) return RAD_E_STRIDE;
+         if (we[e].rank < 2 || we[e].shape[0] < n || we[e].shape[1] < k) return RAD_E_SHAPE;
+@@ -427,8 +442,8 @@ static int moe_gemm_impl(const RadArgs* a, bool quant) {
+         for (int64_t i = 0; i < T; ++i) {
+             if (atok[i] < 0) { stt(Y, i * y_rs + n * y_cs, 0.0f); continue; }
+             const int64_t e = aexp[i];
+-            const bool odd = two && (e & 1);
+-            const int64_t fc = (odd ? N1 : N0) / parts, ke = odd ? K1 : K0;
++            const int q = (int)(e % nc);
++            const int64_t fc = Nq[q] / parts, ke = Kq[q];
+             if (j >= fc) { stt(Y, i * y_rs + n * y_cs, 0.0f); continue; }
+             const int64_t wr = pp * fc + j;
+             /* The expert's weight row is packed when the expert CHANGES, which -- because the
+@@ -454,6 +469,7 @@ static int moe_gemm_impl(const RadArgs* a, bool quant) {
+ 
+ AVX_KERNEL(moe_gemm)   { return moe_gemm_impl(a, false); }
+ AVX_KERNEL(moe_gemm_q) { return moe_gemm_impl(a, true); }
++AVX_KERNEL(moe_gemm_q_mod4) { return moe_gemm_impl(a, true, 4); }
+ 
+ /* ------------------------------------------------------------------ moe_gather */
+ /* y[t] = sum over the token's slots of expert_w[t, j] * y_expert[position of (t, j)].
+diff --git a/libavx/avx_registry.cpp b/libavx/avx_registry.cpp
+index 17d687e..718dda0 100644
+--- a/libavx/avx_registry.cpp
++++ b/libavx/avx_registry.cpp
+@@ -263,6 +263,18 @@ static const RadParamSpec pMoeGemmQ[]   = { P_INT("M"), P_INT("N"), P_INT("K"),
+ static const RadOperandSpec oMoeGemmQ[] = { OPD("a"), OPD_O("a_scale"), WTAB("w"), WTAB("w_scale"),
+                                             OPD("sorted_tok"), OPD("expert_offset"),
+                                             WTAB("w_odd"), WTAB("w_odd_scale"), OUT("y") };
++/* The same over four classes by the expert's number mod 4, `w_q` class q at [N_q, K_q]. Mirrors
++ * libref's and libr4d's schema exactly. */
++static const RadParamSpec pMoeGemmQMod4[]   = { P_INT("M"), P_INT("N"), P_INT("K"),
++                                                P_INT("n_expert"), P_INT("top_k"), P_INT("group"),
++                                                P_STR("a_order"), P_STR("dtype"), P_INTO("N_1"),
++                                                P_INTO("K_1"), P_INTO("N_2"), P_INTO("K_2"),
++                                                P_INTO("N_3"), P_INTO("K_3"), P_INTO("parts") };
++static const RadOperandSpec oMoeGemmQMod4[] = { OPD("a"), OPD_O("a_scale"), WTAB("w"),
++                                                WTAB("w_scale"), OPD("sorted_tok"),
++                                                OPD("expert_offset"), WTAB("w_1"),
++                                                WTAB("w_1_scale"), WTAB("w_2"), WTAB("w_2_scale"),
++                                                WTAB("w_3"), WTAB("w_3_scale"), OUT("y") };
+ 
+ /* `shared` + `shared_gate` present = the shared arm folded in: y = narrow(shared *
+  * act(gate)) + narrow(gathered), the unfused pair's two narrows carried in the stores. `act` is
+@@ -500,6 +512,8 @@ static const RadOpSchema kSchemas[] = {
+ { "moe_gemm", ARR(pMoeGemm), ARR(oMoeGemm), "grouped GEMM over the expert-sorted rows." },
+ { "moe_gemm_q", ARR(pMoeGemmQ), ARR(oMoeGemmQ),
+   "grouped GEMM over the expert-sorted rows, quantised operands." },
++{ "moe_gemm_q_mod4", ARR(pMoeGemmQMod4), ARR(oMoeGemmQMod4),
++  "grouped GEMM over the expert-sorted rows, quantised operands, four classes by number mod 4." },
+ { "moe_gather", ARR(pMoeGather), ARR(oMoeGather), "weighted scatter back to token order." },
+ { "row_topk", ARR(pRowTopk), ARR(oRowTopk), "exact per-row top-R." },
+ { "row_topk_merge", ARR(pRowTopkMerge), ARR(oRowTopkMerge),
+@@ -685,6 +699,9 @@ SIMPLE("avx_moe_gemm", "moe_gemm", "moe", "grouped GEMM over the expert-sorted r
+        L(moe_gemm)),
+ SIMPLE("avx_moe_gemm_q", "moe_gemm_q", "moe",
+        "grouped GEMM over the expert-sorted rows, quantised operands", DT_FLOAT, L(moe_gemm_q)),
++SIMPLE("avx_moe_gemm_q_mod4", "moe_gemm_q_mod4", "moe",
++       "grouped GEMM over the expert-sorted rows, quantised operands, four classes by number mod 4",
++       DT_FLOAT, L(moe_gemm_q_mod4)),
+ SIMPLE("avx_moe_gather", "moe_gather", "moe", "weighted scatter back to token order", DT_FLOAT,
+        L(moe_gather)),
+ SIMPLE("avx_row_topk", "row_topk", "moe", "exact per-row top-R", DT_FLOAT, L(row_topk)),
+diff --git a/libr4d/r4d_layout.cpp b/libr4d/r4d_layout.cpp
+index e520a8f..700a4ce 100644
+--- a/libr4d/r4d_layout.cpp
++++ b/libr4d/r4d_layout.cpp
+@@ -256,6 +256,29 @@ int moe_view(const RadParam* p, int n_p, int operand, MoeView* v) {
+     }
+     return RAD_OK;
+ }
++
++/* `moe_gemm_q_mod4`'s four classes: operands 6/7, 8/9 and 10/11 are classes 1, 2 and 3 at
++ * N_1/K_1, N_2/K_2 and N_3/K_3, answered as 2/3 at that geometry -- the same view, one class
++ * further along. */
++int moe_view_mod4(const RadParam* p, int n_p, int operand, MoeView* v) {
++    if (n_p < 0 || n_p > 32 || (n_p > 0 && !p)) return RAD_E_INVAL;
++    v->n = n_p;
++    v->operand = operand;
++    for (int i = 0; i < n_p; ++i) v->p[i] = p[i];
++    if (operand < 6 || operand > 11) return RAD_OK;
++    static const char* const kN[4] = { "N", "N_1", "N_2", "N_3" };
++    static const char* const kK[4] = { "K", "K_1", "K_2", "K_3" };
++    const int q = (operand - 4) / 2;                 /* 6/7 -> 1, 8/9 -> 2, 10/11 -> 3 */
++    v->operand = 2 + (operand & 1);
++    const long long nq = r4d_pgeti_or(p, n_p, kN[q], -1);
++    const long long kq = r4d_pgeti_or(p, n_p, kK[q], -1);
++    for (int i = 0; i < n_p; ++i) {
++        if (!v->p[i].key) continue;
++        if (nq > 0 && std::strcmp(v->p[i].key, "N") == 0) v->p[i].ival = nq;
++        if (kq > 0 && std::strcmp(v->p[i].key, "K") == 0) v->p[i].ival = kq;
++    }
++    return RAD_OK;
++}
+ }  /* namespace */
+ 
+ /* ================================================================== the hooks
+@@ -819,21 +842,24 @@ void moew5_row(const uint8_t* s, uint8_t* d, int64_t K, uint8_t* nib, bool forwa
+ }
+ }  /* namespace */
+ 
+-extern "C" int r4d_rad_layout_moe_w4(const RadParam* p, int n_p, int operand,
+-                                         const RadEncoding* enc, const int* sel,
+-                                         const RadTensor* pl, int n, RadLayout* out) {
++namespace {
++using MoeViewFn = int (*)(const RadParam*, int, int, MoeView*);
++
++int moew4_layout_by(MoeViewFn view, const RadParam* p, int n_p, int operand,
++                    const RadEncoding* enc, const int* sel, const RadTensor* pl, int n,
++                    RadLayout* out) {
+     MoeView v;
+-    const int rc = moe_view(p, n_p, operand, &v);
++    const int rc = view(p, n_p, operand, &v);
+     return rc != RAD_OK ? rc : moew4_enc_layout(v.p, v.n, v.operand, enc, sel, pl, n, out, nullptr);
+ }
+ 
+-extern "C" int r4d_rad_relayout_moe_w4(const RadParam* p, int n_p, int operand,
+-                                       const RadEncoding* enc, const int* sel,
+-                                       const RadTensor* pl, int n, void* dst, int64_t dst_bytes) {
++int moew4_relayout_by(MoeViewFn view, const RadParam* p, int n_p, int operand,
++                      const RadEncoding* enc, const int* sel, const RadTensor* pl, int n,
++                      void* dst, int64_t dst_bytes) {
+     MoeView v;
+     RadLayout L;
+     WGeom g;
+-    int rc = moe_view(p, n_p, operand, &v);
++    int rc = view(p, n_p, operand, &v);
+     if (rc == RAD_OK) rc = moew4_enc_layout(v.p, v.n, v.operand, enc, sel, pl, n, &L, &g);
+     if (rc != RAD_OK) return rc;
+     if (dst_bytes != L.bytes) return RAD_E_SHAPE;
+@@ -857,13 +883,13 @@ extern "C" int r4d_rad_relayout_moe_w4(const RadParam* p, int n_p, int operand,
+     return RAD_OK;
+ }
+ 
+-extern "C" int r4d_rad_unrelayout_moe_w4(const RadParam* p, int n_p, int operand,
+-                                         const RadEncoding* enc, const int* sel, const void* src,
+-                                         int64_t src_bytes, const RadTensor* pl, int n) {
++int moew4_unrelayout_by(MoeViewFn view, const RadParam* p, int n_p, int operand,
++                        const RadEncoding* enc, const int* sel, const void* src,
++                        int64_t src_bytes, const RadTensor* pl, int n) {
+     MoeView v;
+     RadLayout L;
+     WGeom g;
+-    int rc = moe_view(p, n_p, operand, &v);
++    int rc = view(p, n_p, operand, &v);
+     if (rc == RAD_OK) rc = moew4_enc_layout(v.p, v.n, v.operand, enc, sel, pl, n, &L, &g);
+     if (rc != RAD_OK) return rc;
+     if (src_bytes != L.bytes) return RAD_E_SHAPE;
+@@ -887,6 +913,41 @@ extern "C" int r4d_rad_unrelayout_moe_w4(const RadParam* p, int n_p, int operand
+     return RAD_OK;
+ }
+ 
++}  /* namespace */
++
++extern "C" int r4d_rad_layout_moe_w4(const RadParam* p, int n_p, int operand,
++                                     const RadEncoding* enc, const int* sel,
++                                     const RadTensor* pl, int n, RadLayout* out) {
++    return moew4_layout_by(moe_view, p, n_p, operand, enc, sel, pl, n, out);
++}
++extern "C" int r4d_rad_relayout_moe_w4(const RadParam* p, int n_p, int operand,
++                                       const RadEncoding* enc, const int* sel,
++                                       const RadTensor* pl, int n, void* dst, int64_t dst_bytes) {
++    return moew4_relayout_by(moe_view, p, n_p, operand, enc, sel, pl, n, dst, dst_bytes);
++}
++extern "C" int r4d_rad_unrelayout_moe_w4(const RadParam* p, int n_p, int operand,
++                                         const RadEncoding* enc, const int* sel, const void* src,
++                                         int64_t src_bytes, const RadTensor* pl, int n) {
++    return moew4_unrelayout_by(moe_view, p, n_p, operand, enc, sel, src, src_bytes, pl, n);
++}
++extern "C" int r4d_rad_layout_moe_w4_mod4(const RadParam* p, int n_p, int operand,
++                                          const RadEncoding* enc, const int* sel,
++                                          const RadTensor* pl, int n, RadLayout* out) {
++    return moew4_layout_by(moe_view_mod4, p, n_p, operand, enc, sel, pl, n, out);
++}
++extern "C" int r4d_rad_relayout_moe_w4_mod4(const RadParam* p, int n_p, int operand,
++                                            const RadEncoding* enc, const int* sel,
++                                            const RadTensor* pl, int n, void* dst,
++                                            int64_t dst_bytes) {
++    return moew4_relayout_by(moe_view_mod4, p, n_p, operand, enc, sel, pl, n, dst, dst_bytes);
++}
++extern "C" int r4d_rad_unrelayout_moe_w4_mod4(const RadParam* p, int n_p, int operand,
++                                              const RadEncoding* enc, const int* sel,
++                                              const void* src, int64_t src_bytes,
++                                              const RadTensor* pl, int n) {
++    return moew4_unrelayout_by(moe_view_mod4, p, n_p, operand, enc, sel, src, src_bytes, pl, n);
++}
++
+ extern "C" int r4d_rad_layout_moe_fp8(const RadParam* p, int n_p, int operand,
+                                           const RadEncoding* enc, const int* sel,
+                                           const RadTensor* pl, int n, RadLayout* out) {
+@@ -895,3 +956,11 @@ extern "C" int r4d_rad_layout_moe_fp8(const RadParam* p, int n_p, int operand,
+     return rc != RAD_OK ? rc : r4d_rad_layout_fp8_rowmajor(v.p, v.n, v.operand, enc, sel, pl,
+                                                                n, out);
+ }
++extern "C" int r4d_rad_layout_moe_fp8_mod4(const RadParam* p, int n_p, int operand,
++                                           const RadEncoding* enc, const int* sel,
++                                           const RadTensor* pl, int n, RadLayout* out) {
++    MoeView v;
++    const int rc = moe_view_mod4(p, n_p, operand, &v);
++    return rc != RAD_OK ? rc : r4d_rad_layout_fp8_rowmajor(v.p, v.n, v.operand, enc, sel, pl,
++                                                               n, out);
++}
+diff --git a/libr4d/r4d_moe.hip b/libr4d/r4d_moe.hip
+index 261d8f6..9919725 100644
+--- a/libr4d/r4d_moe.hip
++++ b/libr4d/r4d_moe.hip
+@@ -823,15 +823,26 @@ __device__ __forceinline__ uint4 w4_load(const uint8_t* __restrict__ src, bool l
+  * separate operands because every entry of one table has one geometry. Expert e is entry e / 2 of
+  * class e % 2. The classes differ when a rank holds an uneven slice of each expert's width -- three
+  * 128-column blocks of one parity and two of the other -- and are the same geometry otherwise.
++ * `moe_gemm_q_mod4` has four, by the expert's number mod 4: expert e is entry e / 4 of class e % 4,
++ * which is what lets four ranks take the extra block of a five-block expert in turn.
+  *
+  * `n` is the weight's rows and `k` its K; `w_ld` the packed byte pitch of a weight row and `s_ld`
+  * the scale plane's row pitch in elements. */
+ struct MoeCls {
+-    const void* const* w;  size_t w_s0;
+-    const void* const* s;  size_t s_s0;
++    const void* const* w;
++    const void* const* s;
++    uint32_t w_s0, s_s0;   /* bytes an entry of a stacked plane; 0 marks a pointer table */
+     uint32_t n, k, w_ld, s_ld;
+-    uint32_t tab[4];       /* W4: the code table, r4d_args.h's kW4IntPerm, kW4nlPerm or kW5nlMagPerm */
+ };
++/* W4: the code table, r4d_args.h's kW4IntPerm, kW4nlPerm or kW5nlMagPerm -- one for every class,
++ * since every class is one format.
++ *
++ * FOUR CLASSES AND THE TABLE MUST FIT RAD_KPARAM_BLOB (256 bytes) BESIDE EVERYTHING ELSE, because
++ * a kernel's arguments are packed into one descriptor whether it is launched or described: four
++ * classes at 40 bytes, the five operand pointers and the map, eight words and this. That is why a
++ * class carries 32-bit entry strides and no table of its own, and why `mode` packs three small
++ * values into one word. */
++struct MoeTab { uint32_t v[4]; };
+ 
+ /* W4 IS THE WEIGHT'S FORM: 0 block E4M3, 1 four-bit with one bf16 scale a (row, 128 of K), 2 the
+  * same codes with one E4M3 scale a (row, 64 of K) times the fixed kW4G64Scale (w4nl64a8h), 3 the
+@@ -843,12 +854,14 @@ template <uint32_t MT, uint32_t NTL, uint32_t WGM, uint32_t WGN, int W4 = 0,
+           bool ES = false, bool AL = false, bool SK = false>
+ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_q_kernel(
+     const uint8_t* __restrict__ Aq, const float* __restrict__ As,
+-    const MoeCls c_even, const MoeCls c_odd,
++    const MoeCls c_even, const MoeCls c_odd, const MoeCls c_2, const MoeCls c_3,
+     const int32_t* __restrict__ sorted, const int32_t* __restrict__ off,
+-    uint16_t* __restrict__ Y,
+-    uint32_t T, uint32_t N, uint32_t parts, uint32_t n_expert, uint32_t top_k, uint32_t a_sorted,
+-    uint32_t a_ld, uint32_t as_ld, uint32_t y_ld,
+-    const uint32_t* __restrict__ map) {
++    uint16_t* __restrict__ Y, const uint32_t* __restrict__ map,
++    uint32_t T, uint32_t N, uint32_t n_expert, uint32_t top_k,
++    uint32_t a_ld, uint32_t as_ld, uint32_t y_ld, uint32_t mode, const MoeTab tab) {
++    /* `mode`: bit 0 `a_sorted`, bits 1-2 the class shift (1 for two classes, 2 for four), bits
++     * 8 up `parts`. */
++    const uint32_t a_sorted = mode & 1u, cshift = (mode >> 1) & 3u, parts = mode >> 8;
+     constexpr uint32_t FM = MT * 16, FN = NTL * 16;
+     constexpr uint32_t NTHR = WGM * WGN * kWave;
+     constexpr uint32_t WM = MT / WGM, WN = NTL / WGN;
+@@ -1014,8 +1027,10 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_q_kernel(
+         if (ES && run != jrun) { rs = re; ++run; continue; }
+ 
+         /* The expert's class, and where this block's columns sit in its weight. Block-uniform: a
+-         * pad tile zeroes the run's rows and moves on without touching LDS or a barrier. */
+-        const MoeCls& C = (e & 1u) ? c_odd : c_even;
++         * pad tile zeroes the run's rows and moves on without touching LDS or a barrier. `cshift`
++         * is 1 for two classes and 2 for four; c_2 and c_3 are never read at two. */
++        const uint32_t cls = e & ((1u << cshift) - 1u);
++        const MoeCls& C = cls == 0u ? c_even : cls == 1u ? c_odd : cls == 2u ? c_2 : c_3;
+         const uint32_t fc = C.n / parts;
+         if (j0 >= fc) {
+             const uint32_t nr = re - rs;
+@@ -1033,8 +1048,8 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_q_kernel(
+         const uint32_t kb_n = wn0 / kBlock;           /* the weight scale's N row for this block */
+         if constexpr (W4) (void)kb_n;                 /* w4 scales vary per ROW, not per N block */
+ 
+-        const uint8_t*  Wp  = wtab_at(C.w, C.w_s0, e >> 1);
+-        const uint16_t* Wsp = (const uint16_t*)wtab_at(C.s, C.s_s0, e >> 1);
++        const uint8_t*  Wp  = wtab_at(C.w, C.w_s0, e >> cshift);
++        const uint16_t* Wsp = (const uint16_t*)wtab_at(C.s, C.s_s0, e >> cshift);
+ 
+         /* SK: A WAVE WHOSE M TILES ARE ALL PAST THE RUN has nothing to accumulate. Under AL the
+          * run is the block's rows [rs, re) from its first row, so that is a wave-uniform test;
+@@ -1152,9 +1167,9 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_q_kernel(
+                 const uint32_t r = sn + p * kRPP;
+                 if (r >= FN) continue;
+                 if constexpr (W4 == 4)
+-                    stage8_store<kFK>(s_b, r, sk, w5_expand(bpre4[p], spre[p], C.tab));
++                    stage8_store<kFK>(s_b, r, sk, w5_expand(bpre4[p], spre[p], tab.v));
+                 else if constexpr (W4)
+-                    stage8_store<kFK>(s_b, r, sk, w4_expand(bpre4[p], C.tab));
++                    stage8_store<kFK>(s_b, r, sk, w4_expand(bpre4[p], tab.v));
+                 else
+                     stage8_store<kFK>(s_b, r, sk, bpre8[p]);
+             }
+@@ -2117,42 +2132,56 @@ static int g_moe_prefill_form = 0;
+ /* Both instantiations, from one body. The only things that differ are the weight table's dtype and
+  * its two pitches, so the fp8 launcher and the w4 one are the same forty lines with three values
+  * swapped -- and writing them twice is how a shape check drifts between two paths that must agree.
+- */
++ *
++ * `ncls` is the op's class count: 2 for `moe_gemm_q`, whose odd class is operands 6 and 7 at
++ * N_odd/K_odd, and 4 for `moe_gemm_q_mod4`, whose classes 1..3 are operands 6/7, 8/9 and 10/11 at
++ * N_1/K_1, N_2/K_2 and N_3/K_3, with `y` after them at 12. Everything else is one body. */
+ template <int W4>
+-static int moe_gemm_launch(const RadArgs* a, const R4dSink& sk) {
++static int moe_gemm_launch(const RadArgs* a, const R4dSink& sk, int ncls = 2) {
+     int emit_rc = RAD_OK;
++    if (ncls != 2 && ncls != 4) return R4D_NO(RAD_E_INVAL);
+     const RadTensor* Aq     = r4d_opt(a, 0);
+     const RadTensor* As     = r4d_opt(a, 1);
+-    const RadTensor* W      = r4d_opt(a, 2);
+-    const RadTensor* Ws     = r4d_opt(a, 3);
+     const RadTensor* sorted = r4d_opt(a, 4);
+     const RadTensor* off    = r4d_opt(a, 5);
+-    const RadTensor* W1     = r4d_opt(a, 6);
+-    const RadTensor* Ws1    = r4d_opt(a, 7);
+-    const RadTensor* Y      = r4d_opt(a, 8);
+-    if (!Aq || !As || !W || !Ws || !sorted || !off || !Y || !W1 || !Ws1)
+-        return R4D_NO(RAD_E_INVAL);
++    const RadTensor* Wc[4]  = { r4d_opt(a, 2), r4d_opt(a, 6),
++                                ncls == 4 ? r4d_opt(a, 8) : nullptr,
++                                ncls == 4 ? r4d_opt(a, 10) : nullptr };
++    const RadTensor* Wsc[4] = { r4d_opt(a, 3), r4d_opt(a, 7),
++                                ncls == 4 ? r4d_opt(a, 9) : nullptr,
++                                ncls == 4 ? r4d_opt(a, 11) : nullptr };
++    const RadTensor* Y      = r4d_opt(a, ncls == 4 ? 12 : 8);
++    if (!Aq || !As || !sorted || !off || !Y) return R4D_NO(RAD_E_INVAL);
++    for (int q = 0; q < ncls; ++q)
++        if (!Wc[q] || !Wsc[q]) return R4D_NO(RAD_E_INVAL);
+     if (!Aq->data || !As->data || !sorted->data || !off->data || !Y->data)
+         return R4D_NO(RAD_E_INVAL);
+ 
+-    /* Each class's weight geometry, the odd one defaulting to the even one's; the output is as
+-     * wide as the wider class and the activation as long as the longer K. */
+-    const long long N0 = r4d_geti_or(a, "N", 0);
+-    const long long K0 = r4d_geti_or(a, "K", 0);
+-    const long long N1 = r4d_geti_or(a, "N_odd", N0);
+-    const long long K1 = r4d_geti_or(a, "K_odd", K0);
++    /* Each class's weight geometry, the others defaulting to class 0's; the output is as wide as
++     * the widest class and the activation as long as the longest K. */
++    static const char* const kNk[4][2] = { { "N", "K" }, { "N_1", "K_1" }, { "N_2", "K_2" },
++                                           { "N_3", "K_3" } };
++    long long Nc[4] = { 0, 0, 0, 0 }, Kc[4] = { 0, 0, 0, 0 };
++    Nc[0] = r4d_geti_or(a, "N", 0);
++    Kc[0] = r4d_geti_or(a, "K", 0);
++    for (int q = 1; q < ncls; ++q) {
++        Nc[q] = r4d_geti_or(a, ncls == 4 ? kNk[q][0] : "N_odd", Nc[0]);
++        Kc[q] = r4d_geti_or(a, ncls == 4 ? kNk[q][1] : "K_odd", Kc[0]);
++    }
+     const long long parts = r4d_geti_or(a, "parts", 1);
+     const long long n_expert = r4d_geti_or(a, "n_expert", 0);
+     const long long top_k = r4d_geti_or(a, "top_k", 0);
+     const long long group = r4d_geti_or(a, "group", kBlock);
+-    if (N0 <= 0 || K0 <= 0 || N1 <= 0 || K1 <= 0 || parts <= 0 || n_expert <= 0 || top_k <= 0)
+-        return R4D_NO(RAD_E_SHAPE);
++    if (parts <= 0 || n_expert <= 0 || top_k <= 0) return R4D_NO(RAD_E_SHAPE);
+     if (group != (long long)kBlock) return R4D_NO(RAD_E_SHAPE);
+-    /* A part of either class is whole 64-column tiles, so a tile is all weight or all padding. */
+-    if (K0 % kBlock || K1 % kBlock || N0 % (64 * parts) || N1 % (64 * parts))
+-        return R4D_NO(RAD_E_SHAPE);
+-    const long long N = N0 > N1 ? N0 : N1;
+-    const long long K = K0 > K1 ? K0 : K1;
++    long long N = 0, K = 0;
++    for (int q = 0; q < ncls; ++q) {
++        if (Nc[q] <= 0 || Kc[q] <= 0) return R4D_NO(RAD_E_SHAPE);
++        /* A part of every class is whole 64-column tiles, so a tile is all weight or all padding. */
++        if (Kc[q] % kBlock || Nc[q] % (64 * parts)) return R4D_NO(RAD_E_SHAPE);
++        if (Nc[q] > N) N = Nc[q];
++        if (Kc[q] > K) K = Kc[q];
++    }
+     if (Aq->dtype != RAD_F8E4M3 || As->dtype != RAD_F32 || Y->dtype != RAD_BF16)
+         return R4D_NO(RAD_E_DTYPE);
+     if (sorted->dtype != RAD_I32 || off->dtype != RAD_I32) return R4D_NO(RAD_E_DTYPE);
+@@ -2192,9 +2221,10 @@ static int moe_gemm_launch(const RadArgs* a, const R4dSink& sk) {
+     auto cls_of = [&](const RadTensor* w, const RadTensor* ws, long long cnt, long long n,
+                       long long k, MoeCls* c) -> int {
+         long long w_ld = 0, ws_ld = 0;
++        size_t w_s0 = 0, s_s0 = 0;
+         int rc = wtab_of(w, W4 == 4 ? (uint32_t)R4D_DT_MOEW5
+                             : W4 ? (uint32_t)R4D_DT_MOEW4 : (uint32_t)RAD_F8E4M3,
+-                         W4 == 4 ? 5 : W4 ? 4 : 8, cnt, n, k, &c->w, &c->w_s0, &w_ld);
++                         W4 == 4 ? 5 : W4 ? 4 : 8, cnt, n, k, &c->w, &w_s0, &w_ld);
+         if (rc != RAD_OK) return rc;
+         if constexpr (W4 >= 2) {
+             /* One E4M3 byte per (row, group of 64 or 32 K), and the stored row is exactly those
+@@ -2203,7 +2233,7 @@ static int moe_gemm_launch(const RadArgs* a, const R4dSink& sk) {
+              * its row stride is k, the stored row k/64 or k/32 (r4d_layout.cpp). A tile's scales
+              * are one sixteen- or thirty-two-bit word, so the kernel's pitch is k/128 words. */
+             rc = wtab_of(ws, RAD_F8E4M3, 8, cnt, n, k / (kBlock / (W4 == 3 ? 4 : 2)), &c->s,
+-                         &c->s_s0, &ws_ld);
++                         &s_s0, &ws_ld);
+             if (rc != RAD_OK) return rc;
+             /* A 5-bit row is its nibbles then its sign bits, so its pitch is whole bytes of both;
+              * the kernel finds the signs K/2 bytes in. */
+@@ -2212,27 +2242,42 @@ static int moe_gemm_launch(const RadArgs* a, const R4dSink& sk) {
+             ws_ld = k / kBlock;
+         } else if constexpr (W4) {
+             /* The scale plane is one bf16 per (row, group of 128 K) -- not per 128x128 tile. */
+-            rc = wtab_of(ws, RAD_BF16, 16, cnt, n, k / kBlock, &c->s, &c->s_s0, &ws_ld);
++            rc = wtab_of(ws, RAD_BF16, 16, cnt, n, k / kBlock, &c->s, &s_s0, &ws_ld);
+             if (rc != RAD_OK) return rc;
+             if (w_ld % 2) return R4D_NO(RAD_E_STRIDE);
+             w_ld /= 2;
+         } else {
+             rc = wtab_of(ws, RAD_BF16, 16, cnt, (n + kBlock - 1) / kBlock, k / kBlock, &c->s,
+-                         &c->s_s0, &ws_ld);
++                         &s_s0, &ws_ld);
+             if (rc != RAD_OK) return rc;
+         }
++        /* A stacked entry is one expert's plane, far below 4 GiB; a pointer table is 0. */
++        if (w_s0 > 0xFFFFFFFFull || s_s0 > 0xFFFFFFFFull) return R4D_NO(RAD_E_STRIDE);
++        c->w_s0 = (uint32_t)w_s0;
++        c->s_s0 = (uint32_t)s_s0;
+         c->n = (uint32_t)n;
+         c->k = (uint32_t)k;
+         c->w_ld = (uint32_t)w_ld;
+         c->s_ld = (uint32_t)ws_ld;
+-        for (int i = 0; i < 4; ++i) c->tab[i] = tab[i];
+         return RAD_OK;
+     };
+-    MoeCls ce{}, co{};
+-    int rc = cls_of(W, Ws, (n_expert + 1) / 2, N0, K0, &ce);
+-    if (rc != RAD_OK) return rc;
+-    rc = cls_of(W1, Ws1, n_expert / 2, N1, K1, &co);
+-    if (rc != RAD_OK) return rc;
++    /* Class q holds the experts e with e % ncls == q, entry e / ncls: ceil((n - q) / ncls) of
++     * them. At two classes the last two are never read and stay zero. */
++    MoeCls cl[4]{};
++    for (int q = 0; q < ncls; ++q) {
++        const int rc = cls_of(Wc[q], Wsc[q], (n_expert + ncls - 1 - q) / ncls, Nc[q], Kc[q],
++                              &cl[q]);
++        if (rc != RAD_OK) return rc;
++    }
++    const MoeCls& ce = cl[0];
++    const MoeCls& co = cl[1];
++    const MoeCls& c2 = cl[2];
++    const MoeCls& c3 = cl[3];
++    const uint32_t cshift = ncls == 4 ? 2u : 1u;
++    if (parts > 0xFFFFFF) return R4D_NO(RAD_E_SHAPE);
++    const uint32_t mode = (a_sorted ? 1u : 0u) | (cshift << 1) | ((uint32_t)parts << 8);
++    MoeTab tabv{};
++    for (int i = 0; i < 4; ++i) tabv.v[i] = tab[i];
+ 
+     /* THE BAND: a decode step takes the (tile, run) form -- one 16-row tile of runs spread over
+      * blocks, see the kernel's ES note -- and anything with runs of several rows takes the aligned
+@@ -2245,11 +2290,11 @@ static int moe_gemm_launch(const RadArgs* a, const R4dSink& sk) {
+         const unsigned tiles = (unsigned)((T + 15) / 16);
+         emit_rc = R4D_EMIT(sk, (moe_gemm_q_kernel<1, 4, 1, 4, W4, true>),
+                            dim3(tiles * 16u, ny), dim3(4 * kWave), 0,
+-                           (const uint8_t*)Aq->data, (const float*)As->data, ce, co,
++                           (const uint8_t*)Aq->data, (const float*)As->data, ce, co, c2, c3,
+                            (const int32_t*)sorted->data, (const int32_t*)off->data,
+-                           (uint16_t*)Y->data, (uint32_t)T, (uint32_t)N, (uint32_t)parts,
+-                           (uint32_t)n_expert, (uint32_t)top_k, (uint32_t)(a_sorted ? 1 : 0),
+-                           (uint32_t)a_ld, (uint32_t)as_ld, (uint32_t)y_ld, nullptr);
++                           (uint16_t*)Y->data, nullptr,
++                           (uint32_t)T, (uint32_t)N, (uint32_t)n_expert, (uint32_t)top_k,
++                           (uint32_t)a_ld, (uint32_t)as_ld, (uint32_t)y_ld, mode, tabv);
+     } else {
+         /* THE PREFILL FORM IS ALIGNED TO RUNS when the scratch for a map is there, and uniform
+          * when it is not. A caller that never asked the scratch hook -- a tool replaying a
+@@ -2274,39 +2319,37 @@ static int moe_gemm_launch(const RadArgs* a, const R4dSink& sk) {
+             if (wide_n)
+                 emit_rc = R4D_EMIT(sk, (moe_gemm_q_kernel<kPrefillRows / 16, kPrefillCols / 16, 2, 4, W4, false, true, true>),
+                                    dim3((unsigned)cap, nyw), dim3(8 * kWave), 0,
+-                                   (const uint8_t*)Aq->data, (const float*)As->data, ce, co,
++                                   (const uint8_t*)Aq->data, (const float*)As->data, ce, co, c2, c3,
+                                    (const int32_t*)sorted->data, (const int32_t*)off->data,
+-                                   (uint16_t*)Y->data, (uint32_t)T, (uint32_t)N, (uint32_t)parts,
+-                                   (uint32_t)n_expert, (uint32_t)top_k, (uint32_t)(a_sorted ? 1 : 0),
+-                                   (uint32_t)a_ld, (uint32_t)as_ld, (uint32_t)y_ld,
+-                                   (const uint32_t*)map);
++                                   (uint16_t*)Y->data, (const uint32_t*)map,
++                                   (uint32_t)T, (uint32_t)N, (uint32_t)n_expert, (uint32_t)top_k,
++                                   (uint32_t)a_ld, (uint32_t)as_ld, (uint32_t)y_ld, mode, tabv);
+             else
+             emit_rc = R4D_EMIT(sk, (moe_gemm_q_kernel<kPrefillRows / 16, 4, 2, 2, W4, false, true, true>),
+                                dim3((unsigned)cap, ny), dim3(4 * kWave), 0,
+-                               (const uint8_t*)Aq->data, (const float*)As->data, ce, co,
++                               (const uint8_t*)Aq->data, (const float*)As->data, ce, co, c2, c3,
+                                (const int32_t*)sorted->data, (const int32_t*)off->data,
+-                               (uint16_t*)Y->data, (uint32_t)T, (uint32_t)N, (uint32_t)parts,
+-                               (uint32_t)n_expert, (uint32_t)top_k, (uint32_t)(a_sorted ? 1 : 0),
+-                               (uint32_t)a_ld, (uint32_t)as_ld, (uint32_t)y_ld,
+-                               (const uint32_t*)map);
++                               (uint16_t*)Y->data, (const uint32_t*)map,
++                               (uint32_t)T, (uint32_t)N, (uint32_t)n_expert, (uint32_t)top_k,
++                               (uint32_t)a_ld, (uint32_t)as_ld, (uint32_t)y_ld, mode, tabv);
+         } else if (wide_n) {
+             emit_rc = R4D_EMIT(sk, (moe_gemm_q_kernel<kPrefillRows / 16, kPrefillCols / 16, 2, 4, W4, false, false, true>),
+                                dim3((unsigned)((T + kPrefillRows - 1) / kPrefillRows), nyw),
+                                dim3(8 * kWave), 0,
+-                               (const uint8_t*)Aq->data, (const float*)As->data, ce, co,
++                               (const uint8_t*)Aq->data, (const float*)As->data, ce, co, c2, c3,
+                                (const int32_t*)sorted->data, (const int32_t*)off->data,
+-                               (uint16_t*)Y->data, (uint32_t)T, (uint32_t)N, (uint32_t)parts,
+-                               (uint32_t)n_expert, (uint32_t)top_k, (uint32_t)(a_sorted ? 1 : 0),
+-                               (uint32_t)a_ld, (uint32_t)as_ld, (uint32_t)y_ld, nullptr);
++                               (uint16_t*)Y->data, nullptr,
++                               (uint32_t)T, (uint32_t)N, (uint32_t)n_expert, (uint32_t)top_k,
++                               (uint32_t)a_ld, (uint32_t)as_ld, (uint32_t)y_ld, mode, tabv);
+         } else {
+             emit_rc = R4D_EMIT(sk, (moe_gemm_q_kernel<kPrefillRows / 16, 4, 2, 2, W4, false, false, true>),
+                                dim3((unsigned)((T + kPrefillRows - 1) / kPrefillRows), ny),
+                                dim3(4 * kWave), 0,
+-                               (const uint8_t*)Aq->data, (const float*)As->data, ce, co,
++                               (const uint8_t*)Aq->data, (const float*)As->data, ce, co, c2, c3,
+                                (const int32_t*)sorted->data, (const int32_t*)off->data,
+-                               (uint16_t*)Y->data, (uint32_t)T, (uint32_t)N, (uint32_t)parts,
+-                               (uint32_t)n_expert, (uint32_t)top_k, (uint32_t)(a_sorted ? 1 : 0),
+-                               (uint32_t)a_ld, (uint32_t)as_ld, (uint32_t)y_ld, nullptr);
++                               (uint16_t*)Y->data, nullptr,
++                               (uint32_t)T, (uint32_t)N, (uint32_t)n_expert, (uint32_t)top_k,
++                               (uint32_t)a_ld, (uint32_t)as_ld, (uint32_t)y_ld, mode, tabv);
+         }
+     }
+     if (emit_rc != RAD_OK) return emit_rc;
+@@ -2356,6 +2399,20 @@ static int rad_moe_gemm_w4a8_body(const RadArgs* a, const R4dSink& sk) {
+ }
+ R4D_ENTRY(r4d_rad_moe_gemm_w4a8, rad_moe_gemm_w4a8_body)
+ 
++/* `moe_gemm_q_mod4`: the same launches over four classes, by the expert's number mod 4. The run
++ * map and its scratch are the two-class op's -- they depend on the offsets and nothing else. */
++extern "C" int r4d_rad_moe_gemm_q_mod4(const RadArgs* a, RadStream s) {
++    return moe_gemm_launch<0>(a, r4d_stream_sink(s), 4);
++}
++static int rad_moe_gemm_w4a8_mod4_body(const RadArgs* a, const R4dSink& sk) {
++    const char* wdt = r4d_gets(a, "dtype");
++    if (wdt && !std::strcmp(wdt, "w4nl64a8h")) return moe_gemm_launch<2>(a, sk, 4);
++    if (wdt && !std::strcmp(wdt, "w4nl32a8h")) return moe_gemm_launch<3>(a, sk, 4);
++    if (wdt && !std::strcmp(wdt, "w5nl64a8h")) return moe_gemm_launch<4>(a, sk, 4);
++    return moe_gemm_launch<1>(a, sk, 4);
++}
++R4D_ENTRY(r4d_rad_moe_gemm_w4a8_mod4, rad_moe_gemm_w4a8_mod4_body)
++
+ /* `moe_gemm` at bf16: operands a, w (one table), sorted_tok, expert_offset -> y. The band and the
+  * three forms are moe_gemm_launch's and are chosen by the same rule from the same arguments, so the
+  * scratch hook that sizes the run map is the same function too.
+diff --git a/libr4d/r4d_plugin.h b/libr4d/r4d_plugin.h
+index 0dc49de..60f3573 100644
+--- a/libr4d/r4d_plugin.h
++++ b/libr4d/r4d_plugin.h
+@@ -231,6 +231,11 @@ int64_t r4d_rad_moe_gemm_w4a8_scratch(const RadArgs*);
+  * section for the stored plane. */
+ int     r4d_rad_moe_gemm_w4a8      (const RadArgs*, RadStream);
+ int r4d_rad_moe_gemm_w4a8_describe(const RadArgs*, RadStream, RadLaunchDesc*, int, int*);
++/* `moe_gemm_q_mod4`: the same two kernels over four classes of experts, by the expert's number
++ * mod 4. The scratch hooks are the two-class ones. */
++int     r4d_rad_moe_gemm_q_mod4    (const RadArgs*, RadStream);
++int     r4d_rad_moe_gemm_w4a8_mod4 (const RadArgs*, RadStream);
++int r4d_rad_moe_gemm_w4a8_mod4_describe(const RadArgs*, RadStream, RadLaunchDesc*, int, int*);
+ /* `moe_gemm` at bf16: one weight table of the checkpoint's own row-major planes, no scales. The
+  * same grouping and the same three forms; its scratch hook sizes the same run map. */
+ int     r4d_rad_moe_gemm_bf16      (const RadArgs*, RadStream);
+@@ -326,11 +331,14 @@ R4D_HOOKS(mtp_e4m3)
+ R4D_HOOKS(w4)
+ R4D_HOOKS(w2a8)
+ R4D_HOOKS(moe_w4)
++R4D_HOOKS(moe_w4_mod4)
+ #undef R4D_HOOKS
+ int r4d_rad_layout_fp8_rowmajor(const RadParam*, int, int, const RadEncoding*, const int*,
+                                 const RadTensor*, int, RadLayout*);
+ int r4d_rad_layout_moe_fp8(const RadParam*, int, int, const RadEncoding*, const int*,
+                            const RadTensor*, int, RadLayout*);
++int r4d_rad_layout_moe_fp8_mod4(const RadParam*, int, int, const RadEncoding*, const int*,
++                                const RadTensor*, int, RadLayout*);
+ int r4d_rad_layout_w8a16(const RadParam*, int, int, const RadEncoding*, const int*,
+                          const RadTensor*, int, RadLayout*);
+ int r4d_rad_layout_w8a8(const RadParam*, int, int, const RadEncoding*, const int*,
+@@ -467,6 +475,7 @@ int r4d_shape_router_topk    (const RadParam*, int, int operand, RadOpdDesc*);
+ int r4d_shape_router_topk_scatter(const RadParam*, int, int, RadOpdDesc*);
+ int r4d_shape_moe_scatter    (const RadParam*, int, int operand, RadOpdDesc*);
+ int r4d_shape_moe_gemm_q     (const RadParam*, int, int operand, RadOpdDesc*);
++int r4d_shape_moe_gemm_q_mod4(const RadParam*, int, int operand, RadOpdDesc*);
+ int r4d_shape_moe_gather     (const RadParam*, int, int operand, RadOpdDesc*);
+ int r4d_shape_scale_rows     (const RadParam*, int, int operand, RadOpdDesc*);
+ int r4d_shape_row_topk_merge (const RadParam*, int, int operand, RadOpdDesc*);
+diff --git a/libr4d/r4d_rows.cpp b/libr4d/r4d_rows.cpp
+index 2fda504..07910eb 100644
+--- a/libr4d/r4d_rows.cpp
++++ b/libr4d/r4d_rows.cpp
+@@ -859,6 +859,34 @@ static const RadOperandSpec oMoeGemmQ[] = {
+     { "w_odd_scale",   RAD_OPD_WTAB, 0 },
+     { "y",             RAD_OPD_OUT,  0 },
+ };
++/* THE SAME GEMM OVER FOUR CLASSES, BY THE EXPERT'S NUMBER MOD 4: `w`/`w_scale` hold class 0 at
++ * [N, K] and `w_q`/`w_q_scale` class q at [N_q, K_q], expert e being entry e / 4 of class e % 4.
++ * Four ranks splitting a five-block expert cannot share the extra block evenly over two classes --
++ * whichever two ranks take it carry three blocks of every even/odd pair against the others' two --
++ * and over four they can: rank r takes two blocks of class r and one of each other, five of every
++ * four experts. A separate op and not a parameter on `moe_gemm_q`, because the declaration divides
++ * a table op's weights over its table operands by count alone (core/build/rad_builder.cpp): the
++ * operand list is the class count. `y` follows the last class. */
++static const RadParamSpec pMoeGemmQMod4[] = {
++    P_INT("M"), P_INT("N"), P_INT("K"), P_INT("n_expert"), P_INT("top_k"), P_INT("group"),
++    P_STR("a_order"), P_STR("dtype"), P_INTO("N_1"), P_INTO("K_1"), P_INTO("N_2"), P_INTO("K_2"),
++    P_INTO("N_3"), P_INTO("K_3"), P_INTO("parts"),
++};
++static const RadOperandSpec oMoeGemmQMod4[] = {
++    { "a",             RAD_OPD_IN,   0 },
++    { "a_scale",       RAD_OPD_IN,   1 },
++    { "w",             RAD_OPD_WTAB, 0 },
++    { "w_scale",       RAD_OPD_WTAB, 0 },
++    { "sorted_tok",    RAD_OPD_IN,   0 },
++    { "expert_offset", RAD_OPD_IN,   0 },
++    { "w_1",           RAD_OPD_WTAB, 0 },
++    { "w_1_scale",     RAD_OPD_WTAB, 0 },
++    { "w_2",           RAD_OPD_WTAB, 0 },
++    { "w_2_scale",     RAD_OPD_WTAB, 0 },
++    { "w_3",           RAD_OPD_WTAB, 0 },
++    { "w_3_scale",     RAD_OPD_WTAB, 0 },
++    { "y",             RAD_OPD_OUT,  0 },
++};
+ static const RadParamSpec pMoeGather[] = {
+     P_INT("M"), P_INT("n"), P_INT("top_k"), P_STR("dtype"),
+     /* The shared arm's gate, and it is present exactly when `shared` and `shared_gate` are.
+@@ -1970,6 +1998,11 @@ static const RadOpSchema kSchemas[] = {
+            "[N, K] and `w_odd`/`w_odd_scale` the odd ones at [N_odd, K_odd], expert e at entry "
+            "e/2. The output is max(N, N_odd) wide in `parts` stacked parts, and a class narrower "
+            "than that fills each part's leading columns and zeros the rest."),
++    SCHEMA("moe_gemm_q_mod4", pMoeGemmQMod4, oMoeGemmQMod4,
++           "moe_gemm_q over FOUR weight-table classes by the expert's number mod 4: `w`/`w_scale` "
++           "hold class 0 at [N, K] and `w_q`/`w_q_scale` class q at [N_q, K_q], expert e at entry "
++           "e/4 of class e%4. The output is as wide as the widest class in `parts` stacked parts, "
++           "and a narrower class fills each part's leading columns and zeros the rest."),
+     SCHEMA("moe_gather", pMoeGather, oMoeGather,
+            "scatters the sorted expert output back to token order and weights it. The sum over a "
+            "token's slots runs in ASCENDING SLOT order, which is what makes it reproducible -- "
+@@ -4292,6 +4325,28 @@ static const RadKernelInfo kKernels[] = {
+   r4d_rad_layout_moe_w4, r4d_rad_relayout_moe_w4, nullptr, r4d_rad_unrelayout_moe_w4, nullptr,
+   r4d_rad_moe_gemm_w4a8_describe },
+ 
++{ "moe_gemm_fp8a8_mod4", "moe_gemm_q_mod4", "moe",
++  "moe_gemm_fp8a8 over four classes of experts by number mod 4: the same kernel, each run reading "
++  "its class's table",
++  "as moe_gemm_fp8a8, every class",
++  "as moe_gemm_fp8a8",
++  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
++  ROW(cMoeGemmQ), NOTUNE,
++  nullptr, nullptr, r4d_rad_moe_gemm_q_mod4, r4d_rad_moe_gemm_q_scratch,
++  r4d_rad_layout_moe_fp8_mod4, nullptr,
++  r4d_shape_moe_gemm_q_mod4, nullptr },
++
++{ "moe_gemm_w4a8_mod4", "moe_gemm_q_mod4", "moe",
++  "moe_gemm_w4a8 over four classes of experts by number mod 4: the same kernel, each run reading "
++  "its class's table",
++  "as moe_gemm_w4a8, every class",
++  "as moe_gemm_w4a8",
++  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
++  ROW(cMoeGemmW4), NOTUNE,
++  nullptr, nullptr, r4d_rad_moe_gemm_w4a8_mod4, r4d_rad_moe_gemm_w4a8_scratch,
++  r4d_rad_layout_moe_w4_mod4, r4d_rad_relayout_moe_w4_mod4, nullptr,
++  r4d_rad_unrelayout_moe_w4_mod4, nullptr, r4d_rad_moe_gemm_w4a8_mod4_describe },
++
+ { "moe_gemm_bf16", "moe_gemm", "moe",
+   "the grouped GEMM with unquantised experts: one run of expert-sorted rows a block, bf16 WMMA over "
+   "an LDS-staged 64-deep K pass with the next one prefetched in registers",
+diff --git a/libr4d/r4d_selftest.cpp b/libr4d/r4d_selftest.cpp
+index 8c63b82..45d4660 100644
+--- a/libr4d/r4d_selftest.cpp
++++ b/libr4d/r4d_selftest.cpp
+@@ -6049,6 +6049,7 @@ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int
+     }
+ 
+     const int f_lo = pl.pin_moe ? 1 : 0, f_hi = pl.pin_moe ? 3 : 0;
++    std::vector<uint16_t> two_cls[4];      /* each form's bytes, for the four-class pass below */
+     for (int form = f_lo; form <= f_hi; ++form) {
+         const std::string label = what + " " + kForm[form];
+         if (pl.pin_moe) pl.pin_moe(form);
+@@ -6091,6 +6092,69 @@ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int
+             }
+         ok(label.c_str(), bad == 0, std::to_string(bad) + " of " + std::to_string(Tr * N) +
+                                     " elements off, worst " + std::to_string(worst) + first);
++        two_cls[form] = got;
++    }
++
++    /* AND THE SAME EXPERTS AS FOUR CLASSES, by number mod 4 (`moe_gemm_q_mod4`). Each parity table
++     * read at twice its stride is two of them -- from its first entry, the experts 0, 4, 8, ... of
++     * its parity's numbers mod 4, and from its second the others -- so classes 0 and 2 are the even
++     * table's halves and 1 and 3 the odd one's, at the even and the odd geometry. The same experts
++     * at the same geometry, read in the same order: every form must give the two-class op's bytes,
++     * byte for byte. What this checks is the class and entry each run resolves to. */
++    const RadKernelInfo* r4 = find(pl, "moe_gemm_w4a8_mod4");
++    const std::string what4 = what + ", four classes";
++    if (!r4) {
++        ok(what4.c_str(), false, "row moe_gemm_w4a8_mod4 absent");
++        return;
++    }
++    auto halves = [](const RadTensor& t, int bits, RadTensor* lo, RadTensor* hi) {
++        const int64_t n = t.shape[0];
++        *lo = t;
++        *hi = t;
++        lo->shape[0] = (n + 1) / 2;
++        hi->shape[0] = n / 2;
++        lo->stride[0] = t.stride[0] * 2;
++        hi->stride[0] = t.stride[0] * 2;
++        hi->data = (char*)t.data + t.stride[0] * bits / 8;
++    };
++    const int wbits = w5 ? 5 : 4, sbits = g64 ? 8 : 16;
++    RadTensor c4w[4], c4s[4];
++    halves(ts[2], wbits, &c4w[0], &c4w[2]);
++    halves(ts[3], sbits, &c4s[0], &c4s[2]);
++    halves(ts[6], wbits, &c4w[1], &c4w[3]);
++    halves(ts[7], sbits, &c4s[1], &c4s[3]);
++    std::vector<RadTensor> ts4 = { ts[0], ts[1], c4w[0], c4s[0], ts[4], ts[5], c4w[1], c4s[1],
++                                   c4w[2], c4s[2], c4w[3], c4s[3], ts[8] };
++    std::vector<RadParam> ps4 = {
++        PI("M", M), PI("N", sh.N0), PI("K", sh.K0), PI("N_1", sh.N1), PI("K_1", sh.K1),
++        PI("N_2", sh.N0), PI("K_2", sh.K0), PI("N_3", sh.N1), PI("K_3", sh.K1),
++        PI("parts", sh.parts), PI("n_expert", ne), PI("top_k", top_k), PI("group", group),
++        PS("a_order", "token"), PS("dtype", dt),
++    };
++    RadArgs a4;
++    std::memset(&a4, 0, sizeof(a4));
++    a4.t = ts4.data(); a4.n_t = (int)ts4.size();
++    a4.p = ps4.data(); a4.n_p = (int)ps4.size();
++    for (int form = f_lo; form <= f_hi; ++form) {
++        const std::string label = what4 + " " + kForm[form];
++        if (two_cls[form].empty()) continue;      /* the two-class launch failed, and said so */
++        if (pl.pin_moe) pl.pin_moe(form);
++        {
++            std::vector<uint16_t> junk((size_t)(Tr * N), 0x7f7fu);
++            st_memcpy(d_y, junk.data(), junk.size() * 2, hipMemcpyHostToDevice);
++        }
++        a4.scratch = form == 3 ? nullptr : d_map;
++        a4.scratch_bytes = form == 3 ? 0 : map_bytes;
++        const int rc = r4->launch(&a4, nullptr);
++        st_stream_sync(nullptr);
++        if (pl.pin_moe) pl.pin_moe(0);
++        if (rc != RAD_OK) { ok(label.c_str(), false, "launch rc=" + std::to_string(rc)); continue; }
++        std::vector<uint16_t> got((size_t)(Tr * N));
++        st_memcpy(got.data(), d_y, got.size() * 2, hipMemcpyDeviceToHost);
++        int64_t diff = 0;
++        for (size_t i = 0; i < got.size(); ++i) diff += got[i] != two_cls[form][i];
++        ok(label.c_str(), diff == 0, std::to_string(diff) + " of " + std::to_string(Tr * N) +
++                                     " elements differ from the two-class op's");
+     }
+ }
+ 
+diff --git a/libr4d/r4d_shapes.cpp b/libr4d/r4d_shapes.cpp
+index d1eb6c9..6bc00d0 100644
+--- a/libr4d/r4d_shapes.cpp
++++ b/libr4d/r4d_shapes.cpp
+@@ -1310,6 +1310,49 @@ extern "C" int r4d_shape_moe_gemm_q(const RadParam* p, int n_p, int operand, Rad
+     R4D_PICK(l);
+ }
+ 
++/* The four-class form: class q holds the experts e with e % 4 == q at [N_q, K_q], defaulting to
++ * class 0's, ceil((n - q) / 4) of them; `y` follows the last class. */
++extern "C" int r4d_shape_moe_gemm_q_mod4(const RadParam* p, int n_p, int operand,
++                                         RadOpdDesc* out) {
++    const int64_t M  = pi(p, n_p, "M");
++    int64_t Nc[4], Kc[4];
++    Nc[0] = pi(p, n_p, "N");
++    Kc[0] = pi(p, n_p, "K");
++    Nc[1] = pi(p, n_p, "N_1", Nc[0]); Kc[1] = pi(p, n_p, "K_1", Kc[0]);
++    Nc[2] = pi(p, n_p, "N_2", Nc[0]); Kc[2] = pi(p, n_p, "K_2", Kc[0]);
++    Nc[3] = pi(p, n_p, "N_3", Nc[0]); Kc[3] = pi(p, n_p, "K_3", Kc[0]);
++    const int64_t ne = pi(p, n_p, "n_expert");
++    const int64_t k  = pi(p, n_p, "top_k");
++    int64_t g = pi(p, n_p, "group");
++    if (ne <= 0 || k <= 0) return RAD_E_UNSUPPORTED;
++    if (g <= 0) g = 128;
++    int64_t N = 0, K = 0;
++    for (int q = 0; q < 4; ++q) {
++        if (Nc[q] <= 0 || Kc[q] <= 0) return RAD_E_UNSUPPORTED;
++        if (Nc[q] > N) N = Nc[q];
++        if (Kc[q] > K) K = Kc[q];
++    }
++    int64_t nq[4];
++    for (int q = 0; q < 4; ++q) nq[q] = (ne + 3 - q) / 4;
++    const uint32_t D = dt_act(p, n_p, "dtype");
++    const char* ord = rad_param_gets(p, n_p, "a_order", nullptr);
++    const int64_t AR = (ord && !std::strcmp(ord, "sorted")) ? M * k : M;
++    auto wq = [&](int q) { return opd((uint32_t)RAD_F8E4M3, nq[q], Nc[q], Kc[q]); };
++    auto sq = [&](int q) {
++        return opd((uint32_t)RAD_BF16, nq[q], (Nc[q] + g - 1) / g, (Kc[q] + g - 1) / g);
++    };
++    const RadOpdDesc l[] = {
++        opd((uint32_t)RAD_F8E4M3, AR, K),                 /* a -- see `a_order` */
++        opd((uint32_t)RAD_F32, AR, (K + g - 1) / g),      /* a_scale */
++        wq(0), sq(0),                                     /* w, w_scale -- class 0 */
++        opd_idx(M * k, 0, M * k, -1),                     /* sorted_tok */
++        opd_idx(ne + 1, 0, M * k + 1, -1),                /* expert_offset */
++        wq(1), sq(1), wq(2), sq(2), wq(3), sq(3),         /* classes 1, 2, 3 */
++        opd(D, M * k, N),                                 /* y -- in SORTED order */
++    };
++    R4D_PICK(l);
++}
++
+ extern "C" int r4d_shape_moe_gather(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+     const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n");
+     const int64_t k = pi(p, n_p, "top_k");
+diff --git a/libref/ref_moe.cpp b/libref/ref_moe.cpp
+index 0b67782..c130799 100644
+--- a/libref/ref_moe.cpp
++++ b/libref/ref_moe.cpp
+@@ -173,8 +173,8 @@ int ref_moe_scatter(const RadArgs* a, RadStream) {
+  * here. Only the WEIGHT scale grid is block-shaped -- one scale per 128x128 tile of an expert --
+  * while the activation's is per row per group of K, which is `rblk = 1`, which is what
+  * make_scales derives on its own from the two extents. */
+-static int moe_gemm_impl(const RadArgs* a, bool quant) {
+-    const int n_opd = quant ? 9 : 5;
++static int moe_gemm_impl(const RadArgs* a, bool quant, int ncls = 2) {
++    const int n_opd = quant ? (ncls == 4 ? 13 : 9) : 5;
+     if (!have(a, n_opd)) return RAD_E_INVAL;
+     const RadTensor* A      = &a->t[0];
+     const RadTensor* as_    = quant ? t_in(a, 1) : nullptr;
+@@ -182,12 +182,18 @@ static int moe_gemm_impl(const RadArgs* a, bool quant) {
+     const RadTensor* ws_    = quant ? t_in(a, 3) : nullptr;
+     const RadTensor* sorted = &a->t[quant ? 4 : 2];
+     const RadTensor* off    = &a->t[quant ? 5 : 3];
+-    const RadTensor* Y      = &a->t[quant ? 8 : 4];
+-    /* THE QUANTISED ARM'S EXPERTS ARE TWO TABLES BY PARITY -- see ref_registry.cpp -- and the
+-     * plain arm's are one, which is the same walk with every expert in the first class. */
++    const RadTensor* Y      = &a->t[quant ? (ncls == 4 ? 12 : 8) : 4];
++    /* THE QUANTISED ARM'S EXPERTS ARE TWO TABLES BY PARITY -- see ref_registry.cpp -- or, for
++     * `moe_gemm_q_mod4`, four by the expert's number mod 4; the plain arm's are one, which is the
++     * same walk with every expert in the first class. */
+     const RadTensor* W1     = quant ? &a->t[6] : W;
+     const RadTensor* ws1_   = quant ? t_in(a, 7) : nullptr;
+     const bool two = quant;
++    const int  nc  = quant ? ncls : 1;
++    const RadTensor* Wq[4]  = { W, W1, quant && nc == 4 ? &a->t[8] : W,
++                                quant && nc == 4 ? &a->t[10] : W };
++    const RadTensor* wsq[4] = { ws_, ws1_, quant && nc == 4 ? t_in(a, 9) : nullptr,
++                                quant && nc == 4 ? t_in(a, 11) : nullptr };
+ 
+     /* "sorted" means `a` already has one row per (token, slot) in the scatter's order, which is
+      * what the DOWN projection of a routed block reads -- its input is the first projection's
+@@ -199,19 +205,29 @@ static int moe_gemm_impl(const RadArgs* a, bool quant) {
+ 
+     const int64_t N0 = p_int(a, "N", W->rank >= 3 ? W->shape[1] : 0);
+     const int64_t K0 = p_int(a, "K", W->rank >= 3 ? W->shape[2] : 0);
+-    const int64_t N1 = two ? p_int(a, "N_odd", N0) : N0;
+-    const int64_t K1 = two ? p_int(a, "K_odd", K0) : K0;
++    /* Each class's geometry, defaulting to class 0's: N_odd/K_odd at two classes, N_q/K_q at
++     * four. */
++    static const char* const kN4[4] = { "N", "N_1", "N_2", "N_3" };
++    static const char* const kK4[4] = { "K", "K_1", "K_2", "K_3" };
++    int64_t Nq[4] = { N0, N0, N0, N0 }, Kq[4] = { K0, K0, K0, K0 };
++    for (int q = 1; q < nc; ++q) {
++        Nq[q] = p_int(a, nc == 4 ? kN4[q] : "N_odd", N0);
++        Kq[q] = p_int(a, nc == 4 ? kK4[q] : "K_odd", K0);
++    }
+     const int64_t parts = two ? p_int(a, "parts", 1) : 1;
+     const int64_t n_expert = p_int(a, "n_expert", W->rank >= 3 ? W->shape[0] : 0);
+     const int64_t top_k = p_int(a, "top_k", 1);
+-    if (N0 <= 0 || K0 <= 0 || N1 <= 0 || K1 <= 0 || parts <= 0 || n_expert <= 0 || top_k <= 0)
+-        return RAD_E_SHAPE;
+-    if (N0 % parts || N1 % parts) return RAD_E_SHAPE;
+-    /* The output is the wider class's width, the activation the longer class's K. */
+-    const int64_t N = N0 > N1 ? N0 : N1, K = K0 > K1 ? K0 : K1;
+-    const int64_t ne0 = two ? (n_expert + 1) / 2 : n_expert, ne1 = two ? n_expert / 2 : 0;
+-    if (W->rank < 3 || W->shape[0] < ne0) return RAD_E_SHAPE;
+-    if (two && (W1->rank < 3 || W1->shape[0] < ne1)) return RAD_E_SHAPE;
++    if (parts <= 0 || n_expert <= 0 || top_k <= 0) return RAD_E_SHAPE;
++    /* The output is the widest class's width, the activation the longest class's K. Class q
++     * holds ceil((n - q) / nc) experts. */
++    int64_t N = 0, K = 0;
++    for (int q = 0; q < nc; ++q) {
++        if (Nq[q] <= 0 || Kq[q] <= 0 || Nq[q] % parts) return RAD_E_SHAPE;
++        if (Nq[q] > N) N = Nq[q];
++        if (Kq[q] > K) K = Kq[q];
++        const int64_t neq = (n_expert + nc - 1 - q) / nc;
++        if (neq > 0 && (Wq[q]->rank < 3 || Wq[q]->shape[0] < neq)) return RAD_E_SHAPE;
++    }
+     const int64_t T = numel(Y) / N;
+     if (T <= 0 || numel(sorted) < T || numel(off) < n_expert + 1) return RAD_E_SHAPE;
+ 
+@@ -235,17 +251,17 @@ static int moe_gemm_impl(const RadArgs* a, bool quant) {
+     /* Per-expert readings, built once outside the row loop: a table lookup and a Scales are cheap,
+      * and doing them per row would be T of them against n_expert. A null `data` means the operand
+      * could not be read as a table at all, which is refused before the loop because an OpenMP body
+-     * cannot return. Expert e is entry e / 2 of class e % 2 when there are two classes. */
++     * cannot return. Expert e is entry e / nc of class e % nc. */
+     std::vector<RadTensor> we((size_t)n_expert), wse((size_t)n_expert);
+     std::vector<Mat>       mw((size_t)n_expert);
+     std::vector<Scales>    SW((size_t)n_expert);
+     std::vector<int64_t>   en((size_t)n_expert), ek((size_t)n_expert);
+     for (int64_t e = 0; e < n_expert; ++e) {
+-        const bool odd = two && (e & 1);
+-        const RadTensor* tw = odd ? W1 : W;
+-        const RadTensor* ts = odd ? ws1_ : ws_;
+-        const int64_t ix = two ? e / 2 : e;
+-        const int64_t n = odd ? N1 : N0, k = odd ? K1 : K0;
++        const int q = (int)(e % nc);
++        const RadTensor* tw = Wq[q];
++        const RadTensor* ts = wsq[q];
++        const int64_t ix = e / nc;
++        const int64_t n = Nq[q], k = Kq[q];
+         en[(size_t)e] = n;
+         ek[(size_t)e] = k;
+         we[(size_t)e] = expert_entry(tw, ix);
+@@ -301,6 +317,7 @@ static int moe_gemm_impl(const RadArgs* a, bool quant) {
+ 
+ int ref_moe_gemm(const RadArgs* a, RadStream)   { return moe_gemm_impl(a, false); }
+ int ref_moe_gemm_q(const RadArgs* a, RadStream) { return moe_gemm_impl(a, true); }
++int ref_moe_gemm_q_mod4(const RadArgs* a, RadStream) { return moe_gemm_impl(a, true, 4); }
+ 
+ /* ------------------------------------------------------------------ moe_gather */
+ /* y[t] = sum over the token's slots of expert_w[t, j] * y_expert[position of (t, j)].
+diff --git a/libref/ref_ops.h b/libref/ref_ops.h
+index 23eb896..16e541e 100644
+--- a/libref/ref_ops.h
++++ b/libref/ref_ops.h
+@@ -120,6 +120,7 @@ int ref_router_topk        (const RadArgs*, RadStream);
+ int ref_moe_scatter        (const RadArgs*, RadStream);
+ int ref_moe_gemm           (const RadArgs*, RadStream);
+ int ref_moe_gemm_q         (const RadArgs*, RadStream);
++int ref_moe_gemm_q_mod4    (const RadArgs*, RadStream);
+ int ref_scale_rows         (const RadArgs*, RadStream);
+ int ref_moe_gather         (const RadArgs*, RadStream);
+ int ref_row_topk           (const RadArgs*, RadStream);
+@@ -231,6 +232,7 @@ REF_SHAPE_FN(ref_router_topk);
+ REF_SHAPE_FN(ref_moe_scatter);
+ REF_SHAPE_FN(ref_moe_gemm);
+ REF_SHAPE_FN(ref_moe_gemm_q);
++REF_SHAPE_FN(ref_moe_gemm_q_mod4);
+ REF_SHAPE_FN(ref_scale_rows);
+ REF_SHAPE_FN(ref_moe_gather);
+ REF_SHAPE_FN(ref_row_topk);
+diff --git a/libref/ref_registry.cpp b/libref/ref_registry.cpp
+index 96ec77d..77ee84e 100644
+--- a/libref/ref_registry.cpp
++++ b/libref/ref_registry.cpp
+@@ -344,6 +344,19 @@ static const RadParamSpec pMoeGemmQ[] = { P_INT("M"), P_INT("N"), P_INT("K"), P_
+ static const RadOperandSpec oMoeGemmQ[] = { OPD("a"), OPD_O("a_scale"), WTAB("w"), WTAB("w_scale"),
+                                             OPD("sorted_tok"), OPD("expert_offset"),
+                                             WTAB("w_odd"), WTAB("w_odd_scale"), OUT("y") };
++/* THE SAME OP OVER FOUR CLASSES, by the expert's number mod 4: `w`/`w_scale` class 0 at [N, K],
++ * `w_q`/`w_q_scale` class q at [N_q, K_q], expert e at entry e / 4 of class e % 4 -- how four
++ * ranks take turns with the extra block of a five-block expert. libr4d's schema states the same. */
++static const RadParamSpec pMoeGemmQMod4[] = { P_INT("M"), P_INT("N"), P_INT("K"), P_INT("n_expert"),
++                                              P_INT("top_k"), P_INT("group"), P_STR("a_order"),
++                                              P_STR("dtype"), P_INTO("N_1"), P_INTO("K_1"),
++                                              P_INTO("N_2"), P_INTO("K_2"), P_INTO("N_3"),
++                                              P_INTO("K_3"), P_INTO("parts") };
++static const RadOperandSpec oMoeGemmQMod4[] = { OPD("a"), OPD_O("a_scale"), WTAB("w"),
++                                                WTAB("w_scale"), OPD("sorted_tok"),
++                                                OPD("expert_offset"), WTAB("w_1"),
++                                                WTAB("w_1_scale"), WTAB("w_2"), WTAB("w_2_scale"),
++                                                WTAB("w_3"), WTAB("w_3_scale"), OUT("y") };
+ 
+ /* `shared` and `shared_gate` PRESENT = the shared arm folded in, `y = bf16(shared * act(gate)) +
+  * bf16(gathered)`, which is scale_rows' fused gate-and-add taken one op further back. `act` is
+@@ -770,6 +783,11 @@ static const RadOpSchema kSchemas[] = {
+   "two tables by parity: `w` the even ones at [N, K], `w_odd` the odd ones at [N_odd, K_odd], "
+   "expert e at entry e/2. The output is max(N, N_odd) wide in `parts` stacked parts, and a "
+   "narrower class fills each part's leading columns and zeros the rest." },
++{ "moe_gemm_q_mod4", ARR(pMoeGemmQMod4), ARR(oMoeGemmQMod4),
++  "moe_gemm_q over FOUR weight-table classes by the expert's number mod 4: `w` class 0 at [N, K], "
++  "`w_q` class q at [N_q, K_q], expert e at entry e/4 of class e%4. The output is as wide as the "
++  "widest class in `parts` stacked parts, and a narrower class fills each part's leading columns "
++  "and zeros the rest." },
+ { "moe_gather", ARR(pMoeGather), ARR(oMoeGather),
+   "Scatters the sorted expert output back and weights it. The sum over a token's slots runs in "
+   "ASCENDING SLOT order, which is what makes it reproducible." },
+@@ -1048,6 +1066,9 @@ SIMPLE("ref_moe_gemm", "moe_gemm", "moe", "grouped GEMM over the expert-sorted r
+        ref_moe_gemm),
+ SIMPLE("ref_moe_gemm_q", "moe_gemm_q", "moe",
+        "grouped GEMM over the expert-sorted rows, quantised operands", DT_FLOAT, ref_moe_gemm_q),
++SIMPLE("ref_moe_gemm_q_mod4", "moe_gemm_q_mod4", "moe",
++       "grouped GEMM over the expert-sorted rows, quantised operands, four classes by number mod 4",
++       DT_FLOAT, ref_moe_gemm_q_mod4),
+ SIMPLE("ref_moe_gather", "moe_gather", "moe", "weighted scatter back to token order", DT_FLOAT,
+        ref_moe_gather),
+ SIMPLE("ref_rope_table", "rope_table", "attn", "cos/sin at each position's own row", DT_FLOAT, ref_rope_table),
+diff --git a/libref/ref_shapes.cpp b/libref/ref_shapes.cpp
+index 03de500..58423ef 100644
+--- a/libref/ref_shapes.cpp
++++ b/libref/ref_shapes.cpp
+@@ -1145,6 +1145,44 @@ int ref_moe_gemm_q_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* ou
+     return o.finish("moe_gemm_q", operand, out);
+ }
+ 
++/* The four-class form: class q at [N_q, K_q], defaulting to class 0's, holds the experts e with
++ * e % 4 == q -- ceil((n - q) / 4) of them -- and `y` follows the last class. */
++int ref_moe_gemm_q_mod4_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
++    const int64_t M  = gi(p, n_p, "M", 0);
++    const int64_t N0 = gi(p, n_p, "N", 0), K0 = gi(p, n_p, "K", 0);
++    const int64_t Nq[4] = { N0, gi(p, n_p, "N_1", N0), gi(p, n_p, "N_2", N0), gi(p, n_p, "N_3", N0) };
++    const int64_t Kq[4] = { K0, gi(p, n_p, "K_1", K0), gi(p, n_p, "K_2", K0), gi(p, n_p, "K_3", K0) };
++    const int64_t ne = gi(p, n_p, "n_expert", 0);
++    const int64_t k  = gi(p, n_p, "top_k", 0);
++    int64_t g = gi(p, n_p, "group", 0);
++    if (M <= 0 || ne <= 0 || k <= 0) return RAD_E_UNSUPPORTED;
++    int64_t N = 0, K = 0;
++    for (int q = 0; q < 4; ++q) {
++        if (Nq[q] <= 0 || Kq[q] <= 0) return RAD_E_UNSUPPORTED;
++        if (Nq[q] > N) N = Nq[q];
++        if (Kq[q] > K) K = Kq[q];
++    }
++    if (g <= 0) g = K;
++    const uint32_t D = act_dt(p, n_p);
++    Opd o;
++    const int64_t AR = sorted_a_order(p, n_p) ? M * k : M;
++    auto cls = [&](int q) {
++        const int64_t nq = (ne + 3 - q) / 4;
++        o.t((uint32_t)RAD_F8E4M3, { nq, Nq[q], Kq[q] });
++        o.t(D, { nq, (Nq[q] + g - 1) / g, (Kq[q] + g - 1) / g });
++    };
++    o.t((uint32_t)RAD_F8E4M3, { AR, K });             /* a -- E4M3 codes, see `a_order` */
++    o.t((uint32_t)RAD_F32, { AR, (K + g - 1) / g });   /* a_scale */
++    cls(0);                                           /* w, w_scale -- class 0 */
++    o.t_idx({ M * k }, M * k, -1, 0);                 /* sorted_tok */
++    o.t_idx({ ne + 1 }, M * k + 1, -1, 0);            /* expert_offset */
++    cls(1);
++    cls(2);
++    cls(3);
++    o.t(D, { M * k, N });                             /* y -- in SORTED order */
++    return o.finish("moe_gemm_q_mod4", operand, out);
++}
++
+ int ref_moe_gather_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+     const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+     const int64_t k = gi(p, n_p, "top_k", 0);
+diff --git a/tests/ref_test.cpp b/tests/ref_test.cpp
+index ba0d8d8..e9dd89f 100644
+--- a/tests/ref_test.cpp
++++ b/tests/ref_test.cpp
+@@ -269,7 +269,8 @@ TEST(op_vocabulary) {
+         "dequant",
+         "gemm_nt", "gemm_nt_bias", "gemm_nt_q", "gemm_nt_q_bias", "grid_embed",
+         "attn_paged", "attn_dense", "kv_store", "rope", "rope_table", "qk_norm_rope",
+-        "router_topk", "moe_scatter", "moe_gemm", "moe_gemm_q", "moe_gather", "row_topk",
++        "router_topk", "moe_scatter", "moe_gemm", "moe_gemm_q", "moe_gemm_q_mod4", "moe_gather",
++        "row_topk",
+         "row_topk_merge", "logit_rerank",
+         "gdn_conv_prep", "gdn_conv_update", "gdn_kkt_solve", "gdn_chunk_scan",
+         "gdn_recurrent_update", "gdn_conv_recurrent_update", "gdn_gated_rmsnorm",
+@@ -1925,6 +1926,59 @@ TEST(op_router_topk) {
+     CHECK_NEAR(w2.at(1), 0.26894142f, 1e-6);
+ }
+ 
++/* THE FOUR-CLASS GROUPED GEMM: expert e is entry e / 4 of class e % 4, each class at its own
++ * width, and a narrower class's columns past its width are zero. Ten experts, so classes 0 and 1
++ * hold three and 2 and 3 hold two -- the shape a layer with 510 quantised experts has -- and class
++ * 1 is the wide one, as it is on rank 1. Every value is a small integer, so the sums are exact. */
++TEST(op_moe_gemm_q_mod4) {
++    const int64_t K = 3, top_k = 2, M = 3, ne = 10;
++    const int64_t Nq[4] = { 2, 4, 2, 2 };
++    auto wv = [](int64_t e, int64_t n, int64_t k) { return (float)(e * 100 + n * 10 + k); };
++    std::vector<T> w, ws;
++    w.reserve(4);
++    ws.reserve(4);
++    for (int q = 0; q < 4; ++q) {
++        const int64_t cnt = (ne + 3 - q) / 4;
++        w.emplace_back(RAD_F32, std::vector<int64_t>{ cnt, Nq[q], K });
++        std::vector<float> v;
++        for (int64_t j = 0; j < cnt; ++j)
++            for (int64_t n = 0; n < Nq[q]; ++n)
++                for (int64_t k = 0; k < K; ++k) v.push_back(wv(q + 4 * j, n, k));
++        w.back().f(v);
++        /* One unit scale an expert: the arithmetic under test is which weight a row reads. */
++        ws.emplace_back(RAD_F32, std::vector<int64_t>{ cnt, 1, 1 });
++        ws.back().f(std::vector<float>((size_t)cnt, 1.0f));
++    }
++    T act(RAD_F32, {M, K});
++    act.f({ 1, 2, 3,  4, 5, 6,  7, 8, 9 });
++    T as(RAD_F32, {M, 1});
++    as.f({ 1, 1, 1 });
++    /* Rows by expert: 1 owns rows 0-1, 2 row 2, 6 row 3, 9 rows 4-5, the rest none. */
++    const std::vector<int64_t> eoff = { 0, 0, 2, 3, 3, 3, 3, 4, 4, 4, 6 };
++    const std::vector<int64_t> flat = { 0, 2, 1, 4, 3, 5 };
++    T sorted(RAD_I32, {6}); sorted.n(flat);
++    T off(RAD_I32, {ne + 1}); off.n(eoff);
++    T y(RAD_F32, {6, 4});
++    A a;
++    a.t(act).t(as).t(w[0]).t(ws[0]).t(sorted).t(off).t(w[1]).t(ws[1]).t(w[2]).t(ws[2]).t(w[3])
++     .t(ws[3]).t(y)
++     .i("M", M).i("N", Nq[0]).i("K", K).i("N_1", Nq[1]).i("K_1", K).i("N_2", Nq[2]).i("K_2", K)
++     .i("N_3", Nq[3]).i("K_3", K).i("n_expert", ne).i("top_k", top_k).s("a_order", "token")
++     .s("dtype", "f32");
++    CHECK_OK(run("moe_gemm_q_mod4", a));
++    for (int64_t i = 0; i < 6; ++i) {
++        int64_t e = 0;
++        while (eoff[(size_t)(e + 1)] <= i) ++e;
++        const int64_t tok = flat[(size_t)i] / top_k;
++        for (int64_t n = 0; n < 4; ++n) {
++            float want = 0.0f;
++            if (n < Nq[e % 4])
++                for (int64_t k = 0; k < K; ++k) want += act.at(tok * K + k) * wv(e, n, k);
++            CHECK_EQ(y.at(i * 4 + n), want);
++        }
++    }
++}
++
+ TEST(op_moe_chain) {
+     /* Two tokens, two experts, top_k 2 -- every token visits every expert, so the whole chain is
+      * checkable without any routing subtlety. */
+-- 
+2.55.0
+
+
+From bac297e3c7a6b40f5c2f3d4e1e8c80f8c182dfc1 Mon Sep 17 00:00:00 2001
+From: keptn42 <keptn42@noreply.codeberg.org>
+Date: Mon, 5 Oct 2026 11:55:13 +0200
+Subject: [PATCH 3/5] four-rank Flash-Next: the routed experts in four classes
+
+The parity split gave ranks 0..3 30/30/20/20 % of the routed work. The extra
+block of each five-block expert now goes round all four ranks by expert id
+mod 4: rank r takes two blocks of class r and one of each other class, a
+quarter each. The plain experts' extra tiles move to ranks 0 and 1 so they
+do not stack on the shared expert's. One and two ranks declare as before.
+---
+ arch/common/rad_block_moe_fp8.h    | 162 ++++++++++++++++++++------
+ arch/qwen4exp_fp8/qwen4exp_fp8.cpp |  49 ++++++--
+ docs/ARCHITECTURES.md              |  17 +--
+ tests/arch_test.cpp                | 178 ++++++++++++++++++++++++-----
+ 4 files changed, 324 insertions(+), 82 deletions(-)
+
+diff --git a/arch/common/rad_block_moe_fp8.h b/arch/common/rad_block_moe_fp8.h
+index fce97f5..48772c1 100644
+--- a/arch/common/rad_block_moe_fp8.h
++++ b/arch/common/rad_block_moe_fp8.h
+@@ -45,7 +45,9 @@
+  * Config::ff_lo). So the arrays are declared in separate loops -- gate_up codes, gate_up scales,
+  * down codes, down scales, each for the even experts and then the odd ones -- and NOT as a group
+  * per expert. Interleaving them would give runs of stride two or four, which the operand cannot
+- * express; the failure would be a table whose second entry is a scale plane.
++ * express; the failure would be a table whose second entry is a scale plane. Where four ranks split
++ * every expert the classes are four, by number mod 4 (`moe_gemm_q_mod4`, Config::ff_lo4), and the
++ * runs sixteen, declared the same way class by class.
+  *
+  * The codes run and the scale run of a projection are two VIEWS of one stored weight -- its codes
+  * plane and its scale plane (RadWeightDecl::source) -- so an expert holds two logical weights,
+@@ -163,6 +165,19 @@ struct MoeFP8 {
+          * and the sum of the partials is the expert's output. Rounding moves (two partial sums
+          * where there was one), so this is checked by agreement rather than byte for byte. */
+         int64_t ff_lo[2] = { 0, 0 }, ff_hi[2] = { 0, 0 };
++        /* OR BY THE EXPERT'S NUMBER MOD 4, where four ranks split it: expert e's columns
++         * [ff_lo4[e % 4], ff_hi4[e % 4]), served by `moe_gemm_q_mod4`, and taking precedence over
++         * the parity slices. hi 0 offers none.
++         *
++         * Parity gives the extra block of a five-block expert two places to go, so at four ranks
++         * two of them carry three blocks of every even/odd pair and two carry two -- and the
++         * block's all-reduce has the narrow ranks wait for the wide ones. Four classes give it
++         * four: each rank takes two blocks of one class and one of each other, five of every four
++         * experts. Any count of quantised experts serves: a layer that keeps two plain bf16 has
++         * 510, and its first two classes hold one expert more than the last two (the declaration
++         * gives a table op's first tables the remainder). `n_ff_exp` is the widest slice. "e" is
++         * the expert's place in the sort, as for the parity classes. */
++        int64_t ff_lo4[4] = { 0, 0, 0, 0 }, ff_hi4[4] = { 0, 0, 0, 0 };
+         int64_t n_ff_shared  = 0;   /* the shared expert's, per rank; 0 = no shared expert */
+         /* THE SHARED ARM'S SLICE ON THIS RANK, when its width does not halve into whole fp8 scale
+          * blocks: [shared_lo, shared_hi) of its columns in the model's numbering, with
+@@ -368,6 +383,9 @@ struct MoeFP8 {
+     std::vector<int64_t>    prot;
+     const char*             prot_list = nullptr;
+     int64_t                 n_reg = 0;
++    /* How many weight-table classes the quantised GEMMs take: 2 by parity (`moe_gemm_q`), or 4 by
++     * number mod 4 (`moe_gemm_q_mod4`, Config::ff_lo4). */
++    int                     ncls = 2;
+     /* THIS LAYER'S gate_up AND down FORMATS (format_of's numbers), resolved by declare(): the
+      * probed layer's for both, except that among the codebook forms at E4M3 scales -- w4nl64a8h,
+      * w4nl32a8h, w5nl64a8h -- each projection of each layer takes its own experts'. */
+@@ -653,8 +671,10 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
+                             "places at most %lld last\n", l, prot.size(), (long long)kMaxProtected);
+             return RAD_E_INVAL;
+         }
+-        /* The quantised GEMM takes its experts as two equal tables by parity. */
+-        if (n_reg % 2) {
++        /* The quantised GEMM takes its experts as two equal tables by parity -- at four classes
++         * (Config::ff_lo4) as four tables, the first n_reg % 4 one expert longer, which any count
++         * gives. */
++        if (!(c.ff_hi[0] > 0 && c.ff_hi4[0] > 0) && n_reg % 2) {
+             fprintf(stderr, "radiance: layer %d keeps %zu experts plain bf16 on this rank, which "
+                             "leaves %lld quantised; they come in pairs on a rank so the rest split "
+                             "into two equal tables by parity\n", l, prot.size(), (long long)n_reg);
+@@ -784,21 +804,43 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
+         if (std::find(prot.begin(), prot.end(), e) == prot.end()) reg.push_back(e);
+     w_gu.resize((size_t)ne); w_gus.resize((size_t)ne);
+     w_dn.resize((size_t)ne); w_dns.resize((size_t)ne);
+-    /* Each parity's width on this rank: the Config's slice when the width is split unevenly, and
+-     * `n_ff_exp` for both otherwise. The buffers between the two GEMMs are the wider one's. */
+-    const bool split = c.ff_hi[0] > 0;
+-    int64_t wq[2] = { c.n_ff_exp, c.n_ff_exp };
+-    if (split)
+-        for (int q = 0; q < 2; ++q) wq[q] = c.ff_hi[q] - c.ff_lo[q];
+-    if (split && (wq[0] <= 0 || wq[1] <= 0 || c.n_ff_exp != (wq[0] > wq[1] ? wq[0] : wq[1]))) {
+-        fprintf(stderr, "radiance: the routed experts' slices [%lld, %lld) and [%lld, %lld) do not "
+-                        "describe a width of %lld\n", (long long)c.ff_lo[0], (long long)c.ff_hi[0],
+-                (long long)c.ff_lo[1], (long long)c.ff_hi[1], (long long)c.n_ff_exp);
++    /* Each class's width on this rank: the Config's slice when the width is split unevenly, and
++     * `n_ff_exp` for every class otherwise. The buffers between the two GEMMs are the widest
++     * one's. FOUR CLASSES where the Config offers them (Config::ff_lo4), the parity classes
++     * otherwise. */
++    const bool split = c.ff_hi[0] > 0 || c.ff_hi4[0] > 0;
++    ncls = c.ff_hi4[0] > 0 ? 4 : 2;
++    if (ncls == 4 && n_reg < 4) {
++        fprintf(stderr, "radiance: layer %d serves %lld quantised experts on this rank; four "
++                        "classes need at least one each\n", l, (long long)n_reg);
+         return RAD_E_INVAL;
+     }
+-    for (int q = 0; q < 2; ++q)
++    int64_t qlo[4] = { 0, 0, 0, 0 }, qhi[4] = { 0, 0, 0, 0 };
++    int64_t wq[4] = { c.n_ff_exp, c.n_ff_exp, c.n_ff_exp, c.n_ff_exp };
++    if (split)
++        for (int q = 0; q < ncls; ++q) {
++            qlo[q] = ncls == 4 ? c.ff_lo4[q] : c.ff_lo[q];
++            qhi[q] = ncls == 4 ? c.ff_hi4[q] : c.ff_hi[q];
++            wq[q]  = qhi[q] - qlo[q];
++        }
++    if (split) {
++        int64_t widest = 0;
++        bool    bad = false;
++        for (int q = 0; q < ncls; ++q) {
++            bad = bad || wq[q] <= 0;
++            widest = wq[q] > widest ? wq[q] : widest;
++        }
++        if (bad || c.n_ff_exp != widest) {
++            fprintf(stderr, "radiance: the routed experts' %d class slices, the first [%lld, %lld) "
++                            "and [%lld, %lld), do not describe a width of %lld\n", ncls,
++                    (long long)qlo[0], (long long)qhi[0], (long long)qlo[1], (long long)qhi[1],
++                    (long long)c.n_ff_exp);
++            return RAD_E_INVAL;
++        }
++    }
++    for (int q = 0; q < ncls; ++q)
+         if (wq[q] % RAD_FP8_BLOCK || g.n_embd % RAD_FP8_BLOCK ||
+-            (split && c.ff_lo[q] % RAD_FP8_BLOCK)) {
++            (split && qlo[q] % RAD_FP8_BLOCK)) {
+             fprintf(stderr, "radiance: an expert is %lldx%lld per rank, which is not a whole number "
+                             "of %dx%d scale blocks\n",
+                     (long long)wq[q], (long long)g.n_embd, RAD_FP8_BLOCK, RAD_FP8_BLOCK);
+@@ -858,11 +900,11 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
+     const uint32_t sdt    = c.expert_g64 ? (uint32_t)RAD_F8E4M3 : (uint32_t)RAD_BF16;
+     const int64_t  sgk    = c.expert_g64 ? 1 : RAD_FP8_BLOCK;
+     const char*    escale = c.expert_g64 ? "scale,scale.1" : "scale";
+-    /* A slice of each expert: the gate and up rows [lo, hi) of this parity for the gate/up pair,
++    /* A slice of each expert: the gate and up rows [lo, hi) of this class for the gate/up pair,
+      * columns [lo, hi) for down, and the scale planes the same slice in their own units. */
+     auto span = [&](rad_weight h, int q, int64_t unit) -> int {
+         if (!split || !h) return RAD_OK;
+-        return rad_weight_shard_span(b, h, c.ff_lo[q] / unit, c.ff_hi[q] / unit);
++        return rad_weight_shard_span(b, h, qlo[q] / unit, qhi[q] / unit);
+     };
+     const bool rot = c.expert_rot != 0;
+     if (c.expert_bf16) {
+@@ -916,9 +958,10 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
+                    {w.eff.x, w.sorted, w.eoff}, {w.edn});
+         if (!op_gu || !op_dn) return RAD_E_INVAL;
+     } else {
+-    /* ---- the eight runs, declared as the views the header describes. */
+-    for (int q = 0; q < 2; ++q)
+-        for (int64_t s = q; s < n_reg; s += 2) {
++    /* ---- the eight runs -- sixteen at four classes -- declared as the views the header
++     * describes, class by class. */
++    for (int q = 0; q < ncls; ++q)
++        for (int64_t s = q; s < n_reg; s += ncls) {
+             const int64_t e = reg[(size_t)s];
+             const int64_t parts[2] = { wq[q], wq[q] };
+             rad_weight& h = w_gu[(size_t)s];
+@@ -930,8 +973,8 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
+             if (!h) return RAD_E_INVAL;
+             RAD_ARCH_TRY(span(h, q, 1));
+         }
+-    for (int q = 0; q < 2; ++q)
+-        for (int64_t s = q; s < n_reg; s += 2) {
++    for (int q = 0; q < ncls; ++q)
++        for (int64_t s = q; s < n_reg; s += ncls) {
+             const int64_t e = reg[(size_t)s];
+             const int64_t parts[2] = { wq[q] / sdiv, wq[q] / sdiv };
+             rad_weight& h = w_gus[(size_t)s];
+@@ -947,8 +990,8 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
+             if (!h) return RAD_E_INVAL;
+             RAD_ARCH_TRY(span(h, q, sdiv));
+         }
+-    for (int q = 0; q < 2; ++q)
+-        for (int64_t s = q; s < n_reg; s += 2) {
++    for (int q = 0; q < ncls; ++q)
++        for (int64_t s = q; s < n_reg; s += ncls) {
+             const int64_t e = reg[(size_t)s];
+             rad_weight& h = w_dn[(size_t)s];
+             h = decl_view(b, nm.f("blk.%d.ffn_down_exps.%lld.weight", l,
+@@ -958,8 +1001,8 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
+             if (!h) return RAD_E_INVAL;
+             RAD_ARCH_TRY(span(h, q, 1));
+         }
+-    for (int q = 0; q < 2; ++q)
+-        for (int64_t s = q; s < n_reg; s += 2) {
++    for (int q = 0; q < ncls; ++q)
++        for (int64_t s = q; s < n_reg; s += ncls) {
+             const int64_t e = reg[(size_t)s];
+             rad_weight& h = w_dns[(size_t)s];
+             h = decl_view(b, nm.f("blk.%d.ffn_down_exps.%lld.scale", l,
+@@ -1004,13 +1047,14 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
+                       {w.h.x}, {w.hr.q, w.hr.s});
+     }
+     /* A table op's weights, in its table operands' order: the even experts' codes and scales, then
+-     * the odd experts' (`w`, `w_scale`, `w_odd`, `w_odd_scale`). */
++     * the odd experts' (`w`, `w_scale`, `w_odd`, `w_odd_scale`) -- or at four classes class 0's,
++     * then 1's, 2's and 3's. */
+     auto tables = [&](const std::vector<rad_weight>& wc, const std::vector<rad_weight>& ws) {
+         std::vector<rad_weight> tab;
+         tab.reserve((size_t)n_reg * 2);
+-        for (int q = 0; q < 2; ++q) {
+-            for (int64_t s = q; s < n_reg; s += 2) tab.push_back(wc[(size_t)s]);
+-            for (int64_t s = q; s < n_reg; s += 2) tab.push_back(ws[(size_t)s]);
++        for (int q = 0; q < ncls; ++q) {
++            for (int64_t s = q; s < n_reg; s += ncls) tab.push_back(wc[(size_t)s]);
++            for (int64_t s = q; s < n_reg; s += ncls) tab.push_back(ws[(size_t)s]);
+         }
+         return tab;
+     };
+@@ -1020,7 +1064,18 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
+      * width, which its down projection does not read. */
+     {
+         const std::vector<rad_weight> tab = tables(w_gu, w_gus);
+-        rad_op h = rad_decl_op(b, "moe_gemm_q",
++        rad_op h = ncls == 4
++            ? rad_decl_op(b, "moe_gemm_q_mod4",
++                  RAD_PARAMS(RAD_RANGE("M", 1, c.rows), RAD_INT("N", 2 * wq[0]),
++                             RAD_INT("K", g.n_embd), RAD_INT("n_expert", n_reg),
++                             RAD_INT("top_k", c.top_k), RAD_INT("group", RAD_FP8_BLOCK),
++                             RAD_STR("a_order", "token"), RAD_STR("dtype", edtype[0]),
++                             RAD_INT("N_1", 2 * wq[1]), RAD_INT("K_1", g.n_embd),
++                             RAD_INT("N_2", 2 * wq[2]), RAD_INT("K_2", g.n_embd),
++                             RAD_INT("N_3", 2 * wq[3]), RAD_INT("K_3", g.n_embd),
++                             RAD_INT("parts", 2)),
++                  tab.data(), (int)tab.size())
++            : rad_decl_op(b, "moe_gemm_q",
+                        RAD_PARAMS(RAD_RANGE("M", 1, c.rows), RAD_INT("N", 2 * wq[0]),
+                                   RAD_INT("K", g.n_embd), RAD_INT("n_expert", n_reg),
+                                   RAD_INT("top_k", c.top_k), RAD_INT("group", RAD_FP8_BLOCK),
+@@ -1038,7 +1093,18 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
+                                 false, rot));
+     {
+         const std::vector<rad_weight> tab = tables(w_dn, w_dns);
+-        rad_op h = rad_decl_op(b, "moe_gemm_q",
++        rad_op h = ncls == 4
++            ? rad_decl_op(b, "moe_gemm_q_mod4",
++                  RAD_PARAMS(RAD_RANGE("M", 1, c.rows), RAD_INT("N", g.n_embd),
++                             RAD_INT("K", wq[0]), RAD_INT("n_expert", n_reg),
++                             RAD_INT("top_k", c.top_k), RAD_INT("group", RAD_FP8_BLOCK),
++                             RAD_STR("a_order", "sorted"), RAD_STR("dtype", edtype[1]),
++                             RAD_INT("N_1", g.n_embd), RAD_INT("K_1", wq[1]),
++                             RAD_INT("N_2", g.n_embd), RAD_INT("K_2", wq[2]),
++                             RAD_INT("N_3", g.n_embd), RAD_INT("K_3", wq[3]),
++                             RAD_INT("parts", 1)),
++                  tab.data(), (int)tab.size())
++            : rad_decl_op(b, "moe_gemm_q",
+                        RAD_PARAMS(RAD_RANGE("M", 1, c.rows), RAD_INT("N", g.n_embd),
+                                   RAD_INT("K", wq[0]), RAD_INT("n_expert", n_reg),
+                                   RAD_INT("top_k", c.top_k), RAD_INT("group", RAD_FP8_BLOCK),
+@@ -1095,8 +1161,13 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
+                 return RAD_E_INVAL;
+             } else {
+                 const int64_t nt = full / 64, base = nt / g.world, extra = nt % g.world;
+-                /* Cut by the rank's place (Config::extra_place), not necessarily its index. */
+-                const int64_t pr = c.extra_place >= 0 ? c.extra_place : (int64_t)g.rank;
++                /* Cut by the rank's place (Config::extra_place), not necessarily its index --
++                 * except in a layer served at four classes. The place exists to keep these tiles
++                 * off the ranks holding the routed extra blocks, and at four classes every rank
++                 * holds one; the shared expert's extra block is cut by the same place, so the
++                 * rank's own index keeps the two remainders apart instead. */
++                const int64_t pr = (c.extra_place >= 0 && ncls != 4) ? c.extra_place
++                                                                     : (int64_t)g.rank;
+                 if (pr >= g.world) return RAD_E_INVAL;
+                 const int64_t t0 = pr * base + std::min<int64_t>(pr, extra);
+                 const int64_t t1 = t0 + base + (pr < extra ? 1 : 0);
+@@ -1400,11 +1471,23 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) const
+ 
+     /* The two grouped GEMMs, and the weight tables: the FIRST handle of each run and its length.
+      * The runs are contiguous by construction -- see declare -- so `w_gu[q] + i` is expert
+-     * 2 * i + q, and each parity is its own pair of table operands. */
++     * 2 * i + q, and each parity is its own pair of table operands; at four classes expert
++     * 4 * i + q, class q holding ceil((n_reg - q) / 4). */
++    const int64_t n4[4] = { (n_reg + 3) / 4, (n_reg + 2) / 4, (n_reg + 1) / 4, n_reg / 4 };
+     if (c.expert_bf16)
+         RAD_ISSUE_N(c_, op_gu, rows, brow_slice(w.h.x, r0, rows, g.n_embd),
+                     RAD_WTAB(w_gu[0], ne), brows(w.sorted, rows * k), brows(w.eoff, ne + 1),
+                     brows(w.egu, rows * k));
++    else if (ncls == 4)
++    RAD_ISSUE_N(c_, op_gu, rows,
++                brow_slice(rot ? w.hr.q : w.h.q, r0, rows, g.n_embd),
++                brow_slice(rot ? w.hr.s : w.h.s, r0, rows, g.n_embd / RAD_FP8_BLOCK),
++                RAD_WTAB(w_gu[0], n4[0]), RAD_WTAB(w_gus[0], n4[0]),
++                brows(w.sorted, rows * k), brows(w.eoff, n_reg + 1),
++                RAD_WTAB(w_gu[1], n4[1]), RAD_WTAB(w_gus[1], n4[1]),
++                RAD_WTAB(w_gu[2], n4[2]), RAD_WTAB(w_gus[2], n4[2]),
++                RAD_WTAB(w_gu[3], n4[3]), RAD_WTAB(w_gus[3], n4[3]),
++                brows(w.egu, rows * k));
+     else
+     RAD_ISSUE_N(c_, op_gu, rows,
+                 brow_slice(rot ? w.hr.q : w.h.q, r0, rows, g.n_embd),
+@@ -1419,6 +1502,15 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) const
+     if (c.expert_bf16)
+         RAD_ISSUE_N(c_, op_dn, rows, brows(w.eff.x, rows * k), RAD_WTAB(w_dn[0], ne),
+                     brows(w.sorted, rows * k), brows(w.eoff, ne + 1), brows(w.edn, rows * k));
++    else if (ncls == 4)
++    RAD_ISSUE_N(c_, op_dn, rows,
++                brows(w.eff.q, rows * k), brows(w.eff.s, rows * k),
++                RAD_WTAB(w_dn[0], n4[0]), RAD_WTAB(w_dns[0], n4[0]),
++                brows(w.sorted, rows * k), brows(w.eoff, n_reg + 1),
++                RAD_WTAB(w_dn[1], n4[1]), RAD_WTAB(w_dns[1], n4[1]),
++                RAD_WTAB(w_dn[2], n4[2]), RAD_WTAB(w_dns[2], n4[2]),
++                RAD_WTAB(w_dn[3], n4[3]), RAD_WTAB(w_dns[3], n4[3]),
++                brows(w.edn, rows * k));
+     else
+     RAD_ISSUE_N(c_, op_dn, rows,
+                 brows(w.eff.q, rows * k), brows(w.eff.s, rows * k),
+diff --git a/arch/qwen4exp_fp8/qwen4exp_fp8.cpp b/arch/qwen4exp_fp8/qwen4exp_fp8.cpp
+index bd0477d..4d08c55 100644
+--- a/arch/qwen4exp_fp8/qwen4exp_fp8.cpp
++++ b/arch/qwen4exp_fp8/qwen4exp_fp8.cpp
+@@ -295,10 +295,12 @@ static int64_t ngram_table_rows(int64_t base, int64_t heads, int64_t divisor) {
+ /* A RANK'S PLACE WHEN A WIDTH THAT DOES NOT DIVIDE IS CUT OVER THE RANKS, the first places taking
+  * one unit more: the ranks in order of how many 128-column blocks of an even/odd pair of routed
+  * experts declare()'s parity split gives each, fewest first, by rank among equals. At four ranks
+- * and five blocks that is ranks 2, 3, 0, 1 -- ranks 0 and 1 hold the routed extra blocks, and
+- * cutting the shared expert and the plain experts from rank 0 as well stacks their extra columns on
+- * the ranks every block's all-reduce already waits for. Where the routed width divides it is the
+- * rank; declare() asks only above two ranks. */
++ * and five blocks that is ranks 2, 3, 0, 1 -- under parity ranks 0 and 1 hold the routed extra
++ * blocks, and cutting the shared expert from rank 0 as well would stack its extra columns on the
++ * ranks every block's all-reduce already waits for. The four-class split that four ranks serve
++ * gives every rank the same routed width, and the shared expert's extra block stays rank 2's: the
++ * plain experts' extra tiles are cut by rank there (MoeFP8::declare), so the two do not stack.
++ * Where the routed width divides it is the rank; declare() asks only above two ranks. */
+ static int64_t narrow_place(int64_t n_ff_all, int world, int rank) {
+     const int64_t nb = n_ff_all / RAD_FP8_BLOCK;
+     if (n_ff_all % RAD_FP8_BLOCK || nb < world || nb % world == 0) return rank;
+@@ -520,13 +522,15 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
+          * replicated, every rank computes its slice of every routed expert, and the block's
+          * all-reduce sums the partials.
+          *
+-         * AT FOUR RANKS THE SHARES ARE NOT EQUAL. Parity gives the extra block only two places to
+-         * go, so ranks 0 and 1 compute three blocks of every even/odd pair of experts and ranks 2
+-         * and 3 compute two, and the all-reduce has ranks 2 and 3 wait for the other two. Equal
+-         * shares need the extra block rotated over four places -- the expert's number mod 4, four
+-         * slice tables where moe_gemm_q takes two. What can move without them does: the shared
+-         * expert's extra block and the plain experts' extra tiles go to ranks 2 and 3
+-         * (narrow_place), so ranks 0 and 1 take one shared block and two plain tiles.
++         * AT FOUR RANKS PARITY IS NOT ENOUGH. It gives the extra block only two places to go, so
++         * ranks 0 and 1 would compute three blocks of every even/odd pair of experts and ranks 2
++         * and 3 two, and the all-reduce would have ranks 2 and 3 wait for the other two. So at four
++         * the extra block is rotated over four places, by the expert's number mod 4: four slice
++         * tables (`moe_gemm_q_mod4`), and every rank computes five blocks of every four experts.
++         * A layer keeping two experts plain bf16 has 510 quantised ones, and its first two classes
++         * are one expert longer. What does not divide elsewhere stays apart: the shared expert's
++         * extra block is rank 2's (narrow_place) and the plain experts' extra tiles ranks 0 and
++         * 1's (MoeFP8::declare).
+          *
+          * WHY NOT EXPERT PARALLELISM, which splits the EXPERTS: rank r owns [r*E/W, (r+1)*E/W)
+          * whole. The bytes a rank reads are the same on average either way, but which rank a
+@@ -596,6 +600,29 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
+                          g.rank, (long long)mc.ff_lo[0], (long long)mc.ff_hi[0],
+                          (long long)mc.ff_lo[1], (long long)mc.ff_hi[1], (long long)g.n_ff_all,
+                          (long long)nb, RAD_FP8_BLOCK, (long long)g.world);
++                /* AND AT FOUR RANKS FOUR CLASSES, by the expert's number mod 4 (MoeFP8::Config::
++                 * ff_lo4), which every layer then takes instead: the same cut with the rank's place
++                 * shifted by the class, so the extra block goes round all four ranks instead of
++                 * two. Every block of every expert still has one owner, and each slice is one a
++                 * rank already takes of some parity. */
++                if (g.world == 4) {
++                    for (int q = 0; q < 4; ++q) {
++                        const int64_t p = (g.rank - q + 4) % 4;
++                        const int64_t b0 = p * base + std::min<int64_t>(p, extra);
++                        const int64_t b1 = b0 + base + (p < extra ? 1 : 0);
++                        mc.ff_lo4[q] = b0 * RAD_FP8_BLOCK;
++                        mc.ff_hi4[q] = b1 * RAD_FP8_BLOCK;
++                        mc.n_ff_exp  = std::max(mc.n_ff_exp, mc.ff_hi4[q] - mc.ff_lo4[q]);
++                    }
++                    rad_note(b, "routed experts at four classes: rank %d computes columns [%lld, "
++                                "%lld) [%lld, %lld) [%lld, %lld) [%lld, %lld) of the experts of "
++                                "number 0, 1, 2 and 3 mod 4 -- %lld blocks of every four experts, "
++                                "as every rank does.",
++                             g.rank, (long long)mc.ff_lo4[0], (long long)mc.ff_hi4[0],
++                             (long long)mc.ff_lo4[1], (long long)mc.ff_hi4[1],
++                             (long long)mc.ff_lo4[2], (long long)mc.ff_hi4[2],
++                             (long long)mc.ff_lo4[3], (long long)mc.ff_hi4[3], (long long)nb);
++                }
+             } else {
+                 fprintf(stderr, "radiance: qwen4exp: an expert is %lld blocks of %d, which %d ranks "
+                                 "cannot each take a whole block of in both parities. Lower the rank "
+diff --git a/docs/ARCHITECTURES.md b/docs/ARCHITECTURES.md
+index 63bd9bc..03dd58c 100644
+--- a/docs/ARCHITECTURES.md
++++ b/docs/ARCHITECTURES.md
+@@ -307,13 +307,16 @@ above the block count is refused at declare, by name: a rank with an empty slice
+ and still joins the all-reduce. The shared expert's 640 columns split as evenly as whole blocks
+ allow: five blocks over four ranks is rank 2 `[0, 256)` and one block each on ranks 3, 0 and 1.
+ 
+-**At four ranks the shares are not equal.** Parity gives the extra block only two places to go, so
+-ranks 0 and 1 compute three blocks of every even/odd pair of routed experts and ranks 2 and 3
+-compute two. What does not divide elsewhere is cut from the other end: the shared expert's extra
+-block is rank 2's, and the protected bf16 experts' ten 64-wide tiles go 2, 2, 3, 3. That takes one
+-shared block off rank 0, the slowest rank, and leaves ranks 0 and 1 still a routed block per
+-even/odd pair ahead of ranks 2 and 3 at every block's all-reduce. Equal shares need the extra block
+-rotated by the expert's number mod 4: four slice tables where `moe_gemm_q` takes two.
++**At four ranks the classes are four.** Parity gives the extra block only two places to go, so
++ranks 0 and 1 would compute three blocks of every even/odd pair of routed experts and ranks 2 and 3
++two, and every block's all-reduce would have 2 and 3 wait. So at four ranks the cut above is made
++per class of the expert's number mod 4, the rank's place shifted by the class: rank `r` takes
++`[0, 2)` blocks of class `r` and one block of each other class, five blocks of every four experts
++on every rank. That is `moe_gemm_q_mod4`, four slice tables where `moe_gemm_q` takes two
++(`docs/OPS.md`), and every slice is one a rank already took of some parity. A layer that keeps two
++experts plain bf16 has 510 quantised ones, and its first two classes are one expert longer. What
++does not divide elsewhere stays apart: the shared expert's extra block is rank 2's and the
++protected bf16 experts' ten 64-wide tiles go 3, 3, 2, 2.
+ Expert parallelism — whole experts a rank — is what this replaced, and why it stays replaced: the
+ recipe protects its bf16 experts in pairs precisely so each rank's quantised count stays even, and
+ sharding experts by rank breaks that parity property the weight tables rest on.
+diff --git a/tests/arch_test.cpp b/tests/arch_test.cpp
+index 39bd200..6329f19 100644
+--- a/tests/arch_test.cpp
++++ b/tests/arch_test.cpp
+@@ -1846,9 +1846,11 @@ TEST(a_sizing_declare_leaves_the_step_state_alone_and_shrinks_only_rows) {
+  *     rank names the container rows it wants -- so it is asserted here as a pair of agreeing spans
+  *     whose union is the whole projection.
+  *   - an expert of this model is 640 columns = five 128-column scale blocks, which four ranks
+- *     cannot cut evenly, so the split is UNEVEN BY PARITY and it is the width that divides, not the
++ *     cannot cut evenly, so the split is UNEVEN BY CLASS and it is the width that divides, not the
+  *     expert set: every rank routes every one of the 512 experts and computes [lo, hi) of each, the
+- *     rank taking the odd block alternating with the expert's parity. Sharding the experts instead
++ *     rank taking the odd block going round with the expert's number mod 4 -- five blocks of every
++ *     four experts on every rank -- and with its parity in a layer whose quantised experts do not
++ *     come in fours. Sharding the experts instead
+  *     was tried and is wrong here -- protection is per-rank, so a rank can end up owning one plain
+  *     bf16 expert, leaving an odd count of quantised ones, and the grouped GEMM takes its experts as
+  *     two EQUAL tables by parity. The recipe protects experts in pairs for exactly that reason.
+@@ -1939,49 +1941,62 @@ TEST(flashnext_tp4_replicates_kv_heads_and_splits_expert_widths) {
+             CHECK_EQ(pint(ts, "n_expert"), ne_all);
+             CHECK_EQ(pint(ts, "expert_base"), (int64_t)0);
+         }
+-        /* THE WIDTH EACH RANK TAKES OF EACH PARITY, as a span on every expert's down projection --
+-         * the fixture protects no expert, so an expert's class is its own parity. These six numbers
+-         * per rank are the whole TP4 MoE contract: five blocks of 128, four ranks, and the rank
+-         * taking the odd block alternating with the parity. They are LITERAL here on purpose --
+-         * recomputing them from the plugin's formula would only prove the test agrees with the
+-         * code, not that either agrees with the model. */
++        /* THE WIDTH EACH RANK TAKES OF EACH CLASS, as a span on every expert's down projection --
++         * the fixture protects no expert, so an expert's class is its own number mod 4. These
++         * eight numbers per rank are the whole TP4 MoE contract: five blocks of 128, four ranks,
++         * and the rank taking the odd block going round with the class. They are LITERAL here on
++         * purpose -- recomputing them from the plugin's formula would only prove the test agrees
++         * with the code, not that either agrees with the model. */
+         const int64_t blk = 128;                    /* RAD_FP8_BLOCK, the scale block's width */
+         const int64_t nblk = meta.n_ff / blk;        /* five, at the fixture's 640 */
+-        const int64_t cls_lo[4][2] = { { 0, 512 }, { 256, 0 }, { 384, 256 }, { 512, 384 } };
+-        const int64_t cls_hi[4][2] = { { 256, 640 }, { 384, 256 }, { 512, 384 }, { 640, 512 } };
++        const int64_t cls_lo[4][4] = { { 0, 512, 384, 256 }, { 256, 0, 512, 384 },
++                                       { 384, 256, 0, 512 }, { 512, 384, 256, 0 } };
++        const int64_t cls_hi[4][4] = { { 256, 640, 512, 384 }, { 384, 256, 640, 512 },
++                                       { 512, 384, 256, 640 }, { 640, 512, 384, 256 } };
+         REQUIRE_EQ(nblk, (int64_t)5);
+-        int spanned[2] = { 0, 0 };
++        int spanned[4] = { 0, 0, 0, 0 };
+         for (const RecWeight& w : b[r].weights) {
+             if (w.name.rfind("blk.0.ffn_down_exps.", 0) != 0) continue;
+             if (w.name.compare(w.name.size() - 7, 7, ".weight") != 0) continue;
+-            const int q = atoi(w.name.c_str() + 20) % 2;      /* the expert's parity */
++            const int q = atoi(w.name.c_str() + 20) % 4;      /* the expert's class */
+             CHECK(w.span_set);
+             CHECK_EQ(w.span_lo, cls_lo[r][q]);
+             CHECK_EQ(w.span_hi, cls_hi[r][q]);
+             ++spanned[q];
+         }
+-        CHECK_EQ(spanned[0], ne_all / 2);                /* every expert of each class is declared */
+-        CHECK_EQ(spanned[1], ne_all / 2);
+-        /* AND THE FOUR RANKS' SLICES OF ONE PARITY TILE ITS WIDTH EXACTLY: no block unserved (a
++        for (int q = 0; q < 4; ++q)
++            CHECK_EQ(spanned[q], ne_all / 4);            /* every expert of each class is declared */
++        /* AND THE FOUR RANKS' SLICES OF ONE CLASS TILE ITS WIDTH EXACTLY: no block unserved (a
+          * rank silently dropping a fifth of every expert's output), none claimed twice (the
+          * all-reduce then sums that block twice and the number is wrong by its own size). Read off
+          * the declared spans, not off the formula that produced them. */
+-        for (int q = 0; q < 2; ++q) {
++        for (int q = 0; q < 4; ++q) {
+             int64_t covered = 0;
+             for (int r2 = 0; r2 < world; ++r2)
+                 for (int64_t i = 0; i < nblk; ++i) {
+                     const int64_t lo = cls_lo[r2][q], hi = cls_hi[r2][q];
+                     if (lo <= i * blk && i * blk < hi) ++covered;
+                 }
+-            CHECK_EQ(covered, nblk);   /* per parity, exactly once each */
++            CHECK_EQ(covered, nblk);   /* per class, exactly once each */
+         }
+-        /* The gate/up GEMM's two classes follow the same split, doubled because the operand stacks
+-         * gate and up, and the op's buffers take the WIDER class. */
+-        const RecOp* gu = find_op(b[r], "moe_gemm_q");
++        /* AND EVERY RANK TAKES THE SAME WIDTH: five blocks of every four experts -- the point of
++         * four classes. Two would leave ranks 0 and 1 three blocks of every pair and 2 and 3 two. */
++        {
++            int64_t sum = 0;
++            for (int q = 0; q < 4; ++q) sum += cls_hi[r][q] - cls_lo[r][q];
++            CHECK_EQ(sum, nblk * blk);
++        }
++        /* The gate/up GEMM's four classes follow the same split, doubled because the operand
++         * stacks gate and up, and the op's buffers take the WIDEST class. No parity op is left. */
++        const RecOp* gu = find_op(b[r], "moe_gemm_q_mod4");
+         REQUIRE(gu != nullptr);
+         CHECK_EQ(pint(gu, "N"), 2 * (cls_hi[r][0] - cls_lo[r][0]));
+-        CHECK_EQ(pint(gu, "N_odd"), 2 * (cls_hi[r][1] - cls_lo[r][1]));
++        CHECK_EQ(pint(gu, "N_1"), 2 * (cls_hi[r][1] - cls_lo[r][1]));
++        CHECK_EQ(pint(gu, "N_2"), 2 * (cls_hi[r][2] - cls_lo[r][2]));
++        CHECK_EQ(pint(gu, "N_3"), 2 * (cls_hi[r][3] - cls_lo[r][3]));
+         CHECK_EQ(pint(gu, "n_expert"), ne_all);
++        CHECK_EQ(gu->w.size(), (size_t)(2 * ne_all));   /* codes and scales, every expert once */
++        CHECK_EQ(count_op(b[r], "moe_gemm_q"), 0);
+ 
+         /* (4) THE UNFUSED CHAIN: a standalone collective per reduction, and none of the three
+          * fused world-2 forms. */
+@@ -2087,6 +2102,110 @@ TEST(flashnext_tp4_replicates_kv_heads_and_splits_expert_widths) {
+         CHECK(qwen4exp_fp8::declare(&b3, &meta, &c3) != RAD_OK);
+     }
+ 
++    /* ---- A LAYER THAT KEEPS EXPERTS PLAIN STAYS AT FOUR CLASSES. Two plain experts leave 510
++     * quantised ones, four leave 508; either way the layer is served by `moe_gemm_q_mod4`, the
++     * class being the expert's PLACE in the sort mod 4 (the plain ones sorted last), and at 510
++     * classes 0 and 1 hold 128 experts and 2 and 3 hold 127 -- the declaration hands a table op's
++     * first tables the remainder. The plain experts' extra tiles go to ranks 0 and 1: every rank
++     * holds the same routed width, and the shared expert's extra block is rank 2's. */
++    {
++        const RadEncoding w4p = [] { RadEncoding e = rad_enc_affine(RAD_I4, RAD_BF16, 1, 128);
++                                     rad_enc_copy_str(e.transform, "fwht128"); return e; }();
++        const RadEncoding plain = rad_enc_plain(RAD_BF16);
++        /* The parity slices, [lo, hi) by place parity, and the four-class ones by place mod 4. */
++        const int64_t par_lo[4][2] = { { 0, 512 }, { 256, 0 }, { 384, 256 }, { 512, 384 } };
++        const int64_t par_hi[4][2] = { { 256, 640 }, { 384, 256 }, { 512, 384 }, { 640, 512 } };
++        const int64_t c4_lo[4][4] = { { 0, 512, 384, 256 }, { 256, 0, 512, 384 },
++                                      { 384, 256, 0, 512 }, { 512, 384, 256, 0 } };
++        const int64_t c4_hi[4][4] = { { 256, 640, 512, 384 }, { 384, 256, 640, 512 },
++                                      { 512, 384, 256, 640 }, { 640, 512, 384, 256 } };
++        for (int nprot : { 2, 4 }) {
++            const std::vector<int> pe = nprot == 2 ? std::vector<int>{ 3, 10 }
++                                                   : std::vector<int>{ 3, 10, 21, 40 };
++            for (int r = 0; r < world; ++r) {
++                RadBuilder bp;
++                for (int e : pe) {
++                    bp.encs.push_back({ "blk.1.ffn_gate_up_exps." + std::to_string(e) + ".weight",
++                                        plain });
++                    bp.encs.push_back({ "blk.1.ffn_down_exps." + std::to_string(e) + ".weight",
++                                        plain });
++                }
++                bp.encs.push_back({ "ffn_gate_up_exps", w4p });
++                bp.encs.push_back({ "ffn_down_exps", w4p });
++                RadBuildCtx cp = build_ctx(r, world);
++                cp.max_tok = 2048; cp.max_seqs = 8; cp.max_spec = 3; cp.max_ctx = 200000;
++                REQUIRE_EQ(qwen4exp_fp8::declare(&bp, &meta, &cp), RAD_OK);
++                const int ncls = 4;
++                const int64_t n_reg = ne_all - nprot;
++                /* layer 1's quantised GEMMs, and nobody else's */
++                int l1_ops = 0, other_ops = 0;
++                for (const RecOp& o : bp.ops) {
++                    if (o.op != "moe_gemm_q" && o.op != "moe_gemm_q_mod4") continue;
++                    bool l1 = false;
++                    for (rad_weight wh : o.w)
++                        l1 = l1 || bp.weights[wh - 1].name.rfind("blk.1.", 0) == 0;
++                    if (!l1) { CHECK_EQ(o.op, std::string("moe_gemm_q_mod4")); ++other_ops; continue; }
++                    ++l1_ops;
++                    CHECK_EQ(o.op, std::string(ncls == 4 ? "moe_gemm_q_mod4" : "moe_gemm_q"));
++                    CHECK_EQ(pint(&o, "n_expert"), n_reg);
++                    CHECK_EQ(o.w.size(), (size_t)(2 * n_reg));
++                    /* the four runs, read off the declaration: codes then scales, class by class,
++                     * each class the places q, q + 4, ... -- 128, 128, 127, 127 at 510 */
++                    size_t at = 0;
++                    for (int q = 0; q < 4; ++q) {
++                        const int64_t nq = (n_reg + 3 - q) / 4;
++                        for (int half = 0; half < 2; ++half)
++                            for (int64_t j = 0; j < nq && at < o.w.size(); ++j, ++at) {
++                                const std::string& wn = bp.weights[o.w[at] - 1].name;
++                                const int e = atoi(wn.c_str() + wn.find("_exps.") + 6);
++                                int place = e;
++                                for (int x : pe) place -= x < e ? 1 : 0;
++                                CHECK_EQ(place, (int)(q + 4 * j));
++                                CHECK((wn.find(".scale") != std::string::npos) == (half == 1));
++                            }
++                    }
++                    CHECK_EQ(at, o.w.size());
++                }
++                CHECK_EQ(l1_ops, 2);
++                CHECK(other_ops > 0);
++                /* every quantised expert of layer 1 by its place: the class's slice */
++                int seen = 0;
++                for (const RecWeight& w : bp.weights) {
++                    if (w.name.rfind("blk.1.ffn_down_exps.", 0) != 0) continue;
++                    if (w.name.compare(w.name.size() - 7, 7, ".weight") != 0) continue;
++                    if (w.d.dtype == RAD_BF16) continue;          /* the plain ones, below */
++                    const int e = atoi(w.name.c_str() + 20);
++                    int place = e;
++                    for (int x : pe) place -= x < e ? 1 : 0;
++                    CHECK(w.span_set);
++                    if (ncls == 4) {
++                        CHECK_EQ(w.span_lo, c4_lo[r][place % 4]);
++                        CHECK_EQ(w.span_hi, c4_hi[r][place % 4]);
++                    } else {
++                        CHECK_EQ(w.span_lo, par_lo[r][place % 2]);
++                        CHECK_EQ(w.span_hi, par_hi[r][place % 2]);
++                    }
++                    ++seen;
++                }
++                CHECK_EQ(seen, (int)n_reg);
++                /* the plain experts' tiles: by narrow_place at two classes, by rank at four */
++                const int64_t p2_lo[4] = { 384, 512, 0,   192 }, p2_hi[4] = { 512, 640, 192, 384 };
++                const int64_t p4_lo[4] = { 0, 192, 384, 512 },   p4_hi[4] = { 192, 384, 512, 640 };
++                int pseen = 0;
++                for (const RecWeight& w : bp.weights) {
++                    if (w.name.rfind("blk.1.ffn_", 0) != 0 || w.d.dtype != RAD_BF16) continue;
++                    if (w.name.find("_exps.") == std::string::npos) continue;
++                    if (w.name.compare(w.name.size() - 7, 7, ".weight") != 0) continue;
++                    CHECK(w.span_set);
++                    CHECK_EQ(w.span_lo, ncls == 4 ? p4_lo[r] : p2_lo[r]);
++                    CHECK_EQ(w.span_hi, ncls == 4 ? p4_hi[r] : p2_hi[r]);
++                    ++pseen;
++                }
++                CHECK_EQ(pseen, 2 * nprot);
++            }
++        }
++    }
++
+     /* ---- THE PLAIN bf16 EXPERTS AT FOUR RANKS.
+      *
+      * They are declared beside the quantised ones by a SECOND grouped GEMM, over their own slice of
+@@ -2098,18 +2217,19 @@ TEST(flashnext_tp4_replicates_kv_heads_and_splits_expert_widths) {
+      * it refused the model on the ranks where that number was wrong -- two of four, which then
+      * never arrived at the all-reduce's rendezvous and took the whole launch down with it.
+      *
+-     * Ten tiles over four ranks is 2, 2, 3, 3: an UNEVEN share, still whole tiles, every tile owned
+-     * once. Ranks 2 and 3 compute 192 columns of every protected expert and ranks 0 and 1 compute
+-     * 128, because ranks 0 and 1 take the routed experts' extra blocks (narrow_place). Two
+-     * protected experts so the even-count rule the parity tables need holds, as the production
+-     * recipe's pairs make it hold. */
++     * Ten tiles over four ranks is 3, 3, 2, 2: an UNEVEN share, still whole tiles, every tile owned
++     * once. Ranks 0 and 1 compute 192 columns of every protected expert and ranks 2 and 3 compute
++     * 128: the routed experts are split in four classes, so every rank holds the same routed
++     * width, and rank 2 holds the shared expert's extra block (narrow_place). Two protected
++     * experts, as the production recipe's pairs have it. */
+     {
+         const RadEncoding w4p = [] { RadEncoding e = rad_enc_affine(RAD_I4, RAD_BF16, 1, 128);
+                                      rad_enc_copy_str(e.transform, "fwht128"); return e; }();
+         const RadEncoding plain = rad_enc_plain(RAD_BF16);
+-        /* [lo, hi) of the plain expert's columns, per rank -- literal, for the reason given above. */
+-        const int64_t p_lo[4] = { 384, 512, 0,   192 };
+-        const int64_t p_hi[4] = { 512, 640, 192, 384 };
++        /* [lo, hi) of the plain expert's columns, per rank -- literal, for the reason given above.
++         * The layer is served at four classes, so the extra tiles are cut by rank: 3, 3, 2, 2. */
++        const int64_t p_lo[4] = { 0,   192, 384, 512 };
++        const int64_t p_hi[4] = { 192, 384, 512, 640 };
+         for (int r = 0; r < world; ++r) {
+             RadBuilder bp;
+             bp.encs = { { "blk.1.ffn_gate_up_exps.3.weight", plain },
+-- 
+2.55.0
+
+
+From 00d91af3f0255b865c43b50ee9227aeb819055bc Mon Sep 17 00:00:00 2001
+From: keptn42 <keptn42@noreply.codeberg.org>
+Date: Mon, 5 Oct 2026 11:55:46 +0200
+Subject: [PATCH 4/5] r4d_selftest: moe_gemm_w4a8_mod4 gets a case of its own
+
+The same shapes, at ten experts where the classes are uneven, every form
+held to the two-class op's bytes.
+---
+ libr4d/r4d_selftest.cpp | 25 +++++++++++++++++++++++--
+ 1 file changed, 23 insertions(+), 2 deletions(-)
+
+diff --git a/libr4d/r4d_selftest.cpp b/libr4d/r4d_selftest.cpp
+index 45d4660..2703d34 100644
+--- a/libr4d/r4d_selftest.cpp
++++ b/libr4d/r4d_selftest.cpp
+@@ -5863,9 +5863,10 @@ struct MoeW4Shape { const char* name; int64_t N0, K0, N1, K1, parts, ne; };
+ /* `sub` 2 runs the codebook at E4M3 scales a 64 of K (w4nl64a8h), 4 at a 32 (w4nl32a8h): the
+  * codes' values are the table's and each part of a 128-wide group has its own scale, the fold the
+  * forms must agree on. `w5` with `sub` 2 runs the five-bit codebook (w5nl64a8h), whose stored row
+- * is its nibbles and then its signs. */
++ * is its nibbles and then its signs. `four` also runs `moe_gemm_w4a8_mod4` over the same experts
++ * and holds it to the two-class op's bytes -- that row's own case. */
+ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int sub = 0,
+-                        bool w5 = false) {
++                        bool w5 = false, bool four = false) {
+     const bool g64 = sub > 1;
+     const float* tab = w5 ? kW5nlTable : kW4nlTable;
+     static const char* const kForm[] = { "rule", "aligned prefill form", "decode form",
+@@ -6094,6 +6095,7 @@ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int
+                                     " elements off, worst " + std::to_string(worst) + first);
+         two_cls[form] = got;
+     }
++    if (!four) return;
+ 
+     /* AND THE SAME EXPERTS AS FOUR CLASSES, by number mod 4 (`moe_gemm_q_mod4`). Each parity table
+      * read at twice its stride is two of them -- from its first entry, the experts 0, 4, 8, ... of
+@@ -9724,6 +9726,25 @@ static void device_phase(const Plugin& pl) {
+         }
+     }
+ 
++    if (sel("moe_gemm_w4a8_mod4")) {
++        if (!g_case) std::printf("\nthe 4-bit grouped MoE GEMM over four classes, against its "
++                                 "two-class form\n");
++        /* The same shapes, read as four classes: the even table's halves are classes 0 and 2 and
++         * the odd one's 1 and 3, so the two-class launch is the reference, byte for byte. */
++        static const MoeW4Shape kShapes4[] = {
++            { "one class",   64, 256,  64, 256, 1, 5 },
++            { "gate/up 2:1", 256, 256, 128, 256, 2, 10 },
++            { "down 2:1",    64, 256,  64, 128, 1, 10 },
++            { "300 experts, gate/up 2:1", 256, 128, 128, 128, 2, 300 },
++        };
++        for (const MoeW4Shape& sh : kShapes4)
++            for (const int64_t t : { (int64_t)24, (int64_t)200, (int64_t)600 }) {
++                moe_w4_gemm(pl, t, sh, 0, false, true);
++                moe_w4_gemm(pl, t, sh, 2, false, true);
++                moe_w4_gemm(pl, t, sh, 2, true, true);
++            }
++    }
++
+     if (sel("hc_read_e4m3")) {
+         if (!g_case) std::printf("\nthe gated residual's read at the prefill tile, the wide "
+                                  "kernels against the decode tiles'\n");
+-- 
+2.55.0
+
+
+From c09b985e7695eae00d1e41ce7945bdb02ea81812 Mon Sep 17 00:00:00 2001
+From: keptn42 <keptn42@noreply.codeberg.org>
+Date: Mon, 5 Oct 2026 11:56:22 +0200
+Subject: [PATCH 5/5] oracle: a four-bit expert's E4M3 scale view decodes, on
+ the grid its dtype names
+
+The scale view of a w4nl64a8h, w4nl32a8h or w5nl64a8h expert is the E4M3 scale
+plus its fixed second level, which enc_selection_logical could not read, and
+libref described the weight scale on block fp8's grid for every dtype. So
+RADIANCE_OP_ORACLE left every moe_gemm_q and moe_gemm_q_mod4 issue at those
+formats NOT CHECKED. Both fixed; libref's arithmetic and serving unchanged.
+---
+ core/format/encoding.cpp       |  50 ++++++++++++
+ core/format/encoding.h         |   9 ++-
+ docs/MOE-W4.md                 |   5 +-
+ libref/ref_shapes.cpp          |  44 +++++++++--
+ scripts/oracle.sh              |   5 +-
+ tests/fixture_test.cpp         |  59 ++++++++++++++
+ tests/ref_test.cpp             |  95 ++++++++++++++++++++++
+ tests/relayout_parity_test.cpp | 139 +++++++++++++++++++++++++++++++++
+ 8 files changed, 391 insertions(+), 15 deletions(-)
+
+diff --git a/core/format/encoding.cpp b/core/format/encoding.cpp
+index d057efb..eb7a9c5 100644
+--- a/core/format/encoding.cpp
++++ b/core/format/encoding.cpp
+@@ -346,6 +346,56 @@ int enc_selection_logical(const RadEncoding& e, const int* sel, int n_sel, const
+             }
+         return RAD_OK;
+     }
++    /* A SCALE AND THE LEVELS ABOVE IT, without the codes: each first-level scale times every level
++     * that covers it. It is what a kernel that takes its scales as an operand of their own reads
++     * where the encoding states them in two levels -- the scale view of a w4nl64a8h expert, an
++     * E4M3 scale a (row, 64 of K) under one fixed f32 -- and the product is the scale the
++     * reference multiplies, where the first level on its own is that scale off by the second. One
++     * element a first-level scale, in that plane's extents. A level has to cover whole
++     * first-level blocks -- the whole weight, or a block a multiple of the first's -- or a scale
++     * would straddle two of its elements and have no one product. */
++    if (n_sel >= 2 && !std::strcmp(e.plane[sel[0]].role, "scale")) {
++        bool chain = true;
++        for (int k = 0; k < n_sel && chain; ++k) {
++            const RadEncPlane& p = e.plane[sel[k]];
++            chain = p.kind == RAD_PLANE_TILED && rad_enc_role_in_chain(p.role, "scale") &&
++                    (k == 0 || std::strcmp(p.role, "scale") != 0);
++        }
++        if (chain) {
++            const RadEncPlane& p0 = e.plane[sel[0]];
++            const int64_t r = rows[0], c = cols[0];
++            if (r * c != n)
++                return refuse("its scales hold " + std::to_string(r * c) + " elements and the "
++                              "reader wants " + std::to_string(n));
++            auto covers = [](int64_t b0, int64_t b) { return b <= 0 || (b0 > 0 && b % b0 == 0); };
++            for (int k = 1; k < n_sel; ++k) {
++                const RadEncPlane& p = e.plane[sel[k]];
++                if (!covers(p0.block[0], p.block[0]) || !covers(p0.block[1], p.block[1]))
++                    return refuse(std::string("its '") + p.role + "' level does not cover whole '" +
++                                  p0.role + "' blocks");
++            }
++            const int64_t rb0 = rad_enc_row_bytes(p0.dtype, c);
++            for (int64_t i = 0; i < r; ++i)
++                for (int64_t j = 0; j < c; ++j) {
++                    float v = rad_load_f32((const uint8_t*)data[0] + i * rb0, p0.dtype, j);
++                    for (int k = 1; k < n_sel; ++k) {
++                        const RadEncPlane& p = e.plane[sel[k]];
++                        const int64_t li = p.block[0] > 0 ? i * p0.block[0] / p.block[0] : 0;
++                        const int64_t lj = p.block[1] > 0 ? j * p0.block[1] / p.block[1] : 0;
++                        if (li >= rows[k] || lj >= cols[k])
++                            return refuse(std::string("its '") + p.role + "' level is " +
++                                          std::to_string(rows[k]) + "x" +
++                                          std::to_string(cols[k]) + " and does not reach scale " +
++                                          std::to_string(i) + "," + std::to_string(j));
++                        v *= rad_load_f32((const uint8_t*)data[k] +
++                                              li * rad_enc_row_bytes(p.dtype, cols[k]),
++                                          p.dtype, lj);
++                    }
++                    rad_store_f32(out, dt, i * c + j, v);
++                }
++            return RAD_OK;
++        }
++    }
+     if (n_sel != e.n_planes)
+         return refuse("it takes " + std::to_string(n_sel) + " of its encoding's " +
+                       std::to_string(e.n_planes) + " planes, which decode to nothing on their own");
+diff --git a/core/format/encoding.h b/core/format/encoding.h
+index 3f3e57a..31c6856 100644
+--- a/core/format/encoding.h
++++ b/core/format/encoding.h
+@@ -62,10 +62,11 @@ std::string enc_name(const RadEncoding& e);
+  * `data[k]`, dense [rows[k], cols[k]] in its own elements -- as `n` elements of dtype `dt` at
+  * `out`: the tensor a reference implementation reads where a kernel reads the stored form. One
+  * plane is converted element by element (a bf16 scale plane into an f32 reference, codes as their
+- * values); codes with the scalar codebook they index, each code as its table entry; the whole
+- * encoding is decoded. RAD_OK, or RAD_E_SHAPE with `why` when the planes do not
+- * make that tensor -- part of an encoding, which decodes to nothing on its own, or extents that
+- * disagree with `n`; or the decoder's own refusal. */
++ * values); codes with the scalar codebook they index, each code as its table entry; a scale with
++ * the levels of its chain above it, each scale as their product; the whole encoding is decoded.
++ * RAD_OK, or RAD_E_SHAPE with `why` when the planes do not make that tensor -- part of an
++ * encoding, which decodes to nothing on its own, or extents that disagree with `n`; or the
++ * decoder's own refusal. */
+ int enc_selection_logical(const RadEncoding& e, const int* sel, int n_sel, const int64_t* rows,
+                           const int64_t* cols, const void* const* data, uint32_t dt, int64_t n,
+                           void* out, std::string* why);
+diff --git a/docs/MOE-W4.md b/docs/MOE-W4.md
+index fba291b..e7dc425 100644
+--- a/docs/MOE-W4.md
++++ b/docs/MOE-W4.md
+@@ -381,7 +381,10 @@ typo'd directory is a message, not a silent quality regression.
+   relayout; the same for `w4nl64a8h`, `w4nl32a8h` and `w5nl64a8h`, with a second level other than
+   2^-13 refused, a 32-entry table other than `w5nl` refused, and each refusing the others'
+   encodings. `r4d_selftest --case moe_gemm_w4a8` also checks `w5nl64a8h`'s arranged row bit for
+-  bit against the statement in r4d_layout.cpp, and its inverse.
++  bit against the statement in r4d_layout.cpp, and its inverse. `moe_gemm_q_mod4`'s four classes
++  are held to `moe_gemm_q`'s stored bytes in every format, and for both ops what the op oracle
++  reads through the inverse -- codes as their levels, an E4M3 scale times its second level -- is
++  held to the quantiser's planes.
+ - `r4d_selftest --case gram_accum` -- the accumulator against an f64 host Gram, **launched twice
+   over a seeded buffer**, because a kernel that stored instead of adding would agree with any
+   single-call oracle.
+diff --git a/libref/ref_shapes.cpp b/libref/ref_shapes.cpp
+index 58423ef..c5cfcd2 100644
+--- a/libref/ref_shapes.cpp
++++ b/libref/ref_shapes.cpp
+@@ -1110,12 +1110,36 @@ int ref_moe_gemm_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out)
+     return o.finish("moe_gemm", operand, out);
+ }
+ 
++/* THE WEIGHT SCALE GRID IS THE ONE `dtype` NAMES, and the grouped GEMM serves more than one. The
++ * block-fp8 experts carry the checkpoint's: a scale a 128x128 tile, `group` holding the 128. The
++ * four-bit ones (docs/MOE-W4.md) carry one a ROW per group of K -- all of `group` at w4a8, w4a8h
++ * and w4nla8h, half of it at w4nl64a8h and w5nl64a8h, a quarter at w4nl32a8h. Those strings are
++ * the served formats' own names (arch/common/rad_block_moe_fp8.h, kServed), so this states a
++ * format and guesses at no kernel's stream; anything else is the block grid.
++ *
++ * It matters past the extents. A weight its kernel stores re-laid goes back through that
++ * kernel's inverse into the tensor THIS describes before the oracle hands it over
++ * (core/runtime/oracle.cpp), and the E4M3 scale views are re-laid -- their two levels are one
++ * operand -- so tiles here leave every such expert's scales with nothing to be inverted into.
++ * The arithmetic reads whichever grid it is handed (ref_gemm.h derives the group from the
++ * extents) and is unchanged. Weight rows and K elements a scale covers, or 0 when `group` is too
++ * small to divide. */
++struct MoeScaleGrid { int64_t rows, k; };
++static MoeScaleGrid moe_scale_grid(const RadParam* p, int n_p, int64_t g) {
++    const char* d = gs(p, n_p, "dtype");
++    auto is = [&](const char* s) { return d && std::strcmp(d, s) == 0; };
++    if (is("w4a8") || is("w4a8h") || is("w4nla8h")) return { 1, g };
++    if (is("w4nl64a8h") || is("w5nl64a8h")) return { 1, g / 2 };
++    if (is("w4nl32a8h")) return { 1, g / 4 };
++    return { g, g };
++}
++
+ /* The quantised arm. Same planes, plus the two scale streams: the activation's is per row per
+- * group of K (rblk 1) and the weight's is one [ceil(N/g), ceil(K/g)] plane per expert, which is
+- * the DeepSeek block grid the checkpoint ships. `w` is described as the STACKED [ne, N, K] plane
+- * even though the engine issues a pointer table against it, because a fixture has nowhere to put
+- * a pointer array -- ref_gemm.h's expert_entry() reads both forms and rad-kbench therefore checks
+- * the arithmetic against the same bytes the engine would. */
++ * group of K (rblk 1) and the weight's is one plane per expert on the grid above -- for block fp8
++ * [ceil(N/g), ceil(K/g)], the DeepSeek block grid the checkpoint ships. `w` is described as the
++ * STACKED [ne, N, K] plane even though the engine issues a pointer table against it, because a
++ * fixture has nowhere to put a pointer array -- ref_gemm.h's expert_entry() reads both forms and
++ * rad-kbench therefore checks the arithmetic against the same bytes the engine would. */
+ int ref_moe_gemm_q_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+     const int64_t M  = gi(p, n_p, "M", 0);
+     const int64_t N0 = gi(p, n_p, "N", 0), K0 = gi(p, n_p, "K", 0);
+@@ -1130,17 +1154,19 @@ int ref_moe_gemm_q_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* ou
+     const int64_t N = N0 > N1 ? N0 : N1, K = K0 > K1 ? K0 : K1;
+     const int64_t ne0 = (ne + 1) / 2, ne1 = ne / 2;
+     if (g <= 0) g = K;
++    const MoeScaleGrid sg = moe_scale_grid(p, n_p, g);
++    if (sg.rows <= 0 || sg.k <= 0) return RAD_E_UNSUPPORTED;
+     const uint32_t D = act_dt(p, n_p);
+     Opd o;
+     const int64_t AR = sorted_a_order(p, n_p) ? M * k : M;
+     o.t((uint32_t)RAD_F8E4M3, { AR, K });             /* a -- E4M3 codes, see `a_order` */
+     o.t((uint32_t)RAD_F32, { AR, (K + g - 1) / g });   /* a_scale */
+     o.t((uint32_t)RAD_F8E4M3, { ne0, N0, K0 });       /* w -- the even experts */
+-    o.t(D, { ne0, (N0 + g - 1) / g, (K0 + g - 1) / g });   /* w_scale */
++    o.t(D, { ne0, (N0 + sg.rows - 1) / sg.rows, (K0 + sg.k - 1) / sg.k });   /* w_scale */
+     o.t_idx({ M * k }, M * k, -1, 0);                 /* sorted_tok */
+     o.t_idx({ ne + 1 }, M * k + 1, -1, 0);            /* expert_offset -- see moe_gemm's note */
+     o.t((uint32_t)RAD_F8E4M3, { ne1, N1, K1 });       /* w_odd -- the odd experts */
+-    o.t(D, { ne1, (N1 + g - 1) / g, (K1 + g - 1) / g });   /* w_odd_scale */
++    o.t(D, { ne1, (N1 + sg.rows - 1) / sg.rows, (K1 + sg.k - 1) / sg.k });   /* w_odd_scale */
+     o.t(D, { M * k, N });                             /* y -- in SORTED order */
+     return o.finish("moe_gemm_q", operand, out);
+ }
+@@ -1163,13 +1189,15 @@ int ref_moe_gemm_q_mod4_shape(const RadParam* p, int n_p, int operand, RadOpdDes
+         if (Kq[q] > K) K = Kq[q];
+     }
+     if (g <= 0) g = K;
++    const MoeScaleGrid sg = moe_scale_grid(p, n_p, g);
++    if (sg.rows <= 0 || sg.k <= 0) return RAD_E_UNSUPPORTED;
+     const uint32_t D = act_dt(p, n_p);
+     Opd o;
+     const int64_t AR = sorted_a_order(p, n_p) ? M * k : M;
+     auto cls = [&](int q) {
+         const int64_t nq = (ne + 3 - q) / 4;
+         o.t((uint32_t)RAD_F8E4M3, { nq, Nq[q], Kq[q] });
+-        o.t(D, { nq, (Nq[q] + g - 1) / g, (Kq[q] + g - 1) / g });
++        o.t(D, { nq, (Nq[q] + sg.rows - 1) / sg.rows, (Kq[q] + sg.k - 1) / sg.k });
+     };
+     o.t((uint32_t)RAD_F8E4M3, { AR, K });             /* a -- E4M3 codes, see `a_order` */
+     o.t((uint32_t)RAD_F32, { AR, (K + g - 1) / g });   /* a_scale */
+diff --git a/scripts/oracle.sh b/scripts/oracle.sh
+index 3a471c4..d791dd2 100755
+--- a/scripts/oracle.sh
++++ b/scripts/oracle.sh
+@@ -26,8 +26,9 @@
+ # permuted. The oracle puts those back through the device row's own RadUnrelayoutFn to the planes
+ # and decodes them before it compares; a row that relayouts a weight and publishes no inverse is
+ # NOT CHECKED and says so by name. Read those lines: they are coverage this instrument does not
+-# have. The fp8 rows, the int8 (i8a8) block rows, the MoE 4-bit expert plane and the dense w4
+-# rows answer; the w8a16, w8a8, w2a8 and mxfp4 rows do not.
++# have. The fp8 rows, the int8 (i8a8) block rows, the MoE 4-bit expert plane and its E4M3 scale
++# views (both grouped GEMMs, every class) and the dense w4 rows answer; the w8a16, w8a8, w2a8 and
++# mxfp4 rows do not.
+ #
+ # NOT EVERY GAP IS AN INVERSE SOMEBODY HAS NOT WRITTEN, AND THIS ONE IS A MISSING ZERO POINT.
+ # `gemm_w2a8_nt` -- the 2-bit draft head, live on EVERY speculating container, and the same gap
+diff --git a/tests/fixture_test.cpp b/tests/fixture_test.cpp
+index d69c05c..2b2a5cc 100644
+--- a/tests/fixture_test.cpp
++++ b/tests/fixture_test.cpp
+@@ -849,6 +849,65 @@ TEST(the_reference_reads_what_the_planes_decode_to) {
+         CHECK_EQ(((const float*)out.data())[i], rad_load_f32(sp[0].data(), RAD_BF16, i));
+ }
+ 
++/* A SCALE WITH THE LEVEL ABOVE IT, selected without the codes -- the scale view of a w4nl64a8h
++ * expert, an E4M3 scale a (row, 64 of K) under one f32 for the weight. The reference reads each
++ * scale times the level, in the scale plane's own extents. Part of a chain that does not start at
++ * its first level, a level finer than the scale it would multiply, and a reader wanting another
++ * count are refused rather than read as something. */
++TEST(the_reference_reads_a_scale_times_the_level_above_it) {
++    const int64_t R = 32, C = 256;
++    RadEncoding e;
++    rad_enc_clear(&e);
++    rad_enc_copy_str(e.scheme, "affine");
++    rad_enc_copy_str(e.transform, "fwht128");
++    rad_enc_add_plane(&e, "codes", RAD_U4, 1, 1);
++    rad_enc_add_plane(&e, "scale", RAD_F8E4M3, 1, 64);
++    rad_enc_add_plane(&e, "scale.1", RAD_F32, 0, 0);
++    rad_enc_add_table(&e, "table", RAD_F32, 1, 16);
++    REQUIRE(rad_enc_valid(&e));
++    auto view = [&](const RadEncoding& enc, std::vector<const char*> roles) {
++        KfOperand d;
++        d.role = RAD_OPD_WEIGHT;
++        d.has_enc = true;
++        d.enc = enc;
++        d.dtype = RAD_F32;
++        for (const char* r : roles) {
++            const int i = rad_enc_find(&enc, r);
++            int64_t pr = 0, pc = 0;
++            rad_enc_plane_dims(&enc.plane[i], R, C, &pr, &pc);
++            d.sel.push_back(i);
++            d.sel_rows.push_back(pr);
++            d.sel_cols.push_back(pc);
++        }
++        d.shape = { d.sel_rows[0], d.sel_cols[0] };
++        return d;
++    };
++    const KfOperand d = view(e, { "scale", "scale.1" });
++    REQUIRE_EQ(numel(d), R * C / 64);
++    std::vector<std::vector<uint8_t>> pl;
++    kf_draw_planes(d, 9, &pl);
++    REQUIRE_EQ(pl.size(), (size_t)2);
++    std::vector<uint8_t> out;
++    std::string why;
++    REQUIRE_EQ(kf_planes_logical(d, pl, &out, &why), RAD_OK);
++    const float level = rad_load_f32(pl[1].data(), RAD_F32, 0);
++    const float* f = (const float*)out.data();
++    for (int64_t i = 0; i < R * C / 64; ++i)
++        CHECK_EQ(f[i], rad_load_f32(pl[0].data(), RAD_F8E4M3, i) * level);
++
++    CHECK_EQ(kf_planes_logical(view(e, { "scale.1", "scale" }), pl, &out, &why), RAD_E_SHAPE);
++    KfOperand more = d;
++    more.shape = { R, C / 32 };
++    CHECK_EQ(kf_planes_logical(more, pl, &out, &why), RAD_E_SHAPE);
++    RadEncoding fine = e;
++    fine.plane[rad_enc_find(&e, "scale.1")].block[1] = 32;
++    const KfOperand df = view(fine, { "scale", "scale.1" });
++    std::vector<std::vector<uint8_t>> pf;
++    kf_draw_planes(df, 9, &pf);
++    CHECK_EQ(kf_planes_logical(df, pf, &out, &why), RAD_E_SHAPE);
++    CHECK(why.find("does not cover") != std::string::npos);
++}
++
+ namespace {
+ 
+ int lay_identity(const RadParam*, int, int, const RadEncoding*, const int*, const RadTensor*, int,
+diff --git a/tests/ref_test.cpp b/tests/ref_test.cpp
+index e9dd89f..cd558d7 100644
+--- a/tests/ref_test.cpp
++++ b/tests/ref_test.cpp
+@@ -1979,6 +1979,101 @@ TEST(op_moe_gemm_q_mod4) {
+     }
+ }
+ 
++/* THE WEIGHT SCALE GRID IS THE ONE THE DTYPE NAMES, in both grouped GEMMs: the checkpoint's
++ * 128x128 tiles for block fp8, one scale a row per group of K for the four-bit experts -- a 128 at
++ * w4a8/w4a8h/w4nla8h, a 64 at w4nl64a8h/w5nl64a8h, a 32 at w4nl32a8h. The oracle inverts a re-laid
++ * weight into exactly this description (core/runtime/oracle.cpp), and the E4M3 scale views are
++ * re-laid, so tiles here leave their scales nowhere to go. Then a case built from the description
++ * itself: one expert of the last class at K = 128, whose two 64-wide halves scale by 2 and 3 under
++ * one activation scale of 0.5 over the whole 128 -- a reading at any other grid gives another
++ * number. */
++TEST(op_moe_gemm_q_scale_grid_by_dtype) {
++    struct Want { const char* dt; int64_t rows, cols; };
++    /* N 256, K 512, group 128; the last class at N 128, K 256. */
++    const Want wants[] = { { "fp8a8", 2, 4 },      { "w4a8", 256, 4 },     { "w4a8h", 256, 4 },
++                           { "w4nla8h", 256, 4 },  { "w4nl64a8h", 256, 8 }, { "w5nl64a8h", 256, 8 },
++                           { "w4nl32a8h", 256, 16 } };
++    for (const char* op : { "moe_gemm_q", "moe_gemm_q_mod4" }) {
++        const RadKernelInfo* k = kern(op);
++        REQUIRE(k != nullptr && k->opd_shape != nullptr);
++        const bool four = std::strcmp(op, "moe_gemm_q_mod4") == 0;
++        const int last = four ? 11 : 7;
++        for (const Want& w : wants) {
++            A a;
++            a.i("M", 2).i("N", 256).i("K", 512).i("n_expert", 8).i("top_k", 2).i("group", 128)
++             .s("a_order", "token").s("dtype", w.dt);
++            if (four) a.i("N_3", 128).i("K_3", 256);
++            else      a.i("N_odd", 128).i("K_odd", 256);
++            const RadArgs* r = a.get();
++            RadOpdDesc d{}, dl{};
++            REQUIRE_EQ(k->opd_shape(r->p, r->n_p, 3, &d), RAD_OK);
++            REQUIRE_EQ(k->opd_shape(r->p, r->n_p, last, &dl), RAD_OK);
++            CHECK_EQ(d.dtype, (uint32_t)RAD_BF16);
++            CHECK_EQ(d.rank, 3u);
++            CHECK_EQ(d.shape[0], four ? 2LL : 4LL);
++            if (d.shape[1] != w.rows || d.shape[2] != w.cols)
++                std::fprintf(stderr, "    %s at %s: w_scale [%lld, %lld], want [%lld, %lld]\n", op,
++                             w.dt, (long long)d.shape[1], (long long)d.shape[2],
++                             (long long)w.rows, (long long)w.cols);
++            CHECK_EQ(d.shape[1], w.rows);
++            CHECK_EQ(d.shape[2], w.cols);
++            /* the last class at its own geometry, on the same grid */
++            CHECK_EQ(dl.shape[1], w.rows == 2 ? 1LL : 128LL);
++            CHECK_EQ(dl.shape[2], w.cols / 2);
++        }
++    }
++
++    for (const char* op : { "moe_gemm_q", "moe_gemm_q_mod4" }) {
++        const RadKernelInfo* k = kern(op);
++        REQUIRE(k != nullptr && k->opd_shape != nullptr);
++        const bool four = std::strcmp(op, "moe_gemm_q_mod4") == 0;
++        const int ncls = four ? 4 : 2, ne = ncls, n_opd = four ? 13 : 9;
++        auto params = [&](A& x) {
++            x.i("M", 1).i("N", 2).i("K", 128).i("n_expert", ne).i("top_k", 1).i("group", 128)
++             .s("a_order", "token").s("dtype", "w4nl64a8h");
++        };
++        A p;
++        params(p);
++        const RadArgs* pr = p.get();
++        std::deque<T> opd;
++        for (int i = 0; i < n_opd; ++i) {
++            RadOpdDesc d{};
++            REQUIRE_EQ(k->opd_shape(pr->p, pr->n_p, i, &d), RAD_OK);
++            opd.emplace_back(d.dtype, std::vector<int64_t>(d.shape, d.shape + d.rank));
++        }
++        /* the classes' (codes, scale) operand pairs, class 0 first */
++        std::vector<std::pair<int, int>> cls = { { 2, 3 }, { 6, 7 } };
++        if (four) cls.insert(cls.end(), { { 8, 9 }, { 10, 11 } });
++        for (int q = 0; q < ncls; ++q) {
++            T& w = opd[(size_t)cls[(size_t)q].first];
++            T& s = opd[(size_t)cls[(size_t)q].second];
++            REQUIRE_EQ(s.t.shape[1], 2LL);
++            REQUIRE_EQ(s.t.shape[2], 2LL);
++            const bool hit = q == ncls - 1;
++            std::vector<float> wv(256);
++            for (int64_t n = 0; n < 2; ++n)
++                for (int64_t kk = 0; kk < 128; ++kk)
++                    wv[(size_t)(n * 128 + kk)] = hit ? (float)(n + 1) : 7.0f;
++            w.f(wv);
++            s.f(hit ? std::vector<float>{ 2, 3, 2, 3 } : std::vector<float>{ 1, 1, 1, 1 });
++        }
++        opd[0].f(std::vector<float>(128, 1.0f));
++        opd[1].f({ 0.5f });
++        opd[4].n({ 0 });
++        /* every expert empty but the last one, which owns the one row */
++        std::vector<int64_t> off((size_t)ne + 1, 0);
++        off[(size_t)ne] = 1;
++        opd[5].n(off);
++        A a;
++        for (int i = 0; i < n_opd; ++i) a.t(opd[(size_t)i]);
++        params(a);
++        CHECK_OK(run(op, a));
++        const T& y = opd[(size_t)n_opd - 1];
++        CHECK_EQ(y.at(0), 160.0f);                   /* 0.5 * (64*1*2 + 64*1*3) */
++        CHECK_EQ(y.at(1), 320.0f);                   /* 0.5 * (64*2*2 + 64*2*3) */
++    }
++}
++
+ TEST(op_moe_chain) {
+     /* Two tokens, two experts, top_k 2 -- every token visits every expert, so the whole chain is
+      * checkable without any routing subtlety. */
+diff --git a/tests/relayout_parity_test.cpp b/tests/relayout_parity_test.cpp
+index 3773b04..f1f45f9 100644
+--- a/tests/relayout_parity_test.cpp
++++ b/tests/relayout_parity_test.cpp
+@@ -172,6 +172,8 @@ const Hooks nW2        { r4d_rad_layout_w2a8, r4d_rad_relayout_w2a8, r4d_rad_unr
+ const Hooks nMx        { r4d_rad_layout_mxfp4, r4d_rad_relayout_mxfp4, nullptr };
+ const Hooks nMoeW4     { r4d_rad_layout_moe_w4, r4d_rad_relayout_moe_w4,
+                        r4d_rad_unrelayout_moe_w4 };
++const Hooks nMoeW4Mod4 { r4d_rad_layout_moe_w4_mod4, r4d_rad_relayout_moe_w4_mod4,
++                       r4d_rad_unrelayout_moe_w4_mod4 };
+ 
+ /* gemm_nt_q's operands and the other ops' weight slots, as the kernels number them */
+ enum { B = 2, BSCALE = 3, BREF = 6, LM_W = 1, HC_DOWN = 2, HC_UP = 3, MTP_FCH = 4, MTP_FCE = 5 };
+@@ -479,6 +481,143 @@ TEST(moe_codebook_experts_at_five_bits) {
+                                    (int)s4.t.size(), &L), RAD_E_DTYPE);
+ }
+ 
++namespace {
++
++/* WHAT THE OP ORACLE READS FOR A RE-LAID WEIGHT, got the way Ctx::oracle_unrelayout gets it: the
++ * stored bytes back through the kernel's own inverse into the selected planes, and those through
++ * the core's enc_selection_logical into the values a dense reference multiplies -- f32 here, held
++ * to the same values read straight off the quantiser's planes: a code as itself or as its table
++ * entry, a scale times the levels above it. A selection the core cannot read on its own is a
++ * weight the oracle has to decline, and the E4M3 scale views were one. A view stored as it is has
++ * nothing to invert and is handed over unchanged. */
++void oracle_reads(const char* label, const Hooks& nf, Opts kp, int operand, const Quantised& q,
++                  int64_t R, int64_t C, const std::vector<const char*>& roles) {
++    Selection s = select(q, R, C, roles);
++    RadLayout L{};
++    const int lrc = nf.layout(kp.data(), kp.n(), operand, &q.enc, s.sel.data(), s.t.data(),
++                              (int)s.t.size(), &L);
++    if (lrc == RAD_E_UNSUPPORTED) return;
++    REQUIRE_EQ(lrc, RAD_OK);
++    std::vector<uint8_t> laid((size_t)L.bytes);
++    REQUIRE_EQ(nf.relayout(kp.data(), kp.n(), operand, &q.enc, s.sel.data(), s.t.data(),
++                           (int)s.t.size(), laid.data(), L.bytes), RAD_OK);
++    std::vector<std::vector<uint8_t>> bufs;
++    Selection back = select(q, R, C, roles, &bufs);
++    REQUIRE_EQ(nf.unrelayout(kp.data(), kp.n(), operand, &q.enc, back.sel.data(), laid.data(),
++                             L.bytes, back.t.data(), (int)back.t.size()), RAD_OK);
++    std::vector<int64_t> rows, cols;
++    std::vector<const void*> pd;
++    for (size_t k = 0; k < back.t.size(); ++k) {
++        rows.push_back(back.t[k].shape[0]);
++        cols.push_back(back.t[k].shape[1]);
++        pd.push_back(bufs[k].data());
++    }
++    const int64_t n = rows[0] * cols[0];
++    std::vector<float> got((size_t)n);
++    std::string why;
++    const int rc = rad::enc_selection_logical(q.enc, back.sel.data(), (int)back.sel.size(),
++                                              rows.data(), cols.data(), pd.data(), RAD_F32, n,
++                                              got.data(), &why);
++    if (rc != RAD_OK)
++        std::fprintf(stderr, "    %s operand %d: %s\n", label, operand, why.c_str());
++    REQUIRE_EQ(rc, RAD_OK);
++    const RadEncPlane& p0 = q.enc.plane[s.sel[0]];
++    const uint8_t* src = q.planes[(size_t)s.sel[0]].data();
++    const int64_t rb = rad_enc_row_bytes(p0.dtype, cols[0]);
++    const float* table = nullptr;
++    float level = 1.0f;
++    for (size_t k = 1; k < roles.size(); ++k) {
++        const std::vector<uint8_t>& pk = q.planes[(size_t)s.sel[k]];
++        if (!std::strcmp(roles[k], "table")) table = (const float*)pk.data();
++        else level *= rad_load_f32(pk.data(), q.enc.plane[s.sel[k]].dtype, 0);
++    }
++    int64_t bad = 0;
++    for (int64_t i = 0; i < rows[0]; ++i)
++        for (int64_t j = 0; j < cols[0]; ++j) {
++            float v = rad_load_f32(src + i * rb, p0.dtype, j);
++            if (table) v = table[(int64_t)v];
++            if (got[(size_t)(i * cols[0] + j)] != v * level) ++bad;
++        }
++    if (bad) std::fprintf(stderr, "    %s operand %d: %lld of %lld read wrong\n", label, operand,
++                          (long long)bad, (long long)n);
++    CHECK_EQ(bad, (int64_t)0);
++}
++
++/* A four-bit expert format as the quantiser is asked for it, and its two views. */
++struct MoeFmt {
++    const char* dtype;
++    Opts quant;
++    std::vector<const char*> codes, scales;
++};
++std::vector<MoeFmt> moe_formats() {
++    auto nl = [](const char* table, long long group) {
++        Opts g;
++        g.s("table", table).i("group", group).s("scale", "fp8_e4m3").s("scale2", "f32")
++         .s("block2", "*x*").f("scale2_value", 0x1p-13).s("transform", "fwht128")
++         .s("rule", "search");
++        return g;
++    };
++    Opts i4, nla;
++    i4.s("codes", "i4").i("group", 128).s("scale", "bf16").s("transform", "fwht128");
++    nla.s("table", "w4nl").i("group", 128).s("scale", "bf16").s("transform", "fwht128")
++       .s("rule", "search");
++    return {
++        { "w4a8h", i4, { "codes" }, { "scale" } },
++        { "w4nla8h", nla, { "codes", "table" }, { "scale" } },
++        { "w4nl64a8h", nl("w4nl", 64), { "codes", "table" }, { "scale", "scale.1" } },
++        { "w4nl32a8h", nl("w4nl", 32), { "codes", "table" }, { "scale", "scale.1" } },
++        { "w5nl64a8h", nl("w5nl", 64), { "codes", "table" }, { "scale", "scale.1" } },
++    };
++}
++
++}  /* namespace */
++
++/* THE FOUR CLASSES ARE THE TWO-CLASS HOOKS ONE CLASS FURTHER ALONG. moe_gemm_q_mod4's class q is
++ * operands 2/3 at N/K for q = 0 and 2q+4/2q+5 at N_q/K_q after it, and each is stored, and read
++ * back, exactly as moe_gemm_q's hooks store an expert of that geometry -- codes and scales, in
++ * every four-bit format, at four class geometries. Then what the op oracle reads through each
++ * class's inverse, codes and E4M3 scale views alike, and through the two-class op's own. */
++TEST(moe_four_classes_store_and_read_back_as_two_classes_do) {
++    NEED_LIBQUANT();
++    const int64_t Nq[4] = { 64, 128, 64, 48 }, Kq[4] = { 256, 256, 128, 128 };
++    for (MoeFmt& f : moe_formats()) {
++        Opts kp4;
++        kp4.i("N", Nq[0]).i("K", Kq[0]).i("N_1", Nq[1]).i("K_1", Kq[1]).i("N_2", Nq[2])
++           .i("K_2", Kq[2]).i("N_3", Nq[3]).i("K_3", Kq[3]).s("dtype", f.dtype).i("group", 128);
++        for (int q = 0; q < 4; ++q) {
++            const std::vector<float> w = weight(Nq[q], Kq[q], 30 + q, 1, 128);
++            const int cop = q == 0 ? B : 2 * q + 4, sop = cop + 1;
++            Opts kp2;
++            kp2.i("N", Nq[q]).i("K", Kq[q]).s("dtype", f.dtype).i("group", 128);
++            const std::string label = std::string(f.dtype) + " class " + std::to_string(q);
++            Quantised kept;
++            const uint64_t h4 = stored(label.c_str(), nMoeW4Mod4, kp4, "rtn", f.quant,
++                                       "blk.0.ffn_down_exps.0.weight", Nq[q], Kq[q], w,
++                                       { { cop, f.codes }, { sop, f.scales } }, &kept);
++            const uint64_t h2 = stored(label.c_str(), nMoeW4, kp2, "rtn", f.quant,
++                                       "blk.0.ffn_down_exps.0.weight", Nq[q], Kq[q], w,
++                                       { { B, f.codes }, { BSCALE, f.scales } });
++            if (h4 != h2)
++                std::fprintf(stderr, "    %s: four-class hash 0x%016llx, two-class 0x%016llx\n",
++                             label.c_str(), (unsigned long long)h4, (unsigned long long)h2);
++            CHECK_EQ(h4, h2);
++            REQUIRE_EQ(kept.status, RAD_OK);
++            oracle_reads(label.c_str(), nMoeW4Mod4, kp4, cop, kept, Nq[q], Kq[q], f.codes);
++            oracle_reads(label.c_str(), nMoeW4Mod4, kp4, sop, kept, Nq[q], Kq[q], f.scales);
++            oracle_reads(label.c_str(), nMoeW4, kp2, B, kept, Nq[q], Kq[q], f.codes);
++            oracle_reads(label.c_str(), nMoeW4, kp2, BSCALE, kept, Nq[q], Kq[q], f.scales);
++            /* A class reads its own geometry and nobody else's: class 1 is 128 wide, so an
++             * expert of any other class's width is refused there. */
++            if (q != 1) {
++                Selection s = select(kept, Nq[q], Kq[q], f.codes);
++                RadLayout L{};
++                CHECK_EQ(nMoeW4Mod4.layout(kp4.data(), kp4.n(), 6, &kept.enc, s.sel.data(),
++                                           s.t.data(), (int)s.t.size(), &L), RAD_E_SHAPE);
++            }
++        }
++    }
++}
++
+ TEST(moe_int4_gptq_against_a_calibration_hessian) {
+     NEED_LIBQUANT();
+     /* Correlated activations, so the Hessian is far from diagonal and the error feedback moves
+-- 
+2.55.0
+

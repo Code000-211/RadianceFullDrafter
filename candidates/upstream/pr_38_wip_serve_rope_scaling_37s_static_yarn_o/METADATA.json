@@ -1,0 +1,119 @@
+{
+  "pr_id": 38,
+  "title": "WIP: serve: --rope-scaling, #37's static YaRN on an existing container without a reconvert (supplemental to #37)",
+  "author": "bakon",
+  "url": "https://codeberg.org/StillDeadcode/radiance/pulls/38",
+  "status": "QUEUED_LOW_PRIORITY",
+  "modified_files": [
+    "abi/rad_yarn.h",
+    "arch/common/rad_arch.h",
+    "arch/common/rad_block_dflash2.h",
+    "arch/qwen35_bf16/qwen35_bf16.cpp",
+    "arch/qwen35_fp8/qwen35_fp8.cpp",
+    "docs/OPS.md",
+    "docs/YARN.md",
+    "libavx/avx_attn.cpp",
+    "libavx/avx_cases.cpp",
+    "libavx/avx_registry.cpp",
+    "libr4d/r4d_model_bf16.hip",
+    "libr4d/r4d_qk_norm_rope_gate.hip",
+    "libr4d/r4d_rows.cpp",
+    "libr4d/r4d_selftest.cpp",
+    "libref/ref_attn.cpp",
+    "libref/ref_registry.cpp",
+    "tests/arch_test.cpp",
+    "tests/data/generate_yarn_reference.py",
+    "tests/data/yarn_reference.json",
+    "tests/data/yarn_reference_rocm.json",
+    "tests/ref_test.cpp",
+    "tests/yarn_test.cpp",
+    "arch/common/rad_qsa.h",
+    "arch/qwen4exp_fp8/qwen4exp_fp8.cpp",
+    "docs/OPS.md",
+    "docs/YARN.md",
+    "libr4d/r4d_qsa_block_key_bf16.hip",
+    "libr4d/r4d_rows.cpp",
+    "libr4d/r4d_selftest.cpp",
+    "tests/arch_test.cpp",
+    "abi/rad_yarn.h",
+    "arch/common/rad_arch.h",
+    "docs/YARN-VALIDATION.md",
+    "docs/YARN.md",
+    "libavx/avx_cases.cpp",
+    "tests/ref_test.cpp",
+    "tests/yarn_test.cpp",
+    "core/config.cpp",
+    "core/engine.h",
+    "core/engine_bringup.cpp",
+    "core/format/rope_override.h",
+    "core/rad_core.h",
+    "docs/GUIDE.md",
+    "docs/YARN.md",
+    "tests/config_test.cpp",
+    "tests/yarn_test.cpp"
+  ],
+  "safety_audit": {
+    "passed": true,
+    "violations": []
+  },
+  "jev_evaluation": {
+    "subsystem": {
+      "type": "choice",
+      "choice": "general",
+      "confidence": 0.91,
+      "probabilities": {
+        "tooling": 0.0,
+        "general": 0.92,
+        "interconnect": 0.0,
+        "gemm": 0.0,
+        "moe": 0.0,
+        "serving": 0.05,
+        "drafter": 0.03,
+        "qsa": 0.0,
+        "gdn": 0.0
+      }
+    },
+    "violates_rdna4_limits": {
+      "type": "noul",
+      "noul": 0.06
+    },
+    "feasibility": {
+      "type": "score",
+      "score": 2.02,
+      "confidence": 0.11,
+      "legend": {
+        "0": "Unfeasible / contradicts hardware laws / CUDA-only",
+        "1": "High risk or complex external dependency",
+        "2": "Moderate feasibility / experimental",
+        "3": "Feasible / standard ROCm HIP implementation",
+        "4": "Immediate high-value quick win"
+      },
+      "probabilities": {
+        "0": 0.14,
+        "1": 0.17,
+        "2": 0.27,
+        "3": 0.38,
+        "4": 0.04
+      }
+    },
+    "performance_roi": {
+      "type": "score",
+      "score": 0.47,
+      "confidence": 0.61,
+      "legend": {
+        "0": "Zero or negative performance impact (docs, tool, placebo)",
+        "1": "Marginal gain (<2%) or monitoring/stability utility",
+        "2": "Solid architectural gain (2-5%)",
+        "3": "High-impact gain (5-15%)",
+        "4": "Breakthrough gain (>15%)"
+      },
+      "probabilities": {
+        "0": 0.65,
+        "1": 0.26,
+        "2": 0.06,
+        "3": 0.03,
+        "4": 0.0
+      }
+    }
+  }
+}

@@ -1,0 +1,124 @@
+{
+  "pr_id": 20,
+  "title": "any world size: the attention world, uneven delta-net heads, nothing padded",
+  "author": "bakon",
+  "url": "https://codeberg.org/StillDeadcode/radiance/pulls/20",
+  "status": "READY_TO_TEST",
+  "modified_files": [
+    "abi/rad_builder.h",
+    "core/build/rad_build.h",
+    "core/build/rad_builder.cpp",
+    "core/engine_bringup.cpp",
+    "core/format/share.cpp",
+    "core/format/share.h",
+    "core/rad_core.h",
+    "tests/build_test.cpp",
+    "tests/share_test.cpp",
+    "arch/common/rad_arch.h",
+    "arch/common/rad_block_attn_gated_fp8.h",
+    "arch/common/rad_block_gdn_fp8.h",
+    "arch/common/rad_fp8.h",
+    "arch/qwen4exp_fp8/qwen4exp_fp8.cpp",
+    "docs/TP3.md",
+    "tests/arch_test.cpp",
+    "core/engine_bringup.cpp",
+    "core/mem/kv.cpp",
+    "core/mem/kv.h",
+    "tests/mem_test.cpp",
+    "core/device/dispatch.cpp",
+    "core/engine_bringup.cpp",
+    "docs/TP3.md",
+    "libr4d/r4d.h",
+    "libr4d/r4d_model_bf16.hip",
+    "libr4d/r4d_plugin.h",
+    "libr4d/r4d_rows.cpp",
+    "libr4d/r4d_selftest.cpp",
+    "libr4d/r4d_shapes.cpp",
+    "arch/common/rad_block_attn_gated_fp8.h",
+    "abi/rad_builder.h",
+    "arch/qwen4exp_fp8/qwen4exp_fp8.cpp",
+    "core/build/rad_build.h",
+    "core/build/rad_builder.cpp",
+    "core/mem/kv.cpp",
+    "core/mem/kv.h",
+    "core/rad_core.h",
+    "core/runtime/issue.cpp",
+    "tests/arch_test.cpp",
+    "core/engine.h",
+    "core/engine_bringup.cpp",
+    "arch/common/rad_arch.h",
+    "arch/qwen4exp_fp8/qwen4exp_fp8.cpp",
+    "tests/arch_test.cpp",
+    "docs/OPS.md",
+    "core/engine.cpp",
+    "core/engine_bringup.cpp",
+    "arch/common/rad_arch.h",
+    "arch/qwen4exp_fp8/qwen4exp_fp8.cpp",
+    "core/engine.h",
+    "core/engine_bringup.cpp"
+  ],
+  "safety_audit": {
+    "passed": true,
+    "violations": []
+  },
+  "jev_evaluation": {
+    "subsystem": {
+      "type": "choice",
+      "choice": "gdn",
+      "confidence": 0.63,
+      "probabilities": {
+        "gemm": 0.03,
+        "moe": 0.0,
+        "interconnect": 0.02,
+        "qsa": 0.02,
+        "drafter": 0.0,
+        "gdn": 0.67,
+        "tooling": 0.0,
+        "serving": 0.01,
+        "general": 0.25
+      }
+    },
+    "violates_rdna4_limits": {
+      "type": "noul",
+      "noul": 0.16
+    },
+    "feasibility": {
+      "type": "score",
+      "score": 1.86,
+      "confidence": 0.04,
+      "legend": {
+        "0": "Unfeasible / contradicts hardware laws / CUDA-only",
+        "1": "High risk or complex external dependency",
+        "2": "Moderate feasibility / experimental",
+        "3": "Feasible / standard ROCm HIP implementation",
+        "4": "Immediate high-value quick win"
+      },
+      "probabilities": {
+        "0": 0.15,
+        "1": 0.2,
+        "2": 0.29,
+        "3": 0.35000000000000003,
+        "4": 0.01
+      }
+    },
+    "performance_roi": {
+      "type": "score",
+      "score": 1.32,
+      "confidence": 0.0,
+      "legend": {
+        "0": "Zero or negative performance impact (docs, tool, placebo)",
+        "1": "Marginal gain (<2%) or monitoring/stability utility",
+        "2": "Solid architectural gain (2-5%)",
+        "3": "High-impact gain (5-15%)",
+        "4": "Breakthrough gain (>15%)"
+      },
+      "probabilities": {
+        "0": 0.43,
+        "1": 0.1,
+        "2": 0.2,
+        "3": 0.25,
+        "4": 0.02
+      }
+    }
+  }
+}

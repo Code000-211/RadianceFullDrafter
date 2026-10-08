@@ -1,0 +1,1440 @@
+From 65711093667e67d2806ac3e8843b55f0d70fa7fe Mon Sep 17 00:00:00 2001
+From: keptn42 <keptn42@noreply.codeberg.org>
+Date: Mon, 5 Oct 2026 21:23:03 +0000
+Subject: [PATCH 1/3] moe prefill forms behind R4D_MOE_PF2: wide gather,
+ parallel scan and map prefix, 256-column down
+
+In a prefill chunk moe_gather loads two bytes a lane and waits on every
+slot, moe_scatter scans on one thread, and so does the run map's prefix.
+R4D_MOE_PF2=1, or a mask of the parts: 2 a wave a token and 16 bytes a
+lane with every slot's row in flight, 4 its column groups last first, 8 a
+parallel scan with the tail folded into the placement, 16 the map prefix
+in parallel, 32 a 256-column run-aligned down tile (w4). Each part keeps
+its sums in the same order or is integers: bit-identical. Unset, every
+launch is as before.
+---
+ libr4d/r4d.h            |   8 +
+ libr4d/r4d_moe.hip      | 359 +++++++++++++++++++++++++++++++++++++++-
+ libr4d/r4d_selftest.cpp | 315 +++++++++++++++++++++++++++++++++--
+ 3 files changed, 668 insertions(+), 14 deletions(-)
+
+diff --git a/libr4d/r4d.h b/libr4d/r4d.h
+index f19de54..87dc400 100644
+--- a/libr4d/r4d.h
++++ b/libr4d/r4d.h
+@@ -652,6 +652,14 @@ void r4d_moe_gemm_pin_prefill(int form);
+ // every class's K a multiple of 256, a format that folds scale groups). The two are bit-identical,
+ // and r4d_selftest compares their bytes.
+ void r4d_moe_gemm_pin_fk(int pin);
++// THE PREFILL MoE FORMS (R4D_MOE_PF2), pinned for a test: below zero the switch's rule, otherwise
++// the value the switch would hold -- 0 none, 1 every part, else a mask of the parts (r4d_moe.hip
++// lists them). Every part is bit-identical to the form it replaces, and r4d_selftest compares their
++// bytes: moe_gather and moe_scatter at a prefill chunk, and the GEMM's run-aligned form.
++void r4d_moe_pf2_pin(int pin);
++// The parts the launches since the last call took, under a pin, as R4D_MOE_PF2's mask; cleared by
++// the call. A test reads it to know a part's kernel ran rather than the default's.
++uint32_t r4d_moe_pf2_used(void);
+ // THE GATED RESIDUAL READ'S PREFILL TILE, pinned for a test: 0 is the launcher's rule, 1 the decode
+ // tiles' kernels at 128 rows (hc_down_tiled, then hc_up_tiled into `ubuf` and hc_mix), 2 the wide
+ // kernels (which then refuse a shape they are not built for), 3 the PF2 kernels the rule takes from
+diff --git a/libr4d/r4d_moe.hip b/libr4d/r4d_moe.hip
+index c1c715d..5b811fa 100644
+--- a/libr4d/r4d_moe.hip
++++ b/libr4d/r4d_moe.hip
+@@ -617,6 +617,83 @@ __global__ void scatter_tail_kernel(const int32_t* __restrict__ off, int32_t* __
+     if (i >= live && i < T) sorted[i] = -1;
+ }
+ 
++/* ---- PF2: THE GENERAL SCATTER'S SCAN AND TAIL, AT A PREFILL CHUNK ----------------------------------
++ *
++ * scatter_scan_kernel gives each thread an expert -- two at 512 -- and walks that expert's column of
++ * `bcnt` one tile at a time: load, add, store, and the next load only after. At a 2048 chunk and top
++ * 10 that is 80 tiles, two experts a thread, 160 dependent round trips on one workgroup, and then
++ * one thread prefixes the 512 totals alone. Here a thread holds one expert, its column comes in
++ * kScanBatch loads at a time, all issued before any is used, and the prefix across experts is the
++ * small sort's: a DPP scan in each wave and one exchange of the wave totals. Integers, and every sum
++ * has one answer whatever order it is formed in: the same bcnt, offsets and counts.
++ *
++ * THE TAIL RIDES IN THE PLACEMENT. scatter_tail_kernel is a launch of its own that writes -1 to the
++ * sorted rows past the live count; those rows are never a placement target (every placed slot lands
++ * below `off[n_expert]`), so the placement's own threads can write them, each its own index, with no
++ * thread able to race another for a row. One dependent launch a layer fewer; the same bytes. */
++constexpr uint32_t kScanBatch = 16;
++
++__global__ __launch_bounds__(kMaxExpert) void scatter_scan_par_kernel(
++    int32_t* __restrict__ bcnt, int32_t* __restrict__ off, int32_t* __restrict__ cnt,
++    uint32_t n_tile, uint32_t n_expert) {
++    constexpr uint32_t NW = kMaxExpert / kWave;
++    __shared__ int32_t s_wt[NW];
++    const uint32_t e = threadIdx.x, lane = e % kWave, wave = e / kWave;
++    int32_t run = 0;
++    if (e < n_expert) {
++        for (uint32_t b0 = 0; b0 < n_tile; b0 += kScanBatch) {
++            /* Every load in bounds -- a row past the last is the last row again, and discarded --
++             * so none of them sits in a branch the next one has to wait behind. */
++            int32_t v[kScanBatch];
++#pragma unroll
++            for (uint32_t k = 0; k < kScanBatch; ++k) {
++                const uint32_t b = b0 + k < n_tile ? b0 + k : n_tile - 1u;
++                v[k] = bcnt[(size_t)b * n_expert + e];
++            }
++#pragma unroll
++            for (uint32_t k = 0; k < kScanBatch; ++k) {
++                if (b0 + k >= n_tile) break;
++                bcnt[(size_t)(b0 + k) * n_expert + e] = run;
++                run += v[k];
++            }
++        }
++        cnt[e] = run;
++    }
++    const int32_t x = wave_incl_scan_i32(run, lane);
++    if (lane == kWave - 1) s_wt[wave] = x;
++    lds_barrier();
++    int32_t below = 0, tot = 0;
++#pragma unroll
++    for (uint32_t w = 0; w < NW; ++w) {
++        const int32_t c = s_wt[w];
++        below += (w < wave) ? c : 0;
++        tot   += c;
++    }
++    if (e < n_expert) off[e] = below + x - run;     /* inclusive -> exclusive */
++    if (e == 0) off[n_expert] = tot;
++}
++
++/* scatter_place_kernel, and the tail scatter_tail_kernel writes. The placement is that kernel's,
++ * line for line. */
++__global__ __launch_bounds__(kScatterTile) void scatter_place_tail_kernel(
++    const int32_t* __restrict__ ids, const int32_t* __restrict__ bcnt,
++    const int32_t* __restrict__ off, int32_t* __restrict__ sorted,
++    uint32_t T, uint32_t n_expert, int32_t base, Protect prot) {
++    __shared__ int32_t s_id[kScatterTile];
++    const uint32_t tid = threadIdx.x, b = blockIdx.x;
++    const uint32_t i = b * kScatterTile + tid;
++    const int32_t  l = (i < T) ? ids[i] - base : -1;
++    const int32_t  e = (l >= 0 && l < (int32_t)n_expert) ? sort_place(l, n_expert, prot) : -1;
++    s_id[tid] = e;
++    const uint32_t live = (uint32_t)off[n_expert];
++    if (i >= live && i < T) sorted[i] = -1;
++    __syncthreads();
++    if (i >= T || e < 0) return;
++    int32_t rank = 0;
++    for (uint32_t j = 0; j < tid; ++j) rank += (s_id[j] == e);
++    sorted[off[e] + bcnt[(size_t)b * n_expert + e] + rank] = (int32_t)i;
++}
++
+ 
+ /* ================================================================== the 4-bit expert weight
+  *
+@@ -954,7 +1031,10 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_q_kernel(
+     constexpr uint32_t NTHR = WGM * WGN * kWave;
+     constexpr uint32_t WM = MT / WGM, WN = NTL / WGN;
+     static_assert(MT % WGM == 0 && NTL % WGN == 0, "the wave grid must divide the tile");
+-    static_assert(kBlock % FN == 0, "a block's N rows must sit in one 128-row weight scale row");
++    /* The block-fp8 weight has one scale a 128x128 tile; a w4 weight one a ROW, so its block may
++     * span two of the fp8 grid's scale rows (the 256-column down tile, R4D_MOE_PF2). */
++    static_assert(W4 != 0 || kBlock % FN == 0,
++                  "a block's N rows must sit in one 128-row weight scale row");
+     /* Scale groups a 128-wide block: one, or at W4 2, 3 and 4 the 64- or 32-column ones. */
+     constexpr uint32_t kSub = W4 == 3 ? 4u : (W4 == 2 || W4 == 4) ? 2u : 1u;
+     /* 128-wide blocks a staged pass (one, or two at FK 256), and so scale groups a pass. */
+@@ -1990,6 +2070,113 @@ __global__ __launch_bounds__(NTHR) void gather_kernel(
+     }
+ }
+ 
++/* ---- PF2: THE PREFILL GATHER, A WAVE A TOKEN AND EIGHT COLUMNS A LANE ----------------------------
++ *
++ * At a prefill chunk this op is a read of `ye` -- one row a routed slot, 105 MB a layer at a 2048
++ * chunk of Qwen3.8-Flash-Next on a rank of four -- and gather_kernel moves it TWO BYTES A LANE: a
++ * block is one token's 256 columns, each of its loads one slot's 64 bytes a wave, and a lane's slots
++ * are a loop whose loads wait on the slot table one after the other. That is about two thirds of
++ * the part's cold-stream rate on the op's bytes.
++ *
++ * Here a wave owns one token and 256 columns, eight a lane. The token's slot table is read first
++ * (uniform: scalar loads), then every slot's sixteen bytes are issued before any is used, then
++ * summed. THE ARITHMETIC IS gather_kernel's: per column, ascending slot order, a dropped slot skipped,
++ * `acc += w * x` in f32, and the shared arm's two narrows exactly as there -- the same bits.
++ *
++ * REV takes the column groups last first. The down projection writes `ye` one 128-column tile at a
++ * time, every routed row of a tile before the next (the tile is its grid's slow axis), so when it
++ * ends, the tiles it wrote last are the ones still in the infinity cache. Taken last first, this
++ * kernel's first column groups are read from there rather than from DRAM. Which block reads which
++ * group moves; no sum does. */
++constexpr uint32_t kGatherWideSlots = 16;      /* top_k at most this: the slots live in registers */
++constexpr uint32_t kGatherWideCols  = 8;       /* columns a lane, one sixteen-byte load */
++static_assert(kGatherWideSlots <= kWave, "slot j is read off lane j");
++
++template <uint32_t NW>
++__global__ __launch_bounds__(NW * kWave) void gather_wide_kernel(
++    const uint16_t* __restrict__ ye, const uint16_t* __restrict__ ew,
++    const int32_t* __restrict__ inv, uint16_t* __restrict__ y,
++    uint32_t M, uint32_t n, uint32_t top_k, uint32_t ye_ld, uint32_t ew_ld, uint32_t y_ld,
++    const uint16_t* __restrict__ sh, const uint16_t* __restrict__ sg,
++    uint32_t sh_ld, uint32_t sg_ld, int sig, int rev) {
++    const uint32_t lane = threadIdx.x % kWave;
++    const uint32_t wave = (uint32_t)__builtin_amdgcn_readfirstlane((int)(threadIdx.x / kWave));
++    const uint32_t t = blockIdx.x * NW + wave;
++    const uint32_t g = rev ? gridDim.y - 1u - blockIdx.y : blockIdx.y;
++    const uint32_t c = (g * kWave + lane) * kGatherWideCols;
++    /* No barrier anywhere below, so a wave past the last token simply leaves. */
++    if (t >= M) return;
++
++    /* THE TOKEN'S SLOTS AND WEIGHTS IN ONE LOAD: lane j fetches slot j (a lane past top_k fetches
++     * slot 0 again, in bounds and never used) and every lane then reads them off the lanes, as
++     * constants into scalar registers. Loaded one a slot, each would be a scalar load waited on
++     * just before its own row's load is issued. Every lane of the wave takes part -- a lane past
++     * the last column leaves only after -- since a value is read off ANY lane. */
++    const uint32_t jl = lane < top_k ? lane : 0u;
++    const int32_t  il = inv[(size_t)t * top_k + jl];
++    const int32_t  wl = (int32_t)ew[(size_t)t * ew_ld + jl];
++    int32_t si[kGatherWideSlots];
++    float   sw[kGatherWideSlots];
++#pragma unroll
++    for (uint32_t j = 0; j < kGatherWideSlots; ++j) {
++        si[j] = __builtin_amdgcn_readlane(il, (int)j);
++        sw[j] = bf16_to_f32((uint16_t)__builtin_amdgcn_readlane(wl, (int)j));
++    }
++    if (c >= n) return;
++    /* NO break AND NO continue IN THESE LOOPS: with an early exit the compiler keeps the slot loop
++     * rolled, `yv[j]` is then indexed at run time, and the whole array goes to scratch. Written as
++     * uniform branches over a constant trip count, every index is a constant and every slot a
++     * register. A slot is live exactly where gather_kernel's loop reaches it and does not skip it. */
++    bool  lv[kGatherWideSlots];
++    uint4 yv[kGatherWideSlots];
++#pragma unroll
++    for (uint32_t j = 0; j < kGatherWideSlots; ++j) {
++        lv[j] = j < top_k && si[j] >= 0;
++        yv[j] = make_uint4(0, 0, 0, 0);
++        if (lv[j]) yv[j] = *(const uint4*)(ye + (size_t)si[j] * ye_ld + c);
++    }
++    /* The shared arm after the slots, so nothing it waits on stands in front of their loads. */
++    float gate = 0.0f;
++    uint4 shv  = make_uint4(0, 0, 0, 0);
++    if (sh) {
++        const float v0 = bf16_to_f32(sg[(size_t)t * sg_ld]);
++        gate = sig ? (1.0f / (1.0f + __expf(-v0))) : v0;
++        shv  = *(const uint4*)(sh + (size_t)t * sh_ld + c);
++    }
++
++    float acc[kGatherWideCols];
++#pragma unroll
++    for (uint32_t q = 0; q < kGatherWideCols; ++q) acc[q] = 0.0f;
++#pragma unroll
++    for (uint32_t j = 0; j < kGatherWideSlots; ++j) {
++        if (lv[j]) {
++            const float    wj   = sw[j];
++            const uint32_t d[4] = { yv[j].x, yv[j].y, yv[j].z, yv[j].w };
++#pragma unroll
++            for (uint32_t q = 0; q < 4; ++q) {
++                acc[2 * q]     += wj * bf16_to_f32((uint16_t)(d[q] & 0xFFFFu));
++                acc[2 * q + 1] += wj * bf16_to_f32((uint16_t)(d[q] >> 16));
++            }
++        }
++    }
++
++    const uint32_t s[4] = { shv.x, shv.y, shv.z, shv.w };
++    uint32_t o[4];
++#pragma unroll
++    for (uint32_t q = 0; q < 4; ++q) {
++        uint16_t lo = f32_to_bf16(acc[2 * q]), hi = f32_to_bf16(acc[2 * q + 1]);
++        if (sh) {
++            /* THE SHARED ARM, FOLDED, with gather_kernel's two narrows. */
++            const uint16_t plo = f32_to_bf16(bf16_to_f32((uint16_t)(s[q] & 0xFFFFu)) * gate);
++            const uint16_t phi = f32_to_bf16(bf16_to_f32((uint16_t)(s[q] >> 16)) * gate);
++            lo = f32_to_bf16(bf16_to_f32(plo) + bf16_to_f32(lo));
++            hi = f32_to_bf16(bf16_to_f32(phi) + bf16_to_f32(hi));
++        }
++        o[q] = (uint32_t)lo | ((uint32_t)hi << 16);
++    }
++    *(uint4*)(y + (size_t)t * y_ld + c) = make_uint4(o[0], o[1], o[2], o[3]);
++}
++
+ /* ================================================================== scale_rows
+  *
+  * y[m, i] = x[m, i] * act(s[m]). One workgroup a row, grid-strided along the row, and the scalar
+@@ -2018,6 +2205,47 @@ __global__ __launch_bounds__(NTHR) void scale_rows_kernel(
+ 
+ }  /* namespace */
+ 
++/* R4D_MOE_PF2: the prefill MoE forms -- the shapes a chunk of thousands of routed rows a layer
++ * takes and a decode step never reaches. Unset or 0: as upstream. 1: every part. Any other value is
++ * a mask of the parts, each bit-identical to the form it replaces:
++ *
++ *    2  moe_gather at a prefill chunk: a wave a token and eight columns a lane (gather_wide_kernel)
++ *    4  ...its column groups last first, so the down projection's last tiles come from the cache
++ *    8  moe_scatter's general form: its scan in parallel and its tail in the placement
++ *   16  the run map's prefix in parallel (moe_blockmap_par_kernel)
++ *   32  the down projection's prefill tile 256 columns wide over sixteen waves
++ *
++ * Read once, so a recorded pass and a live one take the same kernels. A test pin over it: below
++ * zero the switch, anything else the value the switch would hold. */
++static constexpr uint32_t kPf2Gather = 2, kPf2GatherRev = 4, kPf2Scan = 8, kPf2Map = 16,
++                          kPf2DnWide = 32;
++static constexpr uint32_t kPf2All = kPf2Gather | kPf2GatherRev | kPf2Scan | kPf2Map | kPf2DnWide;
++static uint32_t moe_pf2_mask(long long x) {
++    if (x <= 0) return 0u;
++    return x == 1 ? kPf2All : (uint32_t)x & kPf2All;
++}
++static int g_moe_pf2_pin = -1;
++static uint32_t moe_pf2() {
++    static const uint32_t v = [] {
++        const char* e = std::getenv("R4D_MOE_PF2");
++        return moe_pf2_mask(e ? std::atoll(e) : 0);
++    }();
++    return g_moe_pf2_pin >= 0 ? moe_pf2_mask(g_moe_pf2_pin) : v;
++}
++/* WHICH PARTS A PINNED LAUNCH TOOK. A part whose kernel did not run -- a shape it refuses, a
++ * condition that never held -- would match the default trivially, so the test asks. Recorded only
++ * under a pin: the pin is a test's, and a serving process never writes either. */
++static uint32_t g_moe_pf2_used = 0;
++static inline void moe_pf2_note(uint32_t part) {
++    if (g_moe_pf2_pin >= 0) g_moe_pf2_used |= part;
++}
++extern "C" void r4d_moe_pf2_pin(int pin) { g_moe_pf2_pin = pin; }
++extern "C" uint32_t r4d_moe_pf2_used(void) {
++    const uint32_t u = g_moe_pf2_used;
++    g_moe_pf2_used = 0;
++    return u;
++}
++
+ /* ============================================================== the plugin ABI entry points */
+ 
+ extern "C" int r4d_rad_router_topk(const RadArgs* a, RadStream s) {
+@@ -2235,6 +2463,18 @@ extern "C" int r4d_rad_moe_scatter(const RadArgs* a, RadStream s) {
+                        (unsigned)(n_expert * sizeof(int32_t)), (hipStream_t)s,
+                        idp, bcnt, (uint32_t)T, (uint32_t)n_expert, (int32_t)base, prot);
+     R4D_MOE_CHK();
++    /* R4D_MOE_PF2 (8): the scan in parallel, the tail in the placement -- the same integers. */
++    if (moe_pf2() & kPf2Scan) {
++        moe_pf2_note(kPf2Scan);
++        hipLaunchKernelGGL(scatter_scan_par_kernel, dim3(1), dim3(kMaxExpert), 0, (hipStream_t)s,
++                           bcnt, op, cp, (uint32_t)n_tile, (uint32_t)n_expert);
++        R4D_MOE_CHK();
++        hipLaunchKernelGGL(scatter_place_tail_kernel, dim3((unsigned)n_tile), dim3(kScatterTile), 0,
++                           (hipStream_t)s, idp, bcnt, op, sp, (uint32_t)T, (uint32_t)n_expert,
++                           (int32_t)base, prot);
++        R4D_MOE_CHK();
++        return RAD_OK;
++    }
+     hipLaunchKernelGGL(scatter_scan_kernel, dim3(1), dim3(256), 0, (hipStream_t)s,
+                        bcnt, op, cp, (uint32_t)n_tile, (uint32_t)n_expert);
+     R4D_MOE_CHK();
+@@ -2445,6 +2685,70 @@ __global__ __launch_bounds__(256) void moe_blockmap_kernel(
+     }
+ }
+ 
++/* PF2: THE SAME MAP WITH ITS PREFIX IN PARALLEL. Above, one thread prefixes the n_expert + 1 block
++ * counts alone -- 513 LDS round trips at 512 experts, in front of a GEMM that waits for the map,
++ * and the map is built twice a routed layer. Here the prefix is the small sort's: a DPP scan in each
++ * wave and one exchange of the wave totals, 256 counts a tile. Integers: the same offsets, so the
++ * same map entry for entry, and everything else is the kernel above line for line. */
++__global__ __launch_bounds__(256) void moe_blockmap_par_kernel(
++    const int32_t* __restrict__ off, uint32_t n_expert, uint32_t T, uint32_t FM, uint32_t cap,
++    uint32_t* __restrict__ map) {
++    constexpr uint32_t NT = 256, NW = NT / kWave, kTiles = (kMaxExpert + NT) / NT;
++    __shared__ uint32_t s_cnt[kMaxExpert + 1];
++    __shared__ int32_t  s_off[kMaxExpert + 1];
++    __shared__ int32_t  s_wt[kTiles][NW];
++    const uint32_t tid = threadIdx.x, lane = tid % kWave, wave = tid / kWave;
++
++    for (uint32_t e = tid; e <= n_expert; e += blockDim.x) s_off[e] = off[e];
++    __syncthreads();
++    for (uint32_t e = tid; e < n_expert; e += blockDim.x) {
++        const uint32_t run = (uint32_t)(s_off[e + 1] - s_off[e]);
++        s_cnt[e] = (run + FM - 1) / FM;
++    }
++    const uint32_t live = (uint32_t)s_off[n_expert];
++    if (tid == 0) s_cnt[n_expert] = T > live ? (T - live + FM - 1) / FM : 0u;
++    __syncthreads();
++
++    /* Exclusive scan over the n_expert + 1 counts, a tile of NT at a time. */
++    uint32_t carry = 0;
++    for (uint32_t b = 0, tl = 0; b <= n_expert; b += NT, ++tl) {
++        const uint32_t e = b + tid;
++        const int32_t  v = e <= n_expert ? (int32_t)s_cnt[e] : 0;
++        const int32_t  x = wave_incl_scan_i32(v, lane);
++        if (lane == kWave - 1) s_wt[tl][wave] = x;
++        lds_barrier();
++        int32_t below = 0, tot = 0;
++#pragma unroll
++        for (uint32_t k = 0; k < NW; ++k) {
++            const int32_t c = s_wt[tl][k];
++            below += (k < wave) ? c : 0;
++            tot   += c;
++        }
++        if (e <= n_expert) s_cnt[e] = carry + (uint32_t)(below + x - v);
++        carry += (uint32_t)tot;
++    }
++    if (tid == 0) map[0] = carry < cap ? carry : cap;
++    __syncthreads();
++
++    for (uint32_t e = tid; e < n_expert; e += blockDim.x) {
++        const uint32_t run = (uint32_t)(s_off[e + 1] - s_off[e]);
++        uint32_t o = s_cnt[e];
++        for (uint32_t r = 0; r < run; r += FM, ++o) {
++            if (o >= cap) break;
++            map[1 + 2 * o + 0] = e;
++            map[1 + 2 * o + 1] = (uint32_t)s_off[e] + r;
++        }
++    }
++    if (tid == 0) {
++        uint32_t o = s_cnt[n_expert];
++        for (uint32_t r = live; r < T; r += FM, ++o) {
++            if (o >= cap) break;
++            map[1 + 2 * o + 0] = kMapTail;
++            map[1 + 2 * o + 1] = r;
++        }
++    }
++}
++
+ /* WHICH FORM A LAUNCH TAKES: 0 is the rule; for a test, 1 pins the run-aligned prefill form, 2 the
+  * (tile, run) decode form and 3 the uniform prefill grid, whatever the band. r4d_selftest --perfmoe
+  * times each on one input and compares it with form 1: all three must match byte for byte. */
+@@ -2650,12 +2954,36 @@ static int moe_gemm_launch(const RadArgs* a, const R4dSink& sk, int ncls = 2) {
+         /* The 128-column tile where no column tile straddles two parts of the weight. */
+         const bool wide_n = (N / parts) % kPrefillCols == 0;
+         const unsigned nyw = (unsigned)(N / kPrefillCols);
++        /* R4D_MOE_PF2: the run map's prefix in parallel (16), and the down projection -- the
++         * sorted operand, one part, a w4 weight whose scale is a row's -- at 256 columns over
++         * sixteen waves where every class's width is whole tiles of it (32). Each wave's share is
++         * the 128-column tile's: one 16-row M tile by two N tiles, the same K passes and the same
++         * fold, so every element is the same sum in the same order. What the wider block buys is
++         * its rows' activation and its run's prologue once for twice the columns. */
++        const uint32_t pf = moe_pf2();
++        bool dn_wide = W4 != 0 && (pf & kPf2DnWide) && a_sorted && parts == 1;
++        for (int q = 0; q < ncls; ++q) dn_wide = dn_wide && Nc[q] % (2 * kPrefillCols) == 0;
+         if (map) {
+-            emit_rc = R4D_EMIT(sk, moe_blockmap_kernel, dim3(1), dim3(256), 0,
++            auto bmap = (pf & kPf2Map) ? &moe_blockmap_par_kernel : &moe_blockmap_kernel;
++            moe_pf2_note(pf & kPf2Map);
++            emit_rc = R4D_EMIT(sk, bmap, dim3(1), dim3(256), 0,
+                                (const int32_t*)off->data, (uint32_t)n_expert, (uint32_t)T,
+                                (uint32_t)kPrefillRows, (uint32_t)cap, map);
+             if (emit_rc != RAD_OK) return emit_rc;
+-            if (wide_n)
++            if (dn_wide) {
++                /* Only a w4 weight takes it (dn_wide is false otherwise), and the block-fp8
++                 * instantiation would not compile: its scale is a 128x128 tile's. */
++                moe_pf2_note(kPf2DnWide);
++                if constexpr (W4 != 0)
++                    emit_rc = R4D_EMIT(sk, (moe_gemm_q_kernel<kPrefillRows / 16, 2 * kPrefillCols / 16, 2, 8, W4, false, true, true>),
++                                       dim3((unsigned)cap, (unsigned)(N / (2 * kPrefillCols))),
++                                       dim3(16 * kWave), 0,
++                                       (const uint8_t*)Aq->data, (const float*)As->data, ce, co, c2, c3,
++                                       (const int32_t*)sorted->data, (const int32_t*)off->data,
++                                       (uint16_t*)Y->data, (const uint32_t*)map,
++                                       (uint32_t)T, (uint32_t)N, (uint32_t)n_expert, (uint32_t)top_k,
++                                       (uint32_t)a_ld, (uint32_t)as_ld, (uint32_t)y_ld, mode, tabv);
++            } else if (wide_n)
+                 emit_rc = R4D_EMIT(sk, (moe_gemm_q_kernel<kPrefillRows / 16, kPrefillCols / 16, 2, 4, W4, false, true, true>),
+                                    dim3((unsigned)cap, nyw), dim3(8 * kWave), 0,
+                                    (const uint8_t*)Aq->data, (const float*)As->data, ce, co, c2, c3,
+@@ -2928,6 +3256,31 @@ extern "C" int r4d_rad_moe_gather(const RadArgs* a, RadStream s) {
+         else if (act && std::strcmp(act, "none"))  return R4D_NO(RAD_E_UNSUPPORTED);
+     }
+ 
++    /* R4D_MOE_PF2 (2, and 4 for the column groups last first): the prefill form a wave a token
++     * and sixteen bytes a lane, where the slots fit its registers and every row it reads or writes
++     * starts on sixteen bytes. The same sums; see gather_wide_kernel. */
++    const uint32_t pf = moe_pf2();
++    auto al16 = [](const void* p, long long ld) {
++        return ((uintptr_t)p % 16) == 0 && ld % (long long)kGatherWideCols == 0;
++    };
++    if (!self && (pf & kPf2Gather) && top_k <= (long long)kGatherWideSlots &&
++        n % (long long)kGatherWideCols == 0 && al16(ye->data, ye_ld) && al16(Y->data, y_ld) &&
++        (!sh || al16(sh->data, sh_ld))) {
++        constexpr uint32_t NW = 8;
++        moe_pf2_note(kPf2Gather | (pf & kPf2GatherRev));
++        const unsigned gw = (unsigned)((n + kWave * kGatherWideCols - 1) / (kWave * kGatherWideCols));
++        hipLaunchKernelGGL((gather_wide_kernel<NW>), dim3((unsigned)((M + NW - 1) / NW), gw),
++                           dim3(NW * kWave), 0, (hipStream_t)s,
++                           (const uint16_t*)ye->data, (const uint16_t*)ew->data, inv,
++                           (uint16_t*)Y->data, (uint32_t)M, (uint32_t)n, (uint32_t)top_k,
++                           (uint32_t)ye_ld, (uint32_t)ew_ld, (uint32_t)y_ld,
++                           sh ? (const uint16_t*)sh->data : nullptr,
++                           sh ? (const uint16_t*)sg->data : nullptr,
++                           (uint32_t)sh_ld, (uint32_t)sg_ld, sig, (pf & kPf2GatherRev) ? 1 : 0);
++        R4D_MOE_CHK();
++        return RAD_OK;
++    }
++
+     const unsigned gy = (unsigned)((n + 255) / 256);
+     hipLaunchKernelGGL((gather_kernel<256>), dim3((unsigned)M, gy), dim3(256), 0, (hipStream_t)s,
+                        (const uint16_t*)ye->data, (const uint16_t*)ew->data, inv,
+diff --git a/libr4d/r4d_selftest.cpp b/libr4d/r4d_selftest.cpp
+index 60bddb3..9c31034 100644
+--- a/libr4d/r4d_selftest.cpp
++++ b/libr4d/r4d_selftest.cpp
+@@ -163,6 +163,8 @@ struct Plugin {
+     void (*pin_qsa)(int) = nullptr;
+     void (*pin_moe)(int) = nullptr;
+     void (*pin_fk)(int) = nullptr;
++    void (*pin_pf2)(int) = nullptr;
++    uint32_t (*pf2_used)(void) = nullptr;
+     void (*pin_hc)(int) = nullptr;
+     void (*pin_qsel)(int) = nullptr;
+ };
+@@ -194,6 +196,8 @@ static bool load(Plugin* pl, const char* path) {
+     okall &= sym(pl->h, "r4d_qsa_score_pin_form", &pl->pin_qsa);
+     okall &= sym(pl->h, "r4d_moe_gemm_pin_prefill", &pl->pin_moe);
+     okall &= sym(pl->h, "r4d_moe_gemm_pin_fk", &pl->pin_fk);
++    okall &= sym(pl->h, "r4d_moe_pf2_pin", &pl->pin_pf2);
++    okall &= sym(pl->h, "r4d_moe_pf2_used", &pl->pf2_used);
+     okall &= sym(pl->h, "r4d_hc_read_pin_prefill", &pl->pin_hc);
+     okall &= sym(pl->h, "r4d_qsa_select_pin_form", &pl->pin_qsel);
+     return okall;
+@@ -2031,11 +2035,30 @@ static void router_gemm_fused_case(const Plugin& pl) {
+  * slots is the one-workgroup form, 3000 the three-pass one, and the first, a middle and the last
+  * expert of a rank's slice are protected so the closing-up is tested at both ends. The fused
+  * decode kernel is held to the standalone pair in topk_scatter_case. */
++/* `pf2` >= 0 pins R4D_MOE_PF2 for the launch (0 off, 1 every part), and the case is then also run
++ * at a prefill chunk's sizes: the general form's scan and tail are what that switch replaces, and
++ * both forms are held to the same host sort. -1 leaves the switch alone. */
++static void scatter_protect_at(const Plugin& pl, const RadKernelInfo* rs, int64_t M, int64_t nl,
++                               int64_t base, int pf2);
++
+ static void scatter_protect_case(const Plugin& pl) {
+     if (!sel("moe_scatter_i32")) return;
+     const RadKernelInfo* rs = find(pl, "moe_scatter_i32");
+     if (!rs) { ok("moe_scatter protect", false, "row absent"); return; }
+-    const int64_t ne = 512, nl = 254, base = 3, k = 10;
++    for (const int64_t M : { 45, 300 }) scatter_protect_at(pl, rs, M, 254, 3, -1);
++    /* R4D_MOE_PF2, off and on, at a prefill chunk: 79 and 80 tiles of the general form, a rank's
++     * slice and every one of 512 experts local (the mod4 split's case). */
++    if (pl.pin_pf2)
++        for (const int pf : { 0, 1 }) {
++            scatter_protect_at(pl, rs, 300, 254, 3, pf);
++            scatter_protect_at(pl, rs, 2000, 254, 3, pf);
++            scatter_protect_at(pl, rs, 2048, 512, 0, pf);
++        }
++}
++
++static void scatter_protect_at(const Plugin& pl, const RadKernelInfo* rs, int64_t M, int64_t nl,
++                               int64_t base, int pf2) {
++    const int64_t ne = 512, k = 10;
+     const std::vector<int64_t> prot = { 0, 17, 101, 253 };
+     std::vector<int64_t> place((size_t)nl);
+     {
+@@ -2044,9 +2067,11 @@ static void scatter_protect_case(const Plugin& pl) {
+             if (std::find(prot.begin(), prot.end(), e) == prot.end()) place[(size_t)e] = next++;
+         for (int64_t p : prot) place[(size_t)p] = next++;
+     }
+-    for (const int64_t M : { 45, 300 }) {
++    {
+         const int64_t NS = M * k;
+-        const std::string at = " (" + std::to_string(NS) + " slots)";
++        const std::string at = " (" + std::to_string(NS) + " slots, slice " + std::to_string(nl) +
++                               (pf2 < 0 ? "" : pf2 ? ", R4D_MOE_PF2 on" : ", R4D_MOE_PF2 off") +
++                               ")";
+         /* Each row's k distinct experts from the whole router, a quarter of them in this slice and
+          * the protected ones over-represented so their runs are long. */
+         std::vector<int32_t> ids((size_t)NS);
+@@ -2092,7 +2117,17 @@ static void scatter_protect_case(const Plugin& pl) {
+                                       T(d_of, RAD_I32, { nl + 1 }), T(d_cn, RAD_I32, { nl }) };
+         std::vector<RadParam> ps = { PI("M", M), PI("n_expert", nl), PI("top_k", k),
+                                      PI("expert_base", base), PS("protect", "0,17,101,253") };
++        if (pf2 >= 0) { pl.pin_pf2(pf2); pl.pf2_used(); }
+         run_case(rs, ts, ps);
++        if (pf2 >= 0) {
++            /* Pinned on, the general form must have taken the parallel scan -- else the bytes
++             * below would be the default's against itself. The one-workgroup form takes nothing. */
++            const uint32_t u = pl.pf2_used();
++            pl.pin_pf2(-1);
++            const bool want = pf2 != 0 && NS > 1024;
++            ok(("moe_scatter took " + std::string(want ? "the R4D_MOE_PF2 scan" : "the default scan") +
++                at).c_str(), ((u & 8u) != 0) == want, "parts used " + std::to_string(u));
++        }
+         std::vector<int32_t> got_s((size_t)NS), got_o((size_t)(nl + 1)), got_c((size_t)nl);
+         st_memcpy(got_s.data(), d_so, (size_t)NS * 4, hipMemcpyDeviceToHost);
+         st_memcpy(got_o.data(), d_of, (size_t)(nl + 1) * 4, hipMemcpyDeviceToHost);
+@@ -2104,7 +2139,8 @@ static void scatter_protect_case(const Plugin& pl) {
+                " live; sorted " + (got_s == want_s ? "ok" : "DIFFERS") + ", offsets " +
+                (got_o == want_o ? "ok" : "DIFFER") + ", counts " + (got_c == want_c ? "ok" : "DIFFER"));
+         /* A list that is not ascending, or reaches past the slice, is refused. */
+-        for (const char* badp : { "17,0", "0,254" }) {
++        const std::string past = "0," + std::to_string(nl);
++        for (const char* badp : { "17,0", past.c_str() }) {
+             std::vector<RadParam> pb = { PI("M", M), PI("n_expert", nl), PI("top_k", k),
+                                          PI("expert_base", base), PS("protect", badp) };
+             run_case(rs, ts, pb, RAD_E_SHAPE);
+@@ -2112,6 +2148,176 @@ static void scatter_protect_case(const Plugin& pl) {
+     }
+ }
+ 
++/* moe_gather AT A PREFILL CHUNK: R4D_MOE_PF2 against the form it replaces, byte for byte.
++ *
++ * Past the self-scan cap the op builds the slot inverse in scratch and sums each token's slots a
++ * column a thread. R4D_MOE_PF2 replaces that sum with a wave a token and sixteen bytes a lane (part
++ * 2) and takes the column groups last first (part 4). Each must write the default's bytes: with and
++ * without the shared arm folded in, under both gates, with dropped slots, at a width that ends
++ * inside a column group, and at Qwen3.8-Flash-Next's 2048-token chunk on a rank of four -- where the
++ * case also prints what each form costs. A decode step (under the cap), a top_k past the wide
++ * form's registers and a width it cannot take in sixteen-byte pieces keep the default form, and the
++ * case checks that they did. `wide` is whether the shape takes it. */
++struct MoeGatherShape { int64_t M, n, k; const char* act; bool wide; };
++
++static void moe_gather_at(const Plugin& pl, const RadKernelInfo* r, const MoeGatherShape& sh) {
++    const int64_t M = sh.M, n = sh.n, k = sh.k, NS = M * k;
++    const bool shared = sh.act != nullptr;
++    const std::string at = " (M=" + std::to_string(M) + ", n=" + std::to_string(n) + ", top " +
++                           std::to_string(k) +
++                           (shared ? std::string(", shared arm, ") + sh.act : std::string()) + ")";
++    uint64_t rs = 0x9E3779B97F4A7C15ull ^ ((uint64_t)M * 1315423911ull) ^
++                  ((uint64_t)n * 2654435761ull) ^ (uint64_t)k;
++    auto rnd = [&]() { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return rs; };
++    /* Each slot to one of 64 experts or, one in thirty-one, dropped; `sorted` is the stable sort by
++     * expert with the live slots first and -1 after them, as moe_scatter writes it. */
++    std::vector<int32_t> ex((size_t)NS), sorted((size_t)NS, -1);
++    for (int64_t i = 0; i < NS; ++i) {
++        const uint64_t v = rnd();
++        ex[(size_t)i] = (v % 31 == 0) ? -1 : (int32_t)((v >> 8) % 64);
++    }
++    {
++        int64_t pos = 0;
++        for (int32_t e = 0; e < 64; ++e)
++            for (int64_t i = 0; i < NS; ++i)
++                if (ex[(size_t)i] == e) sorted[(size_t)pos++] = (int32_t)i;
++    }
++    std::vector<uint16_t> ye((size_t)(NS * n)), ew((size_t)(M * k)), shv, sgv;
++    for (auto& v : ye) v = h_to_bf16((float)((int64_t)(rnd() % 4001) - 2000) / 512.0f);
++    for (auto& v : ew) v = h_to_bf16((float)(rnd() % 1000 + 1) / 1024.0f);
++    if (shared) {
++        shv.resize((size_t)(M * n));
++        sgv.resize((size_t)M);
++        for (auto& v : shv) v = h_to_bf16((float)((int64_t)(rnd() % 4001) - 2000) / 256.0f);
++        for (auto& v : sgv) v = h_to_bf16((float)((int64_t)(rnd() % 801) - 400) / 100.0f);
++    }
++    void* d_ye = dalloc(ye.size() * 2);
++    void* d_ew = dalloc(ew.size() * 2);
++    void* d_so = dalloc(sorted.size() * 4);
++    void* d_sh = shared ? dalloc(shv.size() * 2) : nullptr;
++    void* d_sg = shared ? dalloc(sgv.size() * 2) : nullptr;
++    void* d_y  = dalloc((size_t)(M * n * 2));
++    if (!d_ye || !d_ew || !d_so || !d_y || (shared && (!d_sh || !d_sg))) {
++        ok(("moe_gather R4D_MOE_PF2" + at).c_str(), false, "hipMalloc failed");
++        return;
++    }
++    st_memcpy(d_ye, ye.data(), ye.size() * 2, hipMemcpyHostToDevice);
++    st_memcpy(d_ew, ew.data(), ew.size() * 2, hipMemcpyHostToDevice);
++    st_memcpy(d_so, sorted.data(), sorted.size() * 4, hipMemcpyHostToDevice);
++    if (shared) {
++        st_memcpy(d_sh, shv.data(), shv.size() * 2, hipMemcpyHostToDevice);
++        st_memcpy(d_sg, sgv.data(), sgv.size() * 2, hipMemcpyHostToDevice);
++    }
++    std::vector<RadTensor> ts = { T(d_ye, RAD_BF16, { NS, n }), T(d_ew, RAD_BF16, { M, k }),
++                                  T(d_so, RAD_I32, { NS }),
++                                  T(d_sh, RAD_BF16, { M, n }), T(d_sg, RAD_BF16, { M, 1 }),
++                                  T(d_y, RAD_BF16, { M, n }) };
++    if (!shared) { absent(ts[3]); absent(ts[4]); }
++    std::vector<RadParam> ps = { PI("M", M), PI("n", n), PI("top_k", k) };
++    if (shared) ps.push_back(PS("act", sh.act));
++    RadArgs a;
++    std::memset(&a, 0, sizeof(a));
++    a.t = ts.data(); a.n_t = (int)ts.size();
++    a.p = ps.data(); a.n_p = (int)ps.size();
++    a.world_size = 1;
++    const int64_t need = r->scratch ? r->scratch(&a) : 0;
++    if (need > 0) { a.scratch = dalloc((size_t)need); a.scratch_bytes = need; }
++
++    /* One launch at a pin, over stale bytes, and the parts it took. */
++    auto run = [&](int pin, std::vector<uint16_t>& out, uint32_t* used) -> bool {
++        std::vector<uint16_t> junk((size_t)(M * n), 0x7f7fu);
++        st_memcpy(d_y, junk.data(), junk.size() * 2, hipMemcpyHostToDevice);
++        pl.pin_pf2(pin);
++        pl.pf2_used();
++        const int rc = r->launch(&a, nullptr);
++        const hipError_t he = (hipError_t)st_stream_sync(nullptr);
++        *used = pl.pf2_used();
++        pl.pin_pf2(-1);
++        if (rc != RAD_OK || he != hipSuccess) {
++            ok(("moe_gather R4D_MOE_PF2 pin " + std::to_string(pin) + at).c_str(), false,
++               "rc=" + std::to_string(rc) + " hip=" + hipGetErrorString(he));
++            return false;
++        }
++        out.resize((size_t)(M * n));
++        st_memcpy(out.data(), d_y, out.size() * 2, hipMemcpyDeviceToHost);
++        return true;
++    };
++    std::vector<uint16_t> base, got;
++    uint32_t used = 0;
++    if (!run(0, base, &used)) return;
++    ok(("moe_gather, R4D_MOE_PF2 off, takes no part of it" + at).c_str(), used == 0,
++       "parts used " + std::to_string(used));
++    struct Var { int pin; const char* name; uint32_t parts; };
++    static const Var kVar[] = {
++        { 2, "a wave a token",                            2u },
++        { 6, "a wave a token, column groups last first", 6u },
++        { 1, "every part",                               6u },
++    };
++    for (const Var& v : kVar) {
++        if (!run(v.pin, got, &used)) return;
++        int64_t diff = 0;
++        std::string first;
++        for (size_t i = 0; i < got.size(); ++i)
++            if (got[i] != base[i]) {
++                if (!diff)
++                    first = ", first at token " + std::to_string((int64_t)i / n) + " col " +
++                            std::to_string((int64_t)i % n);
++                ++diff;
++            }
++        const uint32_t want = sh.wide ? v.parts : 0u;
++        ok(("moe_gather R4D_MOE_PF2, " + std::string(v.name) +
++            (sh.wide ? "" : " (the default form, which this shape keeps)") + at).c_str(),
++           diff == 0 && (used & 6u) == want,
++           std::to_string(diff) + " of " + std::to_string(M * n) + " differ" + first +
++               "; parts used " + std::to_string(used) + ", expected " + std::to_string(want));
++    }
++
++    if (M >= 2048) {
++        hipEvent_t e0, e1;
++        st_ev_create(&e0);
++        st_ev_create(&e1);
++        auto time = [&](int pin) -> float {
++            const int it = 20;
++            pl.pin_pf2(pin);
++            for (int w = 0; w < 3; ++w) r->launch(&a, nullptr);
++            st_ev_record(e0, nullptr);
++            for (int i = 0; i < it; ++i) r->launch(&a, nullptr);
++            st_ev_record(e1, nullptr);
++            st_ev_sync(e1);
++            float ms = 0.0f;
++            st_ev_elapsed(&ms, e0, e1);
++            pl.pin_pf2(-1);
++            pl.pf2_used();
++            return ms * 1000.0f / (float)it;
++        };
++        const float t0 = time(0), t2 = time(2), t6 = time(6);
++        std::printf("      moe_gather at %lld routed rows x %lld: default %.1f us, a wave a token "
++                    "%.1f us, last first %.1f us a call, prepass included (the cache that last "
++                    "first is for needs the down projection in front, which this does not run)\n",
++                    (long long)NS, (long long)n, t0, t2, t6);
++        st_ev_destroy(e0);
++        st_ev_destroy(e1);
++    }
++}
++
++static void moe_gather_case(const Plugin& pl) {
++    if (!sel("moe_gather_bf16")) return;
++    const RadKernelInfo* r = find(pl, "moe_gather_bf16");
++    if (!r) { ok("moe_gather_bf16", false, "row absent"); return; }
++    if (!pl.pin_pf2 || !pl.pf2_used) { ok("moe_gather_bf16 R4D_MOE_PF2", false, "pin hooks absent"); return; }
++    static const MoeGatherShape kSh[] = {
++        {  600, 2560, 10, "sigmoid", true  },
++        {  600, 2560, 10, nullptr,   true  },
++        {   77,  520, 10, "none",    true  },
++        {  300,  264,  8, "sigmoid", true  },
++        {   40, 2560, 10, "sigmoid", false },   /* a decode step: the self-scan form */
++        {  100,  512, 20, "sigmoid", false },   /* top_k past the wide form's registers */
++        {  100,  260, 10, nullptr,   false },   /* a width sixteen-byte pieces do not tile */
++        { 2048, 2560, 10, "sigmoid", true  },   /* Qwen3.8-Flash-Next's chunk, timed */
++    };
++    for (const MoeGatherShape& sh : kSh) moe_gather_at(pl, r, sh);
++}
++
+ static void rowtopk_shard_case(const Plugin& pl) {
+     if (!sel("rowtopk_merge") && !sel("rowtopk_bf16")) return;
+     const RadKernelInfo* rt = find(pl, "rowtopk_bf16");
+@@ -6458,7 +6664,9 @@ static float st_e4m3(uint8_t b) {
+  * along the weight rows and the output. One class shape is the plain grouped GEMM; two are a
+  * rank's uneven slice of every expert, where the narrower class's gate/up pair writes zeros past
+  * its part and its down projection reads a shorter K. */
+-struct MoeW4Shape { const char* name; int64_t N0, K0, N1, K1, parts, ne; };
++/* `sorted_a`: the down projection's operand, one row a routed slot in sorted order (a_order
++ * sorted), where the others read the token rows (a_order token). */
++struct MoeW4Shape { const char* name; int64_t N0, K0, N1, K1, parts, ne; bool sorted_a = false; };
+ 
+ /* THE DECODE FORM'S STAGED K, BOTH WAYS, byte for byte: one 128-wide K block a pass and two. Every
+  * launch is DESCRIBED first: a pin that named the other's kernel would match it trivially, so two
+@@ -6526,6 +6734,76 @@ static void moe_dec_variants(const Plugin& pl, const RadKernelInfo* row, RadArgs
+     }
+ }
+ 
++/* THE RUN-ALIGNED PREFILL FORM UNDER R4D_MOE_PF2, against the same form without it, byte for byte:
++ * the run map's prefix in parallel on every shape, and on the sorted operand -- one part, every
++ * class's width whole 256-column tiles -- the down projection's 256-column tile. Described first
++ * where the row can be: the map's kernel must differ from the default's, and the GEMM's must
++ * differ exactly where the wide tile applies, so the bytes below are not one kernel against itself;
++ * and the launch must report the parts it took. `base` is the form's own bytes, already held to the
++ * host decode by the form loop. */
++static void moe_pf2_aligned(const Plugin& pl, const RadKernelInfo* row, RadArgs& a, void* d_y,
++                            void* d_map, int64_t map_bytes, size_t elems,
++                            const std::vector<uint16_t>& base, bool dn_wide,
++                            const std::string& what) {
++    if (!pl.pin_pf2 || !pl.pf2_used || !pl.pin_moe || base.empty()) return;
++    const std::string label = what + " aligned prefill form, R4D_MOE_PF2" +
++                              (dn_wide ? " (and the 256-column down tile)" : "");
++    void* const sc0 = a.scratch;
++    const int64_t sb0 = a.scratch_bytes;
++    a.scratch = d_map;
++    a.scratch_bytes = map_bytes;
++    auto restore = [&] {
++        pl.pin_pf2(-1);
++        pl.pf2_used();
++        pl.pin_moe(0);
++        a.scratch = sc0;
++        a.scratch_bytes = sb0;
++    };
++    pl.pin_moe(1);
++    if (row->describe) {
++        static RadLaunchDesc d0[4], d1[4];
++        int n0 = 0, n1 = 0;
++        pl.pin_pf2(0);
++        const int c0 = row->describe(&a, nullptr, d0, 4, &n0);
++        pl.pin_pf2(1);
++        const int c1 = row->describe(&a, nullptr, d1, 4, &n1);
++        if (c0 != RAD_OK || c1 != RAD_OK || n0 != 2 || n1 != 2) {
++            restore();
++            ok(label.c_str(), false, "describe rc " + std::to_string(c0) + "/" + std::to_string(c1) +
++                                     ", launches " + std::to_string(n0) + "/" + std::to_string(n1));
++            return;
++        }
++        if (d0[0].func == d1[0].func || (d0[1].func != d1[1].func) != dn_wide) {
++            restore();
++            ok(label.c_str(), false, std::string("described kernels: the map's ") +
++                                     (d0[0].func == d1[0].func ? "is the default's" : "differs") +
++                                     ", the GEMM's " +
++                                     (d0[1].func == d1[1].func ? "is the default's" : "differs"));
++            return;
++        }
++    }
++    {
++        std::vector<uint16_t> junk(elems, 0x7f7fu);
++        st_memcpy(d_y, junk.data(), junk.size() * 2, hipMemcpyHostToDevice);
++    }
++    pl.pin_pf2(1);
++    pl.pf2_used();
++    const int rc = row->launch(&a, nullptr);
++    st_stream_sync(nullptr);
++    const uint32_t used = pl.pf2_used();
++    restore();
++    if (rc != RAD_OK) { ok(label.c_str(), false, "launch rc=" + std::to_string(rc)); return; }
++    std::vector<uint16_t> got(elems);
++    st_memcpy(got.data(), d_y, got.size() * 2, hipMemcpyDeviceToHost);
++    int64_t diff = 0;
++    for (size_t i = 0; i < elems; ++i) diff += got[i] != base[i];
++    const uint32_t want = 16u | (dn_wide ? 32u : 0u);
++    ok(label.c_str(), diff == 0 && (used & 48u) == want,
++       std::to_string(diff) + " of " + std::to_string(elems) +
++           " elements differ from the form without it; parts used " + std::to_string(used) +
++           ", expected " + std::to_string(want));
++}
++
+ /* EVERY FORM THE LAUNCHER HAS, each against the host decode: the run-aligned prefill form (a run
+  * map in the scratch it is handed), the (tile, run) decode form, and the uniform prefill grid a
+  * caller with no scratch gets. The rule picks one by the routed-row count, so a case that only
+@@ -6556,7 +6834,8 @@ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int
+     const int64_t Nc[2] = { sh.N0, sh.N1 }, Kc[2] = { sh.K0, sh.K1 };
+     const int64_t nec[2] = { (ne + 1) / 2, ne / 2 };
+     const int64_t N = std::max(sh.N0, sh.N1), K = std::max(sh.K0, sh.K1);
+-    const int64_t kb = K / group, M = Tr / top_k;
++    const int64_t kb = K / group, M = sh.sorted_a ? Tr : Tr / top_k;
++    const char* aord = sh.sorted_a ? "sorted" : "token";
+     const int64_t fy = N / sh.parts;
+     std::vector<RadParam> lp = { PI("N", sh.N0), PI("K", sh.K0), PI("N_odd", sh.N1),
+                                  PI("K_odd", sh.K1), PI("group", group), PS("dtype", dt) };
+@@ -6665,7 +6944,7 @@ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int
+     std::vector<RadParam> ps = {
+         PI("M", M), PI("N", sh.N0), PI("K", sh.K0), PI("N_odd", sh.N1), PI("K_odd", sh.K1),
+         PI("parts", sh.parts), PI("n_expert", ne), PI("top_k", top_k), PI("group", group),
+-        PS("a_order", "token"), PS("dtype", dt),
++        PS("a_order", aord), PS("dtype", dt),
+     };
+     RadArgs a;
+     std::memset(&a, 0, sizeof(a));
+@@ -6688,7 +6967,7 @@ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int
+             double want = 0.0;
+             const int64_t pp = n / fy, j = n - pp * fy;
+             if (f >= 0 && i < live && j < fc) {
+-                const int64_t tok = f / top_k, wr = pp * fc + j;
++                const int64_t tok = sh.sorted_a ? i : f / top_k, wr = pp * fc + j;
+                 for (int64_t g = 0; g < kbc; ++g) {
+                     if (g64) {
+                         /* `sub` scale groups a 128, each an E4M3 byte under the fixed constant. */
+@@ -6778,8 +7057,13 @@ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int
+            diff == 0, std::to_string(diff) + " of " + std::to_string(Tr * N) +
+                       " elements differ");
+     }
+-    /* The decode form's staged K both ways, where this shape can take two blocks a pass. */
+-    const bool fk2 = g64 && sh.K0 % 256 == 0 && sh.K1 % 256 == 0;
++    /* The aligned form under R4D_MOE_PF2: the parallel map prefix always, the 256-column down
++     * tile where the sorted operand's every class is whole tiles of it. */
++    const bool dn_wide = sh.sorted_a && sh.parts == 1 && sh.N0 % 256 == 0 && sh.N1 % 256 == 0;
++    moe_pf2_aligned(pl, r, a, d_y, d_map, map_bytes, (size_t)(Tr * N), two_cls[1], dn_wide, what);
++    /* The decode form's staged K both ways, where this shape can take two blocks a pass --
++     * never on the sorted operand, which the rule keeps at one. */
++    const bool fk2 = !sh.sorted_a && g64 && sh.K0 % 256 == 0 && sh.K1 % 256 == 0;
+     moe_dec_variants(pl, r, a, d_y, (size_t)(Tr * N), fk2, what);
+     if (!four) return;
+ 
+@@ -6817,7 +7101,7 @@ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int
+         PI("M", M), PI("N", sh.N0), PI("K", sh.K0), PI("N_1", sh.N1), PI("K_1", sh.K1),
+         PI("N_2", sh.N0), PI("K_2", sh.K0), PI("N_3", sh.N1), PI("K_3", sh.K1),
+         PI("parts", sh.parts), PI("n_expert", ne), PI("top_k", top_k), PI("group", group),
+-        PS("a_order", "token"), PS("dtype", dt),
++        PS("a_order", aord), PS("dtype", dt),
+     };
+     RadArgs a4;
+     std::memset(&a4, 0, sizeof(a4));
+@@ -6844,6 +7128,8 @@ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int
+         ok(label.c_str(), diff == 0, std::to_string(diff) + " of " + std::to_string(Tr * N) +
+                                      " elements differ from the two-class op's");
+     }
++    moe_pf2_aligned(pl, r4, a4, d_y, d_map, map_bytes, (size_t)(Tr * N), two_cls[1], dn_wide,
++                    what4);
+     moe_dec_variants(pl, r4, a4, d_y, (size_t)(Tr * N), fk2, what4);
+ }
+ 
+@@ -10951,6 +11237,7 @@ static void device_phase(const Plugin& pl) {
+         topk_scatter_case(pl);
+         router_gemm_fused_case(pl);
+         scatter_protect_case(pl);
++        moe_gather_case(pl);
+         if (sel("rowtopk_bf16")) {
+             const RadKernelInfo* r = find(pl, "rowtopk_bf16");
+             if (!r) ok("rowtopk_bf16", false, "row absent");
+@@ -11044,6 +11331,10 @@ static void device_phase(const Plugin& pl) {
+              * search hands every wider expert count to. Runs land on experts on both sides of
+              * 512, and K 256 lets the two-block pass run on that search as well. */
+             { "640 experts, gate/up 2:1, K 256", 256, 256, 128, 256, 2, 640 },
++            /* The down projection as a rank of four runs it: the sorted operand, one part, the
++             * classes at 256 and 128 of K -- and a width of whole 256-column tiles, which is what
++             * R4D_MOE_PF2's wide down tile takes. */
++            { "down, sorted rows, 512 x K 256:128", 512, 256, 512, 128, 1, 10, true },
+         };
+         for (const MoeW4Shape& sh : kShapes) {
+             moe_w4_gemm(pl, 24, sh);
+@@ -11069,6 +11360,8 @@ static void device_phase(const Plugin& pl) {
+             { "300 experts, gate/up 2:1", 256, 128, 128, 128, 2, 300 },
+             { "40 experts, gate/up 2:1, K 768", 256, 768, 128, 768, 2, 40 },
+             { "640 experts, gate/up 2:1, K 256", 256, 256, 128, 256, 2, 640 },
++            { "down, sorted rows, 512 x K 256:128", 512, 256, 512, 128, 1, 10, true },
++            { "40 experts, down, sorted rows, 256 x K 128", 256, 128, 256, 128, 1, 40, true },
+         };
+         for (const MoeW4Shape& sh : kShapes4)
+             for (const int64_t t : { (int64_t)24, (int64_t)200, (int64_t)600 }) {
+-- 
+2.55.0
+
+
+From 4c2a09080f005ff0a1d62855ad0921b72c18359e Mon Sep 17 00:00:00 2001
+From: keptn42 <keptn42@noreply.codeberg.org>
+Date: Mon, 5 Oct 2026 21:43:32 +0000
+Subject: [PATCH 2/3] moe_gemm_q run-aligned form: the first pass's weight at
+ the map read (R4D_MOE_PF2 64)
+
+In the run-aligned form the map entry names the block's expert, yet the
+weight loads wait behind the token load, a barrier, the live count and the
+table entry. Part 64 issues the rows and the live count first, then the
+table entries and the first pass's weight through the uniform global base,
+all unconditional, so the weight stays in flight while the tokens arrive.
+The same bytes go to the same registers and LDS slots: bit-identical.
+---
+ libr4d/r4d_moe.hip      | 166 +++++++++++++++++++++++++++++++++++-----
+ libr4d/r4d_selftest.cpp | 126 ++++++++++++++++--------------
+ 2 files changed, 215 insertions(+), 77 deletions(-)
+
+diff --git a/libr4d/r4d_moe.hip b/libr4d/r4d_moe.hip
+index 5b811fa..8ab01a2 100644
+--- a/libr4d/r4d_moe.hip
++++ b/libr4d/r4d_moe.hip
+@@ -1009,14 +1009,18 @@ static_assert(sizeof(MoeTab) == 16, "the code table is four words");
+  * UW reads the weight and its scales from a uniform global base -- see the UW note at w4_load.
+  * The decode form always takes it. The prefill forms keep the plain loads: the waits UW removes
+  * were measured on the decode grid, and the prefill tiles' timing under UW is unmeasured, so
+- * their instructions stay as they were.
++ * their instructions stay as they were -- except under EW (R4D_MOE_PF2 64), below, which needs
++ * the uniform base for its early loads and was measured with it.
+  *
+  * RS finds an ES block's run in one round trip -- see the RS note at the run search. It covers
+  * up to kMaxExpert experts; a wider expert count takes the chunked search, which numbers the runs
+- * the same way. */
++ * the same way.
++ *
++ * EW issues an AL block's first pass of weight as soon as its map entry has named the expert -- see
++ * the EW note below the map read. */
+ template <uint32_t MT, uint32_t NTL, uint32_t WGM, uint32_t WGN, int W4 = 0,
+           bool ES = false, bool AL = false, bool SK = false, uint32_t FK = kFK, bool UW = false,
+-          bool RS = false>
++          bool RS = false, bool EW = false>
+ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_q_kernel(
+     const uint8_t* __restrict__ Aq, const float* __restrict__ As,
+     const MoeCls c_even, const MoeCls c_odd, const MoeCls c_2, const MoeCls c_3,
+@@ -1064,6 +1068,7 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_q_kernel(
+      * (expert, first row) and the block serves that run and no other. The grid is the upper bound
+      * `n_expert + T/FM`, so the blocks past the real count exit here. */
+     uint32_t r0, rN, e_al = 0;
++    [[maybe_unused]] uint32_t al_end = 0;      /* EW: off[e_al + 1], the run's end */
+     bool tail = false;
+     if constexpr (AL) {
+         if (blockIdx.x >= map[0]) return;
+@@ -1072,6 +1077,7 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_q_kernel(
+         r0   = ent[1];
+         tail = (e_al == kMapTail);
+         const uint32_t lim = tail ? T : (uint32_t)off[e_al + 1];
++        al_end = lim;
+         rN = (r0 + FM < lim) ? (r0 + FM) : lim;
+     } else {
+         r0 = (ES ? (blockIdx.x / FM) : blockIdx.x) * FM;
+@@ -1080,6 +1086,74 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_q_kernel(
+     }
+     const uint32_t n0 = blockIdx.y * FN;
+ 
++    /* EW: THE FIRST PASS'S WEIGHT, IN FLIGHT AS SOON AS THE MAP HAS NAMED THE EXPERT. Under AL the
++     * map entry names the expert, and nothing the weight's address needs comes later -- not the
++     * tokens, not the run's rows, not the live count. In the run loop, the weight's load waits
++     * behind the token loads, the barrier that publishes them, the live count, the run's end read
++     * again and the table entry: four round trips in front of the one that carries the bytes, on a
++     * block whose whole K is one or two passes at the down projection.
++     *
++     * So the block's loads go out in the order their waits want them. First everything the token
++     * barrier needs -- the block's sorted rows and the live count -- then the table entries
++     * (uniform: scalar) and the first pass's weight. The vector-load counter retires in order, so
++     * the wait for the tokens leaves the weight in flight; the token barrier orders LDS alone; and
++     * the run's end is the one the map read already loaded. The weight comes off UW's uniform global
++     * base, which a block whose expert the map names has as much as a decode block does -- a flat
++     * load would also count against the LDS counter the barrier waits on. The first issue() then
++     * takes these registers instead of loading. The same bytes reach the same registers and the
++     * same tokens the same LDS slots: bit-identical.
++     *
++     * EVERY EARLY LOAD IS UNCONDITIONAL. A load under an exec mask -- `if (live) load` -- may not be
++     * issued at all, and the waitcnt pass, not knowing how many went out, then waits for every one
++     * of them where it needs the first. So a dead row (past the class's width, or the whole of a
++     * tail block) reads the expert's row 0 instead, a dead token slot reads a real one, and the
++     * zero is selected where the value is used -- the first issue() for the weight, the token's
++     * store for the slot. */
++    constexpr uint32_t kEwTPR = FK / 32, kEwRPP = NTHR / kEwTPR;
++    constexpr uint32_t kEwBP = (FN + kEwRPP - 1) / kEwRPP;
++    [[maybe_unused]] uint4    ew_b4[EW && W4 ? kEwBP : 1];
++    [[maybe_unused]] uint32_t ew_sp[EW && W4 == 4 ? kEwBP : 1];
++    [[maybe_unused]] Stage8   ew_b8[EW && !W4 ? kEwBP : 1];
++    [[maybe_unused]] bool     ew_ok[EW ? kEwBP : 1];
++    [[maybe_unused]] const uint8_t*  ew_wp  = nullptr;
++    [[maybe_unused]] const uint16_t* ew_wsp = nullptr;
++    [[maybe_unused]] int32_t  ew_f = -1;
++    [[maybe_unused]] uint32_t ew_live = 0;
++    if constexpr (EW) {
++        static_assert(AL && !ES && !RS && UW && FM <= NTHR,
++                      "EW is the run-aligned form's, on UW's uniform weight base");
++        {
++            const uint32_t i = r0 + tid % FM;           /* a real row whatever the thread */
++            ew_f = sorted[i < T ? i : T - 1u];
++        }
++        ew_live = (uint32_t)off[n_expert];
++        /* Nothing below is scheduled in front of these two: the counter retires in order. */
++        __builtin_amdgcn_sched_barrier(0);
++        const uint32_t ee  = tail ? 0u : e_al;        /* a tail block reads a real entry, unused */
++        const uint32_t cls = ee & ((1u << cshift) - 1u);
++        const MoeCls& C = cls == 0u ? c_even : cls == 1u ? c_odd : cls == 2u ? c_2 : c_3;
++        const uint32_t fy = N / parts, part = n0 / fy, j0 = n0 - part * fy;
++        const uint32_t fc = C.n / parts, wn0 = part * fc + j0;
++        ew_wp  = uw_ptr<true>(wtab_at(C.w, C.w_s0, ee >> cshift));
++        ew_wsp = uw_ptr<true>((const uint16_t*)wtab_at(C.s, C.s_s0, ee >> cshift));
++        const uint32_t sn = tid / kEwTPR, sk = (tid % kEwTPR) * 32u;
++        /* Where a staging pass covers the tile's rows exactly, every thread's every row exists:
++         * no guard, so no exec mask around a load (a thread's `sn` is below kEwRPP). */
++#pragma unroll
++        for (uint32_t p = 0; p < kEwBP; ++p) {
++            const uint32_t r = sn + p * kEwRPP;
++            if constexpr (FN % kEwRPP != 0) { if (r >= FN) continue; }
++            ew_ok[p] = !tail && (j0 + r) < fc;
++            const uint8_t* wr = ew_wp + (size_t)(ew_ok[p] ? wn0 + r : 0u) * C.w_ld;
++            if constexpr (W4) {
++                ew_b4[p] = w4_load_w<true>(wr + (sk >> 1), true);
++                if constexpr (W4 == 4)
++                    ew_sp[p] = u32_load_w<true>((const uint32_t*)(wr + (C.k >> 1) + (sk >> 3)));
++            } else
++                ew_b8[p] = stage8_load_w<true>(wr + sk, true);
++        }
++    }
++
+     /* RS: this thread's NPT experts' offsets (and the next one's), which of them hold a run that
+      * meets the tile, and its wave's running count of those -- carried from the loads below to the
+      * run search further down. See the RS note there. */
+@@ -1117,6 +1191,15 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_q_kernel(
+         if (lane == kWave - 1) s_rc[wave] = rs_inc;
+         /* Both of RS's barriers order LDS alone -- the tokens, the counts, the selection. */
+         lds_barrier();
++    } else if constexpr (EW) {
++        /* The tokens and the live count were loaded with the weight, ahead of it; see EW. A row
++         * past the block's is a dropped slot, as the loop of the plain form writes it. */
++        if (tid < FM) {
++            const int32_t f = r0 + tid < rN ? ew_f : -1;
++            s_tok[tid] = f < 0 ? -1 : (a_sorted ? (int32_t)(r0 + tid) : f / (int32_t)top_k);
++        }
++        lds_barrier();
++        live = ew_live;
+     } else {
+     /* The token each of the block's sorted rows reads its activation from, resolved once. -1 marks
+      * a dropped slot, whose output row is zero. */
+@@ -1275,11 +1358,13 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_q_kernel(
+          * never be walked past the last expert -- `off[e + 1]` is read only for e < n_expert, and
+          * off[n_expert] is the live row count, which is the bound the loop already respects.
+          * Under RS the search handed over the run's end, and its start meets it: nothing to walk. */
+-        if constexpr (!RS) {
++        if constexpr (!RS && !EW) {
+             while (e < n_expert && (uint32_t)off[e + 1] <= rs) ++e;
+             if (e >= n_expert) break;
+         }
+-        const uint32_t ehi = RS ? rs_end : (uint32_t)off[e + 1];
++        /* EW: the map's run is e_al's from r0 on, so there is nothing to walk, and its end is the
++         * one the map read loaded. */
++        const uint32_t ehi = RS ? rs_end : EW ? al_end : (uint32_t)off[e + 1];
+         const uint32_t re  = rN < live ? (rN < ehi ? rN : ehi) : (live < ehi ? live : ehi);
+         if (re <= rs) break;
+         /* Not this block's run: walk past it. Block-uniform, so no barrier is skipped by some
+@@ -1310,8 +1395,15 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_q_kernel(
+ 
+         /* Both table entries are loaded before either is made uniform, so under UW the two
+          * readfirstlanes wait on one round trip and not on two. */
+-        const uint8_t*  Wp0  = wtab_at(C.w, C.w_s0, e >> cshift);
+-        const uint16_t* Wsp0 = (const uint16_t*)wtab_at(C.s, C.s_s0, e >> cshift);
++        const uint8_t*  Wp0;
++        const uint16_t* Wsp0;
++        if constexpr (EW) {
++            Wp0  = ew_wp;                 /* EW: loaded at the map read; AL's run is e_al's */
++            Wsp0 = ew_wsp;
++        } else {
++            Wp0  = wtab_at(C.w, C.w_s0, e >> cshift);
++            Wsp0 = (const uint16_t*)wtab_at(C.s, C.s_s0, e >> cshift);
++        }
+         const uint8_t*  Wp   = uw_ptr<UW>(Wp0);
+         const uint16_t* Wsp  = uw_ptr<UW>(Wsp0);
+ 
+@@ -1444,6 +1536,24 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_q_kernel(
+                 const bool    ok  = tok >= 0 && (r0 + r) >= rs && (r0 + r) < re;
+                 apre[p] = stage8_load(Aq + (size_t)(ok ? tok : 0) * a_ld + cc + sk, ok);
+             }
++            if constexpr (EW) {
++                static_assert(kEwBP == kBP && kEwRPP == kRPP, "EW stages the pass issue() would");
++                if (cc == 0) {                /* the first pass's weight is already in flight */
++#pragma unroll
++                    for (uint32_t p = 0; p < kBP; ++p) {
++                        if (sn + p * kRPP >= FN) continue;
++                        /* The dead rows' zeros, as w4_load / stage8_load give them. */
++                        if constexpr (W4) {
++                            bpre4[p] = ew_ok[p] ? ew_b4[p] : make_uint4(0, 0, 0, 0);
++                            if constexpr (W4 == 4) spre[p] = ew_ok[p] ? ew_sp[p] : 0u;
++                        } else {
++                            bpre8[p].v = ew_ok[p] ? ew_b8[p].v : make_uint4(0, 0, 0, 0);
++                            bpre8[p].w = ew_ok[p] ? ew_b8[p].w : make_uint4(0, 0, 0, 0);
++                        }
++                    }
++                    return;
++                }
++            }
+ #pragma unroll
+             for (uint32_t p = 0; p < kBP; ++p) {
+                 const uint32_t r = sn + p * kRPP;
+@@ -2214,12 +2324,14 @@ __global__ __launch_bounds__(NTHR) void scale_rows_kernel(
+  *    8  moe_scatter's general form: its scan in parallel and its tail in the placement
+  *   16  the run map's prefix in parallel (moe_blockmap_par_kernel)
+  *   32  the down projection's prefill tile 256 columns wide over sixteen waves
++ *   64  the run-aligned form's first pass of weight issued at the map read (EW, both projections)
+  *
+  * Read once, so a recorded pass and a live one take the same kernels. A test pin over it: below
+  * zero the switch, anything else the value the switch would hold. */
+ static constexpr uint32_t kPf2Gather = 2, kPf2GatherRev = 4, kPf2Scan = 8, kPf2Map = 16,
+-                          kPf2DnWide = 32;
+-static constexpr uint32_t kPf2All = kPf2Gather | kPf2GatherRev | kPf2Scan | kPf2Map | kPf2DnWide;
++                          kPf2DnWide = 32, kPf2Ew = 64;
++static constexpr uint32_t kPf2All = kPf2Gather | kPf2GatherRev | kPf2Scan | kPf2Map | kPf2DnWide |
++                                    kPf2Ew;
+ static uint32_t moe_pf2_mask(long long x) {
+     if (x <= 0) return 0u;
+     return x == 1 ? kPf2All : (uint32_t)x & kPf2All;
+@@ -2970,12 +3082,18 @@ static int moe_gemm_launch(const RadArgs* a, const R4dSink& sk, int ncls = 2) {
+                                (const int32_t*)off->data, (uint32_t)n_expert, (uint32_t)T,
+                                (uint32_t)kPrefillRows, (uint32_t)cap, map);
+             if (emit_rc != RAD_OK) return emit_rc;
++            /* R4D_MOE_PF2 (64): the first pass's weight at the map read -- see EW at the kernel.
++             * The same kernels otherwise; a function pointer picks the instantiation. */
++            const bool ew = (pf & kPf2Ew) != 0;
++            moe_pf2_note(pf & kPf2Ew);
+             if (dn_wide) {
+                 /* Only a w4 weight takes it (dn_wide is false otherwise), and the block-fp8
+                  * instantiation would not compile: its scale is a 128x128 tile's. */
+                 moe_pf2_note(kPf2DnWide);
+-                if constexpr (W4 != 0)
+-                    emit_rc = R4D_EMIT(sk, (moe_gemm_q_kernel<kPrefillRows / 16, 2 * kPrefillCols / 16, 2, 8, W4, false, true, true>),
++                if constexpr (W4 != 0) {
++                    auto kd = ew ? &moe_gemm_q_kernel<kPrefillRows / 16, 2 * kPrefillCols / 16, 2, 8, W4, false, true, true, kFK, true, false, true>
++                                 : &moe_gemm_q_kernel<kPrefillRows / 16, 2 * kPrefillCols / 16, 2, 8, W4, false, true, true>;
++                    emit_rc = R4D_EMIT(sk, kd,
+                                        dim3((unsigned)cap, (unsigned)(N / (2 * kPrefillCols))),
+                                        dim3(16 * kWave), 0,
+                                        (const uint8_t*)Aq->data, (const float*)As->data, ce, co, c2, c3,
+@@ -2983,22 +3101,28 @@ static int moe_gemm_launch(const RadArgs* a, const R4dSink& sk, int ncls = 2) {
+                                        (uint16_t*)Y->data, (const uint32_t*)map,
+                                        (uint32_t)T, (uint32_t)N, (uint32_t)n_expert, (uint32_t)top_k,
+                                        (uint32_t)a_ld, (uint32_t)as_ld, (uint32_t)y_ld, mode, tabv);
+-            } else if (wide_n)
+-                emit_rc = R4D_EMIT(sk, (moe_gemm_q_kernel<kPrefillRows / 16, kPrefillCols / 16, 2, 4, W4, false, true, true>),
++                }
++            } else if (wide_n) {
++                auto kw = ew ? &moe_gemm_q_kernel<kPrefillRows / 16, kPrefillCols / 16, 2, 4, W4, false, true, true, kFK, true, false, true>
++                             : &moe_gemm_q_kernel<kPrefillRows / 16, kPrefillCols / 16, 2, 4, W4, false, true, true>;
++                emit_rc = R4D_EMIT(sk, kw,
+                                    dim3((unsigned)cap, nyw), dim3(8 * kWave), 0,
+                                    (const uint8_t*)Aq->data, (const float*)As->data, ce, co, c2, c3,
+                                    (const int32_t*)sorted->data, (const int32_t*)off->data,
+                                    (uint16_t*)Y->data, (const uint32_t*)map,
+                                    (uint32_t)T, (uint32_t)N, (uint32_t)n_expert, (uint32_t)top_k,
+                                    (uint32_t)a_ld, (uint32_t)as_ld, (uint32_t)y_ld, mode, tabv);
+-            else
+-            emit_rc = R4D_EMIT(sk, (moe_gemm_q_kernel<kPrefillRows / 16, 4, 2, 2, W4, false, true, true>),
+-                               dim3((unsigned)cap, ny), dim3(4 * kWave), 0,
+-                               (const uint8_t*)Aq->data, (const float*)As->data, ce, co, c2, c3,
+-                               (const int32_t*)sorted->data, (const int32_t*)off->data,
+-                               (uint16_t*)Y->data, (const uint32_t*)map,
+-                               (uint32_t)T, (uint32_t)N, (uint32_t)n_expert, (uint32_t)top_k,
+-                               (uint32_t)a_ld, (uint32_t)as_ld, (uint32_t)y_ld, mode, tabv);
++            } else {
++                auto kn = ew ? &moe_gemm_q_kernel<kPrefillRows / 16, 4, 2, 2, W4, false, true, true, kFK, true, false, true>
++                             : &moe_gemm_q_kernel<kPrefillRows / 16, 4, 2, 2, W4, false, true, true>;
++                emit_rc = R4D_EMIT(sk, kn,
++                                   dim3((unsigned)cap, ny), dim3(4 * kWave), 0,
++                                   (const uint8_t*)Aq->data, (const float*)As->data, ce, co, c2, c3,
++                                   (const int32_t*)sorted->data, (const int32_t*)off->data,
++                                   (uint16_t*)Y->data, (const uint32_t*)map,
++                                   (uint32_t)T, (uint32_t)N, (uint32_t)n_expert, (uint32_t)top_k,
++                                   (uint32_t)a_ld, (uint32_t)as_ld, (uint32_t)y_ld, mode, tabv);
++            }
+         } else if (wide_n) {
+             emit_rc = R4D_EMIT(sk, (moe_gemm_q_kernel<kPrefillRows / 16, kPrefillCols / 16, 2, 4, W4, false, false, true>),
+                                dim3((unsigned)((T + kPrefillRows - 1) / kPrefillRows), nyw),
+diff --git a/libr4d/r4d_selftest.cpp b/libr4d/r4d_selftest.cpp
+index 9c31034..5fd4e95 100644
+--- a/libr4d/r4d_selftest.cpp
++++ b/libr4d/r4d_selftest.cpp
+@@ -6735,73 +6735,87 @@ static void moe_dec_variants(const Plugin& pl, const RadKernelInfo* row, RadArgs
+ }
+ 
+ /* THE RUN-ALIGNED PREFILL FORM UNDER R4D_MOE_PF2, against the same form without it, byte for byte:
+- * the run map's prefix in parallel on every shape, and on the sorted operand -- one part, every
+- * class's width whole 256-column tiles -- the down projection's 256-column tile. Described first
+- * where the row can be: the map's kernel must differ from the default's, and the GEMM's must
+- * differ exactly where the wide tile applies, so the bytes below are not one kernel against itself;
+- * and the launch must report the parts it took. `base` is the form's own bytes, already held to the
+- * host decode by the form loop. */
++ * the run map's prefix in parallel (16) on every shape, the first pass's weight issued at the map
++ * read (64) on every shape, and on the sorted operand -- one part, every class's width whole
++ * 256-column tiles -- the down projection's 256-column tile (32); each alone and all together.
++ * Described first where the row can be: the map's kernel must differ from the default's exactly
++ * when 16 is on, and the GEMM's exactly when 64 is or the wide tile applies, so the bytes below are
++ * never one kernel against itself; and the launch must report the parts it took. `base` is the
++ * form's own bytes, already held to the host decode by the form loop. */
+ static void moe_pf2_aligned(const Plugin& pl, const RadKernelInfo* row, RadArgs& a, void* d_y,
+                             void* d_map, int64_t map_bytes, size_t elems,
+                             const std::vector<uint16_t>& base, bool dn_wide,
+                             const std::string& what) {
+     if (!pl.pin_pf2 || !pl.pf2_used || !pl.pin_moe || base.empty()) return;
+-    const std::string label = what + " aligned prefill form, R4D_MOE_PF2" +
+-                              (dn_wide ? " (and the 256-column down tile)" : "");
+     void* const sc0 = a.scratch;
+     const int64_t sb0 = a.scratch_bytes;
+-    a.scratch = d_map;
+-    a.scratch_bytes = map_bytes;
+-    auto restore = [&] {
+-        pl.pin_pf2(-1);
+-        pl.pf2_used();
+-        pl.pin_moe(0);
+-        a.scratch = sc0;
+-        a.scratch_bytes = sb0;
++    struct Var { int pin; uint32_t mask; const char* name; };
++    static const Var kVar[] = {
++        { 16, 16u,  "map prefix in parallel" },
++        { 48, 48u,  "map prefix in parallel, 256-column down tile" },
++        { 64, 64u,  "first pass's weight at the map read" },
++        { 1,  112u, "every part" },
+     };
+-    pl.pin_moe(1);
+-    if (row->describe) {
+-        static RadLaunchDesc d0[4], d1[4];
+-        int n0 = 0, n1 = 0;
+-        pl.pin_pf2(0);
+-        const int c0 = row->describe(&a, nullptr, d0, 4, &n0);
+-        pl.pin_pf2(1);
+-        const int c1 = row->describe(&a, nullptr, d1, 4, &n1);
+-        if (c0 != RAD_OK || c1 != RAD_OK || n0 != 2 || n1 != 2) {
+-            restore();
+-            ok(label.c_str(), false, "describe rc " + std::to_string(c0) + "/" + std::to_string(c1) +
+-                                     ", launches " + std::to_string(n0) + "/" + std::to_string(n1));
+-            return;
++    for (const Var& v : kVar) {
++        if ((v.mask & 32u) && v.mask != 112u && !dn_wide) continue;   /* the same as 16 here */
++        const bool map_new = (v.mask & 16u) != 0;
++        const bool gemm_new = (v.mask & 64u) || (dn_wide && (v.mask & 32u));
++        const uint32_t want = (v.mask & 16u) | (v.mask & 64u) | (dn_wide ? (v.mask & 32u) : 0u);
++        const std::string label = what + " aligned prefill form, R4D_MOE_PF2 " +
++                                  std::to_string(v.pin) + " (" + v.name + ")";
++        a.scratch = d_map;
++        a.scratch_bytes = map_bytes;
++        auto restore = [&] {
++            pl.pin_pf2(-1);
++            pl.pf2_used();
++            pl.pin_moe(0);
++            a.scratch = sc0;
++            a.scratch_bytes = sb0;
++        };
++        pl.pin_moe(1);
++        if (row->describe) {
++            static RadLaunchDesc d0[4], d1[4];
++            int n0 = 0, n1 = 0;
++            pl.pin_pf2(0);
++            const int c0 = row->describe(&a, nullptr, d0, 4, &n0);
++            pl.pin_pf2(v.pin);
++            const int c1 = row->describe(&a, nullptr, d1, 4, &n1);
++            if (c0 != RAD_OK || c1 != RAD_OK || n0 != 2 || n1 != 2) {
++                restore();
++                ok(label.c_str(), false, "describe rc " + std::to_string(c0) + "/" +
++                                         std::to_string(c1) + ", launches " +
++                                         std::to_string(n0) + "/" + std::to_string(n1));
++                continue;
++            }
++            if ((d0[0].func != d1[0].func) != map_new || (d0[1].func != d1[1].func) != gemm_new) {
++                restore();
++                ok(label.c_str(), false, std::string("described kernels: the map's ") +
++                                         (d0[0].func == d1[0].func ? "is the default's" : "differs") +
++                                         ", the GEMM's " +
++                                         (d0[1].func == d1[1].func ? "is the default's" : "differs"));
++                continue;
++            }
+         }
+-        if (d0[0].func == d1[0].func || (d0[1].func != d1[1].func) != dn_wide) {
+-            restore();
+-            ok(label.c_str(), false, std::string("described kernels: the map's ") +
+-                                     (d0[0].func == d1[0].func ? "is the default's" : "differs") +
+-                                     ", the GEMM's " +
+-                                     (d0[1].func == d1[1].func ? "is the default's" : "differs"));
+-            return;
++        {
++            std::vector<uint16_t> junk(elems, 0x7f7fu);
++            st_memcpy(d_y, junk.data(), junk.size() * 2, hipMemcpyHostToDevice);
+         }
++        pl.pin_pf2(v.pin);
++        pl.pf2_used();
++        const int rc = row->launch(&a, nullptr);
++        st_stream_sync(nullptr);
++        const uint32_t used = pl.pf2_used();
++        restore();
++        if (rc != RAD_OK) { ok(label.c_str(), false, "launch rc=" + std::to_string(rc)); continue; }
++        std::vector<uint16_t> got(elems);
++        st_memcpy(got.data(), d_y, got.size() * 2, hipMemcpyDeviceToHost);
++        int64_t diff = 0;
++        for (size_t i = 0; i < elems; ++i) diff += got[i] != base[i];
++        ok(label.c_str(), diff == 0 && (used & 112u) == want,
++           std::to_string(diff) + " of " + std::to_string(elems) +
++               " elements differ from the form without it; parts used " + std::to_string(used) +
++               ", expected " + std::to_string(want));
+     }
+-    {
+-        std::vector<uint16_t> junk(elems, 0x7f7fu);
+-        st_memcpy(d_y, junk.data(), junk.size() * 2, hipMemcpyHostToDevice);
+-    }
+-    pl.pin_pf2(1);
+-    pl.pf2_used();
+-    const int rc = row->launch(&a, nullptr);
+-    st_stream_sync(nullptr);
+-    const uint32_t used = pl.pf2_used();
+-    restore();
+-    if (rc != RAD_OK) { ok(label.c_str(), false, "launch rc=" + std::to_string(rc)); return; }
+-    std::vector<uint16_t> got(elems);
+-    st_memcpy(got.data(), d_y, got.size() * 2, hipMemcpyDeviceToHost);
+-    int64_t diff = 0;
+-    for (size_t i = 0; i < elems; ++i) diff += got[i] != base[i];
+-    const uint32_t want = 16u | (dn_wide ? 32u : 0u);
+-    ok(label.c_str(), diff == 0 && (used & 48u) == want,
+-       std::to_string(diff) + " of " + std::to_string(elems) +
+-           " elements differ from the form without it; parts used " + std::to_string(used) +
+-           ", expected " + std::to_string(want));
+ }
+ 
+ /* EVERY FORM THE LAUNCHER HAS, each against the host decode: the run-aligned prefill form (a run
+-- 
+2.55.0
+
+
+From baaeb2e20a294a6ef7bbd499bbb8ad6ec8b7b486 Mon Sep 17 00:00:00 2001
+From: keptn42 <keptn42@noreply.codeberg.org>
+Date: Mon, 5 Oct 2026 21:49:10 +0000
+Subject: [PATCH 3/3] r4d_selftest: the R4D_MOE_PF2 aligned-form pass at every
+ class's own geometry, fp8a8 included
+
+moe_q4_gemm holds the run-aligned form under parts 16 and 64 to the form
+without them as well, so the block-fp8 instance of the early weight issue
+and the narrow classes' pad tiles are compared byte for byte too. Past 512
+experts the launcher builds no run map and there is no aligned launch, so
+the pass is skipped there rather than failed.
+---
+ libr4d/r4d_selftest.cpp | 23 +++++++++++++++++++----
+ 1 file changed, 19 insertions(+), 4 deletions(-)
+
+diff --git a/libr4d/r4d_selftest.cpp b/libr4d/r4d_selftest.cpp
+index 5fd4e95..1bec125 100644
+--- a/libr4d/r4d_selftest.cpp
++++ b/libr4d/r4d_selftest.cpp
+@@ -6741,12 +6741,21 @@ static void moe_dec_variants(const Plugin& pl, const RadKernelInfo* row, RadArgs
+  * Described first where the row can be: the map's kernel must differ from the default's exactly
+  * when 16 is on, and the GEMM's exactly when 64 is or the wide tile applies, so the bytes below are
+  * never one kernel against itself; and the launch must report the parts it took. `base` is the
+- * form's own bytes, already held to the host decode by the form loop. */
++ * form's own bytes, already held to the host decode by the form loop.
++ *
++ * PAST 512 EXPERTS THERE IS NO ALIGNED LAUNCH: the map's builder holds kMaxExpert + 1 offsets, so
++ * the launcher hands a wider expert count the uniform grid whatever scratch it is given, and none
++ * of these parts has a launch to take. Such a shape is skipped, not failed. */
+ static void moe_pf2_aligned(const Plugin& pl, const RadKernelInfo* row, RadArgs& a, void* d_y,
+                             void* d_map, int64_t map_bytes, size_t elems,
+-                            const std::vector<uint16_t>& base, bool dn_wide,
++                            const std::vector<uint16_t>& base, bool dn_wide, int64_t ne,
+                             const std::string& what) {
+     if (!pl.pin_pf2 || !pl.pf2_used || !pl.pin_moe || base.empty()) return;
++    if (ne > 512) {
++        skip((what + " aligned prefill form, R4D_MOE_PF2").c_str(),
++             "no run map past 512 experts, so no aligned launch");
++        return;
++    }
+     void* const sc0 = a.scratch;
+     const int64_t sb0 = a.scratch_bytes;
+     struct Var { int pin; uint32_t mask; const char* name; };
+@@ -7074,7 +7083,8 @@ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int
+     /* The aligned form under R4D_MOE_PF2: the parallel map prefix always, the 256-column down
+      * tile where the sorted operand's every class is whole tiles of it. */
+     const bool dn_wide = sh.sorted_a && sh.parts == 1 && sh.N0 % 256 == 0 && sh.N1 % 256 == 0;
+-    moe_pf2_aligned(pl, r, a, d_y, d_map, map_bytes, (size_t)(Tr * N), two_cls[1], dn_wide, what);
++    moe_pf2_aligned(pl, r, a, d_y, d_map, map_bytes, (size_t)(Tr * N), two_cls[1], dn_wide, ne,
++                    what);
+     /* The decode form's staged K both ways, where this shape can take two blocks a pass --
+      * never on the sorted operand, which the rule keeps at one. */
+     const bool fk2 = !sh.sorted_a && g64 && sh.K0 % 256 == 0 && sh.K1 % 256 == 0;
+@@ -7142,7 +7152,7 @@ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int
+         ok(label.c_str(), diff == 0, std::to_string(diff) + " of " + std::to_string(Tr * N) +
+                                      " elements differ from the two-class op's");
+     }
+-    moe_pf2_aligned(pl, r4, a4, d_y, d_map, map_bytes, (size_t)(Tr * N), two_cls[1], dn_wide,
++    moe_pf2_aligned(pl, r4, a4, d_y, d_map, map_bytes, (size_t)(Tr * N), two_cls[1], dn_wide, ne,
+                     what4);
+     moe_dec_variants(pl, r4, a4, d_y, (size_t)(Tr * N), fk2, what4);
+ }
+@@ -7369,6 +7379,7 @@ static void moe_q4_gemm(const Plugin& pl, int64_t Tr, const MoeQ4Shape& sh, cons
+     }
+ 
+     const int f_lo = pl.pin_moe ? 1 : 0, f_hi = pl.pin_moe ? 3 : 0;
++    std::vector<uint16_t> aligned;     /* the aligned form's bytes, for the R4D_MOE_PF2 pass */
+     for (int form = f_lo; form <= f_hi; ++form) {
+         const std::string label = what + " " + kForm[form];
+         if (pl.pin_moe) pl.pin_moe(form);
+@@ -7405,7 +7416,11 @@ static void moe_q4_gemm(const Plugin& pl, int64_t Tr, const MoeQ4Shape& sh, cons
+             }
+         ok(label.c_str(), bad == 0, std::to_string(bad) + " of " + std::to_string(Tr * N) +
+                                     " elements off, worst " + std::to_string(worst) + first);
++        if (form == 1) aligned = got;
+     }
++    /* The aligned form under R4D_MOE_PF2, each class at its own geometry; fp8a8 runs W4 0 here,
++     * the token operand, so no 256-column down tile. */
++    moe_pf2_aligned(pl, r, a, d_y, d_map, map_bytes, (size_t)(Tr * N), aligned, false, ne, what);
+     /* The decode form's variants, each class at its own geometry; fp8a8 runs W4 0 here. */
+     bool fk2 = g64;
+     for (int q = 0; q < 4; ++q) fk2 = fk2 && sh.K[q] % 256 == 0;
+-- 
+2.55.0
+

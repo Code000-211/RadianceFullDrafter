@@ -1,0 +1,76 @@
+{
+  "pr_id": 34,
+  "title": "moe_gemm_q decode form: down gets its own kernel",
+  "author": "keptn42",
+  "url": "https://codeberg.org/StillDeadcode/radiance/pulls/34",
+  "status": "READY_TO_TEST",
+  "modified_files": [
+    "libr4d/r4d.h",
+    "libr4d/r4d_moe.hip",
+    "libr4d/r4d_selftest.cpp"
+  ],
+  "safety_audit": {
+    "passed": true,
+    "violations": []
+  },
+  "jev_evaluation": {
+    "subsystem": {
+      "type": "choice",
+      "choice": "moe",
+      "confidence": 0.95,
+      "probabilities": {
+        "tooling": 0.0,
+        "drafter": 0.0,
+        "interconnect": 0.0,
+        "serving": 0.0,
+        "moe": 0.96,
+        "gdn": 0.0,
+        "general": 0.0,
+        "gemm": 0.04,
+        "qsa": 0.0
+      }
+    },
+    "violates_rdna4_limits": {
+      "type": "noul",
+      "noul": 0.15
+    },
+    "feasibility": {
+      "type": "score",
+      "score": 2.53,
+      "confidence": 0.56,
+      "legend": {
+        "0": "Unfeasible / contradicts hardware laws / CUDA-only",
+        "1": "High risk or complex external dependency",
+        "2": "Moderate feasibility / experimental",
+        "3": "Feasible / standard ROCm HIP implementation",
+        "4": "Immediate high-value quick win"
+      },
+      "probabilities": {
+        "0": 0.08,
+        "1": 0.06,
+        "2": 0.14,
+        "3": 0.69,
+        "4": 0.03
+      }
+    },
+    "performance_roi": {
+      "type": "score",
+      "score": 2.56,
+      "confidence": 0.6,
+      "legend": {
+        "0": "Zero or negative performance impact (docs, tool, placebo)",
+        "1": "Marginal gain (<2%) or monitoring/stability utility",
+        "2": "Solid architectural gain (2-5%)",
+        "3": "High-impact gain (5-15%)",
+        "4": "Breakthrough gain (>15%)"
+      },
+      "probabilities": {
+        "0": 0.04,
+        "1": 0.04,
+        "2": 0.26,
+        "3": 0.64,
+        "4": 0.02
+      }
+    }
+  }
+}

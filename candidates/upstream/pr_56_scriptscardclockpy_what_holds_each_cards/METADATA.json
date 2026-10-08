@@ -1,0 +1,76 @@
+{
+  "pr_id": 56,
+  "title": "scripts/cardclock.py: what holds each card's clock under load, and which card the TP step waits for",
+  "author": "bakon",
+  "url": "https://codeberg.org/StillDeadcode/radiance/pulls/56",
+  "status": "DOCS_OR_TOOLING",
+  "modified_files": [
+    "docs/TOOLS.md",
+    "scripts/README.md",
+    "scripts/cardclock.py"
+  ],
+  "safety_audit": {
+    "passed": true,
+    "violations": []
+  },
+  "jev_evaluation": {
+    "subsystem": {
+      "type": "choice",
+      "choice": "tooling",
+      "confidence": 1.0,
+      "probabilities": {
+        "drafter": 0.0,
+        "interconnect": 0.0,
+        "moe": 0.0,
+        "serving": 0.0,
+        "gemm": 0.0,
+        "general": 0.0,
+        "tooling": 1.0,
+        "gdn": 0.0,
+        "qsa": 0.0
+      }
+    },
+    "violates_rdna4_limits": {
+      "type": "noul",
+      "noul": 0.05
+    },
+    "feasibility": {
+      "type": "score",
+      "score": 2.77,
+      "confidence": 0.64,
+      "legend": {
+        "0": "Unfeasible / contradicts hardware laws / CUDA-only",
+        "1": "High risk or complex external dependency",
+        "2": "Moderate feasibility / experimental",
+        "3": "Feasible / standard ROCm HIP implementation",
+        "4": "Immediate high-value quick win"
+      },
+      "probabilities": {
+        "0": 0.01,
+        "1": 0.03,
+        "2": 0.24,
+        "3": 0.62,
+        "4": 0.1
+      }
+    },
+    "performance_roi": {
+      "type": "score",
+      "score": 0.93,
+      "confidence": 0.9,
+      "legend": {
+        "0": "Zero or negative performance impact (docs, tool, placebo)",
+        "1": "Marginal gain (<2%) or monitoring/stability utility",
+        "2": "Solid architectural gain (2-5%)",
+        "3": "High-impact gain (5-15%)",
+        "4": "Breakthrough gain (>15%)"
+      },
+      "probabilities": {
+        "0": 0.1,
+        "1": 0.89,
+        "2": 0.0,
+        "3": 0.01,
+        "4": 0.0
+      }
+    }
+  }
+}

@@ -1,0 +1,81 @@
+{
+  "pr_id": 48,
+  "title": "checkpoint: import an NVFP4 release as its codes beside the e4m3 table over the tensor's f32 global, and per-channel FP8 by its row scale",
+  "author": "devmilan",
+  "url": "https://codeberg.org/StillDeadcode/radiance/pulls/48",
+  "status": "REJECTED_UNFEASIBLE",
+  "modified_files": [
+    "README.md",
+    "core/format/checkpoint.cpp",
+    "core/format/checkpoint.h",
+    "data/recipes/q38-27b-nvfp4-df2.recipe",
+    "docs/GUIDE.md",
+    "tests/CMakeLists.txt",
+    "tests/checkpoint_test.cpp",
+    "tests/recipe_test.cpp"
+  ],
+  "safety_audit": {
+    "passed": true,
+    "violations": []
+  },
+  "jev_evaluation": {
+    "subsystem": {
+      "type": "choice",
+      "choice": "gemm",
+      "confidence": 0.66,
+      "probabilities": {
+        "qsa": 0.0,
+        "serving": 0.01,
+        "interconnect": 0.0,
+        "gemm": 0.7,
+        "moe": 0.0,
+        "tooling": 0.0,
+        "gdn": 0.0,
+        "general": 0.29,
+        "drafter": 0.0
+      }
+    },
+    "violates_rdna4_limits": {
+      "type": "noul",
+      "noul": 0.15
+    },
+    "feasibility": {
+      "type": "score",
+      "score": 0.81,
+      "confidence": 0.33,
+      "legend": {
+        "0": "Unfeasible / contradicts hardware laws / CUDA-only",
+        "1": "High risk or complex external dependency",
+        "2": "Moderate feasibility / experimental",
+        "3": "Feasible / standard ROCm HIP implementation",
+        "4": "Immediate high-value quick win"
+      },
+      "probabilities": {
+        "0": 0.49,
+        "1": 0.29,
+        "2": 0.15,
+        "3": 0.07,
+        "4": 0.0
+      }
+    },
+    "performance_roi": {
+      "type": "score",
+      "score": 0.59,
+      "confidence": 0.48,
+      "legend": {
+        "0": "Zero or negative performance impact (docs, tool, placebo)",
+        "1": "Marginal gain (<2%) or monitoring/stability utility",
+        "2": "Solid architectural gain (2-5%)",
+        "3": "High-impact gain (5-15%)",
+        "4": "Breakthrough gain (>15%)"
+      },
+      "probabilities": {
+        "0": 0.7,
+        "1": 0.1,
+        "2": 0.09,
+        "3": 0.1,
+        "4": 0.01
+      }
+    }
+  }
+}

@@ -1,0 +1,79 @@
+{
+  "pr_id": 26,
+  "title": "hc_read: a second prefill form behind R4D_HC_READ_PF2",
+  "author": "keptn42",
+  "url": "https://codeberg.org/StillDeadcode/radiance/pulls/26",
+  "status": "READY_TO_TEST",
+  "modified_files": [
+    "libr4d/r4d.h",
+    "libr4d/r4d_hc_bf16.hip",
+    "libr4d/r4d_selftest.cpp",
+    "libr4d/r4d.h",
+    "libr4d/r4d_hc_bf16.hip",
+    "libr4d/r4d_selftest.cpp"
+  ],
+  "safety_audit": {
+    "passed": true,
+    "violations": []
+  },
+  "jev_evaluation": {
+    "subsystem": {
+      "type": "choice",
+      "choice": "gemm",
+      "confidence": 0.86,
+      "probabilities": {
+        "gemm": 0.88,
+        "gdn": 0.08,
+        "qsa": 0.0,
+        "moe": 0.03,
+        "interconnect": 0.0,
+        "drafter": 0.0,
+        "serving": 0.0,
+        "tooling": 0.0,
+        "general": 0.01
+      }
+    },
+    "violates_rdna4_limits": {
+      "type": "noul",
+      "noul": 0.16
+    },
+    "feasibility": {
+      "type": "score",
+      "score": 2.2,
+      "confidence": 0.28,
+      "legend": {
+        "0": "Unfeasible / contradicts hardware laws / CUDA-only",
+        "1": "High risk or complex external dependency",
+        "2": "Moderate feasibility / experimental",
+        "3": "Feasible / standard ROCm HIP implementation",
+        "4": "Immediate high-value quick win"
+      },
+      "probabilities": {
+        "0": 0.15,
+        "1": 0.08,
+        "2": 0.22,
+        "3": 0.52,
+        "4": 0.03
+      }
+    },
+    "performance_roi": {
+      "type": "score",
+      "score": 2.46,
+      "confidence": 0.23,
+      "legend": {
+        "0": "Zero or negative performance impact (docs, tool, placebo)",
+        "1": "Marginal gain (<2%) or monitoring/stability utility",
+        "2": "Solid architectural gain (2-5%)",
+        "3": "High-impact gain (5-15%)",
+        "4": "Breakthrough gain (>15%)"
+      },
+      "probabilities": {
+        "0": 0.14,
+        "1": 0.07,
+        "2": 0.17,
+        "3": 0.43,
+        "4": 0.19
+      }
+    }
+  }
+}
