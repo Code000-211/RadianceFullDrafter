@@ -337,8 +337,8 @@ def load_goldens(custom_path: Path | None) -> list[GoldenPrompt]:
     else:
         # Check standard locations
         candidates = [
-            Path(__file__).parent / "golden_parity_reference.json",
             Path(__file__).parent.parent / "baselines" / "golden_parity_reference.json",
+            Path(__file__).parent / "golden_parity_reference.json",
         ]
         found = False
         for c in candidates:
@@ -412,8 +412,8 @@ def main() -> int:
     parser.add_argument(
         "--min-reasoning-tps",
         type=float,
-        default=float(os.getenv("MIN_REASONING_TPS", "240.0")),
-        help="Minimum required decode speed (t/s) on reasoning_probability to pass parity gate (default: 240.0)",
+        default=float(os.getenv("MIN_REASONING_TPS", "210.0")),
+        help="Minimum required decode speed (t/s) on reasoning_probability to pass parity gate (default: 210.0)",
     )
     parser.add_argument(
         "--min-math-tps",

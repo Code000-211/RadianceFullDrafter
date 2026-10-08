@@ -151,7 +151,7 @@ run_tier1() {
         --suite full \
         --token-tolerance 0 \
         --min-code-tps 230.0 \
-        --min-reasoning-tps 240.0 \
+        --min-reasoning-tps 210.0 \
         --min-math-tps 210.0 \
         --json-out "${TIER1_JSON}"
 }

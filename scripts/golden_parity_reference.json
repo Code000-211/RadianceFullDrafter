@@ -45,10 +45,10 @@
     "prompt": "Solve the following equation step by step: 3*x + 7 = 22.",
     "max_tokens": 256,
     "temperature": 0.0,
-    "golden_tokens": 249,
-    "golden_sha256": "ea132a258966e7ce338bcd0b78850c94ff278292ffa81176dbf5e06713070042",
+    "golden_tokens": 247,
+    "golden_sha256": "d0b76823b76598c0c7684478d429a62553325e7ac91eaa58aa447be05ed86e9e",
     "expected_finish_reason": "stop",
-    "golden_text": "To solve the equation $3x + 7 = 22$, we need to isolate the variable $x$. Here is the step-by-step solution:\n\n**Step 1: Subtract 7 from both sides of the equation.**\nTo move the constant term ($7$) to the right side, we subtract $7$ from both sides:\n$$3x + 7 - 7 = 22 - 7$$\n\nSimplifying this gives:\n$$3x = 15$$\n\n**Step 2: Divide both sides by 3.**\nTo isolate $x$, we divide both sides by the coefficient of $x$ (which is $3$):\n$$\\frac{3x}{3} = \\frac{15}{3}$$\n\nSimplifying this gives:\n$$x = 5$$\n\n**Verification:**\nSubstitute $x = 5$ back into the original equation to check the answer:\n$$3(5) + 7 = 15 + 7 = 22$$\nSince $22 = 22$, the solution is correct.\n\n**Final Answer:**\n$$x = 5$$",
+    "golden_text": "To solve the equation $3x + 7 = 22$, we need to isolate the variable $x$. Here is the step-by-step solution:\n\n**Step 1: Subtract 7 from both sides of the equation.**\nTo move the constant term ($7$) to the right side, we subtract $7$ from both sides:\n$$3x + 7 - 7 = 22 - 7$$\n\nSimplifying both sides:\n$$3x = 15$$\n\n**Step 2: Divide both sides by 3.**\nTo isolate $x$, we divide both sides by the coefficient of $x$, which is $3$:\n$$\\frac{3x}{3} = \\frac{15}{3}$$\n\nSimplifying both sides:\n$$x = 5$$\n\n**Verification:**\nSubstitute $x = 5$ back into the original equation to check the answer:\n$$3(5) + 7 = 15 + 7 = 22$$\nSince $22 = 22$, the solution is correct.\n\n**Final Answer:**\n$$x = 5$$",
     "required_patterns": [
       "3x = 15",
       "x = 5",

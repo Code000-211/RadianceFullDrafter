@@ -73,6 +73,7 @@ benchmarks/runs/*
 !benchmarks/runs/.gitkeep
 telemetry/*.json
 !telemetry/.gitkeep
+baselines/*_results.json
 tmp/
 *.tmp
 
