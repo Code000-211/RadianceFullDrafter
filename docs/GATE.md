@@ -20,6 +20,7 @@ Im Normalfall ruft `scripts/lever_queue.py` das Gate auf (siehe `docs/ORCA_AGENT
 | Tier 0 | `check_epistemic_invariants.py --repo-root <kandidat>` | Operatoren haben ELF-Symbole, keine stillen Test-Skips, Seals in `baselines/gate_thresholds.json` stimmen, keine verschluckten Fehler in Gate-Skripten | ja |
 | Tier 3 | `isa_diff.py <baseline> <kandidat>` | Bericht: Kernel mit mehr VGPRs, weniger Waves, neuen Spills. Harte Regel nur: keine neuen `v_movrel`-Waterfall-Loops im Hot-Path | nur Waterfall |
 | Tier 1 + 2 | `ab_gate.py` | je Block eigene Engine; Parität (Golden-Hashes, Toleranz 0) in jedem Block; BetterBench single-stream + C8 + Prefill mit Zufalls-Nonces; Kandidat gegen Baseline je Metrik innerhalb `tier2.slack_pct` | ja |
+| Tier 4 | `ab_gate.py` (nach den Blöcken, nur wenn bis dahin PASS) | `radiance --diagnose` einmal mit der Baseline, einmal mit dem Kandidaten gegen deren Bericht: gleiche Prompts (BetterBench-Korpus, sonst der eingebaute), gleiche Seeds, Temperatur 1; Token-Parität über Kategorien, Concurrency 1–8 und Prefill bis 60k; Draft-Annahme je Kategorie und Position. `DROPPED` scheitert immer; abweichende Tokens scheitern, außer der Kandidat deklariert `"numerics": "reordered"` (dann PASS mit Vermerk, Leon entscheidet beim Merge) | ja |
 
 Reihenfolge der Blöcke: `A, B` (Standard) oder `A, B, B, A` (`--abba`, zusätzlich A/A-Streuung;
 ist sie größer als die Toleranz, ist das Ergebnis INCONCLUSIVE und das Gate scheitert).
@@ -28,9 +29,17 @@ Ein Lauf dauert mit A/B etwa 10 Minuten.
 Ergebnisse: `<out>/ab/report.md` (Tabelle), `<out>/ab/summary.json` (alle Blöcke mit
 Binary-SHA256, Startzeit, MCLK-Anteil, Parität, Metriken), `<out>/isa_diff.json`.
 
-Exit-Codes von `ab_gate.py`: 0 PASS; 2 Kandidat scheitert (Parität, Speed, oder seine Engine
-startet nicht — der Bericht enthält dann das Ende des Engine-Logs); 3 Setup-Fehler/Inconclusive
-(GPUs belegt, Baseline-Engine startet nicht, Baseline verfehlt selbst die Parität → Goldens veraltet).
+Exit-Codes von `ab_gate.py`: 0 PASS; 2 Kandidat scheitert (Parität, Speed, Diagnose, oder seine
+Engine startet nicht — der Bericht enthält dann das Ende des Engine-Logs); 3 Setup-Fehler/Inconclusive
+(GPUs belegt, Baseline-Engine startet nicht, Baseline verfehlt selbst die Parität → Goldens veraltet,
+Diagnose-Lauf der Baseline ist keine Messung).
+
+Tier 4 liest seine Einstellungen aus einem optionalen Abschnitt `"diagnose"` in
+`baselines/gate_thresholds.json` (`enabled`, `tokens`, `runs`, `concurrency`, `prefill`,
+`timeout_s`); fehlt er, gelten die Defaults in `ab_gate.py` (`DIAGNOSE_DEFAULTS`). `--no-diagnose`
+überspringt die Stufe für einen einzelnen Lauf. Ergebnisse: `<out>/ab/diagnose_baseline/`,
+`<out>/ab/diagnose_candidate/` (je `diagnose.md`, `diagnose.json`, `engine.log`) und der Abschnitt
+„Tier 4“ in `report.md`.
 
 ## Einstellungen
 

@@ -21,6 +21,15 @@ Verdict per metric: candidate mean vs baseline mean must not be worse than
 tier2.slack_pct. In "abba" mode the A/A spread is checked against the slack as well;
 a spread larger than the slack makes the result inconclusive, which fails the gate.
 
+Tier 4, after the blocks: the engine's own diagnose run (`radiance --diagnose`, docs/GUIDE.md
+§6.8) once on the baseline build and once on the candidate build, the candidate compared with
+the baseline's report (`--diagnose-baseline`). Same prompts, same seeds, temperature 1, over the
+BetterBench categories, a concurrency sweep and a prefill sweep, so it checks token parity on the
+paths the goldens do not reach (batched decode, long prefill) and draft acceptance per category
+and position. A drop in draft acceptance (DROPPED) always fails. Differing tokens fail unless the
+candidate declares `"numerics": "reordered"` in its gate.json (AGENTS.md §3, Numerik): then the
+goldens and the token parity are reported but do not fail the gate, and Leon decides at the merge.
+
 Exit codes: 0 pass, 2 candidate fails (parity, speed, or its engine does not start),
 3 setup error (GPUs busy, baseline engine does not start) / inconclusive.
 """
@@ -52,6 +61,17 @@ REPO_ROOT = SCRIPT_DIR.parent
 
 HIGHER_IS_BETTER = ("decode_med_tps", "concurrency_tps", "prefill_med_tps")
 LOWER_IS_BETTER = ("c1_itl_p99_ms", "c8_itl_p99_ms", "ttft_p50_ms")
+
+# The diagnose run's workload when gate_thresholds.json has no "diagnose" section. Prefill lengths
+# stay under start_engine.sh's --max-model-len 65536; concurrency up to its --max-num-seqs 8.
+DIAGNOSE_DEFAULTS: dict[str, Any] = {
+    "enabled": True,
+    "tokens": 256,
+    "runs": 3,
+    "concurrency": "1,2,4,8",
+    "prefill": "1024,8192,32768,60000",
+    "timeout_s": 3600,
+}
 
 
 class SetupError(RuntimeError):
@@ -256,6 +276,108 @@ def run_benchmark(port: int, cfg_path: Path, bb_path: str) -> dict[str, Any]:
     return results
 
 
+def export_bb_corpus(bb_path: str, out: Path) -> tuple[Path | None, str]:
+    """BetterBench's corpus as a --diagnose-corpus JSONL. Returns (path, note); (None, why) when
+    the corpus has no shape this understands, and the diagnose run then uses the engine's
+    built-in corpus -- still a parity and acceptance check, both sides run the same prompts."""
+    try:
+        sys.path.insert(0, bb_path)
+        from betterbench.corpus import load_corpus  # noqa: PLC0415
+        corpus = load_corpus(None, None)
+    except Exception as e:  # noqa: BLE001 -- any failure to import or load is reported, not raised
+        return None, f"BetterBench corpus not loadable: {e}"
+
+    def field(item: Any, name: str) -> Any:
+        return item.get(name) if isinstance(item, dict) else getattr(item, name, None)
+
+    items = list(corpus.values()) if isinstance(corpus, dict) else list(corpus)
+    rows = []
+    for item in items:
+        category = field(item, "category")
+        messages = field(item, "messages")
+        if messages is None and isinstance(field(item, "prompt"), str):
+            messages = [{"role": "user", "content": field(item, "prompt")}]
+        if not isinstance(category, str) or not isinstance(messages, list) or not messages:
+            return None, f"BetterBench corpus entry without category and messages: {type(item).__name__}"
+        row: dict[str, Any] = {"category": category, "messages": messages}
+        if isinstance(field(item, "max_tokens"), int) and field(item, "max_tokens") > 0:
+            row["max_tokens"] = field(item, "max_tokens")
+        rows.append(row)
+    if not rows:
+        return None, "BetterBench corpus is empty"
+    out.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows))
+    cats = sorted({r["category"] for r in rows})
+    return out, f"BetterBench corpus, {len(rows)} prompts in {len(cats)} categories ({', '.join(cats)})"
+
+
+def run_diagnose(build_dir: Path, out_dir: Path, dcfg: dict[str, Any], corpus: Path | None,
+                 baseline_report: Path | None, extra_args: list[str], extra_env: dict[str, str]) -> dict[str, Any]:
+    """One `radiance --diagnose` run through start_engine.sh in the foreground, in its own process
+    group. Returns the exit code, the parsed report (or None) and the log path."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    log_path = out_dir / "engine.log"
+    env = {**os.environ, **extra_env, "RADIANCE_ENGINE_FOREGROUND": "1"}
+    model = env.get("MODEL_PATH", "/root/models/qwen3.8-next-flash-fp8-iq4r-moe/qwen3.8-next-flash-fp8-iq4r-moe.rad")
+    cmd = ["bash", str(SCRIPT_DIR / "start_engine.sh"), "--build-dir", str(build_dir.resolve()),
+           "--port", str(dcfg.get("port", 8000)), model,
+           "--diagnose", str(out_dir), "--diagnose-tokens", str(dcfg["tokens"]),
+           "--diagnose-runs", str(dcfg["runs"]), "--diagnose-concurrency", str(dcfg["concurrency"]),
+           "--diagnose-prefill", str(dcfg["prefill"])]
+    if corpus is not None:
+        cmd += ["--diagnose-corpus", str(corpus)]
+    if baseline_report is not None:
+        cmd += ["--diagnose-baseline", str(baseline_report)]
+    cmd += extra_args
+    t0 = time.time()
+    with log_path.open("w") as log_f:
+        proc = subprocess.Popen(cmd, stdout=log_f, stderr=subprocess.STDOUT, env=env, start_new_session=True)
+        try:
+            rc = proc.wait(timeout=dcfg["timeout_s"])
+        except subprocess.TimeoutExpired:
+            os.killpg(proc.pid, signal.SIGTERM)
+            try:
+                proc.wait(timeout=60)
+            except subprocess.TimeoutExpired:
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait(timeout=30)
+            rc = None
+    report_path = out_dir / "diagnose.json"
+    report = None
+    if report_path.is_file():
+        try:
+            report = json.loads(report_path.read_text())
+        except json.JSONDecodeError:
+            report = None
+    return {"rc": rc, "wall_s": round(time.time() - t0, 1), "report": report,
+            "report_path": str(report_path), "log": str(log_path)}
+
+
+def judge_diagnose(base: dict[str, Any], cand: dict[str, Any], declared_reordered: bool) -> dict[str, Any]:
+    """Tier 4's verdict from the two runs. `kind` is pass, fail (the candidate's) or setup (the
+    baseline's run is not usable, so nothing was compared)."""
+    if base["rc"] is None or base["report"] is None:
+        return {"kind": "setup", "why": f"baseline diagnose run did not finish (rc {base['rc']}), see {base['log']}"}
+    if base["report"].get("verdict") != "valid":
+        return {"kind": "setup", "why": f"baseline diagnose run is not a measurement: {base['report'].get('problems')}"}
+    if cand["rc"] is None or cand["report"] is None:
+        return {"kind": "fail", "why": f"candidate diagnose run did not finish (rc {cand['rc']}), see {cand['log']}"}
+    rep = cand["report"]
+    if rep.get("verdict") != "valid":
+        return {"kind": "fail", "why": f"candidate diagnose run is not a measurement: {rep.get('problems')}"}
+    parity = rep.get("parity") or {}
+    if "compared" not in parity:
+        return {"kind": "setup", "why": f"no comparison with the baseline: {parity.get('verdict', 'missing')}"}
+    if parity.get("acceptance_verdict") != "no drop":
+        return {"kind": "fail", "why": f"draft acceptance dropped: {parity.get('acceptance_dropped')}"}
+    if parity.get("verdict") != "identical":
+        if declared_reordered:
+            return {"kind": "pass", "declared": True,
+                    "why": f"tokens differ ({parity.get('verdict')}), declared reordered numerics: Leon decides at the merge"}
+        return {"kind": "fail", "why": f"token parity {parity.get('verdict')}: "
+                                       f"{parity.get('identical')} of {parity.get('compared')} requests identical"}
+    return {"kind": "pass", "why": f"{parity.get('compared')} requests identical, no acceptance drop"}
+
+
 def run_block(name: str, role: str, engine: Engine, cfg: dict[str, Any], out_dir: Path) -> dict[str, Any]:
     log(f"block {name} ({role}): starting {engine.build_dir}")
     manifest = engine.start(cfg["engine_ready_timeout_s"])
@@ -324,6 +446,21 @@ def render_report(summary: dict[str, Any]) -> str:
     for r in summary["comparison"]["rows"]:
         spread = "-" if r["baseline_spread_pct"] is None else f"{r['baseline_spread_pct']:.1f} %"
         lines.append(f"| {r['metric']} | {r['baseline']} | {r['candidate']} | {r['delta_pct']:+.1f} % | {r['slack_pct']} % | {spread} | {r['verdict']} |")
+    d = summary.get("diagnose")
+    if d:
+        lines += ["", "## Tier 4: diagnose parity and draft acceptance", ""]
+        lines.append(f"- Verdict: **{d['judgement']['kind'].upper()}**: {d['judgement']['why']}")
+        lines.append(f"- Corpus: {d['corpus_note']}")
+        for role in ("baseline", "candidate"):
+            r = d.get(role)
+            if r:
+                lines.append(f"- {role}: exit {r['rc']}, {r['wall_s']} s, report `{r['report_path']}`")
+        parity = ((d.get("candidate") or {}).get("report") or {}).get("parity") or {}
+        for x in parity.get("differing", [])[:20]:
+            lines.append(f"  - differs: {x['point']} run {x['run']} request {x['request']} "
+                         f"from token {x['first_different_token']}")
+        for x in parity.get("acceptance_dropped", []):
+            lines.append(f"  - acceptance dropped: {x['point']} {x['what']} {x['now']} vs {x['baseline']} (z {x['z']})")
     lines += ["", "## Engines", ""]
     for b in summary["blocks"]:
         m = b["manifest"]
@@ -339,9 +476,15 @@ def main() -> int:
     parser.add_argument("--abba", action="store_true", help="A,B,B,A instead of A,B (adds an A/A noise check)")
     parser.add_argument("--candidate-arg", action="append", default=[], help="extra engine flag for the candidate (repeatable)")
     parser.add_argument("--candidate-env", action="append", default=[], help="KEY=VALUE environment for the candidate (repeatable)")
+    parser.add_argument("--numerics", choices=("bitexact", "reordered"), default="bitexact",
+                        help="the candidate's declared numerics (gate.json \"numerics\", AGENTS.md §3)")
+    parser.add_argument("--no-diagnose", action="store_true", help="skip Tier 4 (the diagnose run)")
     args = parser.parse_args()
 
-    cfg = gate_thresholds.load()["tier2"]
+    thresholds = gate_thresholds.load()
+    cfg = thresholds["tier2"]
+    dcfg = {**DIAGNOSE_DEFAULTS, "port": cfg["port"], **thresholds.get("diagnose", {})}
+    declared_reordered = args.numerics == "reordered"
     mode = "abba" if args.abba else cfg["mode"]
     args.out.mkdir(parents=True, exist_ok=True)
     cand_env = dict(kv.split("=", 1) for kv in args.candidate_env)
@@ -373,9 +516,10 @@ def main() -> int:
     comparison = compare(blocks, cfg["slack_pct"])
     baseline_parity_ok = all(b["parity"]["passed"] for b in blocks if b["role"] == "baseline")
     candidate_parity_ok = all(b["parity"]["passed"] for b in blocks if b["role"] == "candidate")
+    notes: list[str] = []
     if not baseline_parity_ok:
         verdict, rc = "SETUP_ERROR (baseline fails parity: goldens stale)", 3
-    elif not candidate_parity_ok:
+    elif not candidate_parity_ok and not declared_reordered:
         verdict, rc = "FAIL (parity)", 2
     elif comparison["inconclusive"]:
         verdict, rc = f"INCONCLUSIVE ({', '.join(comparison['inconclusive'])})", 3
@@ -383,14 +527,52 @@ def main() -> int:
         verdict, rc = f"FAIL ({', '.join(comparison['regressions'])})", 2
     else:
         verdict, rc = "PASS", 0
+        if not candidate_parity_ok:
+            notes.append("goldens differ, declared reordered numerics")
+
+    # Tier 4 only for a candidate that passed so far: a failed one has its answer, and the two
+    # diagnose runs cost GPU time the queue's next job needs.
+    diagnose = None
+    if rc == 0 and dcfg["enabled"] and not args.no_diagnose:
+        log("tier 4: diagnose runs (baseline, then candidate against it)")
+        corpus, corpus_note = export_bb_corpus(cfg["betterbench_path"], args.out / "diagnose_corpus.jsonl")
+        if corpus is None:
+            corpus_note = f"engine built-in ({corpus_note})"
+        base = run_diagnose(args.baseline_build, args.out / "diagnose_baseline", dcfg, corpus, None, [], {})
+        log(f"tier 4: baseline exit {base['rc']} after {base['wall_s']} s")
+        cand = None
+        if base["rc"] == 0 and base["report"] is not None:
+            cand = run_diagnose(args.candidate_build, args.out / "diagnose_candidate", dcfg, corpus,
+                                Path(base["report_path"]), args.candidate_arg, cand_env)
+            log(f"tier 4: candidate exit {cand['rc']} after {cand['wall_s']} s")
+        judgement = judge_diagnose(base, cand or {"rc": None, "report": None, "log": "-"}, declared_reordered)
+        def slim(r: dict[str, Any] | None) -> dict[str, Any] | None:
+            # The full reports stay in their directories; the summary keeps the verdicts.
+            if r is None:
+                return None
+            rep = r["report"] or {}
+            return {**r, "report": {"verdict": rep.get("verdict"), "problems": rep.get("problems"),
+                                    "parity": rep.get("parity")}}
+        diagnose = {"judgement": judgement, "corpus_note": corpus_note, "baseline": slim(base), "candidate": slim(cand)}
+        log(f"tier 4: {judgement['kind']}: {judgement['why']}")
+        if judgement["kind"] == "setup":
+            verdict, rc = f"SETUP_ERROR (diagnose: {judgement['why']})", 3
+        elif judgement["kind"] == "fail":
+            verdict, rc = f"FAIL (diagnose: {judgement['why']})", 2
+        elif judgement.get("declared"):
+            notes.append("diagnose tokens differ, declared reordered numerics")
+    if rc == 0 and notes:
+        verdict = f"PASS (Leon decides at the merge: {'; '.join(notes)})"
 
     summary = {
         "verdict": verdict,
         "mode": mode,
+        "numerics": args.numerics,
         "baseline_build": str(args.baseline_build.resolve()),
         "candidate_build": str(args.candidate_build.resolve()),
         "blocks": blocks,
         "comparison": comparison,
+        "diagnose": diagnose,
     }
     (args.out / "summary.json").write_text(json.dumps(summary, indent=2))
     report = render_report(summary)

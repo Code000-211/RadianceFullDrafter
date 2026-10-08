@@ -97,7 +97,12 @@ def cmd_claims(args: argparse.Namespace) -> int:
     if gate_json is not None:
         try:
             cfg = json.loads(gate_json)
-            print(f"✓ gate.json: engine_args={cfg.get('engine_args', [])} engine_env={cfg.get('engine_env', {})}")
+            numerics = cfg.get("numerics", "bitexact")
+            print(f"✓ gate.json: engine_args={cfg.get('engine_args', [])} engine_env={cfg.get('engine_env', {})} "
+                  f"numerics={numerics}")
+            if numerics not in ("bitexact", "reordered"):
+                print(f"❌ gate.json numerics must be \"bitexact\" or \"reordered\" (AGENTS.md §3), not {numerics!r}")
+                failed = True
         except json.JSONDecodeError as e:
             print(f"❌ gate.json is not valid JSON: {e}")
             failed = True

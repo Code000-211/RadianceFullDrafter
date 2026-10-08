@@ -114,40 +114,52 @@ fi
 # RADIANCE_ENGINE_PREFIX puts a launcher directly in front of the binary, e.g. rocprofv3 for
 # scripts/profile_engine.py: the profiler then wraps only bin/radiance, as libr4d/isa/trace.sh's
 # callers do, and not this script and every helper it runs. Split on spaces on purpose.
+ENGINE_ARGS=(
+  --model "${MODEL_PATH}"
+  --port "${PORT}"
+  --tp "${TP}"
+  --tp-wire "${TP_WIRE}"
+  --max-num-seqs 8
+  --max-model-len 65536
+  --placement expert_tiered
+  --ngram-placement auto
+  --host-pool-mib 12288
+  --gpu-headroom-mib "${GPU_HEADROOM_MIB:-64}"
+  --checkpoint-slots 4
+  --vram-kv-mib 1600
+  --kv-cache-dtype fp8
+  --num-speculative-tokens 3
+  --adaptive-spec
+  --prefix-cache-host-mib 8192
+  --prefix-cache-disk-mib 0
+  --prefix-aware-prefetch
+  --no-ced-prefetch
+  --ridgefill "${RADIANCE_RIDGEFILL}"
+  --ridgefill-projector "${RADIANCE_RIDGEFILL_PROJECTOR}"
+  --reasoning-effort "${REASONING_EFFORT:-none}"
+  --temp 1.0
+  --top-p 0.95
+  --top-k 20
+  --min-p 0.0
+  --presence-penalty 0.0
+  --repetition-penalty 1.0
+  --max-num-batched-tokens 2048
+  --checkpoint-interval 2048
+  --mm-max-patches 0
+  "$@"
+)
+
+# RADIANCE_ENGINE_FOREGROUND=1: a run that ends by itself (--diagnose, --kld-ref) listens on no
+# port, so there is nothing to wait for and no warmup to send; the engine's exit code is the result.
+if [ "${RADIANCE_ENGINE_FOREGROUND:-0}" = "1" ]; then
+    rc=0
+    # shellcheck disable=SC2086
+    $WRAPPER ${RADIANCE_ENGINE_PREFIX:-} "${BIN_PATH}" "${ENGINE_ARGS[@]}" || rc=$?
+    exit "${rc}"
+fi
+
 # shellcheck disable=SC2086
-$WRAPPER ${RADIANCE_ENGINE_PREFIX:-} "${BIN_PATH}" \
-  --model "${MODEL_PATH}" \
-  --port "${PORT}" \
-  --tp "${TP}" \
-  --tp-wire "${TP_WIRE}" \
-  --max-num-seqs 8 \
-  --max-model-len 65536 \
-  --placement expert_tiered \
-  --ngram-placement auto \
-  --host-pool-mib 12288 \
-  --gpu-headroom-mib "${GPU_HEADROOM_MIB:-64}" \
-  --checkpoint-slots 4 \
-  --vram-kv-mib 1600 \
-  --kv-cache-dtype fp8 \
-  --num-speculative-tokens 3 \
-  --adaptive-spec \
-  --prefix-cache-host-mib 8192 \
-  --prefix-cache-disk-mib 0 \
-  --prefix-aware-prefetch \
-  --no-ced-prefetch \
-  --ridgefill "${RADIANCE_RIDGEFILL}" \
-  --ridgefill-projector "${RADIANCE_RIDGEFILL_PROJECTOR}" \
-  --reasoning-effort "${REASONING_EFFORT:-none}" \
-  --temp 1.0 \
-  --top-p 0.95 \
-  --top-k 20 \
-  --min-p 0.0 \
-  --presence-penalty 0.0 \
-  --repetition-penalty 1.0 \
-  --max-num-batched-tokens 2048 \
-  --checkpoint-interval 2048 \
-  --mm-max-patches 0 \
-  "$@" &
+$WRAPPER ${RADIANCE_ENGINE_PREFIX:-} "${BIN_PATH}" "${ENGINE_ARGS[@]}" &
 SERVER_PID=$!
 
 trap "kill -TERM $SERVER_PID 2>/dev/null || true; exit 0" EXIT INT TERM

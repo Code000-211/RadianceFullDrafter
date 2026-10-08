@@ -219,6 +219,12 @@ def process(job_path: Path) -> dict[str, Any]:
                 gate_cmd += ["--candidate-arg", a]
             for k, v in gate_cfg.get("engine_env", {}).items():
                 gate_cmd += ["--candidate-env", f"{k}={v}"]
+            # The lever's declared numerics (AGENTS.md §3, Numerik): "reordered" lets differing
+            # tokens through to Leon instead of failing; anything else is held to bit parity.
+            numerics = gate_cfg.get("numerics", "bitexact")
+            if numerics not in ("bitexact", "reordered"):
+                raise StepFailed("gate-json-numerics", 1)
+            gate_cmd += ["--numerics", numerics]
             run_step("gate", gate_cmd, log_f, REPO_ROOT)
             tag = f"winner/{slug}-{ts}"
             run_step("tag", ["git", "tag", tag, result["candidate_sha"]], log_f, REPO_ROOT)

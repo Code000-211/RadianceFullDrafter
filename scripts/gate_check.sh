@@ -6,6 +6,8 @@
 #               (scripts/check_epistemic_invariants.py --repo-root/--build-dir)
 #   Tier 1 + 2: parity and A/B speed against the baseline build, each in its own
 #               freshly started engine (scripts/ab_gate.py)
+#   Tier 4:     the engine's diagnose run on both builds: token parity over batched decode
+#               and long prefill, draft acceptance per category and position (also ab_gate.py)
 #   Tier 3:     per-kernel VGPR/spill diff baseline -> candidate (scripts/isa_diff.py)
 #
 # Fail-closed: a tier that cannot run fails the gate. DRY_RUN never certifies.
@@ -15,6 +17,7 @@
 #   gate_check.sh --build-dir <candidate build_hip> [--candidate-root <tree>]
 #                 [--baseline-build-dir <dir>] [--out <dir>] [--abba]
 #                 [--candidate-arg <engine flag>]... [--candidate-env KEY=VALUE]...
+#                 [--numerics bitexact|reordered] [--no-diagnose]
 #                 [--tier 0|ab|3|all]
 # ==============================================================================
 set -euo pipefail
@@ -39,7 +42,9 @@ while [[ $# -gt 0 ]]; do
         --abba) AB_ARGS+=("--abba"); shift ;;
         --candidate-arg) AB_ARGS+=("--candidate-arg=$2"); shift 2 ;;
         --candidate-env) AB_ARGS+=("--candidate-env=$2"); shift 2 ;;
-        --help|-h) sed -n '2,19p' "$0"; exit 0 ;;
+        --numerics) AB_ARGS+=("--numerics=$2"); shift 2 ;;
+        --no-diagnose) AB_ARGS+=("--no-diagnose"); shift ;;
+        --help|-h) sed -n '2,22p' "$0"; exit 0 ;;
         *) echo "❌ Unknown argument: $1" >&2; exit 1 ;;
     esac
 done
@@ -87,13 +92,13 @@ run_tier0() {
 
 run_tier_ab() {
     echo ""
-    echo "=== Tier 1 + 2: parity and A/B speed ==="
+    echo "=== Tier 1 + 2 + 4: parity, A/B speed, diagnose ==="
     python3 "${SCRIPT_DIR}/ab_gate.py" \
         --baseline-build "${BASELINE_BUILD_DIR}" \
         --candidate-build "${BUILD_DIR}" \
         --out "${OUT_DIR}/ab" \
         "${AB_ARGS[@]}"
-    TIERS_RUN+=(1 2)
+    TIERS_RUN+=(1 2 4)
 }
 
 run_tier3() {

@@ -71,11 +71,12 @@ Korrektheitsbefund.
 **Warum „die Antwort ist noch richtig“ nicht reicht.** Ein Modell beantwortet einfache Prompts
 auch mit einem echten Rechenfehler oft richtig, etwa einer falschen Skalierung in einem selten
 gerouteten Experten oder einem Fehler erst ab 16k Kontext. Richtige Antworten sind deshalb nur
-eine grobe Zusatzprüfung. Der Schutz ist die Deklaration mit Beleg; über jede deklarierte
-Abweichung entscheidet Leon anhand des Paritätsberichts (erste abweichende Stelle je Request,
-`radiance --diagnose --diagnose-baseline`).
+eine grobe Zusatzprüfung. Der Schutz ist die Deklaration mit Beleg. Das Gate (Tier 4,
+`docs/GATE.md`) prüft Token-Parität über die ganze Diagnose-Last; bei deklariertem `reordered`
+besteht ein Kandidat mit abweichenden Tokens mit Vermerk, und Leon entscheidet beim Merge anhand
+des Paritätsberichts (erste abweichende Stelle je Request).
 
-**Draft-Annahme ist ein Pflichtsignal.** Der Diagnose-Lauf misst bei Temperatur 1, der
+**Draft-Annahme ist ein Pflichtsignal.** Der Diagnose-Lauf im Gate misst bei Temperatur 1, der
 Betriebstemperatur, und vergleicht die Annahmerate je Kategorie und Draft-Position mit der
 Baseline. Bitgenaue Builds nehmen identisch an. Meldet der Vergleich `DROPPED` (gepoolte Zählungen,
 z < −3), ist das blockierend, auch für einen deklarierten Hebel: Review des numerischen Pfads und

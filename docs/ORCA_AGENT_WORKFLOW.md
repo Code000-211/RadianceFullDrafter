@@ -69,7 +69,8 @@ Im Orca-Worktree der Automation (Branch `OoguroRyuuya/<name>`, abgeleitet von `o
 candidates/<slug>/
 ├── README.md     Was, warum, erwartete Wirkung als Hypothese (keine erfundenen Messwerte)
 ├── lever.patch   git diff gegen origin/main (git diff origin/main -- <dateien> > lever.patch)
-└── gate.json     optional: {"engine_args": ["--flag"], "engine_env": {"VAR": "1"}}
+└── gate.json     optional: {"engine_args": ["--flag"], "engine_env": {"VAR": "1"},
+                            "numerics": "bitexact" | "reordered"}   (AGENTS.md §3, Numerik)
 ```
 
 - `lever.patch` muss mit `git diff` erzeugt sein. Handgeschriebene Patches mit erfundenen
