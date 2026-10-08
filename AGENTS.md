@@ -12,6 +12,7 @@ Details stehen in genau einem Dokument je Thema:
 | Hardware-Fakten (gemessen) | `HARDWARE_GROUND_TRUTH.md` |
 | Gate: was gemessen wird, Schwellen, Kalibrierung | `docs/GATE.md` |
 | Arbeitsablauf der Orca-Automationen, Hebel-Pakete, Issue-Labels | `docs/ORCA_AGENT_WORKFLOW.md` |
+| Rollen-Prompts der Agents | `docs/agents/<rolle>.md` |
 | Engine-Architektur | `spec.md`, Quellcode |
 | Geschichte (frühere Optimierungen, Postmortems, Hebel-Katalog) | `docs/history/` |
 

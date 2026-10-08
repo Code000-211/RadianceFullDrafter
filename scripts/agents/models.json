@@ -1,0 +1,53 @@
+{
+  "_doc": "Modell- und Grenzen-Konfiguration für scripts/orca_agent.py. Siehe docs/ORCA_AGENT_WORKFLOW.md.",
+  "backends": {
+    "opus": {
+      "cli": "claude",
+      "model": "opus"
+    },
+    "glm": {
+      "cli": "claude",
+      "model": "glm-5.3",
+      "env": {
+        "ANTHROPIC_BASE_URL": "https://api.z.ai/api/anthropic",
+        "ANTHROPIC_DEFAULT_OPUS_MODEL": "glm-5.3",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-5.3",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL": "glm-5.3"
+      },
+      "key_file": "~/.config/zai/api_key",
+      "key_env": "ANTHROPIC_AUTH_TOKEN"
+    },
+    "gemini-flash": {
+      "cli": "agy",
+      "model": null,
+      "_todo": "Exakten Namen aus `agy models` eintragen (Gemini Flash 3.8). null = Backend gesperrt."
+    },
+    "gemini-pro": {
+      "cli": "agy",
+      "model": null,
+      "_todo": "Exakten Namen aus `agy models` eintragen. alphaXiv ist in Antigravity angemeldet."
+    }
+  },
+  "tiers": {
+    "light": "gemini-flash",
+    "medium": "glm",
+    "heavy": "opus"
+  },
+  "roles": {
+    "plan":     {"backend": "opus",       "timeout_min": 60},
+    "code":     {"tiered": true,          "timeout_min": 120},
+    "review":   {"tiered": true, "tier_offset": 1, "timeout_min": 60},
+    "research": {"backend": "gemini-pro", "timeout_min": 60},
+    "audit":    {"backend": "opus",       "timeout_min": 90},
+    "upstream": {"backend": "glm",        "timeout_min": 45}
+  },
+  "limits": {
+    "max_parallel": 5,
+    "max_review_rounds": 2,
+    "max_plan_revisions": 2,
+    "max_no_handoff": 2,
+    "max_open_ideas": 8,
+    "interval_hours": {"research": 24, "audit": 12},
+    "cooldown_min": 60
+  }
+}

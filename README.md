@@ -8,23 +8,33 @@ aktuelle Baseline gemessen, bevor sie nach `main` kommen.
 ## Überblick
 
 ```
-Codeberg-PRs ──► watch_upstream.py (Jev: nützlich?) ──► candidates/upstream/REVIEW.md
-                                                              │ Orca „Upstream-Bewertung“
-GitHub-Issue research:new-lever ──► Orca „Neue Hebel“ ──► Branch + candidates/<slug>/
-                                                              │ status:ready-to-test
-                         lever_queue.py (systemd) ◄───────────┘
+Codeberg-PRs ──► watch_upstream.py (Jev: nützlich?) ──► candidates/upstream/REVIEW.md ──► Agent upstream (Bewertung)
+
+Agent research (Papers, andere Engines) ─┐
+Agent audit (Coverage-Karte des Codes) ──┼─► Issue research:new-lever
+Leon ────────────────────────────────────┘          │
+                                           Agent plan (Opus): verwerfen oder Plan + tier:*
+                                                    │ plan:ready
+                                           Agent code (Modell nach tier) ◄──┐ changes-requested
+                                                    │ needs-code-review     │
+                                           Agent review (eine Stufe höher) ─┘
+                                                    │ status:ready-to-test
+                         lever_queue.py (systemd) ◄─┘
                          ├─ Worktree auf origin/main + Patch, frischer Build
                          ├─ gate_check.sh: Tier 0 statisch · Tier 3 ISA-Diff · A/B Parität+Speed
                          └─ Ergebnis ins Issue ──► PASS: PR (Leon merged)
-                                              └─► FAIL: status:needs-review ──► Orca „Lever-Fix“
+                                              └─► FAIL: status:needs-review ──► Agent code (Gate-Fix)
 ```
+
+Die Agents sind Orca-Automationen; `scripts/orca_agent.py` wählt Arbeit, Modell und Slot.
 
 ## Dokumente
 
 | | |
 |---|---|
 | `AGENTS.md` | Regeln für alle Agents |
-| `docs/ORCA_AGENT_WORKFLOW.md` | Ablauf der Automationen, Hebel-Pakete, Labels |
+| `docs/ORCA_AGENT_WORKFLOW.md` | Ablauf der Automationen, Hebel-Pakete, Labels, Modelle, Grenzen |
+| `docs/agents/` | Rollen-Prompts (plan, code, review, research, audit, upstream) |
 | `docs/GATE.md` | Was das Gate misst und wie streng |
 | `HARDWARE_GROUND_TRUTH.md` | Gemessene Hardware-Werte |
 | `spec.md` | Engine-Architektur (Upstream) |
@@ -35,6 +45,7 @@ GitHub-Issue research:new-lever ──► Orca „Neue Hebel“ ──► Branch
 ```bash
 python3 scripts/lever_queue.py add <slug>          # Hebel aus candidates/<slug> testen
 python3 scripts/lever_queue.py list                # Warteschlange und Ergebnisse
+python3 scripts/orca_agent.py status              # Agent-Slots, Backends, letzte Läufe
 python3 scripts/lever_review.py claims <slug>      # Belege im Hebel-README prüfen
 python3 scripts/lever_review.py similar "<idee>"   # schon versucht?
 python3 scripts/watch_upstream.py --done <PR> --verdict useful|not-useful
