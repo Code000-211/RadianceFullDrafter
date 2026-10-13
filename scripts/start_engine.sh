@@ -51,6 +51,7 @@ export RADIANCE_RIDGEFILL_ALPHA=1.0
 export RADIANCE_ADAPTIVE_SPEC=1
 export RADIANCE_HEAT_RESIDENCY=0
 export GPU_KEEP_ALIVE=0
+export RADIANCE_GDN_ANCHOR="${RADIANCE_GDN_ANCHOR:-1}"
 
 # ==============================================================================
 # GPU Power Profile Governance: Compute Mode & DPM Boost
