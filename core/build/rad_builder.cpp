@@ -984,6 +984,10 @@ int Builder::declare_logits(rad_buf b) {
             prog_.buffers[prog_.logits_buf].name.c_str(), prog_.buffers[b].name.c_str());
         return RAD_E_STATE;
     }
+    if (b == prog_.drafter_tree_buf) {
+        err(RAD_E_INVAL, "declare_logits: buffer %u cannot be the drafter tree buffer", (unsigned)b);
+        return RAD_E_INVAL;
+    }
     prog_.logits_buf = b;
     return RAD_OK;
 }
@@ -1125,11 +1129,12 @@ int Builder::declare_drafter(const RadDrafterDecl* d) {
     int64_t block = d->block;
     if (d->kind == RAD_DRAFT_BLOCK) {
         if (block == 0) block = (int64_t)d->depth + 1;
-        if (block < 2 || block < (int64_t)d->depth || block > (int64_t)d->depth + 1) {
-            err(RAD_E_INVAL, "declare_drafter '%s': block %lld rows at depth %d. The head runs "
-                             "over the last %d rows of the block, so the block is either %d rows "
-                             "(the anchor predicts nothing) or %d (it does).",
-                nm, (long long)block, d->depth, d->depth, d->depth + 1, d->depth);
+        const bool ok_single = (block == (int64_t)d->depth || block == (int64_t)d->depth + 1);
+        const bool ok_multi  = (block >= 2 && ((int64_t)d->depth % (block - 1) == 0));
+        if (block < 2 || (!ok_single && !ok_multi)) {
+            err(RAD_E_INVAL, "declare_drafter '%s': block %lld rows at depth %d. Multi-stage or block drafter "
+                             "requires stages * (block - 1) == depth or block in {depth, depth + 1}.",
+                nm, (long long)block, d->depth);
             return RAD_E_INVAL;
         }
     } else if (block != 0) {
@@ -1150,6 +1155,82 @@ int Builder::declare_drafter(const RadDrafterDecl* d) {
     prog_.drafter.name = nullptr;
     prog_.drafter.block = block;
     if (prog_.drafter.proposal_pitch == 0) prog_.drafter.proposal_pitch = 1;
+    return RAD_OK;
+}
+
+/* THE TREE PROPOSAL BUFFER. Declared beside the linear drafter proposal.
+ * Validates handle, dtype (RAD_I32), rank (2), row width (1 + 2 * capacity),
+ * row count (>= max_seqs), existing BLOCK drafter, capacity (1..16), and absence of duplicates.
+ * Sets Program metadata without touching branched_tree_supported or enabling unsupported paths. */
+int Builder::declare_drafter_tree(rad_buf tree, int64_t node_capacity) {
+    if (finished_) {
+        err(RAD_E_STATE, "declare_drafter_tree after declare finished");
+        return RAD_E_STATE;
+    }
+    if (prog_.drafter_tree_buf != RAD_NULL_HANDLE || prog_.drafter_tree_capacity != 0) {
+        err(RAD_E_STATE, "declare_drafter_tree: tree buffer already declared (%u); duplicate declaration",
+            (unsigned)prog_.drafter_tree_buf);
+        return RAD_E_STATE;
+    }
+    if (prog_.drafter.kind != RAD_DRAFT_BLOCK) {
+        err(RAD_E_INVAL, "declare_drafter_tree: requires an existing RAD_DRAFT_BLOCK drafter");
+        return RAD_E_INVAL;
+    }
+    if (node_capacity < 1 || node_capacity > 16) {
+        err(RAD_E_INVAL, "declare_drafter_tree: node_capacity %lld outside [1, 16]",
+            (long long)node_capacity);
+        return RAD_E_INVAL;
+    }
+    if (tree == RAD_NULL_HANDLE || (size_t)tree >= prog_.buffers.size()) {
+        err(RAD_E_INVAL, "declare_drafter_tree: buffer %u is not a declared buffer", (unsigned)tree);
+        return RAD_E_INVAL;
+    }
+    if (tree == prog_.drafter.proposal) {
+        err(RAD_E_INVAL, "declare_drafter_tree: tree buffer %u cannot be the linear proposal buffer",
+            (unsigned)tree);
+        return RAD_E_INVAL;
+    }
+    if (prog_.logits_buf != RAD_NULL_HANDLE && tree == prog_.logits_buf) {
+        err(RAD_E_INVAL, "declare_drafter_tree: tree buffer %u cannot be the logits buffer",
+            (unsigned)tree);
+        return RAD_E_INVAL;
+    }
+
+    const BufferInfo& buf = prog_.buffers[tree];
+    if (buf.decl.dtype != RAD_I32) {
+        err(RAD_E_INVAL, "declare_drafter_tree: buffer '%s' dtype %u != RAD_I32 (%u)",
+            buf.name.c_str(), buf.decl.dtype, (unsigned)RAD_I32);
+        return RAD_E_INVAL;
+    }
+    if (buf.decl.rank != 2) {
+        err(RAD_E_INVAL, "declare_drafter_tree: buffer '%s' rank %u != 2",
+            buf.name.c_str(), buf.decl.rank);
+        return RAD_E_INVAL;
+    }
+    const int64_t expected_width = 1 + 2 * node_capacity;
+    if (buf.decl.shape[1] != expected_width) {
+        err(RAD_E_INVAL, "declare_drafter_tree: buffer '%s' row width %lld != %lld (1 + 2 * capacity %lld)",
+            buf.name.c_str(), (long long)buf.decl.shape[1], (long long)expected_width, (long long)node_capacity);
+        return RAD_E_INVAL;
+    }
+    if (buf.decl.shape[0] <= 0) {
+        err(RAD_E_INVAL, "declare_drafter_tree: buffer '%s' rows %lld <= 0",
+            buf.name.c_str(), (long long)buf.decl.shape[0]);
+        return RAD_E_INVAL;
+    }
+    if (prog_.ctx.max_seqs > 0 && buf.decl.shape[0] < prog_.ctx.max_seqs) {
+        err(RAD_E_INVAL, "declare_drafter_tree: buffer '%s' rows %lld < max_seqs %lld",
+            buf.name.c_str(), (long long)buf.decl.shape[0], (long long)prog_.ctx.max_seqs);
+        return RAD_E_INVAL;
+    }
+    if (buf.decl.shape[0] > INT64_MAX / (expected_width * (int64_t)sizeof(int32_t))) {
+        err(RAD_E_INVAL, "declare_drafter_tree: buffer '%s' byte size overflows int64",
+            buf.name.c_str());
+        return RAD_E_INVAL;
+    }
+
+    prog_.drafter_tree_buf = tree;
+    prog_.drafter_tree_capacity = node_capacity;
     return RAD_OK;
 }
 
@@ -1620,6 +1701,12 @@ int rad_decl_name_map(RadBuilder* b, const RadNameMap* m) {
     return B(b)->decl_name_map(m);
 }
 
+int rad_disable_branched_tree(RadBuilder* b) {
+    if (!b) return RAD_E_INVAL;
+    B(b)->disable_branched_tree();
+    return RAD_OK;
+}
+
 int rad_declare_logits(RadBuilder* b, rad_buf logits) {
     if (!b) return RAD_E_INVAL;
     return B(b)->declare_logits(logits);
@@ -1628,6 +1715,11 @@ int rad_declare_logits(RadBuilder* b, rad_buf logits) {
 int rad_declare_drafter(RadBuilder* b, const RadDrafterDecl* d) {
     if (!b) return RAD_E_INVAL;
     return B(b)->declare_drafter(d);
+}
+
+int rad_declare_drafter_tree(RadBuilder* b, rad_buf tree, int64_t node_capacity) {
+    if (!b) return RAD_E_INVAL;
+    return B(b)->declare_drafter_tree(tree, node_capacity);
 }
 
 int rad_declare_encoder(RadBuilder* b, const RadEncoderDecl* d) {

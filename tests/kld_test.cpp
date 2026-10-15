@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <random>
 #include <string>
 #include <vector>
@@ -223,6 +224,119 @@ TEST(a_reference_is_written_once_and_read_only_when_complete) {
 }
 
 /* A DOCUMENT WITH NOTHING TO SCORE is refused when it is added, not discovered as a missing row. */
+/* A TAPS RECORDING (--kld-taps): every scored row's tap parts side by side in taps.bf16 at that
+ * row, no logp.f16, a manifest that says both, and a ref run that refuses the directory. Each tap
+ * value encodes its document, position, part and column, so a row written to the wrong place --
+ * or a part to the wrong columns -- fails by value rather than by luck. */
+TEST(a_taps_recording_keeps_each_rows_taps_beside_it) {
+    TmpDir t;
+    const std::string dir = t.path + "/taps";
+    constexpr int64_t PW = 8, P = 3;
+    auto tap_value = [](uint64_t id, int64_t pos, int64_t part, int64_t col) {
+        return (uint16_t)(id * 4096 + (uint64_t)(pos * 64 + part * 8 + col));
+    };
+    const auto la = make_logits(40, 11), lb = make_logits(25, 12);
+
+    Kld rec;
+    CHECK_OK(rec.add_doc("a", kDocA, 8));
+    CHECK_OK(rec.add_doc("b", kDocB, 0));
+    CHECK_OK(rec.set_taps("1,23,lm_head_input", P, PW));
+    CHECK_OK(rec.record_into(dir, V, "taps"));
+    CHECK_EQ(rec.set_taps("1", P, PW), RAD_E_INVAL);          /* after record_into: too late */
+
+    auto feed_taps = [&](uint64_t id, int64_t n, const std::vector<float>& full) {
+        const int64_t cut = n / 2;
+        for (int half = 0; half < 2; ++half) {
+            const int64_t p0 = half ? cut : 0, cnt = half ? n - cut : cut;
+            std::vector<float> part(full.begin() + p0 * V, full.begin() + (p0 + cnt) * V);
+            Shards sh(part, cnt);
+            std::vector<std::vector<uint16_t>> parts((size_t)P, std::vector<uint16_t>((size_t)(cnt * PW)));
+            for (int64_t r = 0; r < cnt; ++r)
+                for (int64_t k = 0; k < P; ++k)
+                    for (int64_t c = 0; c < PW; ++c)
+                        parts[(size_t)k][(size_t)(r * PW + c)] = tap_value(id, p0 + r, k, c);
+            KldTaps tp;
+            tp.part_width = PW;
+            for (auto& v : parts) tp.parts.push_back(v.data());
+            CHECK_OK(rec.score({ { id, p0, cnt, 0 } }, sh.s, &tp));
+        }
+    };
+    {
+        /* a step without its taps is refused, not recorded as zeros */
+        std::vector<float> part(la.begin(), la.begin() + V);
+        Shards sh(part, 1);
+        CHECK_EQ(rec.score({ { 1, 0, 1, 0 } }, sh.s), RAD_E_STATE);
+    }
+    feed_taps(1, 40, la);
+    feed_taps(2, 25, lb);
+    CHECK_OK(rec.finish());
+
+    CHECK(!std::filesystem::exists(dir + "/logp.f16"));
+    std::ifstream in(dir + "/taps.bf16", std::ios::binary);
+    std::vector<uint16_t> taps((size_t)((31 + 24) * P * PW));
+    in.read(reinterpret_cast<char*>(taps.data()), (std::streamsize)(taps.size() * 2));
+    CHECK((size_t)in.gcount() == taps.size() * 2);
+    int64_t wrong = 0;
+    auto check_doc = [&](uint64_t id, int64_t row0, int64_t from, int64_t n) {
+        for (int64_t p = from; p < n - 1; ++p)
+            for (int64_t k = 0; k < P; ++k)
+                for (int64_t c = 0; c < PW; ++c)
+                    wrong += taps[(size_t)((row0 + p - from) * P * PW + k * PW + c)] != tap_value(id, p, k, c);
+    };
+    check_doc(1, 0, 8, 40);
+    check_doc(2, 31, 0, 25);
+    CHECK_EQ(wrong, (int64_t)0);
+
+    std::ifstream mj(dir + "/kld.json");
+    const std::string manifest((std::istreambuf_iterator<char>(mj)), std::istreambuf_iterator<char>());
+    CHECK(manifest.find("\"logp\": false") != std::string::npos);
+    CHECK(manifest.find("\"width\": 24") != std::string::npos);
+    CHECK(manifest.find("\"top\": 32") != std::string::npos);       /* kKldTopTaps */
+    CHECK_EQ((int64_t)std::filesystem::file_size(dir + "/top.bin"), (int64_t)((31 + 24) * kKldTopTaps * 8));
+
+    Kld ref;
+    CHECK(ref.score_against(dir, "", V, "x") < 0);
+
+    /* and taps handed to an ordinary recording are refused, not dropped */
+    Kld plain;
+    CHECK_OK(plain.add_doc("a", kDocA, 8));
+    CHECK_OK(plain.record_into(t.path + "/plain", V, "x"));
+    std::vector<float> part(la.begin(), la.begin() + V);
+    Shards sh(part, 1);
+    std::vector<uint16_t> zeros((size_t)(P * PW));
+    KldTaps tp;
+    tp.part_width = PW;
+    for (int64_t k = 0; k < P; ++k) tp.parts.push_back(zeros.data());
+    CHECK_EQ(plain.score({ { 1, 8, 1, 0 } }, sh.s, &tp), RAD_E_STATE);
+}
+
+/* A CORPUS LINE CAN CARRY ITS TOKEN IDS, for a document whose tokens are known exactly; it needs no
+ * tokenizer, and a line with both a prompt and ids -- or neither -- is refused. */
+TEST(a_corpus_line_can_carry_its_token_ids) {
+    TmpDir t;
+    const std::string corpus = t.path + "/c.jsonl";
+    { std::ofstream o(corpus); o << "{\"ids\": [5, 6, 7, 8], \"score_from\": 1, \"source\": \"x\"}\n"; }
+    Config cfg;
+    cfg.kld_record = t.path + "/r";
+    cfg.kld_corpus = corpus;
+    Kld k;
+    CHECK_OK(k.open(cfg, nullptr, V, "m"));
+    CHECK_EQ(k.n_docs(), (size_t)1);
+    CHECK(k.tokens(0) == std::vector<int32_t>({ 5, 6, 7, 8 }));
+    CHECK_EQ(k.n_rows(), (int64_t)2);
+
+    for (const char* bad : { "{\"ids\": [1, 2], \"prompt\": \"x\"}", "{\"score_from\": 0}",
+                             "{\"ids\": [1, -2]}", "{\"ids\": [1, \"2\"]}" }) {
+        const std::string path = t.path + "/bad.jsonl";
+        { std::ofstream o(path); o << bad << "\n"; }
+        Config c2;
+        c2.kld_record = t.path + "/bad";
+        c2.kld_corpus = path;
+        Kld k2;
+        CHECK_EQ(k2.open(c2, nullptr, V, "m"), RAD_E_FORMAT);
+    }
+}
+
 TEST(a_document_must_leave_a_position_to_score) {
     Kld k;
     CHECK_EQ(k.add_doc("x", { 1 }, 0), RAD_E_INVAL);

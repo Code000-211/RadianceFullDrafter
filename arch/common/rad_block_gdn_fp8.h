@@ -354,7 +354,7 @@ inline int GdnFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, const Con
      * stops at eight tokens a sequence; not RAD_ARCH_TRY, since a plugin without the row is the
      * ordinary case and the pair runs. */
     {
-        const int64_t hi = g.max_tok < 8 ? g.max_tok : 8;
+        const int64_t hi = g.max_tok < 16 ? g.max_tok : 16;
         op_cr = rw(b, RAD_OP(b, "gdn_conv_recurrent_update",
                        RAD_PARAMS(RAD_RANGE("q_len", 1, hi), RAD_INT("head_k", cfg.head_k),
                                   RAD_INT("head_v", cfg.head_v),

@@ -1806,7 +1806,7 @@ extern "C" int r4d_shape_dflash_conv(const RadParam* p, int n_p, int operand,
     /* The entry point's own conditions: NG is H/group and a thread owns eight channels. Checked
      * here so a geometry that cannot be served declines rather than being described into -1. */
     if (H <= 0 || grp <= 0 || NG <= 0 || taps <= 0) return RAD_E_UNSUPPORTED;
-    if (H % (grp * 8) || NG != H / grp) return RAD_E_UNSUPPORTED;
+    if (H % grp || H % 8 || NG != H / grp) return RAD_E_UNSUPPORTED;
     const RadOpdDesc l[] = {
         opd(D, T, H),
         /* delta IS A SLICE of the [T, 2, taps, NG] kernel projection and its row pitch is

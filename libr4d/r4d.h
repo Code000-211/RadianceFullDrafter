@@ -168,10 +168,111 @@ int r4d_gdn_kkt_solve_k128_c64_bf16(const void* k, const void* beta, const void*
 // DFlash2's grouped dynamic depthwise convolution, fused into one pass. The reference builds it as
 // ~6 full [T, H] elementwise passes plus a materialised [T, taps, num_groups, group] coefficient
 // tensor, all consumed exactly once. delta is a SLICE of the [T, 2, taps, NG] kernel projection, so
-// dpitch is 2*taps*NG; out must not alias x. block_size must be a power of two.
+// dpitch is 2*taps*NG; out must not alias x. block_size is any positive value (the draft block,
+// 1 + num_speculative_tokens); the position law is t % block_size.
 int r4d_dflash_conv_t2_g16_bf16(
         const void* x, const void* delta, const void* base, void* out,
         int T, int H, int dpitch, int NG, int taps, int group, int block_size, void* stream);
+
+// DFlash2's draft-step preamble (r4d_dflash2_prep_h128.hip): everything between the fused
+// context K/V projection GEMM and the draft forward, in one launch -- prepare_dflash_inputs
+// (draft query ids / positions / slots, sample tables, context positions / slots, the padding
+// past the live batch), the per-layer K rms norm, NeoX rope on K, and the per-layer paged cache
+// write of K and V (fp8-e4m3 with per-layer scales, or bf16). Replaces ~10 eager launches per
+// step; the GEMM and the hidden norm before it stay. head_dim 128; num_layers <= 8, kv heads <= 8,
+// num_layers * kv_heads <= 64 rows per token; kv-cache groups <= 4; rotary a multiple of 8 up to
+// 128, NeoX only; context parallel size 1 only. Strides are in ELEMENTS of the cache dtype and
+// multiples of 8. Integer logic is bit-identical to the Triton prepare kernel; the norm's
+// sum-of-squares order is unspecified (a rare 1-ulp bf16 flip); the fp8 convert is Triton's
+// exact sequence. Nothing allocates; the grid is host-known, so a launch records into a graph.
+enum { R4D_DFLASH2_PREP_MAX_LAYERS = 8, R4D_DFLASH2_PREP_MAX_GROUPS = 4 };
+struct R4DDflash2PrepArgs {
+    // ---- context K/V, after the fused projection ------------------------------------------
+    const void*  kv;              // [T, num_layers*2*kv_heads*128] bf16; per row, layer-major:
+                                  //   layer l -> K heads then V heads (the F.linear output)
+    long         kv_row_stride;   // elements
+    const void*  k_norm_w;        // [num_layers, 128] bf16, the stacked k_norm weights
+    const void*  cos_sin;         // [max_position, rotary] bf16: cos [0, rotary/2), sin after
+    const float* kv_scales;       // [2*num_layers] fp32 device: k scale of layer l at l, v scale
+                                  //   at num_layers + l (fp8 cache only; null for bf16)
+    void*        cache[R4D_DFLASH2_PREP_MAX_LAYERS];  // per-layer combined (K|V per slot) cache
+    long         cache_block_stride, cache_head_stride, cache_tok_stride;  // elements
+    long         cache_v_offset;  // elements from a slot's K row to its V row (head_dim here)
+    int          layer_group[R4D_DFLASH2_PREP_MAX_LAYERS];  // kv-cache group of each layer
+    int          num_layers, num_kv_heads, rotary;
+    float        eps;
+    // ---- per kv-cache group ---------------------------------------------------------------
+    const int*   block_table[R4D_DFLASH2_PREP_MAX_GROUPS];   // [max_num_reqs, bt_stride] int32,
+                                                              //   batch-row indexed
+    long         bt_stride[R4D_DFLASH2_PREP_MAX_GROUPS];      // columns
+    int          block_size[R4D_DFLASH2_PREP_MAX_GROUPS];     // kernel block size (tokens)
+    long*        query_slot_mapping[R4D_DFLASH2_PREP_MAX_GROUPS];    // [max_num_tokens] int64
+    long*        context_slot_mapping[R4D_DFLASH2_PREP_MAX_GROUPS];  // [max_num_tokens] int64
+    int          num_groups;
+    int          cp_size;         // must be 1
+    // ---- the target step ------------------------------------------------------------------
+    const long*  target_positions;        // [T] int64
+    const int*   target_query_start_loc;  // [num_reqs + 1] int32
+    const int*   idx_mapping;             // [num_reqs] int32, batch row -> request state
+    const long*  last_sampled;            // [max_num_reqs] int64, by request state
+    const int*   next_prefill_tokens;     // [max_num_reqs] int32, by request state
+    const int*   num_sampled;             // [num_reqs] int32
+    const int*   num_rejected;            // [num_reqs] int32
+    const float* temperature_in;          // [max_num_reqs] fp32, by request state
+    const long*  seeds_in;                // [max_num_reqs] int64, by request state
+    // ---- the draft step's inputs (written) ------------------------------------------------
+    int*         input_ids;          // [max_num_tokens] int32
+    long*        positions;          // [max_num_tokens] int64
+    int*         query_start_loc;    // [max_num_reqs + 1] int32
+    int*         seq_lens;           // [max_num_reqs] int32
+    long*        context_positions;  // [max_num_tokens] int64
+    long*        sample_indices;     // [max_num_reqs * num_speculative_steps] int64
+    long*        sample_pos;         // same
+    int*         sample_idx_mapping; // same, int32 (-1 = inert row)
+    float*       temperature_out;    // [max_num_reqs] fp32
+    long*        seeds_out;          // [max_num_reqs] int64
+    // ---- scalars --------------------------------------------------------------------------
+    int          T;                       // scheduled target tokens this step (rows of kv)
+    int          max_query_len;           // largest per-request scheduled token count (host-known: the
+                                          //   Triton wrapper's num_scheduled_tokens.max()); sizes the grid
+    int          num_reqs;
+    int          num_query_per_req;       // 1 + num_speculative_steps
+    int          num_speculative_steps;
+    int          max_num_reqs;
+    int          max_num_tokens;
+    int          max_model_len;
+    int          mask_token_id;           // the parallel-drafting token
+    int          tokens_per_program;      // context tokens one workgroup packs, 1..8; 0 lets the launcher
+                                          //   choose from T and the row count (r4d_dflash2_prep_packing):
+                                          //   one (token, layer, head) item per 16-lane slot, workgroups of
+                                          //   256 / 512 / 1024 threads
+    // ---- instrumentation ------------------------------------------------------------------
+    unsigned long long* prof;             // null in serving. Else [stamps_per_program * programs] device
+                                          //   u64 (thread 0 of each program): 0 entry, 1 request scalars
+                                          //   in, 2 item vectors in (norm scale computed), 3 table entry
+                                          //   and cos/sin in (rope done), 4 stores issued, 5 exit -- from
+                                          //   the constant-rate counter r4d_dflash2_prep_wall_clock_khz
+                                          //   reports; r4d_dflash2_prep_prof_stamps sizes it.
+};
+// Return 0 on success; -1 layer/head geometry, -2 rotary (a multiple of 16 in [16, 128]),
+// -3 cache/group tables, -4 sizes or a missing pointer (num_reqs < 256), -5 tokens_per_program
+// outside [0, 8] or more items than a 1024-thread program holds, -6 alignment, <= -100 a HIP
+// launch error.
+int  r4d_dflash2_prep_h128_fp8kv (const R4DDflash2PrepArgs* a, hipStream_t stream);
+int  r4d_dflash2_prep_h128_bf16kv(const R4DDflash2PrepArgs* a, hipStream_t stream);
+void r4d_dflash2_prep_dims(int* head_dim, int* max_layers, int* max_groups, int* max_rows);
+long r4d_dflash2_prep_wall_clock_khz(int device);
+// The packing a launch runs at for T, rows = num_layers * kv_heads and the caller's pin (0 =
+// the launcher's choice): tokens per program and workgroup threads. The grid is (blocks per
+// request + 1, num_reqs) with blocks = ceil((max_query_len + num_query_per_req) / tpp);
+// program index r * (blocks + 1) + b, the padding program at (blocks, 0). prof holds
+// stamps_per_program u64 per program.
+void r4d_dflash2_prep_packing(int T, int rows, int tokens_per_program, int* tpp, int* threads);
+long r4d_dflash2_prep_programs(int T, int max_query_len, int num_reqs, int num_query_per_req,
+                               int rows, int tokens_per_program);
+long r4d_dflash2_prep_prof_stamps(int T, int max_query_len, int num_reqs, int num_query_per_req,
+                                  int rows, int tokens_per_program);
+int  r4d_dflash2_prep_prof_stamps_per_program(void);
 
 // DFlash2's candidate selector: the low-rank edge scores and the greedy path walk, one workgroup a
 // sequence and no launch between steps. `cand` and `unary` are row_topk's two output planes at row
@@ -319,6 +420,13 @@ void r4d_ar_gather_2rank(long peer_scratch, long my_scratch, long peer_flags, lo
                          long seq_ctrs, long slot_stride16, long inp, long out, long n_elem,
                          long dtype, long rank, long row_elems, long stream, long nblocks,
                          long nthreads, long drain, long acq);
+
+// ---- FullDrafter TP=2 split-vocab helpers (V/2 = 124160 columns per GPU) --------------------
+extern "C" int r4d_rad_ar_gather_logits_tp2(const void* local_logits, void* full_logits,
+                                            int M, int rank, void* instance, void* s);
+extern "C" int r4d_rad_ar_cross_gpu_argmax_tp2(const uint32_t* cand_rank0, const float* val_rank0,
+                                               const uint32_t* cand_rank1, const float* val_rank1,
+                                               uint32_t* out_tokens, int M);
 
 // ---- all-reduce: one-shot, push, 4 or 8 ranks over P2P -------------------------------------
 // The same algorithm at width (r4d_ar_oneshot_Nrank_exact.hip). The peer arguments are ascending

@@ -2893,7 +2893,7 @@ static void dflash_conv_numeric(const Plugin& pl, int64_t nt, int64_t H, int64_t
         for (int64_t h = 0; h < H; ++h) {
             float want = 0;
             for (int64_t k = 0; k < taps; ++k) {
-                if ((t & (bsz - 1)) < k || t - k < 0) continue;
+                if ((t % bsz) < k || t - k < 0) continue;
                 const float coef = h_bf16(hb[(size_t)(k * H + h)]) +
                                    h_bf16(hd[(size_t)(t * dpitch + k * NG + h / group)]);
                 want += coef * h_bf16(hx[(size_t)((t - k) * H + h)]);
@@ -9793,6 +9793,7 @@ static void device_phase(const Plugin& pl) {
          * mask is the block position and a block of 16 exercises a different mask. */
         dflash_conv_numeric(pl, 64, 256, 16, 2, 16);
         dflash_conv_numeric(pl, 32, 5120, 16, 2, 8);
+        dflash_conv_numeric(pl, 64, 64, 16, 2, 7);
     }
 
     /* --- dflash select: NUMERIC, because the thing worth testing is the CHAINING.

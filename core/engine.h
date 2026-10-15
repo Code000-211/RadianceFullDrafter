@@ -177,7 +177,7 @@ private:
     std::unique_ptr<RankBarrier>  barrier_;
     std::atomic<const RadBatch*>  step_batch_{nullptr};
     /* WHAT A RELEASE ASKS THE RANKS TO ISSUE: the forward pass and its sampler (kIssueAll), the
-     * forward pass alone (kIssueModel) -- the next step's, issued before this one is read back --
+     * forward pass alone (kIssueModel) -- a block drafter, or the next step issued ahead --
      * or that pass's sampler alone (kIssueSampler), once the host has committed what the sampler
      * stages from. Every release sets it: one left over from the release before tells a draft
      * pass to issue nothing but its sampler. */
@@ -222,14 +222,15 @@ private:
     void probe_arena_levels();
     int  step_loop();
     /* The step's sampled ids on their way to the host, and then the wait for them and what they
-     * mean. Split so the copy can be issued before draft passes that overwrite the ids and the
-     * wait left until after them. */
+     * mean. The copy and trunk_end_ precede draft passes, so acceptance and commit can overlap
+     * them without waiting for step_end_. */
     int  collect_issue(const RadBatch* b, StepOut& so);
     int  collect_step(const RadBatch* b, StepOut& so);
+    /* The sampled-token readback completes here, before any drafter work. collect_step waits
+     * only for this event; it must not wait for the proposal readback at step_end_. */
     int  mark_trunk_end(const RadBatch* b, StepOut& so);
-    /* WHERE THE STEP ENDS ON THE CARD: after its last draft pass and the copies the host reads,
-     * and before the step issued ahead of it. collect_step waits for this and not for the
-     * stream, so the card runs the next step while the host commits this one. */
+    /* After the last draft pass and its readbacks, before any step issued ahead. Waited after
+     * commit and before publishing proposals, not by collect_step. */
     int  mark_step_end(const RadBatch* b, StepOut& so);
     RadEvent trunk_end_ = nullptr;
     RadEvent step_end_ = nullptr;
@@ -259,6 +260,7 @@ private:
         ~Readback();
     };
     Readback             readback_;
+    Readback             sample_readback_; /* trunk ids must survive the preissued block readback */
     bool serial_drafting() const;
     int  advance_all(int mode, int round, bool from_proposal, int rows = -1);
     int  issue_serial_drafter(int step, const RadBatch* b, StepOut& so);
@@ -297,6 +299,13 @@ private:
      * that fills every drafted position at once. DFlash2 is this shape. */
     rad_buf              raw_buf_ = 0;  /* RADIANCE_DRAFT_RAW's bisect; see run_block_drafter */
     int  run_block_drafter(int step);
+    int  issue_block_drafter(int step, const RadBatch* b, StepOut& so);
+    int  finish_block_drafter(const StepOut& so);
+    int  run_block_pass(const RadBatch* b, int step, const char* what);
+    int  publish_block_drafts(bool committed);
+    std::vector<Scheduler::BlockRow> block_rows_;
+    bool block_preissued_ = false;
+    int  block_rows_count_ = 0;
     /* THE ENCODER DRIVER (spec §11): every media item the scheduler is waiting on, encoded in
      * passes of whole segments and read back into the item, between steps and never inside one.
      * core/engine_mm.cpp. */
@@ -355,6 +364,14 @@ private:
     std::unique_ptr<Kld> kld_;
     std::vector<float*>  kld_host_;
     std::vector<int64_t> kld_vocab0_, kld_width_;   /* per rank read: its logits columns */
+    /* --kld-taps: rank 0's tap buffers (the stream is replicated, so one rank holds all of it),
+     * a pinned block each for a step's rows, and their common row width. */
+    std::vector<rad_buf>   kld_tap_buf_;
+    std::vector<uint16_t*> kld_tap_host_;
+    int64_t                kld_tap_pw_ = 0;
+    rad_buf                kld_anchor_buf_ = RAD_NULL_HANDLE;
+    uint16_t*              kld_anchor_host_ = nullptr;
+    int64_t                kld_anchor_w_ = 0;
     /* The engine half of /server_info, as a JSON object. See the definition in engine.cpp. */
     std::string engine_info() const;
 

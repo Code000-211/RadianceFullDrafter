@@ -34,7 +34,7 @@ static inline int check_dims_once() {
 }
 
 /* Operand indices, from oAttnPaged in r4d_rows.cpp. */
-enum { AP_Q = 0, AP_KV, AP_BT, AP_SEQ, AP_KDS, AP_VDS, AP_CU, AP_OUT };
+enum { AP_Q = 0, AP_KV, AP_BT, AP_SEQ, AP_KDS, AP_VDS, AP_CU, AP_OUT, AP_TREE };
 
 /* Fill R4DArgs from a RadArgs. Returns RAD_OK, or the negative code naming what is wrong.
  *
@@ -110,6 +110,7 @@ static inline int fill_paged(const RadArgs* a, R4DArgs* r, int expect_head_dim) 
 
     const RadTensor* kds = r4d_opt(a, AP_KDS);
     const RadTensor* vds = r4d_opt(a, AP_VDS);
+    const RadTensor* tree = r4d_opt(a, AP_TREE);
 
     std::memset(r, 0, sizeof(*r));
     r->q           = q->data;
@@ -119,7 +120,16 @@ static inline int fill_paged(const RadArgs* a, R4DArgs* r, int expect_head_dim) 
     r->out         = o->data;
     r->k_descale   = kds ? (const float*)kds->data : nullptr;
     r->v_descale   = vds ? (const float*)vds->data : nullptr;
-    r->q_descale   = nullptr;                 /* the query is bf16 in every variant */
+    if (tree && tree->data) {
+        r->q_descale = (const float*)tree->data;
+    } else {
+        long long tree_ptr = 0;
+        if (r4d_geti(a, "tree_ancestors", &tree_ptr) && tree_ptr != 0) {
+            r->q_descale = (const float*)(uintptr_t)tree_ptr;
+        } else {
+            r->q_descale = nullptr;
+        }
+    }
     r->scratch     = a->scratch;
     r->num_seqs    = (int)num_seqs;
     r->cu_q        = ragged ? (const int*)cu->data : nullptr;

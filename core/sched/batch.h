@@ -71,6 +71,11 @@ struct StepEntry {
     /* THIS ENTRY'S LAST ROW IS DRAFT ROUND 1 (RadBatch::draft_out_ids): set on a history-pass
      * entry whose sequence drafts, whose rows end with the position round 1 continues from. */
     bool    draft_out = false;
+    /* A BLOCK QUERY PASS's entry: WHICH ROW OF THE TRUNK STEP'S out_ids its anchor was sampled
+     * at, or -1. Staged into RadBatch::draft_out_ids, one a drafting sequence, so a drafter that
+     * reads the trunk's hidden states at the last accepted position gathers them through a device
+     * index -- the same pointer every step, which is what lets the pass be replayed. */
+    int32_t src_row = -1;
     bool    is_prefill = false;
     bool    produces_token = false;   /* this entry's last token is the sequence's last */
     /* A DEVICE ROW: the card fills its tokens, positions, rollback count and slots from the slot's
@@ -221,9 +226,10 @@ private:
 
         int32_t *h_tok = nullptr, *h_pos = nullptr, *h_cu = nullptr, *h_sid = nullptr;
         int32_t *h_q = nullptr, *h_ctx = nullptr, *h_acc = nullptr, *h_parent = nullptr;
+        uint16_t *h_tree_ancestors = nullptr, *d_tree_ancestors = nullptr;
         int32_t *h_cktok = nullptr, *h_ckslot = nullptr;
         int32_t *h_out = nullptr;      /* [n_out] which of this step's tokens want logits */
-        int32_t *h_dout = nullptr;     /* [n_draft_out] a history pass's round-1 rows */
+        int32_t *h_dout = nullptr;     /* [n_draft_out] round-1 rows, or a query pass's src_row */
         int32_t *d_tok = nullptr, *d_pos = nullptr, *d_cu = nullptr, *d_sid = nullptr;
         int32_t *d_q = nullptr, *d_ctx = nullptr, *d_acc = nullptr, *d_parent = nullptr;
         int32_t *d_cktok = nullptr, *d_ckslot = nullptr;

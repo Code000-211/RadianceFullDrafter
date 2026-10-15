@@ -48,6 +48,7 @@ enum AdvMode : int32_t {
     ADV_HIST   = 3,   /* before the draft head's history pass: the verified positions */
     ADV_ROUND  = 4,   /* before draft round `round` >= 2: the next position, the last proposal */
     ADV_TAKE   = 5,   /* after the last round: its proposal into the state */
+    ADV_BLOCK  = 6,   /* before a stateless block query: the accepted anchor and tap row */
 };
 
 /* One KV group, as the builder stages it for this build. Offsets are bytes into the rank's slab,
@@ -72,6 +73,7 @@ struct AdvanceArgs {
     int32_t n_groups = 0;
     char*   slab = nullptr;   /* this rank's device slab */
     int64_t tok_off = 0, pos_off = 0, ctx_off = 0, acc_off = 0, out_off = 0;
+    int64_t dout_off = 0;     /* [n_seq] the block query's accepted trunk tap rows */
     int64_t sid_off = 0, cu_off = 0, q_off = 0;
     /* [4][row_pitch] int32: device-row flag; the verify step's token row of the row's first
      * verified position; its first sampled row, or -1 for a row that sampled nothing; and one

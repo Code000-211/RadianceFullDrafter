@@ -971,6 +971,71 @@ TEST(the_drafter_name_survives_the_program_leaving_the_builder) {
     CHECK_EQ(p.drafter.depth, 3);
 }
 
+TEST(multistage_block_drafter_geometry_validation) {
+    Registry reg;
+    std::unique_ptr<Builder> b(new Builder(reg, make_meta(), make_ctx()));
+    RadBufDecl bd{};
+    bd.dtype = RAD_I32;
+    bd.shape[0] = 8; bd.shape[1] = 12;
+    bd.rank = 2;
+    bd.kind = RAD_BUF_TRANSIENT;
+    bd.domain = RAD_DOMAIN_DEVICE;
+    rad_buf prop = b->decl_buffer("prop", &bd);
+
+    // Multi-stage: block=7, depth=12 (2 * (7 - 1) == 12)
+    RadDrafterDecl d{};
+    d.kind = RAD_DRAFT_BLOCK;
+    d.name = "fulldrafter";
+    d.depth = 12;
+    d.block = 7;
+    d.proposal = prop;
+    d.mask_token = 151643;
+    CHECK_OK(b->declare_drafter(&d));
+
+    // Multi-stage invalid depth: block=7, depth=13 (13 % 6 != 0)
+    Builder b_inval(reg, make_meta(), make_ctx());
+    rad_buf p_inval = b_inval.decl_buffer("prop", &bd);
+    d.proposal = p_inval;
+    d.depth = 13;
+    d.block = 7;
+    CHECK_EQ(b_inval.declare_drafter(&d), RAD_E_INVAL);
+
+    // Multi-stage invalid block < 2
+    Builder b_b1(reg, make_meta(), make_ctx());
+    d.proposal = b_b1.decl_buffer("prop", &bd);
+    d.depth = 12;
+    d.block = 1;
+    CHECK_EQ(b_b1.declare_drafter(&d), RAD_E_INVAL);
+
+    // Single-stage block == depth + 1 (block=8, depth=7)
+    Builder b_single(reg, make_meta(), make_ctx());
+    d.proposal = b_single.decl_buffer("prop", &bd);
+    d.depth = 7;
+    d.block = 8;
+    CHECK_OK(b_single.declare_drafter(&d));
+
+    // Single-stage block == depth (block=7, depth=7)
+    Builder b_anchor(reg, make_meta(), make_ctx());
+    d.proposal = b_anchor.decl_buffer("prop", &bd);
+    d.depth = 7;
+    d.block = 7;
+    CHECK_OK(b_anchor.declare_drafter(&d));
+
+    // Multi-stage 3-stage: block=7, depth=18 (3 * (7 - 1) == 18)
+    Builder b_s3(reg, make_meta(), make_ctx());
+    d.proposal = b_s3.decl_buffer("prop", &bd);
+    d.depth = 18;
+    d.block = 7;
+    CHECK_OK(b_s3.declare_drafter(&d));
+
+    // Invalid geometry with depth < block: block=10, depth=3
+    Builder b_b10(reg, make_meta(), make_ctx());
+    d.proposal = b_b10.decl_buffer("prop", &bd);
+    d.depth = 3;
+    d.block = 10;
+    CHECK_EQ(b_b10.declare_drafter(&d), RAD_E_INVAL);
+}
+
 
 /* ================================================================== the enum name tables
  *

@@ -65,6 +65,7 @@ struct KVGroupPlan {
     std::string name;
     int         kind = RAD_KV_FULL;
     int64_t     n_layers = 0;
+    int64_t     n_head_kv = 1;
 
     int64_t     block_size = 0;        /* tokens per block, from the resolved kernel */
     int64_t     bytes_per_block = 0;   /* covers EVERY layer bound to the group -- see the note

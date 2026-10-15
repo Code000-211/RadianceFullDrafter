@@ -143,6 +143,7 @@ int KVManager::plan_groups(const std::vector<KVGroupInfo>& groups, const Config&
         p.name     = g.name.empty() ? fmt("kv%zu", i) : g.name;
         p.kind     = g.decl.kind;
         p.n_layers = (int64_t)g.layers.size();
+        p.n_head_kv = g.decl.n_head_kv > 0 ? g.decl.n_head_kv : 1;
 
         if (p.n_layers <= 0) {
             RAD_ERR("KV group '%s': no layers are bound to it. rad_bind_layer_kv() is what tells "

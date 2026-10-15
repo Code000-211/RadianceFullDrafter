@@ -85,6 +85,16 @@ __host__ __device__ __forceinline__ int r4d_attn_used(int ctx, int tile, int spl
     int t = r4d_attn_tiles(ctx, tile), tps = r4d_attn_tps(ctx, tile, splits); return (t + tps - 1) / tps;
 }
 
+__host__ __device__ __forceinline__ bool r4d_attn_is_visible(
+    int k, int prefix_len, int ctx, int klimit, uint16_t mask, int wlo = 0, bool win = false, bool cz = true)
+{
+    if (win && (k < wlo || (!cz && k > klimit))) return false;
+    if (k < prefix_len) return true;
+    if (k >= ctx) return false;
+    const int tree_k = k - prefix_len;
+    return (tree_k < 16) && ((mask & (1u << tree_k)) != 0);
+}
+
 // WIN turns on a sliding window (a.window positions, ending at each row's causal
 // limit). It is a TEMPLATE parameter and defaults to 0, so a full-attention geometry
 // compiles with no bound, no clamp and no extra mask term.
@@ -205,6 +215,10 @@ void r4d_attn_decode_kernel(const R4DArgs a, int splits)
                                                    : ctx - 1);
     const int wlo    = (WIN && a.window > 0) ? (pos - a.window + 1 > 0
                                                ? pos - a.window + 1 : 0) : 0;
+    const int prefix_len = cz ? (ctx - qlen) : ctx;
+    const uint16_t* p_tree = (const uint16_t*)a.q_descale;
+    const uint16_t* seq_tree = (cz && p_tree) ? (p_tree + (size_t)seq * 16) : nullptr;
+    const uint16_t my_ancestor_mask = (qrow < 16 && seq_tree) ? seq_tree[qrow] : (uint16_t)(qrow < 16 ? ((1u << (qrow + 1)) - 1u) : 0xFFFFu);
     float m_ref = -3.0e38f;
     float off   = PSHIFT + 3.0e38f;
     float l_i   = 0.0f;
@@ -383,11 +397,13 @@ void r4d_attn_decode_kernel(const R4DArgs a, int splits)
             for (int e = 0; e < 8; ++e) sc[e] = FOLDQ ? s[e] : s[e] * mul;
 
             const int kbase = k0 + mt * 16 + 8 * h;
-            if (!MSKIP || wave_any(kbase + 7 > klimit) || (WIN && wave_any(kbase < wlo))) {
+            if (!MSKIP || wave_any(kbase + 7 >= prefix_len) || (WIN && wave_any(kbase < wlo || (!cz && kbase + 7 > klimit)))) {
                 #pragma unroll
-                for (int e = 0; e < 8; ++e)
-                    sc[e] = ((kbase + e <= klimit) && (!WIN || kbase + e >= wlo))
+                for (int e = 0; e < 8; ++e) {
+                    const int k = kbase + e;
+                    sc[e] = r4d_attn_is_visible(k, prefix_len, ctx, klimit, my_ancestor_mask, wlo, WIN, (cz != 0))
                           ? sc[e] : -INFINITY;
+                }
             }
             float smax = sc[0];
             #pragma unroll

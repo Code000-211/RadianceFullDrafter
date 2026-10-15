@@ -1,23 +1,30 @@
 /* engine_draft.cpp -- the two drafter drivers (spec §10).
  *
- * A draft head runs as EXTRA PASSES after the trunk step has been sampled and committed, and
- * there are two shapes of it: SERIAL runs `depth` dependent passes, BLOCK runs a context pass and
- * then one pass that fills the whole block. Which one this program has is what the architecture
- * plugin DECLARED (rad_declare_drafter); nothing in this file knows what model it is.
+ * A draft head runs as EXTRA PASSES behind the sampled trunk step, and there are two shapes:
+ * SERIAL runs `depth` dependent passes; BLOCK runs a context pass and one pass that fills the
+ * whole block. Stateless block queries can be issued before commit, so their GPU work overlaps
+ * the host's acceptance and commit. Stateful block passes are issued after commit.
  *
- * Split out of the step loop's file because both drivers are the same idea from the loop's point
- * of view -- one call after commit -- and neither is on the trunk path. See engine_priv.h.
+ * Split out of the step loop's file because both drivers publish their proposals after commit.
+ * See engine_priv.h.
  */
 #include "engine_priv.h"
 
 #include "sched/scheduler.h"
 #include "device/device.h"
 
+#if __has_include("arch/common/rad_tree_candidate.h")
+#include "arch/common/rad_tree_candidate.h"
+#else
+#include "../arch/common/rad_tree_candidate.h"
+#endif
+
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -27,6 +34,18 @@ namespace rad {
 /* Every rank's StepSlots, zeroed, and its sorted end-of-generation ids; and the pinned host copy
  * of rank 0's slots that the step reads back. Once, at start: nothing on the step path allocates. */
 int Engine::step_state_init() {
+    // This driver only publishes proposals declared by the architecture plugin.
+    const char* sidecar = std::getenv("RADIANCE_FULLDRAFTER_SIDECAR");
+    if (sidecar && *sidecar) {
+        if (drafter_.kind != RAD_DRAFT_BLOCK || drafter_.proposal == 0) {
+            RAD_ERR("RADIANCE_FULLDRAFTER_SIDECAR is set, but no block drafter with active proposals "
+                    "was declared (kind=%d, proposal=%d); refusing to silently substitute another drafter",
+                    (int)drafter_.kind, (int)drafter_.proposal);
+            return RAD_E_INVAL;
+        }
+        RAD_INFO("RADIANCE_FULLDRAFTER_SIDECAR connected: drafter '%s' (kind=%d, depth=%d, block=%lld, proposal=%d)",
+                 drafter_.name, (int)drafter_.kind, drafter_.depth, (long long)drafter_.block, (int)drafter_.proposal);
+    }
     std::vector<int32_t> eog;
     if (vocab_) eog = vocab_->eog();
     std::sort(eog.begin(), eog.end());
@@ -55,6 +74,8 @@ int Engine::step_state_init() {
     if (!slots_host_) return RAD_E_NOMEM;
     RAD_TRY(rad_event_create_as(&step_end_, RAD_EVENT_LOCAL | RAD_EVENT_HOST_WAIT));
     RAD_TRY(rad_event_create_as(&trunk_end_, RAD_EVENT_LOCAL | RAD_EVENT_HOST_WAIT));
+
+    radiance::TreeRegistry::instance().clear_all();
     return RAD_OK;
 }
 
@@ -72,6 +93,7 @@ void Engine::step_state_fini() {
     trunk_end_ = nullptr;
     if (step_end_) rad_event_destroy(step_end_);
     step_end_ = nullptr;
+    radiance::TreeRegistry::instance().clear_all();
 }
 
 /* ------------------------------------------------------------------ the serial driver
@@ -328,6 +350,69 @@ int Engine::finish_serial_drafter(const StepOut& so) {
  * They go out through set_draft() like every other proposal, so nothing downstream can tell a
  * block draft from a prompt-lookup one.
  */
+/* Block out_ids name hidden-state rows, not rows for the trunk sampler. Model-only issue skips
+ * its staging gate and leaves the trunk sampler parameters untouched. */
+int Engine::run_block_pass(const RadBatch* db, int step, const char* what) {
+    issue_what_.store(kIssueModel, std::memory_order_release);
+    step_batch_.store(db, std::memory_order_release);
+    barrier_->arrive_and_wait();
+    barrier_->arrive_and_wait();
+    const int s = step_status_.load(std::memory_order_acquire);
+    if (s < 0)
+        RAD_ERR("drafter '%s': %s pass of step %d failed: %s -- the engine cannot continue",
+                drafter_.name, what, step, rad_strerror(s));
+    if (s >= 0 && (int)log_level() >= (int)Log::Trace)
+        dump_buffers(ranks_[0]->ctx, step, std::getenv("RADIANCE_DUMP_BUF"), what);
+    return s;
+}
+
+int Engine::issue_block_drafter(int step, const RadBatch* b, StepOut& so) {
+    block_preissued_ = false;
+    block_rows_count_ = 0;
+    static const bool no_draft = std::getenv("RADIANCE_NO_DRAFT") != nullptr;
+    static const char* const raw_name = std::getenv("RADIANCE_DRAFT_RAW");
+    const bool stateless_block = drafter_.name && std::strcmp(drafter_.name, "fulldrafter") == 0;
+    if (drafter_.kind != RAD_DRAFT_BLOCK || drafter_.depth <= 0 || no_draft ||
+        !stateless_block || raw_name || b->phase != RAD_PHASE_DECODE) return RAD_OK;
+    for (const StepEntry& e : sched_.plan().e)
+        if (!e.produces_token || e.is_prefill) return RAD_OK;
+
+    RAD_TRY(advance_all(ADV_ACCEPT, 0, false));
+    if (!so.rb) RAD_TRY(collect_issue(b, so));
+    const int block = drafter_.block > 0 ? (int)drafter_.block : drafter_.depth + 1;
+    block_rows_.resize((size_t)cfg_.max_seqs);
+    block_rows_count_ = sched_.block_begin(block, drafter_.depth, (int)drafter_.window,
+                                          drafter_.mask_token, block_rows_.data(),
+                                          (int)block_rows_.size(), /*pre_commit=*/true);
+    draft_out_.clear();
+    if (block_rows_count_ > 0) {
+        const RadBatch* qb = sched_.block_query(step);
+        if (!qb) return RAD_E_STATE;
+        RAD_TRY(advance_all(ADV_BLOCK, 0, false));
+        RAD_TRY(run_block_pass(qb, step, "query"));
+        Rank& r0 = *ranks_[0];
+        void* src = r0.ctx.buf_ptr(drafter_.proposal);
+        if (!src) return RAD_E_STATE;
+        const int64_t n_raw = (int64_t)block_rows_count_ * drafter_.depth;
+        int32_t* const raw = readback_.reserve(n_raw);
+        if (!raw) return RAD_E_NOMEM;
+        RAD_TRY(rad_memcpy_async(raw, src, n_raw * 4, r0.ctx.stream()));
+    }
+    block_preissued_ = true;
+    return RAD_OK;
+}
+
+/* step_end_ has completed the proposal readback; commit has resolved the actual anchor. */
+int Engine::finish_block_drafter(const StepOut& so) {
+    (void)so;
+    sched_.block_end();
+    block_preissued_ = false;
+    if (block_rows_count_ <= 0) return RAD_OK;
+    const size_t n_raw = (size_t)block_rows_count_ * (size_t)drafter_.depth;
+    draft_out_.assign(readback_.p, readback_.p + n_raw);
+    return publish_block_drafts(/*committed=*/true);
+}
+
 int Engine::run_block_drafter(int step) {
     if (drafter_.kind != RAD_DRAFT_BLOCK || drafter_.depth <= 0) return RAD_OK;
     static const bool no_draft = std::getenv("RADIANCE_NO_DRAFT") != nullptr;
@@ -338,9 +423,10 @@ int Engine::run_block_drafter(int step) {
      * one its checkpoint was trained in; rad_builder.h has the two conventions side by side, and
      * declare_drafter has already defaulted and checked this. */
     const int block = drafter_.block > 0 ? (int)drafter_.block : drafter_.depth + 1;
-    std::vector<Scheduler::BlockRow> rows((size_t)cfg_.max_seqs);
+    block_rows_.resize((size_t)cfg_.max_seqs);
     const int n = sched_.block_begin(block, steps, (int)drafter_.window, drafter_.mask_token,
-                                  rows.data(), (int)rows.size());
+                                    block_rows_.data(), (int)block_rows_.size());
+    block_rows_count_ = n;
 
     Rank& r0 = *ranks_[0];
     void* prop = r0.ctx.buf_ptr(drafter_.proposal);
@@ -382,44 +468,15 @@ int Engine::run_block_drafter(int step) {
                  r0.program.buffers[drafter_.proposal].name.c_str());
     }
 
-    /* Neither pass samples: the context pass produces no logits at all, and the query pass ends in
-     * the drafter's own selector. A zero-row sampler chain is what the serial driver's history
-     * pass builds for the same reason. */
-    auto run_pass = [&](const RadBatch* db, const char* what) -> int {
-        for (auto& rk : ranks_) {
-            int s = rk->sampler.build_greedy(0);
-            if (s < 0) {
-                RAD_ERR("drafter '%s': build_greedy: %s", drafter_.name, rad_strerror(s));
-                return s;
-            }
-        }
-        issue_what_.store(kIssueAll, std::memory_order_release);
-        step_batch_.store(db, std::memory_order_release);
-        barrier_->arrive_and_wait();
-        barrier_->arrive_and_wait();
-        const int s = step_status_.load(std::memory_order_acquire);
-        if (s < 0)
-            RAD_ERR("drafter '%s': %s pass of step %d failed: %s -- the engine cannot continue",
-                    drafter_.name, what, step, rad_strerror(s));
-        /* THE PROBE HAS TO SEE INSIDE THESE TOO. A drafter that runs as extra passes leaves every
-         * one of its buffers holding the PREVIOUS step's values at the moment the step loop dumps,
-         * so reading them there answers a question one iteration out of date -- which is how a
-         * context pass that produces NaN reads as a query pass that consumes it. */
-        if (s >= 0 && (int)log_level() >= (int)Log::Trace)
-            dump_buffers(r0.ctx, step, std::getenv("RADIANCE_DUMP_BUF"), what);
-        return s;
-    };
-
-    /* THE CONTEXT PASS RUNS EVEN WHEN NOTHING CAN DRAFT. A sequence three chunks into a long
-     * prompt has hidden states the drafter's attention will need and no token to anchor on yet --
-     * exactly the case where skipping it would leave a hole nothing ever fills. */
-    /* RADIANCE_DRAFT_NOCTX=1 runs no context pass at all, so the query block attends to whatever
-     * the drafter's KV cache already held. It answers one question and it is the question that
-     * splits the drafter in half: if acceptance does not move, the conditioning is not reaching
-     * the query pass and the backbone is drafting from the anchor token alone. */
+    /* THE CONTEXT PASS RUNS EVEN WHEN NOTHING CAN DRAFT for KV-backed block drafters (DFlash2).
+     * FullDrafter is stateless (no drafter KV cache; step() at draft_pass < 0 issues zero ops),
+     * so skipping the empty context pass avoids a redundant batch build and worker barrier on
+     * every prefill chunk and decode step. */
     static const bool no_ctx = std::getenv("RADIANCE_DRAFT_NOCTX") != nullptr;
-    if (!no_ctx)
-        if (const RadBatch* cb = sched_.block_context(step)) RAD_TRY(run_pass(cb, "context"));
+    const bool stateless_block = drafter_.name && std::strcmp(drafter_.name, "fulldrafter") == 0;
+    if (!no_ctx && !stateless_block)
+        if (const RadBatch* cb = sched_.block_context(step))
+            RAD_TRY(run_block_pass(cb, step, "context"));
 
     /* EMPTY UNTIL THIS CALL'S QUERY PASS FILLS IT. It is a member, so a query batch that could
      * not be built would otherwise leave the previous step's proposals standing -- published
@@ -428,7 +485,7 @@ int Engine::run_block_drafter(int step) {
     draft_out_.clear();
     if (n > 0) {
         if (const RadBatch* qb = sched_.block_query(step)) {
-            RAD_TRY(run_pass(qb, "query"));
+            RAD_TRY(run_block_pass(qb, step, "query"));
             draft_out_.assign((size_t)n * (size_t)steps, 0);
             const rad_buf from = raw_buf_ ? raw_buf_ : drafter_.proposal;
             void* src = (from == drafter_.proposal) ? prop : r0.ctx.buf_ptr(from);
@@ -452,10 +509,45 @@ int Engine::run_block_drafter(int step) {
     sched_.block_end();
     if (n <= 0 || draft_out_.empty()) return RAD_OK;
 
-    for (int i = 0; i < n; ++i) {
+    return publish_block_drafts(/*committed=*/false);
+}
+
+int Engine::publish_block_drafts(bool committed) {
+    Rank& r0 = *ranks_[0];
+    const int steps = drafter_.depth;
+    for (int i = 0; i < block_rows_count_; ++i) {
         /* A request the sampler will not speculate on gets no draft; see finish_serial_drafter. */
-        if (!r0.sampler.allows_speculation(rows[(size_t)i].seq)) continue;
-        sched_.set_draft(rows[(size_t)i].seq, &draft_out_[(size_t)i * (size_t)steps], steps);
+        if (!r0.sampler.allows_speculation(block_rows_[(size_t)i].seq)) continue;
+
+        const auto& row = block_rows_[(size_t)i];
+        int32_t anchor = row.anchor_token;
+        int64_t pos = row.root_pos;
+        if (committed && !sched_.block_committed_anchor(row.seq, row.slot, &anchor, &pos))
+            continue;
+        if (anchor < 0 || pos < 0 || pos > INT32_MAX - 15) continue;
+        const uint32_t anchor_tok = static_cast<uint32_t>(anchor);
+        const uint32_t root_pos = static_cast<uint32_t>(pos);
+
+        uint32_t draft_tokens[16] = {0};
+        const int max_k = std::min(steps, 15);
+        int copy_k = 0;
+        for (int s = 0; s < max_k; ++s) {
+            const int32_t tok = draft_out_[(size_t)i * (size_t)steps + (size_t)s];
+            if (tok < 0) break;
+            draft_tokens[copy_k++] = static_cast<uint32_t>(tok);
+        }
+        if (copy_k <= 0) continue;
+
+        radiance::CandidateTree ctree;
+        // The proposal buffer is a sequence, not a tree: it carries no parents or
+        // per-branch candidates. An environment override cannot supply that contract.
+        ctree.build_linear(anchor_tok, draft_tokens, copy_k);
+
+        const int rc = sched_.set_draft_tree(row.seq, ctree, root_pos);
+        if (rc < 0 && rc != RAD_E_NOTFOUND) {
+            // Request may have cancelled or unsupported topology; non-fatal for serving.
+            continue;
+        }
     }
     return RAD_OK;
 }

@@ -75,9 +75,9 @@ cmd_start() {
         echo "❌ An engine started by engine_manager is already running; stop it first." >&2
         return 1
     fi
-    if pgrep -f "bin/radiance" >/dev/null 2>&1; then
+    if pgrep -x "radiance" >/dev/null 2>&1; then
         echo "❌ Another radiance process holds the GPUs:" >&2
-        pgrep -a -f "bin/radiance" | cut -c1-160 >&2
+        pgrep -a -x "radiance" | cut -c1-160 >&2
         return 1
     fi
     if [ ! -x "${BUILD_DIR}/bin/radiance" ]; then

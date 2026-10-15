@@ -51,6 +51,7 @@ target architecture. They are reported by the `r4d_*_dims()` accessors in
 | `gemm_w8a8_tiled` | the prefill sibling of the above |
 | `gemm_w8a16_nt_m64` | 8-bit weight, f16 activation, skinny |
 | `gemm_w2a8_nt` | 2-bit weight against int8 activation — the fast draft head |
+| `r4d_fulldrafter_lmhead_gemv12_kernel` | coarse teacher head: SmoothQuant-balanced W4A8 with interleaved unsigned nibbles, 158,924,800 weight bytes per 124160×2560 shard plus row/column scales; exact BF16 rescoring of the selected top 16 retains the original hidden-slot indexing |
 | `gemm_mxfp4a8_nt_m64` | OCP-MXFP4 weight, fp8 activation, skinny |
 | `attn_decode_h128_gqa4_fp8kv` / `..._bf16kv` | head_dim 128, 4 queries per KV head, sliding window — a block-diffusion drafter's geometry. Decode only; `attn_h128_gqa4_have_prefill()` reports 0 so a caller routes long queries to its own fallback |
 | `rowtopk_bf16` / `rowtopk_bf16_chunks` | exact per-row top-K over a bf16 matrix, two-stage |
@@ -66,6 +67,22 @@ target architecture. They are reported by the `r4d_*_dims()` accessors in
 | `qk_norm_rope_gate` | q/k rms-norm, rope and the attention gate in one kernel |
 | `ar_oneshot_{4,8}rank_exact`, `ar_twoshot_{4,8}rank_exact`, `ar_twoshot_4rank_ti8` | the wider-world all-reduces (TP4/TP8), exact and int8-wire |
 | `p2p_copy2d`, `p2p_copy2d_kernel`, `p2p_fence` | strided peer device-to-device copy, through the copy engines or a kernel |
+
+## ALoDLM 2x4 draft window
+
+With `alodlm_max_depth == 1`, FullDrafter uses two four-slot Transformer passes.
+The second pass starts from the normalized hidden state and selected token of
+slot 3; it is not launched when the requested depth is at most four. The engine
+passes that depth in the opaque GPU-parameter tensor's host extent (1–12 means
+a requested depth; the legacy full-struct extent uses `alodlm_pad`): 3 for concurrent decoding, 4 for
+normal single-stream decoding, or 7 after a high-acceptance streak. Seven
+proposals plus the teacher anchor fit one eight-row verification tile.
+
+Standalone callers using the legacy parameter extent and `alodlm_pad == 0`
+request all eight proposals, regardless of batch size. Unsubmitted slots through slot 11 receive the sentinel token.
+Markov pruning retains the exact Cauchy–Schwarz certificate and Top-16 selector;
+this path does not use a quantized shortlist.
+
 ## Asking the library instead of remembering
 
 A geometry could be written down three times: in the entry point's name, in the check the entry

@@ -1292,7 +1292,10 @@ would be the core, which is the one component that must not know.
 what the last one proposed, so tokens arrive one at a time and a pass that declines ends the
 chain. `RAD_DRAFT_BLOCK` runs a context pass and then one pass that fills every drafted position
 at once. MTP, EAGLE and Medusa-serial are all serial; a block-diffusion drafter is block. A plugin
-picks the shape that describes it and needs no core change to do it.
+picks the shape that describes it and needs no core change to do it. A block drafter that reads the
+trunk's hidden states at the last accepted position finds that row on its query pass in
+`RadBatch::draft_out_ids` — a device index, so the pass's operands do not change between steps and
+its recording replays; host-side row numbers baked into operand offsets would not.
 
 Separate draft models would load as a second plugin, which is a design and not a feature. A
 drafter is part of the model's source instead: `rad-convert --draft-model` merges its checkpoint
@@ -1356,6 +1359,41 @@ treating the state cache as a rolling window of `width-1 + num_spec` entries and
 slot the last accepted token left, so a rejection is a change of read offset rather than a
 recompute. The engine's contract is that a linear-attention kernel pair must support this, and it
 is part of the op's schema rather than an assumption.
+
+**A declared tree proposal is additive and optional beside the linear chain.** `RadDrafterDecl`
+remains unchanged and carries linear proposals (`RadDrafterDecl::proposal`). An architecture plugin
+with a block drafter that can propose tree candidates declares a separate output buffer:
+
+```c
+rad_declare_drafter_tree(b, tree_buf, node_capacity);
+```
+
+The declared `tree` buffer is a `RAD_I32` rank-2 tensor with fixed shape
+`[max_seqs, 1 + 2 * node_capacity]` (row width `1 + 2 * node_capacity`), laid out per sequence row as:
+
+```text
+[count, token[node_capacity], parent[node_capacity]]
+```
+
+`node_capacity` is root-inclusive, bounded to `1..16` (`RAD_TREE_MAX_NODES = 16`). Node 0 is the
+root, included in `count`, with parent `-1`. Every non-root node has parent `0 <= parent < node_idx`.
+Unused trailing row entries are ignored.
+
+At declare time, `rad_declare_drafter_tree()` performs strict validation before any state is mutated:
+- Validates that declare is not finished (`RAD_E_STATE`).
+- Validates that no tree buffer was previously declared (`RAD_E_STATE` on duplicate).
+- Validates that an existing `RAD_DRAFT_BLOCK` drafter is declared (`RAD_E_INVAL`).
+- Validates `1 <= node_capacity <= 16` (`RAD_E_INVAL`).
+- Validates the buffer handle, verifying it is a declared buffer different from the linear proposal buffer and logits buffer (`RAD_E_INVAL`).
+- Validates that the buffer has `dtype == RAD_I32`, `rank == 2`, row width exactly `1 + 2 * node_capacity`, row count `shape[0] >= max_seqs` (and `> 0`), and total byte size does not overflow `int64` (`RAD_E_INVAL`).
+
+The logits/tree distinction is independent of declaration order: `rad_declare_logits()` rejects
+an already-declared tree buffer with `RAD_E_INVAL`, without changing Program metadata. Its existing
+`RAD_E_STATE` checks for finished declaration or a second, different logits buffer take precedence.
+
+Declaring a tree records Program metadata (`drafter_tree_buf` and `drafter_tree_capacity`) and claims
+no branching capability. `prog.branched_tree_supported` is untouched by declaration; unsupported
+recurrence/attention topologies continue to veto branching monotonically.
 
 ---
 

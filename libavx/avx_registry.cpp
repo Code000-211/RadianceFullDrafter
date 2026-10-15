@@ -197,7 +197,8 @@ static const RadParamSpec pAttnPaged[] = {
 };
 static const RadOperandSpec oAttnPaged[] = {
     OPD("q"), OPD("kv_cache"), OPD("block_table"), OPD("seqused"),
-    OPD_O("k_descale"), OPD_O("v_descale"), OPD_O("cu_seqlens"), OUT("out")
+    OPD_O("k_descale"), OPD_O("v_descale"), OPD_O("cu_seqlens"), OUT("out"),
+    OPD_O("tree_ancestors")
 };
 static const RadConstraint cPagedBlock[] = { RAD_CGE("block_size", 1) };
 

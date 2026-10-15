@@ -25,12 +25,24 @@
  *                reference saw, not on a re-tokenisation that could differ.
  *   logp.f16     [rows, n_vocab] log-probabilities, f16. Near log p = 0 an f16 has its finest
  *                resolution, and the tail tokens it rounds coarsely carry almost no mass.
- *   top.bin      [rows, kKldTop] {int32 id, f32 log p}: the most likely tokens exactly, which is
+ *   top.bin      [rows, top] {int32 id, f32 log p} (top = kKldTop; kKldTopTaps in a taps recording,
+ *                as kld.json's "top" says): the most likely tokens exactly, which is
  *                where the KL of a confident position lives and where f16 would cost ~1e-4 nats.
  *   rows.f32     [rows, 2] the reference's own next-token NLL and entropy.
  *
  * Document d scores positions [score_from, n - 1): the logits at p predict token p + 1, and the
  * last token predicts nothing in the corpus. Its row r is row0 + p - score_from.
+ *
+ * A TAPS RECORDING (--kld-taps, set_taps) is the same run with the model's hidden states beside
+ * each row instead of the full log-probabilities: a drafter is trained on what the trunk computed
+ * at position p and on the tokens that follow p, and 485 KB of f16 a position over a 248K
+ * vocabulary is what makes millions of positions impossible to keep. So:
+ *   taps.bf16    [rows, parts * part_width] bf16: the plugin's tap buffers side by side, part k at
+ *                columns [k * part_width, (k + 1) * part_width), row r beside top.bin's row r.
+ *   logp.f16     NOT WRITTEN. kld.json says "logp": false, and --kld-ref refuses the directory:
+ *                a reference without the whole distribution cannot be scored against.
+ * tokens.i32, top.bin and rows.f32 are written exactly as above, so a reader can still check every
+ * row's next token against the model's own argmax (top.bin's first entry).
  */
 #pragma once
 #include "rad_core.h"
@@ -61,8 +73,21 @@ struct KldShard {
     int64_t      width  = 0;
 };
 
+/* A step's tap rows, rank 0's: `parts[k]` is the plugin's k-th tap buffer as copied back, rows of
+ * `part_width` bf16 in the same order as the logits block. Only a taps recording passes one. */
+struct KldTaps {
+    std::vector<const uint16_t*> parts;
+    int64_t part_width = 0;
+    const uint16_t* anchor = nullptr;
+    int64_t anchor_width = 0;
+};
+
 /* The exact head kept beside every f16 row. */
 static constexpr int kKldTop = 16;
+/* ...and beside every taps row, where it is the ONLY distribution kept: 32 covers a top_k 20
+ * sampling profile with room, so the probabilities a sampled verify draws from can be rebuilt
+ * exactly from top.bin wherever top_p cuts inside them. */
+static constexpr int kKldTopTaps = 32;
 
 class Kld {
 public:
@@ -78,6 +103,10 @@ public:
      * add_doc() each document, then record_into() creates DIR. score_against() is the ref mode
      * whole. */
     int add_doc(const std::string& source, const std::vector<int32_t>& ids, int64_t score_from);
+    /* Makes record_into() a taps recording: `parts` tap buffers of `part_width` bf16 a row, which
+     * every score() then has to hand over, and no logp.f16. `layers` is what the manifest says the
+     * parts are. Before record_into(); a ref run takes none. */
+    int set_taps(const std::string& layers, int64_t parts, int64_t part_width);
     int record_into(const std::string& dir, int64_t n_vocab, const std::string& model);
     int score_against(const std::string& dir, const std::string& out, int64_t n_vocab,
                       const std::string& model);
@@ -90,8 +119,10 @@ public:
 
     /* A step's scored rows. Rows outside a document's scored range are skipped; a row seen twice
      * -- a document re-prefilled after preemption -- is simply computed again. Blocks until every
-     * row is written (record) or scored (ref): the engine reuses the block at the next step. */
-    int score(const std::vector<KldSpan>& spans, const std::vector<KldShard>& shards);
+     * row is written (record) or scored (ref): the engine reuses the block at the next step.
+     * `taps` is required of a taps recording and refused anywhere else. */
+    int score(const std::vector<KldSpan>& spans, const std::vector<KldShard>& shards,
+              const KldTaps* taps = nullptr);
 
     /* Record: checks every row was written and writes the manifest. Ref: the report, printed and,
      * with --kld-out, written. */
@@ -115,7 +146,8 @@ private:
     int  load_corpus(const Config& cfg, const std::shared_ptr<const Vocab>& vocab);
     int  load_ref(const std::string& dir);
     void size_rows();
-    void record_row(const Job& j, const std::vector<KldShard>& sh, std::vector<uint16_t>& f16);
+    void record_row(const Job& j, const std::vector<KldShard>& sh, std::vector<uint16_t>& f16,
+                    const KldTaps* taps, std::vector<uint16_t>& tap_row);
     void score_row(const Job& j, const std::vector<KldShard>& sh, std::vector<uint16_t>& f16);
     int  report();
 
@@ -126,7 +158,13 @@ private:
     std::vector<int32_t> tokens_;
     std::vector<Doc> docs_;
     int64_t n_rows_ = 0;
-    int fd_logp_ = -1, fd_top_ = -1, fd_rows_ = -1;
+    int fd_logp_ = -1, fd_top_ = -1, fd_rows_ = -1, fd_taps_ = -1;
+
+    /* A taps recording (set_taps): zero parts is an ordinary reference. */
+    std::string taps_layers_;
+    int64_t taps_parts_ = 0, taps_pw_ = 0;
+    int     top_n_ = kKldTop;          /* entries a top.bin row holds */
+    int64_t taps_width() const { return taps_parts_ * taps_pw_; }
 
     /* Per reference row. `seen_` marks a row written or scored; the rest is the ref mode's. */
     std::vector<uint8_t> seen_;

@@ -446,10 +446,12 @@ inline void QsaIndexer::step(RadCtx* c_, const ActFP8& in, const RadBatch* batch
     if (live > c.max_blocks) live = c.max_blocks;
     if (live < 1) live = 1;
 
-    const bool do_part = (g.world == 2) && (T >= 8) && (T % 8 == 0) &&
+    /* Each rank owns ceil(T / 2) rows. Odd batches gather one padded row into
+     * the existing max_tok capacity; downstream attention still consumes T rows. */
+    const int64_t Th = (T + 1) / 2;
+    const bool do_part = (g.world == 2) && (T >= 4) && (2 * Th <= g.max_tok) &&
                          op_score_shard && op_select_shard && op_gather_sel && op_gather_sequ;
     if (do_part) {
-        const int64_t Th = T / 2;
         const int rank = rad_rank(c_);
         const int64_t m_off = (rank == 1) ? Th : 0;
         RAD_ISSUE_N(c_, op_score_shard, Th,
@@ -464,8 +466,8 @@ inline void QsaIndexer::step(RadCtx* c_, const ActFP8& in, const RadBatch* batch
                     praw((const int32_t*)batch->positions + m_off, RAD_I32, Th),
                     praw(batch->cu_seqlens, RAD_I32, S + 1),
                     brows(w.sel_shard, Th), brows(w.nsel, Th), brows(w.sequ_shard, Th));
-        RAD_ISSUE_N(c_, op_gather_sel, Th * (c.topk + 1), brows(w.sel_shard, Th), brows(w.sel, T));
-        RAD_ISSUE_N(c_, op_gather_sequ, Th, brows(w.sequ_shard, Th), brows(w.sequ, T));
+        RAD_ISSUE_N(c_, op_gather_sel, Th * (c.topk + 1), brows(w.sel_shard, Th), brows(w.sel, 2 * Th));
+        RAD_ISSUE_N(c_, op_gather_sequ, Th, brows(w.sequ_shard, Th), brows(w.sequ, 2 * Th));
     } else {
         RAD_ISSUE_N(c_, op_score, T,
                     brows(w.q, T), kv_cache(kv_bk, layer),

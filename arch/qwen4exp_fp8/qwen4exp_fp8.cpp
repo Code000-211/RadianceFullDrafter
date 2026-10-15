@@ -92,6 +92,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <mutex>
 #include <vector>
 
 #include <arch/rad_arch.h>
@@ -103,6 +104,13 @@
 #include <arch/rad_block_ple.h>
 #include <arch/rad_qsa.h>
 #include <arch/rad_block_vit.h>
+#if __has_include("arch/common/rad_block_fulldrafter.h")
+#include "arch/common/rad_block_fulldrafter.h"
+#elif __has_include("../common/rad_block_fulldrafter.h")
+#include "../common/rad_block_fulldrafter.h"
+#else
+#include <arch/rad_block_fulldrafter.h>
+#endif
 
 namespace qwen4exp_fp8 {
 
@@ -183,8 +191,50 @@ struct Model {
     rad_buf     b_mtp_dlog = 0, b_mtp_didx = 0, b_mtp_dval = 0;
     rad_buf     b_mtp_dpair = 0, b_mtp_dgath = 0;
 
+    /* ---- FullDrafter Discrete Two-Stage Drafter (arch/common/rad_block_fulldrafter.h) */
+    bool                         have_fulldrafter = false;
+    radiance::FullDrafterWeights fulldrafter_weights{};
+    rad_buf                      b_fd_hout = 0;
+    rad_buf                      b_fd_logits = 0;
+    rad_buf                      b_fd_cand = 0;
+    rad_buf                      b_fd_unary = 0;
+    rad_buf                      b_fd_dpair = 0;
+    rad_buf                      b_fd_dgath = 0;
+    rad_buf                      b_fd_tokens = 0;
+
+    rad_buf                      b_fd_conv_x = 0;
+    rad_buf                      b_fd_conv_delta = 0;
+    rad_buf                      b_fd_conv_out = 0;
+    rad_weight                   w_fd_conv_base = 0;
+    rad_op                       op_fd_conv = 0;
+
+    rad_op                       op_fd_logits = 0;
+    rad_op                       op_fd_topk = 0;
+    rad_op                       op_fd_gather = 0;
+    rad_op                       op_fd_merge = 0;
+    rad_op                       op_fulldrafter = 0;
+    /* The trunk's taps at each drafting sequence's LAST ACCEPTED row, gathered on the query pass
+     * through RadBatch::draft_out_ids into rows 0..n_seq-1: kld_tap0, kld_tap1 and the lm_head's
+     * input (fd_ctx_src). Persistent like the taps, so the planner's liveness is untouched. */
+    rad_buf                      b_fd_ctx[3] = {};
+    rad_op                       op_fd_ctx[3] = {};
+
     HcEnter   enter;
     HyperConn mixer;            /* the 97th connection: no write half */
+
+    /* ---- --kld-taps (core/kld.h): a drafter's training features, recorded and never served.
+     * Tap k < n_ktap is the block input of layer ktap_layer[k] -- what that layer's attention
+     * connection reads out of the wide stream, `a_x` right after hc_mix.read -- and tap n_ktap is
+     * the hidden state the lm_head reads, `a_x` right after the mixer. Each is gathered at the
+     * step's `out_ids` into its own PERSISTENT buffer, so the engine can copy the rows off after
+     * the step without the buffer planner having given that storage to anything else. Declared
+     * only when RAD_KLD_TAPS names layers, which only `--kld-record --kld-taps` sets. */
+    int        n_ktap = 0;
+    int        ktap_layer[8] = {};
+    rad_buf    b_ktap[9] = {};
+    rad_op     op_ktap[9] = {};
+    rad_buf    b_ktap_anchor = 0;
+    rad_op     op_ktap_anchor = 0;
 
     std::vector<Layer> layers;
 
@@ -201,6 +251,15 @@ struct Model {
 };
 
 static Model g_model[MAX_RANKS];
+static radiance::FullDrafterWeights g_shared_fd_weights;
+static std::mutex                   g_shared_fd_mu;
+static std::string                  g_shared_fd_path;
+static size_t                       g_shared_fd_ranks = 0;
+
+/* Which tap each FullDrafter context input is: the two layer taps, then the lm_head's input. */
+static inline rad_buf fd_ctx_src(const Model& m, int j) {
+    return m.b_ktap[j < 2 ? j : m.n_ktap];
+}
 
 static inline bool is_full_attention(int64_t l, int64_t interval) {
     return interval > 0 && ((l + 1) % interval == 0);
@@ -1227,6 +1286,58 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                     {m.b_hout}, {m.b_logits});
     if (!m.op_embed || !m.op_gather || !m.op_logits) return RAD_E_INVAL;
 
+    /* ---- the recording taps (Model::n_ktap). After op_logits, so the gathers' reads of `a_x`
+     * extend its life to the end of the step rather than shortening anything; their outputs are
+     * persistent and outside the planner's liveness altogether. */
+    const char* fd_env = std::getenv("RADIANCE_FULLDRAFTER");
+    const char* fd_sidecar = std::getenv("RADIANCE_FULLDRAFTER_SIDECAR");
+    const int64_t fd_meta = meta_int2(meta, "qwen4exp.fulldrafter", "fulldrafter", 0);
+    const bool use_fulldrafter = (fd_env && *fd_env && strcmp(fd_env, "0") != 0) ||
+                                 (fd_sidecar && *fd_sidecar) ||
+                                 (fd_meta > 0);
+
+    const char* tl = std::getenv("RAD_KLD_TAPS");
+    if (!tl || !*tl) {
+        const char* tt = std::getenv("RADIANCE_TEACHER_TAPS");
+        if (use_fulldrafter || (tt && *tt)) {
+            tl = g.n_layer >= 24 ? "1,23" : (g.n_layer >= 2 ? "1" : "");
+        }
+    }
+    if (tl && *tl) {
+        for (const char* p = tl; *p;) {
+            while (*p == ',') ++p;
+            if (!*p) break;
+            char* e = nullptr;
+            const long l = std::strtol(p, &e, 10);
+            if (e == p || l < 0 || l >= g.n_layer || m.n_ktap >= 8) {
+                fprintf(stderr, "radiance: qwen4exp: RAD_KLD_TAPS '%s' names a layer outside "
+                                "0..%lld or more than 8 of them\n", tl, (long long)g.n_layer - 1);
+                return RAD_E_INVAL;
+            }
+            m.ktap_layer[m.n_ktap++] = (int)l;
+            p = e;
+        }
+        if (g.act_dtype != RAD_BF16) return RAD_E_UNSUPPORTED;   /* the recording is bf16 */
+        for (int k = 0; k <= m.n_ktap; ++k) {
+            m.b_ktap[k] = decl_b(b, nm.f("kld_tap%d", k), g.act_dtype,
+                                 {g.max_logit_rows, g.n_embd}, RAD_BUF_PERSIST);
+            m.op_ktap[k] = rw(b, RAD_OP(b, "gather_rows",
+                                  RAD_PARAMS(RAD_RANGE("M", 1, g.max_logit_rows),
+                                             RAD_INT("n", g.n_embd), RAD_STR("dtype", g.dtype)),
+                                  RAD_NOWEIGHTS),
+                              {m.a_x.x}, {m.b_ktap[k]});
+            if (!m.b_ktap[k] || !m.op_ktap[k]) return RAD_E_INVAL;
+        }
+        m.b_ktap_anchor = decl_b(b, nm.f("kld_tap_anchor"), g.act_dtype,
+                                 {g.max_logit_rows, g.n_embd}, RAD_BUF_PERSIST);
+        m.op_ktap_anchor = rw(b, RAD_OP(b, "gather_rows",
+                                  RAD_PARAMS(RAD_RANGE("M", 1, g.max_logit_rows),
+                                             RAD_INT("n", g.n_embd), RAD_STR("dtype", g.dtype)),
+                                  RAD_NOWEIGHTS),
+                              {m.a_x.x}, {m.b_ktap_anchor});
+        if (!m.b_ktap_anchor || !m.op_ktap_anchor) return RAD_E_INVAL;
+    }
+
     /* ---- the multi-token-prediction head (arch/common/rad_block_mtp_hc.h).
      *
      * AFTER op_logits, and that is load-bearing rather than tidy. Declaration order IS the buffer
@@ -1241,7 +1352,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * non-zero max_spec on purpose. */
     const int64_t nextn = meta_int2(meta, "qwen4exp.mtp_num_hidden_layers",
                                     "mtp_num_hidden_layers", 0);
-    if (nextn > 0 && g.max_spec > 0) {
+    if (nextn > 0 && g.max_spec > 0 && !use_fulldrafter) {
         const char* mpre = "mtp";
         /* AT max_tok, NOT max_logit_rows. A draft round is one row a sequence, but the history
          * pass that fills the head's own K and V is one row a TOKEN over a whole prefill chunk. */
@@ -1380,6 +1491,150 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                     "speculative window (max_spec 0). Its weights stay off the card");
     }
 
+    /* ---- FullDrafter Block Drafter (arch/common/rad_block_fulldrafter.h) */
+    if (use_fulldrafter) {
+        m.b_fd_hout   = decl_b(b, nm.f("fd_hout"),   g.act_dtype, {g.max_logit_rows, g.n_embd});
+        m.b_fd_logits = decl_b(b, nm.f("fd_logits"), RAD_F32,     {g.max_logit_rows, g.n_vocab});
+        m.b_fd_cand   = decl_b(b, nm.f("fd_cand"),   RAD_I32,     {g.max_logit_rows, 16});
+        m.b_fd_unary  = decl_b(b, nm.f("fd_unary"),  RAD_F32,     {g.max_logit_rows, 16});
+        if (g.world > 1) {
+            m.b_fd_dpair = decl_b(b, nm.f("fd_dpair"), RAD_F32, {g.max_logit_rows, 16, 2});
+            m.b_fd_dgath = decl_b(b, nm.f("fd_dgath"), RAD_F32, {g.max_logit_rows, (int64_t)g.world * 16, 2});
+        }
+        m.b_fd_tokens = decl_b(b, nm.f("fulldrafter_tokens"), RAD_I32, {g.max_seqs, 12});
+
+        // Direct route through teacher LM-head WITHOUT additional final teacher RMSNorm
+        m.op_fd_logits = rw(b, RAD_OP(b, "logits_gemm",
+                                RAD_PARAMS(RAD_RANGE("M", 1, g.max_logit_rows),
+                                           RAD_INT("n_vocab", g.n_vocab), RAD_INT("n_embd", g.n_embd),
+                                           RAD_STR("dtype", g.dtype)),
+                                RAD_WEIGHTS(m.w_lm_head)),
+                            {m.b_fd_hout}, {m.b_fd_logits});
+
+        if (g.world > 1) {
+            m.op_fd_topk = rw(b, RAD_OP(b, "row_topk",
+                                    RAD_PARAMS(RAD_RANGE("M", 1, g.max_logit_rows),
+                                               RAD_INT("N", g.n_vocab),
+                                               RAD_INT("R", 16),
+                                               RAD_INT("vocab_off", g.vocab_off),
+                                               RAD_STR("dtype", g.dtype)),
+                                    RAD_NOWEIGHTS),
+                              {m.b_fd_logits}, {m.b_fd_cand, m.b_fd_unary, m.b_fd_dpair});
+            m.op_fd_gather = rw(b, RAD_OP(b, "all_gather",
+                                     RAD_PARAMS(RAD_INT("world_size", g.world),
+                                                RAD_INT("numel", g.max_logit_rows * 16 * 2),
+                                                RAD_STR("dtype", "f32"),
+                                                RAD_INT("row", 16 * 2)),
+                                     RAD_NOWEIGHTS),
+                                {m.b_fd_dpair}, {m.b_fd_dgath});
+            m.op_fd_merge = rw(b, RAD_OP(b, "row_topk_merge",
+                                    RAD_PARAMS(RAD_RANGE("M", 1, g.max_logit_rows),
+                                               RAD_INT("R", 16),
+                                               RAD_INT("world_size", g.world),
+                                               RAD_STR("dtype", g.dtype)),
+                                    RAD_NOWEIGHTS),
+                               {m.b_fd_dgath}, {m.b_fd_cand, m.b_fd_unary});
+        } else {
+            m.op_fd_topk = rw(b, RAD_OP(b, "row_topk",
+                                    RAD_PARAMS(RAD_RANGE("M", 1, g.max_logit_rows),
+                                               RAD_INT("N", g.n_vocab),
+                                               RAD_INT("R", 16),
+                                               RAD_STR("dtype", g.dtype)),
+                                    RAD_NOWEIGHTS),
+                              {m.b_fd_logits}, {m.b_fd_cand, m.b_fd_unary});
+        }
+
+        /* DFlash2 dynamic convolution kernel hook: H=64, block size 7 (libr4d/r4d_dflash_conv_t2_g16_bf16.hip) */
+        constexpr int64_t conv_h = 64;
+        constexpr int64_t conv_taps = 2;
+        constexpr int64_t conv_group = 16;
+        constexpr int64_t conv_ng = conv_h / conv_group;
+        constexpr int64_t conv_block = 7;
+        const int64_t conv_t = g.max_seqs * conv_block;
+
+        m.b_fd_conv_x     = decl_b(b, nm.f("fd_conv_x"),     g.act_dtype, {conv_t, conv_h});
+        m.b_fd_conv_delta = decl_b(b, nm.f("fd_conv_delta"), g.act_dtype, {conv_t, 2, conv_taps, conv_ng});
+        m.b_fd_conv_out   = decl_b(b, nm.f("fd_conv_out"),   g.act_dtype, {conv_t, conv_h});
+        m.w_fd_conv_base  = decl_w(b, nm.f("conv.w_base"), g.act_dtype, {conv_taps, conv_h},
+                                   RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_model(), /*optional=*/1);
+
+        m.op_fd_conv = rw(b, RAD_OP(b, "dflash_conv",
+                                RAD_PARAMS(RAD_RANGE("T", 1, conv_t),
+                                           RAD_INT("hidden_size", conv_h),
+                                           RAD_INT("taps", conv_taps),
+                                           RAD_INT("group_size", conv_group),
+                                           RAD_INT("NG", conv_ng),
+                                           RAD_INT("block_size", conv_block),
+                                           RAD_STR("dtype", g.dtype)),
+                                RAD_WEIGHTS(m.w_fd_conv_base)),
+                            {m.b_fd_conv_x, m.b_fd_conv_delta}, {m.b_fd_conv_out});
+
+        /* THE TAPS AT THE ACCEPTED ROW. The trunk gathered its taps at every out_ids row of the
+         * verify step; the drafter continues from each sequence's last accepted one, which the
+         * query pass names in RadBatch::draft_out_ids. Gathered through that device index rather
+         * than sliced at host-side row numbers, so the pass's operands are the same every step and
+         * its recording replays. */
+        if (m.n_ktap < 1 || !m.b_ktap_anchor) return RAD_E_INVAL;
+        for (int j = 0; j < 3; ++j) {
+            m.b_fd_ctx[j] = decl_b(b, nm.f("fd_ctx%d", j), g.act_dtype,
+                                   {g.max_seqs, g.n_embd}, RAD_BUF_PERSIST);
+            m.op_fd_ctx[j] = rw(b, RAD_OP(b, "gather_rows",
+                                    RAD_PARAMS(RAD_RANGE("M", 1, g.max_seqs),
+                                               RAD_INT("n", g.n_embd), RAD_STR("dtype", g.dtype)),
+                                    RAD_NOWEIGHTS),
+                                {fd_ctx_src(m, j)}, {m.b_fd_ctx[j]});
+            if (!m.b_fd_ctx[j] || !m.op_fd_ctx[j]) return RAD_E_INVAL;
+        }
+
+        m.op_fulldrafter = rw(b, RAD_OP(b, "fulldrafter_two_stage",
+                                RAD_PARAMS(RAD_RANGE("M", 1, g.max_seqs),
+                                           RAD_INT("block_stride", 7),
+                                           RAD_STR("dtype", "bf16")),
+                                RAD_NOWEIGHTS),
+                            {m.b_fd_ctx[0], m.b_fd_ctx[1], m.b_fd_ctx[2], m.b_ktap_anchor},
+                            {m.b_fd_tokens});
+
+        if (ctx && ctx->shape_probe) {
+            m.have_fulldrafter = true;
+        } else {
+            std::lock_guard<std::mutex> lk(g_shared_fd_mu);
+            std::string err;
+            int requested_ranks = ctx ? ctx->world_size : 2;
+            std::string sc_path = (fd_sidecar && *fd_sidecar) ? fd_sidecar : "";
+            if (g_shared_fd_weights.num_ranks != static_cast<size_t>(requested_ranks) ||
+                g_shared_fd_path != sc_path ||
+                !g_shared_fd_weights[0].d_gpu_pointers) {
+                const bool use_tp2_p2p = (requested_ranks == 2);
+                if (radiance::FullDrafterLoader::load_weights(sc_path, &g_shared_fd_weights, nullptr, &err, requested_ranks)) {
+                    if (!radiance::FullDrafterLoader::load_teacher_matrices("", &g_shared_fd_weights, &err, use_tp2_p2p)) {
+                        rad_note(b, "FullDrafter teacher matrices loading note: %s", err.c_str());
+                    }
+                    g_shared_fd_path  = sc_path;
+                    g_shared_fd_ranks = static_cast<size_t>(requested_ranks);
+                } else {
+                    rad_note(b, "FullDrafter sidecar loading note: %s", err.c_str());
+                }
+                if (ctx && ctx->rank >= 0) (void)hipSetDevice(ctx->rank);
+            }
+            m.have_fulldrafter = true;
+        }
+
+        RadDrafterDecl drf{};
+        drf.name           = "fulldrafter";
+        drf.kind           = RAD_DRAFT_BLOCK;
+        drf.depth          = 12;
+        drf.block          = 7;
+        drf.proposal       = m.b_fd_tokens;
+        drf.proposal_pitch = 12;
+        drf.window         = 0;
+        drf.mask_token     = 151643;
+        RAD_ARCH_TRY(rad_declare_drafter(b, &drf));
+        rad_note(b, "FullDrafter declared: 2 stages of 6 tokens (total 12), discrete chaining");
+        if (nextn > 0) {
+            rad_note(b, "the FullDrafter drafter DISPLACES the MTP head");
+        }
+    }
+
     /* THERE IS NO LAYER BISECT AND THERE ARE NO BLOCK ABLATIONS HERE, which is a deliberate
      * absence rather than an omission.
      *
@@ -1406,6 +1661,107 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 }
 
 
+static void step_fulldrafter_two_stage(RadCtx* c, const RadBatch* batch, Model& m) {
+    if (!m.have_fulldrafter) return;
+    int rank = rad_rank(c);
+    int safe_rank = (rank >= 0 && rank < (int)g_shared_fd_weights.num_ranks) ? rank : 0;
+    const auto& w = g_shared_fd_weights[safe_rank];
+    if (!w.teacher_embedding_table || !w.teacher_lm_head) return;
+
+    uint32_t* out_tokens = static_cast<uint32_t*>(rad_buf_ptr(c, m.b_fd_tokens));
+    if (!out_tokens) return;
+
+    const int64_t n_seq = batch->n_seq;
+    constexpr size_t C = radiance::FullDrafterConfig::CONTEXT_DIM;
+    constexpr size_t W = radiance::FullDrafterConfig::TARGET_WIDTH;
+
+    auto copy_from_buf = [](void* dst, const void* src, size_t bytes) {
+        if (!src || !dst || bytes == 0) return;
+        hipPointerAttribute_t attr{};
+        if (hipPointerGetAttributes(&attr, src) == hipSuccess && attr.type == hipMemoryTypeDevice) {
+            (void)hipMemcpy(dst, src, bytes, hipMemcpyDeviceToHost);
+        } else {
+            (void)hipGetLastError();
+            std::memcpy(dst, src, bytes);
+        }
+    };
+
+    auto copy_to_buf = [](void* dst, const void* src, size_t bytes) {
+        if (!src || !dst || bytes == 0) return;
+        hipPointerAttribute_t attr{};
+        if (hipPointerGetAttributes(&attr, dst) == hipSuccess && attr.type == hipMemoryTypeDevice) {
+            (void)hipMemcpy(dst, src, bytes, hipMemcpyHostToDevice);
+        } else {
+            (void)hipGetLastError();
+            std::memcpy(dst, src, bytes);
+        }
+    };
+
+    for (int64_t s = 0; s < n_seq; ++s) {
+        /* step() has already gathered this sequence's accepted-row taps and its anchor embedding
+         * into row s of fd_ctx* and kld_tap_anchor; the anchor token is its block's first row. */
+        int64_t block_stride = (n_seq > 0) ? (batch->n_tok / n_seq) : 7;
+        int64_t anchor_idx = s * block_stride;
+
+        uint32_t anchor_tok = 0;
+        if (batch->token_ids && anchor_idx < batch->n_tok) {
+            hipPointerAttribute_t attr{};
+            if (hipPointerGetAttributes(&attr, batch->token_ids) == hipSuccess && attr.type == hipMemoryTypeDevice) {
+                int32_t dev_tok = 0;
+                (void)hipMemcpy(&dev_tok, batch->token_ids + anchor_idx, sizeof(int32_t), hipMemcpyDeviceToHost);
+                anchor_tok = static_cast<uint32_t>(dev_tok);
+            } else {
+                (void)hipGetLastError();
+                anchor_tok = static_cast<uint32_t>(batch->token_ids[anchor_idx]);
+            }
+        }
+
+        std::vector<radiance::rad_bf16_t> dummy_ctx(C, 0);
+        for (int j = 0; j < 3; ++j) {
+            const void* p = rad_buf_ptr(c, m.b_fd_ctx[j]);
+            if (p)
+                copy_from_buf(dummy_ctx.data() + j * W,
+                              static_cast<const radiance::rad_bf16_t*>(p) + s * W,
+                              W * sizeof(radiance::rad_bf16_t));
+        }
+        const radiance::rad_bf16_t* ctx_ptr = dummy_ctx.data();
+
+        std::vector<radiance::rad_bf16_t> dummy_anc(W, 0);
+        if (const void* anc_dev = rad_buf_ptr(c, m.b_ktap_anchor))
+            copy_from_buf(dummy_anc.data(), static_cast<const radiance::rad_bf16_t*>(anc_dev) + s * W,
+                          W * sizeof(radiance::rad_bf16_t));
+        const radiance::rad_bf16_t* anc_ptr = dummy_anc.data();
+
+        std::vector<uint32_t> local_tokens(12, 0);
+        if (g_shared_fd_weights.num_ranks == 2) {
+            const auto& w0 = g_shared_fd_weights[0];
+            const auto& w1 = g_shared_fd_weights[1];
+            radiance::FullDrafterExecutor::propose_candidates_tp2(
+                ctx_ptr,
+                anc_ptr,
+                anchor_tok,
+                w0.teacher_lm_head,
+                w1.teacher_lm_head,
+                w.teacher_embedding_table,
+                w,
+                local_tokens.data()
+            );
+        } else {
+            radiance::FullDrafterExecutor::propose_candidates(
+                ctx_ptr,
+                anc_ptr,
+                anchor_tok,
+                w.teacher_lm_head,
+                w.teacher_embedding_table,
+                w,
+                local_tokens.data()
+            );
+        }
+        copy_to_buf(out_tokens + s * 12, local_tokens.data(), 12 * sizeof(uint32_t));
+    }
+}
+
+
 static void step(RadCtx* c, const RadBatch* batch) {
     Model& m = g_model[rad_rank(c)];
     const Geom& g = m.g;
@@ -1417,14 +1773,77 @@ static void step(RadCtx* c, const RadBatch* batch) {
         return;
     }
 
-    /* AN MTP PASS RUNS THE HEAD AND NOTHING ELSE. The trunk already ran this step and left its
-     * wide stream in `h`; the head reads the rows it wants out of it and turns them into either a
-     * draft token or one more position of its own attention history. Which of the two is the SIGN
-     * of `draft_pass`, and rad_block_mtp_hc.h says why there are two.
-     *
-     * Zero is a trunk step, so a zeroed RadBatch runs the model -- the same convention, and for
-     * the same reason, as `num_accepted` (docs/OPS.md). */
+    /* AN MTP OR FULLDRAFTER PASS RUNS THE DRAFTER AND NOTHING ELSE. */
     if (batch->draft_pass != 0) {
+        if (m.have_fulldrafter) {
+            if (batch->draft_pass > 0) {
+                /* THE QUERY PASS'S INPUTS, both read through device indices, so the pass issues
+                 * the same operands every step and its recording replays.
+                 *
+                 * The ANCHOR is the token the trunk just sampled, at the first row of each
+                 * sequence's block (tok_shift 0) -- not the trunk's own input at its last row,
+                 * the token before it, which is what kld_tap_anchor holds after the trunk step.
+                 * Embedded here and gathered at cu_seqlens into kld_tap_anchor rows 0..n_seq-1;
+                 * a --kld-record run copies that buffer after the trunk step and drafts nothing.
+                 *
+                 * The CONTEXT is the trunk's taps at each sequence's last accepted position, the
+                 * row draft_out_ids names (core/sched/scheduler.cpp, block_begin) -- row s holds
+                 * whatever position the verify step happened to put there. */
+                const int64_t n_seq = batch->n_seq;
+                if (n_seq <= 0 || batch->n_draft_out != n_seq || !batch->draft_out_ids) {
+                    rad_step_fail(c, "FullDrafter query pass names no accepted trunk row a "
+                                     "sequence (RadBatch::draft_out_ids)");
+                    return;
+                }
+                int rank = rad_rank(c);
+                int safe_rank = (rank >= 0 && rank < (int)g_shared_fd_weights.num_ranks) ? rank : 0;
+                const auto& w = g_shared_fd_weights[safe_rank];
+                const bool fast_local_anc = false;
+
+                if (!fast_local_anc) {
+                    if (n_seq == 1) {
+                        RAD_ISSUE_N(c, m.op_embed, 1, praw(batch->token_ids, RAD_I32, 1),
+                                    RAD_W(m.w_tok), brows(m.b_ktap_anchor, 1));
+                        if (m.op_embed_ar)
+                            RAD_ISSUE_N(c, m.op_embed_ar, g.n_embd, brows(m.b_ktap_anchor, 1), RAD_NONE);
+                    } else {
+                        RAD_ISSUE_N(c, m.op_embed, T, praw(batch->token_ids, RAD_I32, T),
+                                    RAD_W(m.w_tok), brows(m.a_x.x, T));
+                        if (m.op_embed_ar)
+                            RAD_ISSUE_N(c, m.op_embed_ar, T * g.n_embd, brows(m.a_x.x, T), RAD_NONE);
+                        RAD_ISSUE_N(c, m.op_ktap_anchor, n_seq,
+                                    brows(m.a_x.x, T), praw(batch->cu_seqlens, RAD_I32, n_seq),
+                                    brows(m.b_ktap_anchor, n_seq));
+                    }
+                }
+                if (m.op_fulldrafter && w.d_gpu_pointers && m.b_fd_tokens) {
+                    if (rank == 0 || w.tp2_p2p_active) {
+                        for (int j = 0; j < 3; ++j)
+                            RAD_ISSUE_N(c, m.op_fd_ctx[j], n_seq,
+                                        RAD_B(fd_ctx_src(m, j)), praw(batch->draft_out_ids, RAD_I32, n_seq),
+                                        brows(m.b_fd_ctx[j], n_seq));
+                        /* The parameter operand's count carries scheduled slots (1..12) to the
+                         * launcher; the pointer still names the full struct. Recorded with the
+                         * issue, so tape replay preserves 3/4/7 without a host upload or sync. */
+                        RAD_ISSUE_N(c, m.op_fulldrafter, n_seq,
+                                    brows(m.b_fd_ctx[0], n_seq),
+                                    brows(m.b_fd_ctx[1], n_seq),
+                                    brows(m.b_fd_ctx[2], n_seq),
+                                    brows(m.b_ktap_anchor, n_seq),
+                                    praw(batch->token_ids, RAD_I32, T),
+                                    praw(w.d_gpu_pointers, RAD_BF16, batch->n_spec),
+                                    brows(m.b_fd_tokens, n_seq));
+                    }
+                } else {
+                    for (int j = 0; j < 3; ++j)
+                        RAD_ISSUE_N(c, m.op_fd_ctx[j], n_seq,
+                                    RAD_B(fd_ctx_src(m, j)), praw(batch->draft_out_ids, RAD_I32, n_seq),
+                                    brows(m.b_fd_ctx[j], n_seq));
+                    step_fulldrafter_two_stage(c, batch, m);
+                }
+            }
+            return;
+        }
         if (!m.have_mtp) {
             rad_step_fail(c, "the batch asks for a drafter pass and no drafter is declared: the "
                              "container carries no `mtp.` head, or declare ran at max_spec 0, "
@@ -1462,6 +1881,10 @@ static void step(RadCtx* c, const RadBatch* batch) {
      * into, because the first thing that touches the stream is a gated-residual read. */
     if (m.op_embed_ar)
         RAD_ISSUE_N(c, m.op_embed_ar, T * g.n_embd, brows(m.a_x.x, T), RAD_NONE);
+    if (m.op_ktap_anchor && batch->n_out > 0)
+        RAD_ISSUE_N(c, m.op_ktap_anchor, batch->n_out,
+                    brows(m.a_x.x, T), praw(batch->out_ids, RAD_I32, batch->n_out),
+                    brows(m.b_ktap_anchor, batch->n_out));
     /* The PLE's token-dependent ops (hash, gather, cast, key/value projections) run on Lane 1
      * concurrently with enter, rope, and Layer 0 (Block 0 GDN + MoE), hiding PLE gather latency.
      * ONLY FOR SMALL PASSES: a prefill chunk's PLE GEMMs compete with Block 0 for the CUs instead
@@ -1494,6 +1917,11 @@ static void step(RadCtx* c, const RadBatch* batch) {
         }
         {
             l.hc_mix.read(c, T, 0, T);
+            for (int k = 0; k < m.n_ktap; ++k)
+                if (m.ktap_layer[k] == (int)li && batch->n_out > 0)
+                    RAD_ISSUE_N(c, m.op_ktap[k], batch->n_out,
+                                brows(m.a_x.x, T), praw(batch->out_ids, RAD_I32, batch->n_out),
+                                brows(m.b_ktap[k], batch->n_out));
             if (l.full) {
                 l.qsa.step(c, l.attn.w.h, batch);
                 l.attn.step(c, batch);
@@ -1521,6 +1949,10 @@ static void step(RadCtx* c, const RadBatch* batch) {
         RAD_ISSUE_N(c, m.op_logits, batch->n_out,
                     brows(m.b_hout, batch->n_out), RAD_W(m.w_lm_head),
                     brows(m.b_logits, batch->n_out));
+        if (m.n_ktap > 0)
+            RAD_ISSUE_N(c, m.op_ktap[m.n_ktap], batch->n_out,
+                        brows(m.a_x.x, T), praw(batch->out_ids, RAD_I32, batch->n_out),
+                        brows(m.b_ktap[m.n_ktap], batch->n_out));
     }
 }
 
@@ -1539,8 +1971,16 @@ static void step(RadCtx* c, const RadBatch* batch) {
 static int probe(const RadModelMeta* meta, RadArchProbe* out) {
     if (!meta || !out) return RAD_E_INVAL;
     out->draft_depth = 0;
-    if (meta_int2(meta, "qwen4exp.mtp_num_hidden_layers", "mtp_num_hidden_layers", 0) > 0)
+    const char* fd_env = std::getenv("RADIANCE_FULLDRAFTER");
+    const char* fd_sidecar = std::getenv("RADIANCE_FULLDRAFTER_SIDECAR");
+    const int64_t fd_meta = meta_int2(meta, "qwen4exp.fulldrafter", "fulldrafter", 0);
+    if ((fd_env && *fd_env && strcmp(fd_env, "0") != 0) ||
+        (fd_sidecar && *fd_sidecar) ||
+        (fd_meta > 0)) {
+        out->draft_depth = 12;
+    } else if (meta_int2(meta, "qwen4exp.mtp_num_hidden_layers", "mtp_num_hidden_layers", 0) > 0) {
         out->draft_depth = 3;
+    }
     out->shape_probe_ok = 1;      /* declare() writes scratch under shape_probe */
     return RAD_OK;
 }

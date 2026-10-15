@@ -1,6 +1,6 @@
 /* draft.h -- the speculative draft-depth controller.
  *
- * IT IS STATIC. The depth is `--num-speculative-tokens` and nothing moves it.
+ * Static for serial heads; block-drafter ceilings are 7 slots below five streams, otherwise 3.
  *
  * No dynamic policy sits here, and the reason is structural rather than a tuning failure. The
  * dynamic policy this engine is otherwise modelled on -- a confidence-product gate against a
@@ -36,24 +36,15 @@ public:
     int  configure(const Params& p);
     const Params& params() const { return p_; }
 
-    /* The draft depth for the next step.
-     * When adaptive is false: static depth is preserved (tests and fixed profiles).
-     * When adaptive is true:
-     *   - Floor is ALWAYS 3 (guaranteeing zero regression against Opt33 baseline across all categories).
-     *   - Single stream expands to 4 on high-acceptance streaks (ema_accept_len >= 2.6).
-     *   - Concurrency also adaptively expands to 4 on high-acceptance streaks (batch ema_accept_len >= 2.65),
-     *     maximizing throughput when multiple streams hit high-acceptance patterns. */
+    /* The next-step ceiling. Large block drafters use 7 slots below five streams, otherwise 3.
+     * Smaller static heads keep their configured depth; adaptive serial heads cap concurrency
+     * at 3 and let SchedReq::suggest_depth select the single-stream depth. */
     int  next_depth(int active_seqs = 1) const {
         if (p_.max_depth <= 0) return 0;
+        if (p_.max_depth >= 6) return 8;
         if (!p_.adaptive) return p_.max_depth;
         if (p_.max_depth < 3) return p_.max_depth;
-
-        /* Concurrency: strictly clamp to optimal baseline depth 3.
-         * Depth 3 maximizes tokens accepted per step while keeping latency within bounds. */
-        if (active_seqs > 1) return std::min(p_.max_depth, 3);
-
-        /* Single stream: return full ceiling p_.max_depth so SchedReq::suggest_depth
-         * can dynamically promote to depth 4 or 5 on high-acceptance streaks. */
+        if (active_seqs > 1) return std::min(p_.max_depth, 4);
         return p_.max_depth;
     }
 

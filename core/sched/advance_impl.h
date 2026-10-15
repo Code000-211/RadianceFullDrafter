@@ -146,6 +146,10 @@ RAD_ADV_FN void adv_row(const AdvanceArgs& a, int i) {
     case ADV_TAKE:
         S.tok[a.round] = a.src[(int64_t)i * a.src_pitch];
         return;
+    case ADV_BLOCK:
+        tok[k] = S.tok[0];
+        adv_i32(a, a.dout_off)[i] = rtok + S.acc;
+        return;
     default:
         return;
     }

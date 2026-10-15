@@ -4,6 +4,14 @@
 #include "sampler.h"
 #include "gbnf.h"
 
+#if __has_include("../../arch/common/rad_tree_candidate.h")
+#include "../../arch/common/rad_tree_candidate.h"
+#elif __has_include("../arch/common/rad_tree_candidate.h")
+#include "../arch/common/rad_tree_candidate.h"
+#elif __has_include("arch/common/rad_tree_candidate.h")
+#include "arch/common/rad_tree_candidate.h"
+#endif
+
 #include <algorithm>
 #include <chrono>
 #include <cstring>
@@ -549,10 +557,42 @@ int Sampler::build_step(const std::vector<Request*>& reqs) {
         return true;
     };
 
+    /* Validate the batch transactionally before any row is staged or any automaton pushed. */
+    int64_t total_pos = 0;
     for (Request* r : reqs) {
         if (!r) continue;
-        const SamplingParams& sp = r->sp;
         const int n_pos = r->n_draft + 1;
+        total_pos += n_pos;
+
+        const bool is_tree = r->tree_parent && r->tree_depth;
+        bool tree_branched = false;
+        if (is_tree) {
+            const char* bad = nullptr;
+            if (n_pos > (int)radiance::RAD_TREE_MAX_NODES)
+                bad = "the window exceeds the 16-node tree budget";
+            else if (r->tree_parent[0] != -1 || r->tree_depth[0] != 0)
+                bad = "the root is not parent -1 at depth 0";
+            else if (n_pos > 1 && !r->draft)
+                bad = "the node tokens are absent";
+            for (int j = 1; !bad && j < n_pos; ++j) {
+                const int32_t pj = r->tree_parent[j];
+                if (pj < 0 || pj >= j || r->tree_depth[j] != r->tree_depth[pj] + 1)
+                    bad = "a node's parent is not an earlier node one depth above it";
+                else {
+                    if (pj != j - 1) tree_branched = true;
+                    for (int i = 1; i < j; ++i)
+                        if (r->tree_parent[i] == pj && r->draft[j - 1] == r->draft[i - 1]) {
+                            bad = "two siblings propose the same token";
+                            break;
+                        }
+                }
+            }
+            if (bad) {
+                RAD_ERR("sampler: request %llu's tree window is malformed: %s",
+                        (unsigned long long)r->id, bad);
+                return RAD_E_INVAL;
+            }
+        }
 
         if (n_pos > 1 && !allows_speculation(r->id)) {
             RAD_ERR("sampler: request %llu carries a constraining grammar its backend cannot "
@@ -564,11 +604,38 @@ int Sampler::build_step(const std::vector<Request*>& reqs) {
             return RAD_E_UNSUPPORTED;
         }
 
-        if (n_seq_ + n_pos > cap) {
-            RAD_ERR("sampler: %lld sampled positions exceeds the %lld the arena was sized for",
-                    (long long)(n_seq_ + n_pos), (long long)cap);
-            return RAD_E_FULL;
+        /* A BRANCHED TREE HAS NO GRAMMAR YET. The walk masks draft position k against the
+         * state drafts 0..k-1 leave the automaton in -- a LINEAR conditioning, which is exactly
+         * what a chain's path is. Two nodes that share a parent are conditioned on different
+         * histories, and serving either with the other's mask constrains a branch against a
+         * state its sequence is not in; a correct per-path fork state is separate work, and this
+         * refuses until it exists rather than quietly unconstraining the branch. A LINEAR
+         * topology under a grammar is not refused: its paths are the flat draft, and the walk is
+         * the right one. */
+        if (is_tree && tree_branched) {
+            auto it_g = seqs_.find(r->id);
+            if (it_g != seqs_.end() && it_g->second.grammar) {
+                RAD_ERR("sampler: request %llu carries a constraining grammar over a branched "
+                        "tree window. The grammar's mask for one node is the state its own "
+                        "ancestor path leaves the automaton in, and no per-path fork state "
+                        "exists; refusing the step rather than masking siblings against one "
+                        "branch's state", (unsigned long long)r->id);
+                return RAD_E_UNSUPPORTED;
+            }
         }
+    }
+
+    if (total_pos > cap) {
+        RAD_ERR("sampler: %lld sampled positions exceeds the %lld the arena was sized for",
+                (long long)total_pos, (long long)cap);
+        return RAD_E_FULL;
+    }
+
+    for (Request* r : reqs) {
+        if (!r) continue;
+        const SamplingParams& sp = r->sp;
+        const int n_pos = r->n_draft + 1;
+        const bool is_tree = r->tree_parent && r->tree_depth;
 
         const int64_t n_prompt = (int64_t)r->prompt.size();
         const int64_t n_out    = (int64_t)r->output.size();
@@ -613,7 +680,37 @@ int Sampler::build_step(const std::vector<Request*>& reqs) {
 
         for (int k = 0; k < n_pos; ++k) {
             if (walk && k > 0 && !dead && gr->accept_token(r->draft[k - 1]) < 0) dead = true;
-            if (budget && k > 0) think.push(sp.reasoning, r->draft[k - 1]);
+            /* THE TOKENS IN FRONT OF THE COMMITTED OUTPUT at this row's position: drafts 0..k-1
+             * for a chain, or -- when the window is a tree -- the ANCESTOR PATH of node k,
+             * root's child down to k itself, which is what the token sampled at this row is
+             * conditioned on. Row k IS node k; once two nodes share a parent the physical row
+             * index names another branch's history, so everything below reads `pre` and not
+             * r->draft. The path lands in caller stack storage -- fixed-size, nothing on this
+             * path allocates (spec §3.1) -- and the walk parents down from k, each step to a
+             * strictly smaller node id, so it is bounded by the depth the validation capped. */
+            int32_t        tree_path[radiance::RAD_TREE_MAX_NODES];
+            const int32_t* pre   = r->draft;
+            int64_t        n_pre = k;
+            if (is_tree) {
+                int32_t j = (int32_t)k;
+                int32_t d = r->tree_depth[k];
+                while (d > 0) {
+                    tree_path[d - 1] = r->draft[j - 1];
+                    j = r->tree_parent[j];
+                    --d;
+                }
+                pre   = tree_path;
+                n_pre = r->tree_depth[k];
+            }
+            /* THE REASONING BUDGET AT THIS ROW'S POSITION: the committed reply plus the path in
+             * front of it, recomputed from the committed state per row because a tree's rows are
+             * not one growing prefix. For a chain this is the same sequence of pushes the
+             * incremental walk made -- ReasoningCount is a pure state machine over the tokens
+             * pushed, and drafts 0..k-1 in order is what it saw. */
+            if (budget) {
+                think = st->think;
+                for (int64_t i = 0; i < n_pre; ++i) think.push(sp.reasoning, pre[i]);
+            }
             const int64_t row = n_seq_++;
 
             DeviceSampleParams& p = params_stage_[row];
@@ -622,8 +719,11 @@ int Sampler::build_step(const std::vector<Request*>& reqs) {
             p.seed = sp.seed;
             /* The output position, advanced across the speculative window: draft position k is
              * the (n_out + k)-th token this request will emit, so its randomness is the same
-             * whether it arrived through speculation or one token at a time. */
-            p.pos = (uint64_t)(n_out + k);
+             * whether it arrived through speculation or one token at a time. A tree row takes its
+             * NODE'S DEPTH as that advance -- the position the token it verifies would occupy on
+             * its own branch -- and never the physical row index, which for a sibling is a
+             * position on the other branch. */
+            p.pos = (uint64_t)(n_out + n_pre);
 
             p.temp        = sp.temp;
             p.top_p       = sp.top_p;
@@ -662,23 +762,24 @@ int Sampler::build_step(const std::vector<Request*>& reqs) {
             /* THE HISTORY THE PENALTIES AND DRY READ, staged only for a row that runs one of them
              * -- the copy is scheduler-thread work and the upload is step-path bytes, and neither
              * buys anything for a row that reads none of it. It is the prompt, everything
-             * generated so far and, at draft position k, the k drafted tokens in front of it: the
-             * token sampled there is emitted only if those drafts are, so they are part of the
-             * output it is penalised against, exactly as they would be one token at a time. Oldest
-             * first, truncated to the declared window -- a bound on the buffer, not a policy on
-             * the sampler; penalty_last_n still decides how much of it counts. The row owns its
-             * own row of the plane, so the window starts at offset 0 within it. */
+             * generated so far and the tokens in front of that position (`pre`): the chain's
+             * k drafted tokens, or the tree row's ancestor path. The token sampled there is
+             * emitted only if that path is, so it is part of the output it is penalised against,
+             * exactly as it would be one token at a time. Oldest first, truncated to the declared
+             * window -- a bound on the buffer, not a policy on the sampler; penalty_last_n still
+             * decides how much of it counts. The row owns its own row of the plane, so the window
+             * starts at offset 0 within it. */
             p.hist_off = 0;
             p.hist_len = 0;
             if (pen || dry) {
-                const int64_t len  = n_total + k;
+                const int64_t len  = n_total + n_pre;
                 const int64_t take = std::min<int64_t>(len, cfg_.max_hist);
                 int32_t* h = hist_stage_ + row * cfg_.max_hist;
                 for (int64_t i = 0; i < take; ++i) {
                     const int64_t src = len - take + i;
                     h[i] = src < n_prompt ? r->prompt[(size_t)src]
                          : src < n_total  ? r->output[(size_t)(src - n_prompt)]
-                                          : r->draft[src - n_total];
+                                          : pre[src - n_total];
                 }
                 p.hist_len = (int32_t)take;
                 if (pen) p.flags |= RAD_SP_PENALTY;

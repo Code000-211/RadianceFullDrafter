@@ -540,8 +540,8 @@ extern "C" int r4d_rad_ar_gather_2rank(const RadArgs* a, RadStream s) {
     const long long row = r4d_pgeti_or(a->p, a->n_p, "row", 0);
     if (row < 0 || (row > 0 && (n % row || (row * in->esize) % 16))) return RAD_E_SHAPE;
 
-    /* 16-byte vector stores, and libr4d throws on a message that is not a whole number of them. */
-    if (((long long)n * in->esize) % 16) return RAD_E_ALIGN;
+    /* The 2-rank gather moves 16-byte vectors plus up to three 4-byte tail words. */
+    if (((long long)n * in->esize) % 4) return RAD_E_ALIGN;
     if (!r4d_aligned(x->data, 16) || !r4d_aligned(y->data, 16)) return RAD_E_ALIGN;
 
     R4dArCfg cfgv;
@@ -556,6 +556,115 @@ extern "C" int r4d_rad_ar_gather_2rank(const RadArgs* a, RadStream s) {
                             in->my_seq, in->slot16, r4d_addr(x), r4d_addr(y), n, in->dtype,
                             in->rank, (long)row, (long)(uintptr_t)s, nblocks, cfg->nthreads,
                             cfg->drain, cfg->acq));
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ TP=2 logit gathering & argmax
+ * Helpers for FullDrafter split vocabulary (V/2 = 124160 columns per GPU) on dual R9700. */
+
+/**
+ * Gathers split vocabulary logits from Rank 0 and Rank 1 into full vocabulary logits.
+ * local_logits: [M, 124160] (M rows of 124160 floats)
+ * full_logits:  [M, 248320] (M rows of 248320 floats, Rank 0 followed by Rank 1)
+ */
+extern "C" int r4d_rad_ar_gather_logits_tp2(
+    const void* local_logits,
+    void* full_logits,
+    int M,
+    int rank,
+    void* instance,
+    RadStream s
+) {
+    if (!local_logits || !full_logits || M <= 0 || (rank != 0 && rank != 1) || !instance) return RAD_E_INVAL;
+    const ArInst* in = (const ArInst*)instance;
+    if (in->world != 2) return RAD_E_INVAL;
+
+    const long shard_vocab = 124160;
+    const long n = (long)M * shard_vocab;
+    const long esize = sizeof(float);
+    constexpr int dtype_fp32 = 2; // libr4d code: 0 bf16, 1 fp16, 2 fp32
+
+    const long words16 = n * esize / 16;
+    int nblocks = nb_for(words16, in->nb_cap);
+    if (nblocks > in->max_blocks) nblocks = in->max_blocks;
+
+    R4D_TRY("ar_gather_2rank_logits",
+        r4d_ar_gather_2rank(in->peer_scratch[0], in->my_scratch, in->peer_flags[0], in->my_flags,
+                            in->my_seq, in->slot16, (long)(uintptr_t)local_logits,
+                            (long)(uintptr_t)full_logits, n, dtype_fp32,
+                            rank, (long)shard_vocab, (long)(uintptr_t)s, nblocks, 256,
+                            0, 0));
+    return RAD_OK;
+}
+
+__global__ void r4d_cross_gpu_argmax_tp2_kernel(
+    const uint32_t* __restrict__ cand_rank0,
+    const float*    __restrict__ val_rank0,
+    const uint32_t* __restrict__ cand_rank1,
+    const float*    __restrict__ val_rank1,
+    uint32_t*       __restrict__ out_tokens,
+    int M
+) {
+    int m = blockIdx.x * blockDim.x + threadIdx.x;
+    if (m < M) {
+        const float v0 = val_rank0[m];
+        const float v1 = val_rank1[m];
+        const uint32_t id0 = cand_rank0[m];
+        const uint32_t id1 = cand_rank1[m];
+        if (v1 > v0 || (v1 == v0 && id1 < id0)) {
+            out_tokens[m] = id1;
+        } else {
+            out_tokens[m] = id0;
+        }
+    }
+}
+
+/**
+ * Cross-GPU argmax over dual-GPU split logits shards under TP=2.
+ * Gathers candidate pairs (id, val) from Rank 0 and Rank 1 and selects the winning token ID.
+ * Supports both device buffers (via GPU kernel) and host buffers.
+ */
+extern "C" int r4d_rad_ar_cross_gpu_argmax_tp2(
+    const uint32_t* cand_rank0,    /* [M] winning candidate ID on Rank 0 */
+    const float* val_rank0,        /* [M] max logit on Rank 0 */
+    const uint32_t* cand_rank1,    /* [M] winning candidate ID on Rank 1 */
+    const float* val_rank1,        /* [M] max logit on Rank 1 */
+    uint32_t* out_tokens,          /* [M] winning token IDs */
+    int M
+) {
+    if (!cand_rank0 || !val_rank0 || !cand_rank1 || !val_rank1 || !out_tokens || M <= 0) {
+        return RAD_E_INVAL;
+    }
+
+    hipPointerAttribute_t attr{};
+    bool is_device = false;
+    if (hipPointerGetAttributes(&attr, cand_rank0) == hipSuccess && attr.type == hipMemoryTypeDevice) {
+        is_device = true;
+    } else {
+        (void)hipGetLastError();
+    }
+
+    if (is_device) {
+        int threads = 256;
+        int blocks = (M + threads - 1) / threads;
+        r4d_cross_gpu_argmax_tp2_kernel<<<blocks, threads>>>(
+            cand_rank0, val_rank0, cand_rank1, val_rank1, out_tokens, M
+        );
+        hipError_t err = hipGetLastError();
+        return (err == hipSuccess) ? RAD_OK : RAD_E_DEVICE;
+    }
+
+    for (int m = 0; m < M; ++m) {
+        const float v0 = val_rank0[m];
+        const float v1 = val_rank1[m];
+        const uint32_t id0 = cand_rank0[m];
+        const uint32_t id1 = cand_rank1[m];
+        if (v1 > v0 || (v1 == v0 && id1 < id0)) {
+            out_tokens[m] = id1;
+        } else {
+            out_tokens[m] = id0;
+        }
+    }
     return RAD_OK;
 }
 

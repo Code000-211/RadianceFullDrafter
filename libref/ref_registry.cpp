@@ -246,7 +246,8 @@ static const RadParamSpec pAttnPaged[] = {
 };
 static const RadOperandSpec oAttnPaged[] = {
     OPD("q"), OPD("kv_cache"), OPD("block_table"), OPD("seqused"),
-    OPD_O("k_descale"), OPD_O("v_descale"), OPD_O("cu_seqlens"), OUT("out")
+    OPD_O("k_descale"), OPD_O("v_descale"), OPD_O("cu_seqlens"), OUT("out"),
+    OPD_O("tree_ancestors")
 };
 /* kv_store's, and attn_paged's only in the sense that it is skipped there: `block_size` is
  * RAD_DERIVED on attn_paged now, and a constraint on a derived key the caller did not supply does

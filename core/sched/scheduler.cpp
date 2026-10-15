@@ -214,6 +214,28 @@ Request* Scheduler::find(uint64_t id) {
     return it == by_id_.end() ? nullptr : reqs_[(size_t)it->second]->req.get();
 }
 
+/* A PARENT-BEFORE-CHILD PREFIX IS STILL A TREE. BatchBuilder and accept_tree_greedy bound the
+ * registry's proposal by the planned row count, so the sampler must use that SAME prefix after a
+ * depth/context clamp. Its topology remains in SchedReq storage until the window is retired.
+ * Only a prefix that still branches needs path conditioning: a root or chain keeps the flat
+ * sampler (and its grammar walk), even if discarded nodes of the proposal were siblings. */
+static void publish_tree_meta(Request& r, const SchedReq& s, int32_t n_spec) {
+    const int32_t tree_n_draft = s.has_draft_tree ? static_cast<int32_t>(s.draft_tree.node_count() - 1) : 0;
+    bool branched = false;
+    if (n_spec > 0 && s.tree_branched && n_spec <= tree_n_draft) {
+        if (n_spec == tree_n_draft) branched = true;
+        else for (int32_t j = 2; j <= n_spec; ++j)
+            if (s.tree_node_parent[j] != j - 1) { branched = true; break; }
+    }
+    if (branched) {
+        r.tree_parent = s.tree_node_parent;
+        r.tree_depth  = s.tree_node_depth;
+    } else {
+        r.tree_parent = nullptr;
+        r.tree_depth  = nullptr;
+    }
+}
+
 int Scheduler::set_draft(uint64_t id, const int32_t* tokens, int n) {
     std::lock_guard<std::mutex> lk(mu_);
     auto it = by_id_.find(id);
@@ -231,9 +253,11 @@ int Scheduler::set_draft(uint64_t id, const int32_t* tokens, int n) {
             return RAD_E_STATE;
         }
         for (int i = 0; i < n; ++i) s.draft[i] = tokens[i];
+        s.has_draft_tree = false;  /* promotion must not reuse a previous tree's topology */
         s.n_draft = n;
         s.req->n_draft = n;
         s.req->draft = n ? s.draft : nullptr;
+        publish_tree_meta(*s.req, s, 0);
         return RAD_OK;
     }
 
@@ -243,8 +267,13 @@ int Scheduler::set_draft(uint64_t id, const int32_t* tokens, int n) {
      * fallback as well. */
     if (!s.req->may_speculate) {
         s.n_draft = 0; s.req->n_draft = 0; s.req->draft = nullptr;
+        s.has_draft_tree = false;
+        publish_tree_meta(*s.req, s, 0);
+        radiance::TreeRegistry::instance().clear(id);
         return RAD_OK;
     }
+    s.has_draft_tree = false;
+    radiance::TreeRegistry::instance().clear(id);
 
     int cap = draft_.next_depth((int)running_.size());
     cap = s.suggest_depth(cap, draft_.params().adaptive, running_.size() > 1, draft_.params().max_depth);
@@ -259,6 +288,136 @@ int Scheduler::set_draft(uint64_t id, const int32_t* tokens, int n) {
     s.n_draft = n;
     s.req->n_draft = n;
     s.req->draft = s.draft;
+    publish_tree_meta(*s.req, s, 0);   /* a linear redraft: the flat window the sampler always had */
+    return RAD_OK;
+}
+
+int Scheduler::set_draft_tree(uint64_t id, const radiance::CandidateTree& tree, uint32_t root_pos) {
+    std::lock_guard<std::mutex> lk(mu_);
+    auto it = by_id_.find(id);
+    if (it == by_id_.end()) return RAD_E_NOTFOUND;
+    SchedReq& s = *reqs_[(size_t)it->second];
+
+    const int total_nodes = static_cast<int>(tree.node_count());
+    if (total_nodes <= 1) {
+        s.n_draft = 0; s.has_draft_tree = false;
+        s.req->n_draft = 0; s.req->draft = nullptr;
+        publish_tree_meta(*s.req, s, 0);
+        radiance::TreeRegistry::instance().clear(id);
+        return RAD_OK;
+    }
+
+    if (!s.req->may_speculate) {
+        s.n_draft = 0; s.has_draft_tree = false;
+        s.req->n_draft = 0; s.req->draft = nullptr;
+        publish_tree_meta(*s.req, s, 0);
+        radiance::TreeRegistry::instance().clear(id);
+        return RAD_OK;
+    }
+
+    /* THE TREE IS CHECKED BEFORE ANYTHING OF THIS REQUEST IS WRITTEN, and the check restates what
+     * CandidateTree::add_node enforces rather than trusting the producer's discipline: nodes in
+     * topological order, every non-root's parent an earlier node exactly one depth above it, and
+     * no parent with two children proposing the SAME token -- under sample-and-match a duplicate
+     * sibling is one continuation claimed by two nodes, and which of them verifies is not a
+     * property of the tokens. O(n^2) at n <= 16, once per published window. */
+    if (total_nodes > (int)radiance::RAD_TREE_MAX_NODES) return RAD_E_INVAL;
+    if (tree[0].parent_id != -1 || tree[0].depth != 0) {
+        RAD_ERR("set_draft_tree: request %llu's root is not parent -1 at depth 0",
+                (unsigned long long)id);
+        return RAD_E_INVAL;
+    }
+    bool branched = false;
+    for (int i = 1; i < total_nodes; ++i) {
+        const int32_t p = tree[i].parent_id;
+        if (p < 0 || p >= i || tree[i].depth != tree[p].depth + 1) {
+            RAD_ERR("set_draft_tree: node %d of request %llu has parent %d at depth %d -- not an "
+                    "earlier node one depth above it", i, (unsigned long long)id, p,
+                    tree[i].depth);
+            return RAD_E_INVAL;
+        }
+        if (p != i - 1) branched = true;
+        for (int j = 1; j < i; ++j)
+            if (tree[j].parent_id == p && tree[j].token_id == tree[i].token_id) {
+                RAD_ERR("set_draft_tree: nodes %d and %d of request %llu are siblings proposing "
+                        "the same token %u", j, i, (unsigned long long)id, tree[i].token_id);
+                return RAD_E_INVAL;
+            }
+    }
+
+    // Recurrent/rolling caches replay a linear accepted prefix. They cannot
+    // restore a sibling's parent state from tree metadata alone.
+    if (branched && prog_) {
+        bool supported = prog_->branched_tree_supported;
+        for (const auto& group : prog_->kv_groups)
+            if (group.decl.kind == RAD_KV_LINEAR || group.decl.kind == RAD_KV_CONV)
+                supported = false;
+        if (!supported) {
+            s.n_draft = 0; s.has_draft_tree = false;
+            s.req->n_draft = 0; s.req->draft = nullptr;
+            publish_tree_meta(*s.req, s, 0);
+            radiance::TreeRegistry::instance().clear(id);
+            return RAD_E_UNSUPPORTED;
+        }
+    }
+
+    int n_draft = total_nodes > 1 ? total_nodes - 1 : 0;
+    if (n_draft > RAD_SCHED_MAX_SPEC) n_draft = RAD_SCHED_MAX_SPEC;
+    if (s.req->max_tokens > 0) {
+        const int64_t rem = (int64_t)s.req->max_tokens - (int64_t)s.req->output.size();
+        const int64_t max_d = rem > 1 ? rem - 1 : 0;
+        if (n_draft > max_d) n_draft = (int)max_d;
+    }
+
+    if (n_draft == 0) {
+        s.n_draft = 0; s.has_draft_tree = false;
+        s.req->n_draft = 0; s.req->draft = nullptr;
+        publish_tree_meta(*s.req, s, 0);
+        radiance::TreeRegistry::instance().clear(id);
+        return RAD_OK;
+    }
+
+    // Publish exactly the prefix whose proposal rows are available to verification.
+    radiance::CandidateTree active_tree;
+    for (int i = 0; i <= n_draft; ++i) {
+        const auto& node = tree[i];
+        active_tree.add_node(i, node.parent_id, node.token_id, node.depth, node.score);
+    }
+    s.draft_tree = active_tree;
+    s.has_draft_tree = true;
+    s.n_draft = n_draft;
+
+    uint32_t u_tokens[RAD_SCHED_MAX_SPEC] = {0};
+    active_tree.populate_tensors(u_tokens, s.tree_ancestors, s.tree_positions, root_pos);
+
+    const int populate_count = std::min(n_draft, static_cast<int>(RAD_SCHED_MAX_SPEC));
+    for (int i = 0; i < populate_count; ++i) {
+        s.draft[i] = static_cast<int32_t>(u_tokens[i + 1]);
+        s.tree_parents[i] = tree[i + 1].parent_id;
+    }
+
+    /* THE NODE-INDEXED TOPOLOGY THE SAMPLER STAGES FROM (root included), beside the tokens:
+     * row j's conditioning is its ancestor path, so the parents and depths travel with the
+     * window they describe. */
+    s.tree_node_parent[0] = -1;
+    s.tree_node_depth[0]  = 0;
+    bool active_branched = false;
+    for (int i = 1; i <= n_draft; ++i) {
+        s.tree_node_parent[i] = active_tree[i].parent_id;
+        s.tree_node_depth[i]  = active_tree[i].depth;
+        if (active_tree[i].parent_id != i - 1) active_branched = true;
+    }
+    s.tree_branched = active_branched;
+
+    s.req->n_draft = n_draft;
+    s.req->draft = s.draft;
+    /* A CHAIN PUBLISHES NO TOPOLOGY. Its rows are the flat draft the sampler has always staged,
+     * which is also the only shape a grammar walk is correct for; only a genuinely branched
+     * window switches the sampler to per-node conditioning. */
+    publish_tree_meta(*s.req, s, n_draft);
+
+    radiance::TreeRegistry::instance().set(id, active_tree, root_pos);
+
     return RAD_OK;
 }
 
@@ -357,6 +516,14 @@ void Scheduler::close_request(SchedReq& s, ReqState st, const char* reason, bool
         }
     }
 
+    s.has_draft_tree = false;
+    s.tree_branched = false;
+    if (s.req) {
+        radiance::TreeRegistry::instance().clear(s.req->id);
+        s.req->n_draft = 0;
+        s.req->draft = nullptr;
+        publish_tree_meta(*s.req, s, 0);
+    }
     if (defer_free) {
         if (!s.pending_free) ++n_deferred_;
         s.pending_free = true;
@@ -432,6 +599,12 @@ void Scheduler::take_completed(std::vector<uint64_t>* out) {
 void Scheduler::release_locked(SchedReq& s) {
     if (s.pending_free) { free_kv(s); s.pending_free = false; --n_deferred_; }
     if (s.reap_pending) { s.reap_pending = false; --n_deferred_; }
+    if (s.req) {
+        radiance::TreeRegistry::instance().clear(s.req->id);
+        s.req->n_draft = 0;
+        s.req->draft = nullptr;
+        publish_tree_meta(*s.req, s, 0);
+    }
     by_id_.erase(s.req->id);
     s.req.reset();
     free_slots_.push_back(s.slot);
@@ -722,12 +895,15 @@ void Scheduler::preempt_back() {
     r.n_accepted = 0;
     r.state = ReqState::Preempted;
     s.drafter_reset();
+    s.has_draft_tree = false;
+    radiance::TreeRegistry::instance().clear(r.id);
     /* AND THE REQUEST'S OWN COPY OF THE WINDOW. The sampler stages 1 + Request::n_draft rows for
      * a request (Sampler::build_step), and a drafter may have set it for the step this preemption
      * just took away. Left standing, the recompute's first sampled step stages rows its batch does
      * not have, and every request after it in the step samples another's logits row. */
     r.n_draft = 0;
     r.draft = nullptr;
+    publish_tree_meta(r, s, 0);
     s.running = false;
 
     running_.pop_back();
@@ -905,6 +1081,7 @@ const RadBatch* Scheduler::step() {
                            (req.n_computed + 1 < tgt);
         if (!is_pf) n_running_dec++;
     }
+    (void)n_running_dec;
     int depth = draft_.next_depth((int)running_.size());
     if (running_.size() == 1 && (size_t)running_[0] < reqs_.size() && reqs_[(size_t)running_[0]]) {
         depth = reqs_[(size_t)running_[0]]->suggest_depth(depth, draft_.params().adaptive, false, draft_.params().max_depth);
@@ -1040,6 +1217,9 @@ const RadBatch* Scheduler::step() {
          * where the window is decided. */
         r.n_draft = e.n_spec;
         r.draft   = e.n_spec ? s.draft : nullptr;
+        /* A shortened parent-before-child prefix retains its topology, just as the batch and
+         * acceptance retain the corresponding registry prefix. A prefill has no draft window. */
+        publish_tree_meta(r, s, e.n_spec);
         /* ONE-BASED, AND A PREFILL ROW IS 1 AND NOT 0. See StepEntry: the value is "how many
          * tokens the previous step committed", the rolling windows are read at `n_accepted - 1`,
          * and zero is not a value any of them can read. A prefill has nothing to roll back, which
@@ -1131,6 +1311,7 @@ const RadBatch* Scheduler::step() {
              * set before it was taken off the device. */
             r.n_draft = 0;
             r.draft = nullptr;
+            publish_tree_meta(r, s, 0);
             e.n_accepted = 1;               /* one-based; a prefill rolls nothing back */
             e.conv_cursor = s.conv_cursor;
             e.draft = s.draft;
@@ -1427,7 +1608,8 @@ void Scheduler::promote_next() {
         s.entry_next = -1;
         s.draft_next = 0;
         s.sched_tokens = plan_.e[i].n_tokens;
-        if (s.req) { s.req->n_draft = plan_.e[i].n_spec; s.req->draft = s.draft; }
+        if (s.req) { s.req->n_draft = plan_.e[i].n_spec; s.req->draft = s.draft;
+                     publish_tree_meta(*s.req, s, plan_.e[i].n_spec); }
     }
     ++m_.steps_decode;
     ++m_.steps_ahead;
@@ -1501,6 +1683,7 @@ int Scheduler::commit(const StepResult& res) {
             pc_->commit_checkpoint(r, (int64_t)e.ctx_len + e.ckpt_tok + 1);
 
         if (e.is_prefill) {
+            r.n_accepted = 0;
             r.n_computed += e.n_tokens;
             step_prefill_tok_ += e.n_tokens;
             /* Once, when the prompt is fully placed: the admission accounting the usage block
@@ -1589,7 +1772,9 @@ int Scheduler::commit(const StepResult& res) {
             }
         }
         s.n_draft = 0;
+        s.has_draft_tree = false;  /* a later prompt-lookup draft is a new, linear window */
         r.n_draft = 0;
+        publish_tree_meta(r, s, 0);
         s.entry = -1;
 
         /* A REQUEST THE NEXT STEP CARRIES FINISHES NOW AND KEEPS ITS BLOCKS: that step is writing
@@ -1975,8 +2160,8 @@ void Scheduler::serial_end(int rounds_done) {
 }
 
 /* ------------------------------------------------------------------- the block drafter */
-/* Which sequences the drafter runs over after the step just committed, and which of those may also
- * propose. Called while plan() still describes that step, because the context pass MIRRORS it.
+/* Which sequences the drafter runs over after commit, or pre-commit for stateless decode queries.
+ * Called while plan() still describes that step, because the context pass MIRRORS it.
  *
  * The mirror is exact, including a verify step's rejected suffix. That is not sloppiness, it is
  * what keeps the pass free of coordinates: the drafter reads the trunk's tapped hidden states
@@ -1985,12 +2170,19 @@ void Scheduler::serial_end(int rounds_done) {
  * n_computed + block), which the query pass overwrites before anything reads it -- and the one
  * ensure() below covers them, because n_computed + block is at least the trunk step's own end.
  */
-int Scheduler::block_begin(int block, int depth, int window, int32_t mask, BlockRow* out, int max) {
+int Scheduler::block_begin(int block, int depth, int window, int32_t mask, BlockRow* out, int max,
+                           bool pre_commit) {
     std::lock_guard<std::mutex> lk(mu_);
     block_.clear();
     block_len_ = 0;
     block_depth_ = 0;
-    if (block < 2 || depth <= 0 || depth > block || !out || max <= 0) return 0;
+    const bool ok_geom = (block == depth) || (block >= 2 && (depth % (block - 1) == 0));
+    if (block < 2 || depth <= 0 || !ok_geom || !out || max <= 0) return 0;
+    if (pre_commit) {
+        if (plan_.phase != RAD_PHASE_DECODE) return 0;
+        for (const StepEntry& e : plan_.e)
+            if (!e.produces_token || e.is_prefill) return 0;
+    }
     block_len_   = (int32_t)block;
     block_depth_ = (int32_t)depth;
     block_mask_.assign((size_t)(block - 1), mask);
@@ -2006,8 +2198,14 @@ int Scheduler::block_begin(int block, int depth, int window, int32_t mask, Block
     if (max <= 0) return 0;
 
     int n_draft_rows = 0;
+    int32_t logit_row = 0;
     for (size_t i = 0; i < plan_.e.size(); ++i) {
         const StepEntry& e = plan_.e[i];
+        int32_t row_base = -1;
+        if (e.produces_token) {
+            row_base = logit_row;
+            logit_row += 1 + e.n_spec;
+        }
 
         BlockSeq d{};
         d.seq      = e.seq;
@@ -2039,7 +2237,8 @@ int Scheduler::block_begin(int block, int depth, int window, int32_t mask, Block
          * what the block's attention will read. The high end is this step's own context pass,
          * which has not run yet and is about to cover everything up to the trunk's end. The low
          * end is draft_lo, which is non-zero only after a prefix-cache hit THAT LEFT A HOLE. */
-        const bool have_tok = e.produces_token && !r.output.empty() && r.n_computed >= 1;
+        const bool have_tok = e.produces_token && (pre_commit ||
+                                                  (!r.output.empty() && r.n_computed >= 1));
         /* Where this sequence's draft cache will start once the context pass about to run has
          * written: its own floor, or -- for a sequence that has never had one -- wherever this
          * step's first row sits, which is 0 for an ordinary prefill and the hit length for a
@@ -2054,10 +2253,12 @@ int Scheduler::block_begin(int block, int depth, int window, int32_t mask, Block
          * drafted at all, so it stays healthy while tok/step falls to 1. No counter distinguishes
          * the two, and nothing else tells the five gates below apart. */
         const bool ok_room = n_draft_rows < max;
-        /* The query block writes positions n_computed .. n_computed + block - 1, and none of them
-         * may be at or past the end of the context. */
-        const bool ok_ctx  = ctx_limit_ <= 0 || r.n_computed + block <= ctx_limit_;
-        const bool ok_kv   = ok_room && ok_ctx && kv_->ensure(r.id, r.n_computed + block) >= 0;
+        /* The query block writes positions n_computed .. n_computed + span - 1, and none of them
+         * may be at or past the end of the context. For multi-stage drafters, span is depth. */
+        const int span = std::max(block, depth);
+        const int64_t reserve_end = r.n_computed + (pre_commit ? 1 + e.n_spec : 0) + span;
+        const bool ok_ctx  = ctx_limit_ <= 0 || reserve_end <= ctx_limit_;
+        const bool ok_kv   = ok_room && ok_ctx && kv_->ensure(r.id, reserve_end) >= 0;
         static const bool dbg = [] { const char* v = std::getenv("RADIANCE_DEBUG_DRAFT");
                                      return v && *v && *v != '0'; }();
         if (dbg) {
@@ -2078,14 +2279,30 @@ int Scheduler::block_begin(int block, int depth, int window, int32_t mask, Block
         }
         if (may_draft && have_tok && reach && ok_kv) {
             d.can_draft = true;
+            d.dev = pre_commit;
+            d.dev_tok = row_base;
             out[n_draft_rows].seq  = d.seq;
             out[n_draft_rows].slot = d.slot;
             out[n_draft_rows].card = d.card;
+            out[n_draft_rows].anchor_token = pre_commit ? -1 : r.output.back();
+            out[n_draft_rows].root_pos = pre_commit ? -1 : r.n_computed;
+            d.tap_row = !pre_commit && row_base >= 0 ? row_base + r.n_accepted : -1;
+            out[n_draft_rows].tap_row = d.tap_row;
             ++n_draft_rows;
         }
         block_.push_back(d);
     }
     return n_draft_rows;
+}
+
+bool Scheduler::block_committed_anchor(uint64_t seq, int32_t slot, int32_t* token,
+                                       int64_t* pos) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    const Request* r = live_req(slot, seq);
+    if (!r || r->state != ReqState::Running || r->output.empty()) return false;
+    *token = r->output.back();
+    *pos = r->n_computed;
+    return true;
 }
 
 const Request* Scheduler::block_req(const BlockSeq& d) const { return live_req(d.slot, d.seq); }
@@ -2146,12 +2363,19 @@ const RadBatch* Scheduler::block_query(int step) {
     block_plan_.draft_pass = 1;
     block_plan_.tok_shift  = 0;            /* the anchor sits at its own row; see StepPlan */
     block_plan_.e.reserve(block_.size());
+    const bool multi_seq = running_.size() > 1;
+    const int policy_depth = std::min(depth, draft_.next_depth((int)running_.size()));
 
     int32_t row = 0;
     for (const BlockSeq& d : block_) {
         if (!d.can_draft) continue;
         const Request* rq = block_req(d);
         if (!rq) return nullptr;   /* see block_context */
+        const SchedReq& s = *reqs_[(size_t)d.slot];
+        const int scheduled_k = s.suggest_depth(policy_depth, draft_.params().adaptive,
+                                               multi_seq, draft_.params().max_depth);
+        /* Query passes carry the requested proposal count, not verified draft rows. */
+        block_plan_.n_spec = std::max(block_plan_.n_spec, scheduled_k);
         StepEntry e;
         e.req        = rq;
         e.seq        = d.seq;
@@ -2166,6 +2390,9 @@ const RadBatch* Scheduler::block_query(int step) {
         e.draft      = block_mask_.data();
         e.n_draft    = steps;
         e.produces_token = false;
+        e.dev        = d.dev;
+        e.dev_tok    = d.dev_tok;
+        e.src_row    = d.tap_row >= 0 ? d.tap_row : 0; /* ADV_BLOCK patches pre-commit tap rows */
         /* THE LAST `depth` ROWS OF THE BLOCK. At block = depth + 1 that skips the anchor; at
          * block = depth it starts on it, because there the anchor row is a predicting row.
          *
@@ -2178,10 +2405,11 @@ const RadBatch* Scheduler::block_query(int step) {
          * is known. Debug-only: it drafts `depth` tokens for `depth` positions starting one too
          * early, so positions 1.. are deliberately misaligned and only position 0 means anything. */
         static const bool anchor_head = std::getenv("RADIANCE_DFLASH_ANCHOR") != nullptr;
-        int32_t head0 = block - depth;
+        int32_t head_n = (block == depth) ? depth : (block - 1);
+        int32_t head0  = block - head_n;
         if (anchor_head && head0 > 0) head0 = 0;
         e.hidden_row = row + head0;
-        e.hidden_n   = depth;
+        e.hidden_n   = head_n;
         block_plan_.e.push_back(e);
         block_plan_.n_tok += block;
         row += block;
@@ -2213,6 +2441,7 @@ void Scheduler::block_end() {
 
 int32_t Scheduler::conv_window() const {
     int32_t W = 1;
+    if (!prog_) return W;
     for (const KVGroupInfo& g : prog_->kv_groups)
         if (g.decl.kind == RAD_KV_CONV && g.decl.conv_width > 0)
             W = (int32_t)conv_window_entries(g.decl, cfg_.n_spec);

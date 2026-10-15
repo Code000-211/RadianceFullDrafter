@@ -5,6 +5,12 @@
 #include "derive.h"
 #include "device/device.h"
 
+#if __has_include("arch/common/rad_tree_candidate.h")
+#include "arch/common/rad_tree_candidate.h"
+#elif __has_include("../arch/common/rad_tree_candidate.h")
+#include "../arch/common/rad_tree_candidate.h"
+#endif
+
 #include <algorithm>
 #include <cstring>
 #include <cstdlib>
@@ -100,7 +106,8 @@ void BatchBuilder::carve(Set& s, char* h) {
      * side, and the two have to agree or the plugin gathers into a buffer smaller than out_ids. */
     /* ...or one row a TOKEN, which an MTP history pass is: it gathers the trunk`s hidden state
      * for every position the step just computed, and names those rows through the same array. */
-    int64_t O = S * (1 + (cfg_.n_spec > 0 ? (int64_t)cfg_.n_spec : 0));
+    const int64_t spec_factor = cfg_.n_spec > 0 ? (cfg_.n_spec >= 16 ? cfg_.n_spec + 1 : 16) : 1;
+    int64_t O = S * spec_factor;
     if (O < T) O = T;
     /* ...and in the KL mode a row at every token as well, after the sampled ones
      * (Request::score). RadBuildCtx::max_out_rows says the same number to the plugin. */
@@ -116,6 +123,11 @@ void BatchBuilder::carve(Set& s, char* h) {
     pair(&s.h_tok,    &s.d_tok,    2 * T);
     pair(&s.h_pos,    &s.d_pos,    T);
     pair(&s.h_parent, &s.d_parent, T);
+    auto pair16 = [&](uint16_t** ph, uint16_t** pd, int64_t n) {
+        *ph = ::rad::carve<uint16_t>(h, oh, n);
+        *pd = ::rad::carve<uint16_t>(d, od, n);
+    };
+    pair16(&s.h_tree_ancestors, &s.d_tree_ancestors, S * 16);
     pair(&s.h_cu,     &s.d_cu,     S + 1);
     pair(&s.h_sid,    &s.d_sid,    S);
     pair(&s.h_q,      &s.d_q,      S);
@@ -754,7 +766,7 @@ int BatchBuilder::build_groups(const StepPlan& plan, const IKVManager& kv, Set& 
                 if (lo < hi) {
                     int32_t* w = pay + np;
                     const int64_t nc = nb > lo ? nb - lo : 0;
-                    std::memcpy(w, bt.data() + lo, (size_t)nc * sizeof(int32_t));
+                    if (nc > 0) std::memcpy(w, bt.data() + lo, (size_t)nc * sizeof(int32_t));
                     std::fill(w + nc, w + (hi - lo), -1);
                     stage(g.bt_fix + i * pitch + lo, np, hi - lo);
                     np += hi - lo;
@@ -859,15 +871,7 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
                 (long long)max_seqs_, (long long)max_tok_);
         return nullptr;
     }
-    if (plan.spec_is_tree) {
-        /* spec_parent is in the ABI and its pool is allocated, but no drafter in v1 emits a tree,
-         * so the parent chain and the positions a tree implies are not written. Saying so beats
-         * filling the array with the linear-chain answer, which would verify a tree against the
-         * wrong causal mask and produce fluent wrong text. */
-        RAD_ERR("tree-layout speculation was requested but is not implemented in this build");
-        return nullptr;
-    }
-
+    // Tree-layout speculation (Milestone 2 DARTree) is supported via TreeRegistry
     Set& s = set_;
     const int64_t n_seq = (int64_t)plan.e.size();
 
@@ -956,9 +960,38 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
          * step reaches its proposal. StepPlan::tok_shift says how far, because it is the HEAD's
          * indexing and not the draft round's: DFlash2 is a draft pass that shifts by nothing. */
         const int64_t shift = plan.tok_shift;
-        for (int32_t j = 0; j < e.n_tokens; ++j) {
-            s.h_tok[k + j] = token_at(e, (int64_t)e.ctx_len + j + shift);
-            s.h_pos[k + j] = e.ctx_len + j;
+        if (plan.draft_pass == 0 && (e.is_prefill || e.n_tokens > 16 || !e.produces_token)) {
+            radiance::TreeRegistry::instance().clear(e.seq);
+        }
+        radiance::ActiveTreeRecord trec;
+        const bool has_draft_tree = !e.is_prefill && e.produces_token && e.n_tokens <= 16 && radiance::TreeRegistry::instance().get(e.seq, &trec);
+        if (has_draft_tree) {
+            s.h_tok[k + 0] = token_at(e, (int64_t)e.ctx_len + shift);
+            s.h_pos[k + 0] = static_cast<int32_t>(trec.positions[0]);
+            s.h_parent[k + 0] = trec.parents[0];
+            for (int32_t j = 1; j < e.n_tokens; ++j) {
+                s.h_tok[k + j] = (j - 1 < e.n_draft && e.draft && e.draft[j - 1] >= 0)
+                               ? e.draft[j - 1]
+                               : token_at(e, (int64_t)e.ctx_len + j + shift);
+                s.h_pos[k + j] = static_cast<int32_t>(trec.positions[j]);
+                s.h_parent[k + j] = trec.parents[j];
+            }
+            if (s.h_tree_ancestors) {
+                for (size_t m = 0; m < 16; ++m) {
+                    s.h_tree_ancestors[i * 16 + m] = trec.ancestors[m];
+                }
+            }
+        } else {
+            for (int32_t j = 0; j < e.n_tokens; ++j) {
+                s.h_tok[k + j] = token_at(e, (int64_t)e.ctx_len + j + shift);
+                s.h_pos[k + j] = e.ctx_len + j;
+                s.h_parent[k + j] = j > 0 ? (j - 1) : -1;
+            }
+            if (s.h_tree_ancestors) {
+                for (size_t m = 0; m < 16; ++m) {
+                    s.h_tree_ancestors[i * 16 + m] = static_cast<uint16_t>((1u << (m + 1)) - 1u);
+                }
+            }
         }
         /* THE ROTARY POSITION OF EACH ROW, at the row's own position -- the draft head's rows
          * rotate at the index they write, not at the token they embed. Planes of n_tok. */
@@ -1007,11 +1040,16 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
         if (e.hidden_row >= 0) {
             const int32_t nr = e.hidden_n > 0 ? e.hidden_n : e.n_tokens;
             for (int32_t j = 0; j < nr; ++j) s.h_out[n_out++] = e.hidden_row + j;
+        } else if (has_draft_tree) {
+            for (int32_t j = 0; j < e.n_tokens; ++j) {
+                s.h_out[n_out++] = (int32_t)(k + j);
+            }
         } else if (e.produces_token) {
             const int32_t first = (int32_t)(k + e.n_tokens) - 1 - e.n_spec;
             for (int32_t j = 0; j <= e.n_spec; ++j) s.h_out[n_out++] = first + j;
         }
         if (e.draft_out) s.h_dout[n_dout++] = (int32_t)(k + e.n_tokens - 1);
+        else if (e.src_row >= 0) s.h_dout[n_dout++] = e.src_row;
         /* RADIANCE_DFLASH_TRACE prints what a drafter pass actually consumes -- the pass kind, the
          * absolute positions, and the token ids at them. A block-diffusion drafter reads an ANCHOR
          * the target has already chosen followed by mask ids, and every way of getting that wrong
@@ -1196,7 +1234,8 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
          * makes the kernels fall back to their absent-operand default of 1 on exactly the step that
          * had something to roll back. */
         B.num_accepted = cfg_.n_spec > 0 ? on_rank(base, b0, s.d_acc) : nullptr;
-        B.spec_parent = nullptr;      /* a linear chain; the tree case is refused above */
+        B.spec_parent = (plan.spec_is_tree || plan.n_spec > 0) ? (const int32_t*)on_rank(base, b0, s.d_parent) : nullptr;
+        B.tree_ancestors = (plan.spec_is_tree || plan.n_spec > 0) ? (const uint16_t*)on_rank(base, b0, s.d_tree_ancestors) : nullptr;
         B.rope_pos = mm_on_ ? on_rank(base, b0, s.d_rope) : nullptr;
         B.rope_mixed = rope_mixed;
         B.n_mm_rows = n_mm;
@@ -1258,6 +1297,7 @@ AdvanceArgs BatchBuilder::advance_args(int rank) const {
     a.ctx_off  = off(s.d_ctx);
     a.acc_off  = off(s.d_acc);
     a.out_off  = off(s.d_out);
+    a.dout_off = off(s.d_dout);
     a.sid_off  = off(s.d_sid);
     a.cu_off   = off(s.d_cu);
     a.q_off    = off(s.d_q);

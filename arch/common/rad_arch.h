@@ -744,7 +744,8 @@ inline int geom_from(Geom& g, const RadModelMeta* m, const RadBuildCtx* c,
     g.max_seqs  = c->max_seqs;
     g.max_ctx   = c->max_ctx;
     g.max_spec  = c->max_spec;
-    g.max_logit_rows = c->max_seqs * (c->max_spec > 0 ? c->max_spec + 1 : 1);
+    const int64_t spec_factor = c->max_spec > 0 ? (c->max_spec >= 16 ? c->max_spec + 1 : 16) : 1;
+    g.max_logit_rows = c->max_seqs * spec_factor;
     if (g.max_logit_rows > c->max_tok) g.max_logit_rows = c->max_tok;
     /* The engine's KL mode reads a row at every prompt position (RadBuildCtx::max_out_rows), which
      * is more rows than tokens: the sampler's own rows come first and repeat a scored one. */

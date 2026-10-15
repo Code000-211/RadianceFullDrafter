@@ -132,7 +132,9 @@ public:
     int         op_resolved  (rad_op h) const;
     int         decl_name_map(const RadNameMap* m);
     int         declare_logits(rad_buf b);
+    void disable_branched_tree() { prog_.branched_tree_supported = false; }
     int         declare_drafter(const RadDrafterDecl* d);
+    int         declare_drafter_tree(rad_buf tree, int64_t node_capacity);
     int         declare_encoder(const RadEncoderDecl* d);
     void        note_v       (const char* f, va_list ap);
 

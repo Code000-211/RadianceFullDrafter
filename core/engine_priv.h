@@ -109,10 +109,9 @@ struct TierPump {
     std::vector<uint64_t> waiting;
 };
 
-/* THE BUFFER PROBE (engine_probe.cpp). Declared here because three files call it: the step
- * loop dumps after a trunk step, and each drafter dumps after its own passes -- a drafter that
- * runs as extra passes leaves every one of its buffers holding the PREVIOUS step's values at the
- * moment the step loop dumps. */
+/* THE BUFFER PROBE (engine_probe.cpp). Draft passes probe at issue, before a later pass can
+ * overwrite their buffers. Stateless block queries may issue before trunk collection, so the
+ * trunk loop's dump alone cannot identify which pass produced a buffer's current contents. */
 void dump_buffers(Ctx& ctx, int step, const char* names, const char* phase = "");
 
 /* The sampler a request that names none is served with: the command line, a generation config

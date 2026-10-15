@@ -150,6 +150,28 @@ TEST(the_kl_mode_records_or_scores_and_says_which_input_it_lacks) {
     CHECK_EQ(parse({ "--kld-ref" }, &f), RAD_E_INVAL);
 }
 
+/* --kld-taps BELONGS TO A RECORDING, IS A LIST OF LAYERS, AND REACHES THE PLUGIN ONLY THROUGH THE
+ * FLAG: config_parse sets RAD_KLD_TAPS from it and clears it without it, so a serving run never
+ * declares tap buffers because a shell once recorded. */
+TEST(the_kl_taps_are_a_recordings_layer_list_and_nothing_else_sets_them) {
+    Config c;
+    CHECK_EQ(parse({ "--kld-record", "/r", "--kld-corpus", "/c.jsonl", "--kld-taps", "1,23" }, &c),
+             RAD_OK);
+    CHECK_EQ(c.kld_taps, std::string("1,23"));
+    const char* env = getenv("RAD_KLD_TAPS");
+    CHECK(env != nullptr && std::string(env) == "1,23");
+
+    Config d;
+    CHECK_EQ(parse({}, &d), RAD_OK);
+    CHECK(getenv("RAD_KLD_TAPS") == nullptr);
+
+    Config f;
+    CHECK_EQ(parse({ "--kld-taps", "1,23" }, &f), RAD_E_INVAL);             /* not recording */
+    CHECK_EQ(parse({ "--kld-ref", "/r", "--kld-taps", "1" }, &f), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--kld-record", "/r", "--kld-corpus", "/c", "--kld-taps", "1;23" }, &f),
+             RAD_E_INVAL);
+}
+
 /* THE DIAGNOSIS MODE: one directory, and lists that are lists. A sweep point named twice would be
  * measured twice and reported as two rows of one number; a mode combined with another would have
  * to pick one silently. */

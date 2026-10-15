@@ -199,7 +199,13 @@ static const Flag g_flags[] = {
     { "--kld-ref",            "DIR",    "instead of serving, score this model against the reference in DIR:\n"
     "                                    mean, median, 99/99.9/99.99th percentile KL divergence and top-1\n"
     "                                    agreement, over the positions and tokens DIR was recorded at" },
-    { "--kld-corpus",         "FILE",   "JSONL, one {\"prompt\", \"score_from\"?, \"source\"?} a line; --kld-record only" },
+    { "--kld-corpus",         "FILE",   "JSONL, one {\"prompt\" | \"ids\", \"score_from\"?, \"source\"?} a line; --kld-record\n"
+    "                                    only. \"ids\" is the document's token ids as they are, for tokens known\n"
+    "                                    exactly; \"prompt\" is rendered text, tokenised with control tokens" },
+    { "--kld-taps",           "L,L,..", "with --kld-record: record each named layer's block input (0-based) and\n"
+    "                                    the hidden state the lm_head reads beside every row, into taps.bf16,\n"
+    "                                    instead of the log-probabilities -- a drafter's training features.\n"
+    "                                    Only a plugin that declares the tap buffers serves it" },
     { "--kld-out",            "FILE",   "the --kld-ref report as JSON, and every position's numbers in FILE.rows" },
 
     { "--diagnose",           "DIR",    "instead of serving, run a fixed workload on this engine and write\n"
@@ -729,6 +735,7 @@ int config_parse(int argc, char** argv, Config* c) {
         else if (S("--kld-ref"))               { if (!(v = need(i))) return RAD_E_INVAL; c->kld_ref = v; }
         else if (S("--kld-corpus"))            { if (!(v = need(i))) return RAD_E_INVAL; c->kld_corpus = v; }
         else if (S("--kld-out"))               { if (!(v = need(i))) return RAD_E_INVAL; c->kld_out = v; }
+        else if (S("--kld-taps"))              { if (!(v = need(i))) return RAD_E_INVAL; c->kld_taps = v; }
         else if (S("--diagnose"))              { if (!(v = need(i))) return RAD_E_INVAL; c->diagnose = v; }
         else if (S("--diagnose-tokens")) {
             if (!(v = need(i))) return RAD_E_INVAL;
@@ -827,6 +834,24 @@ int config_parse(int argc, char** argv, Config* c) {
         RAD_ERR("--kld-ref reads its tokens from the reference, which recorded them; drop "
                 "--kld-corpus");
         return RAD_E_INVAL;
+    }
+    /* THE TAPS: a list of layer indices, and only for a recording. The plugin learns them through
+     * RAD_KLD_TAPS at declare -- set here from the flag and CLEARED without it, so the variable
+     * cannot reach a serving run from a shell that once recorded. */
+    if (!c->kld_taps.empty()) {
+        if (c->kld_record.empty()) {
+            RAD_ERR("--kld-taps is part of a recording; give it with --kld-record");
+            return RAD_E_INVAL;
+        }
+        for (const char* p = c->kld_taps.c_str(); *p; ++p)
+            if (!((*p >= '0' && *p <= '9') || *p == ',')) {
+                RAD_ERR("--kld-taps takes layer indices separated by commas (got '%s')",
+                        c->kld_taps.c_str());
+                return RAD_E_INVAL;
+            }
+        if (setenv("RAD_KLD_TAPS", c->kld_taps.c_str(), 1) != 0) return RAD_E_INVAL;
+    } else {
+        unsetenv("RAD_KLD_TAPS");
     }
     if (!c->kld_out.empty() && c->kld_ref.empty()) {
         RAD_ERR("--kld-out is the --kld-ref report");

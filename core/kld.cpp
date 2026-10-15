@@ -157,7 +157,17 @@ Kld::Kld() {
 }
 
 Kld::~Kld() {
-    for (int fd : { fd_logp_, fd_top_, fd_rows_ }) if (fd >= 0) ::close(fd);
+    for (int fd : { fd_logp_, fd_top_, fd_rows_, fd_taps_ }) if (fd >= 0) ::close(fd);
+}
+
+/* After add_doc is fine; after record_into is not, and the open top.bin is what says that. */
+int Kld::set_taps(const std::string& layers, int64_t parts, int64_t part_width) {
+    if (parts <= 0 || part_width <= 0 || fd_top_ >= 0) return RAD_E_INVAL;
+    taps_layers_ = layers;
+    taps_parts_  = parts;
+    taps_pw_     = part_width;
+    top_n_       = kKldTopTaps;
+    return RAD_OK;
 }
 
 std::vector<int32_t> Kld::tokens(size_t d) const {
@@ -212,8 +222,9 @@ int Kld::load_corpus(const Config& cfg, const std::shared_ptr<const Vocab>& voca
     corpus_ = cfg.kld_corpus;
     std::ifstream in(corpus_, std::ios::binary);
     if (!in) { RAD_ERR("kld: cannot read --kld-corpus %s", corpus_.c_str()); return RAD_E_IO; }
+    /* Built at the first "prompt" line: a corpus of "ids" alone needs no tokenizer. */
     Tokenizer tok;
-    RAD_TRY(tok.init(vocab));
+    bool tok_ready = false;
     std::string line;
     int64_t lineno = 0;
     corpus_hash_ = fnv1a(nullptr, 0);
@@ -227,14 +238,35 @@ int Kld::load_corpus(const Config& cfg, const std::shared_ptr<const Vocab>& voca
             RAD_ERR("kld: %s line %lld is not JSON: %s", corpus_.c_str(), (long long)lineno, e.what());
             return RAD_E_FORMAT;
         }
-        if (!j.contains("prompt") || !j["prompt"].is_string()) {
-            RAD_ERR("kld: %s line %lld has no \"prompt\" string", corpus_.c_str(), (long long)lineno);
+        const bool has_prompt = j.contains("prompt"), has_ids = j.contains("ids");
+        if (has_prompt == has_ids || (has_prompt && !j["prompt"].is_string()) ||
+            (has_ids && !j["ids"].is_array())) {
+            RAD_ERR("kld: %s line %lld needs exactly one of a \"prompt\" string or an \"ids\" array",
+                    corpus_.c_str(), (long long)lineno);
             return RAD_E_FORMAT;
         }
-        /* THE TEXT AS THE SERVER WOULD SEE A RENDERED TEMPLATE: control tokens in it are
-         * themselves, and nothing is added in front. */
         std::vector<int32_t> ids;
-        RAD_TRY(tok.encode(j["prompt"].get<std::string>(), ids, false, true));
+        if (has_ids) {
+            /* THE TOKENS THEMSELVES, for a document whose tokens are known exactly -- a prompt the
+             * server rendered and tokenised, followed by what the model generated. Re-encoding the
+             * generated text can split it differently from how it was sampled, and a drafter's
+             * targets are the sampled tokens. */
+            const int64_t nv = vocab ? (int64_t)vocab->n_tokens() : 0;
+            for (const json& t : j["ids"]) {
+                if (!t.is_number_integer() || t.get<int64_t>() < 0 ||
+                    (nv > 0 && t.get<int64_t>() >= nv)) {
+                    RAD_ERR("kld: %s line %lld: \"ids\" holds something other than a token id of "
+                            "this vocabulary", corpus_.c_str(), (long long)lineno);
+                    return RAD_E_FORMAT;
+                }
+                ids.push_back((int32_t)t.get<int64_t>());
+            }
+        } else {
+            /* THE TEXT AS THE SERVER WOULD SEE A RENDERED TEMPLATE: control tokens in it are
+             * themselves, and nothing is added in front. */
+            if (!tok_ready) { RAD_TRY(tok.init(vocab)); tok_ready = true; }
+            RAD_TRY(tok.encode(j["prompt"].get<std::string>(), ids, false, true));
+        }
         const int64_t from = j.value("score_from", (int64_t)0);
         if (add_doc(j.value("source", std::string()), ids, from) < 0) {
             RAD_ERR("kld: %s line %lld: %zu tokens leave nothing to score from position %lld",
@@ -265,17 +297,22 @@ int Kld::record_into(const std::string& dir, int64_t n_vocab, const std::string&
         RAD_ERR("kld: cannot write %s/tokens.i32: %s", dir_.c_str(), std::strerror(errno));
         return RAD_E_IO;
     }
-    fd_logp_ = create_sized(dir_ + "/logp.f16", n_rows_ * n_vocab_ * 2);
-    fd_top_  = create_sized(dir_ + "/top.bin", n_rows_ * kKldTop * (int64_t)sizeof(TopEntry));
+    /* A taps recording keeps the hidden states INSTEAD of the whole distribution (kld.h). */
+    const bool taps = taps_parts_ > 0;
+    if (!taps) fd_logp_ = create_sized(dir_ + "/logp.f16", n_rows_ * n_vocab_ * 2);
+    else       fd_taps_ = create_sized(dir_ + "/taps.bf16", n_rows_ * taps_width() * 2);
+    fd_top_  = create_sized(dir_ + "/top.bin", n_rows_ * top_n_ * (int64_t)sizeof(TopEntry));
     fd_rows_ = create_sized(dir_ + "/rows.f32", n_rows_ * 2 * 4);
-    if (fd_logp_ < 0 || fd_top_ < 0 || fd_rows_ < 0) {
+    if ((taps ? fd_taps_ : fd_logp_) < 0 || fd_top_ < 0 || fd_rows_ < 0) {
         RAD_ERR("kld: cannot create the reference files in %s: %s", dir_.c_str(),
                 std::strerror(errno));
         return RAD_E_IO;
     }
-    RAD_INFO("kld: recording %lld positions over %zu documents (%zu tokens) into %s, %.1f GiB",
+    const int64_t row_bytes = taps ? taps_width() * 2 : n_vocab_ * 2;
+    RAD_INFO("kld: recording %lld positions over %zu documents (%zu tokens) into %s, %.1f GiB of %s",
              (long long)n_rows_, docs_.size(), tokens_.size(), dir_.c_str(),
-             (double)(n_rows_ * n_vocab_ * 2) / (1024.0 * 1024.0 * 1024.0));
+             (double)(n_rows_ * row_bytes) / (1024.0 * 1024.0 * 1024.0),
+             taps ? "taps" : "log-probabilities");
     return RAD_OK;
 }
 
@@ -296,6 +333,11 @@ int Kld::load_ref(const std::string& dir) {
     if (m.value("format", std::string()) != kFormat) {
         RAD_ERR("kld: %s/kld.json is not %s", dir.c_str(), kFormat);
         return RAD_E_FORMAT;
+    }
+    if (!m.value("logp", true)) {
+        RAD_ERR("kld: %s is a taps recording and holds no log-probabilities to score against",
+                dir.c_str());
+        return RAD_E_INVAL;
     }
     if (m.value("n_vocab", (int64_t)0) != n_vocab_ || m.value("top", 0) != kKldTop) {
         RAD_ERR("kld: the reference in %s has a %lld-token vocabulary and this model %lld",
@@ -342,7 +384,21 @@ int Kld::load_ref(const std::string& dir) {
 }
 
 /* ------------------------------------------------------------------ a step's rows */
-int Kld::score(const std::vector<KldSpan>& spans, const std::vector<KldShard>& shards) {
+int Kld::score(const std::vector<KldSpan>& spans, const std::vector<KldShard>& shards,
+               const KldTaps* taps) {
+    /* A taps recording without its taps would leave rows of zeros that look like data, and taps
+     * handed to anything else would be dropped without a word. */
+    if ((record_ && taps_parts_ > 0) != (taps != nullptr)) {
+        RAD_ERR("kld: a step's taps %s", taps ? "were handed to a run that records none"
+                                              : "are missing from a taps recording");
+        return RAD_E_STATE;
+    }
+    if (taps && ((int64_t)taps->parts.size() != taps_parts_ || taps->part_width != taps_pw_)) {
+        RAD_ERR("kld: a step handed %zu tap parts of %lld and the recording takes %lld of %lld",
+                taps->parts.size(), (long long)taps->part_width, (long long)taps_parts_,
+                (long long)taps_pw_);
+        return RAD_E_STATE;
+    }
     std::vector<Job> jobs;
     for (const KldSpan& s : spans) {
         if (s.id == 0 || s.id > docs_.size()) continue;
@@ -358,9 +414,10 @@ int Kld::score(const std::vector<KldSpan>& spans, const std::vector<KldShard>& s
     std::atomic<size_t> next{0};
     auto work = [&] {
         std::vector<uint16_t> f16((size_t)n_vocab_);
+        std::vector<uint16_t> tap_row((size_t)taps_width());
         for (size_t i; (i = next.fetch_add(1, std::memory_order_relaxed)) < jobs.size();) {
             const Job& j = jobs[i];
-            if (record_) record_row(j, shards, f16);
+            if (record_) record_row(j, shards, f16, taps, tap_row);
             else         score_row(j, shards, f16);
             if (!seen_[(size_t)j.row]) {
                 seen_[(size_t)j.row] = 1;
@@ -380,8 +437,12 @@ int Kld::score(const std::vector<KldSpan>& spans, const std::vector<KldShard>& s
     return RAD_OK;
 }
 
-/* THE REFERENCE ROW: log-softmax over the whole vocabulary, in double where it sums. */
-void Kld::record_row(const Job& j, const std::vector<KldShard>& sh, std::vector<uint16_t>& f16) {
+/* THE REFERENCE ROW: log-softmax over the whole vocabulary, in double where it sums. A taps
+ * recording keeps the head, the NLL and the entropy the same way and writes the tap row in place
+ * of the f16 one. */
+void Kld::record_row(const Job& j, const std::vector<KldShard>& sh, std::vector<uint16_t>& f16,
+                     const KldTaps* taps, std::vector<uint16_t>& tap_row) {
+    const bool keep_logp = fd_logp_ >= 0;
     float m = -std::numeric_limits<float>::infinity();
     for (const KldShard& s : sh) {
         const float* l = s.rows + j.at * s.width;
@@ -396,7 +457,8 @@ void Kld::record_row(const Job& j, const std::vector<KldShard>& sh, std::vector<
 
     /* The head kept exactly: a min-heap on log p, so an entry leaves only for a strictly larger
      * one and a tie keeps the lower id, which is the candidate's argmax rule. */
-    TopEntry top[kKldTop];
+    TopEntry top[kKldTopTaps] = {};
+    const int cap = top_n_;
     int n_top = 0;
     auto worse = [](const TopEntry& a, const TopEntry& b) {
         return a.lp > b.lp || (a.lp == b.lp && a.id < b.id);
@@ -407,10 +469,10 @@ void Kld::record_row(const Job& j, const std::vector<KldShard>& sh, std::vector<
         for (int64_t i = 0; i < s.width; ++i) {
             const float lp = (float)((double)l[i] - lse);
             const int64_t id = s.vocab0 + i;
-            f16[(size_t)id] = rad_f32_to_f16(lp);
+            if (keep_logp) f16[(size_t)id] = rad_f32_to_f16(lp);
             const double p = std::exp((double)lp);
             if (p > 0) ent -= p * (double)lp;
-            if (n_top < kKldTop) {
+            if (n_top < cap) {
                 top[n_top++] = { (int32_t)id, lp };
                 std::push_heap(top, top + n_top, worse);
             } else if (lp > top[0].lp) {
@@ -423,8 +485,17 @@ void Kld::record_row(const Job& j, const std::vector<KldShard>& sh, std::vector<
     std::sort(top, top + n_top, worse);
     const float rows[2] = { (float)(lse - (double)logit_at(sh, j.at, j.next)), (float)ent };
     const int64_t r = j.row;
-    if (!pwrite_all(fd_logp_, f16.data(), (size_t)n_vocab_ * 2, r * n_vocab_ * 2) ||
-        !pwrite_all(fd_top_, top, sizeof top, r * (int64_t)sizeof top) ||
+    if (taps) {
+        const int64_t pw = taps->part_width;
+        for (size_t k = 0; k < taps->parts.size(); ++k)
+            std::memcpy(tap_row.data() + (int64_t)k * pw, taps->parts[k] + j.at * pw,
+                        (size_t)pw * 2);
+        if (!pwrite_all(fd_taps_, tap_row.data(), tap_row.size() * 2,
+                        r * (int64_t)tap_row.size() * 2))
+            io_err_.store(1);
+    }
+    if ((keep_logp && !pwrite_all(fd_logp_, f16.data(), (size_t)n_vocab_ * 2, r * n_vocab_ * 2)) ||
+        !pwrite_all(fd_top_, top, (size_t)cap * sizeof(TopEntry), r * cap * (int64_t)sizeof(TopEntry)) ||
         !pwrite_all(fd_rows_, rows, sizeof rows, r * (int64_t)sizeof rows))
         io_err_.store(1);
 }
@@ -497,8 +568,11 @@ int Kld::finish() {
     }
     if (!record_) return report();
 
-    for (int fd : { fd_logp_, fd_top_, fd_rows_ })
-        if (::fsync(fd) != 0) { RAD_ERR("kld: fsync: %s", std::strerror(errno)); return RAD_E_IO; }
+    for (int fd : { fd_logp_, fd_top_, fd_rows_, fd_taps_ })
+        if (fd >= 0 && ::fsync(fd) != 0) {
+            RAD_ERR("kld: fsync: %s", std::strerror(errno));
+            return RAD_E_IO;
+        }
     json m;
     m["format"]         = kFormat;
     m["model"]          = model_;
@@ -506,8 +580,13 @@ int Kld::finish() {
     m["corpus_fnv1a64"] = fmt("%016llx", (unsigned long long)corpus_hash_);
     m["created"]        = now_iso();
     m["n_vocab"]        = n_vocab_;
-    m["top"]            = kKldTop;
+    m["top"]            = top_n_;
     m["rows"]           = n_rows_;
+    m["logp"]           = fd_logp_ >= 0;
+    if (taps_parts_ > 0)
+        m["taps"] = { {"file", "taps.bf16"}, {"dtype", "bf16"}, {"layers", taps_layers_},
+                      {"parts", taps_parts_}, {"part_width", taps_pw_},
+                      {"width", taps_width()} };
     json docs = json::array();
     for (const Doc& d : docs_)
         docs.push_back({ {"source", d.source}, {"tokens", d.n}, {"score_from", d.score_from},

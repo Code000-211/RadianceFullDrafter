@@ -173,6 +173,12 @@ inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
                                  rad_kvgroup group, int64_t rotary_dim, const Wire& wire,
                                  const Src& src, bool fold, bool add_out,
                            int ar_in, bool ar_out_) {
+    /* Sparse selected tables do not carry the ancestor mask. Never replace
+     * them with dense attention merely to admit a branched proposal. */
+    if (qsa_sel) {
+        const int rc = rad_disable_branched_tree(b);
+        if (rc != RAD_OK) return rc;
+    }
     g = geom; w = wire; layer = l;
     ar_out = ar_out_; kv = group; n_rot = rotary_dim;
 
@@ -543,7 +549,8 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch) const {
                      * sequences one decode row each -- and without it the kernel has to
                      * assume a single q_len for the whole step, which it cannot. */
                     praw(batch->cu_seqlens, RAD_I32, batch->n_seq + 1),
-                    brows(w.attn.x, T));
+                    brows(w.attn.x, T),
+                    batch->tree_ancestors ? praw(batch->tree_ancestors, RAD_U16, batch->n_seq * 16) : RAD_NONE);
     }
 
     if (op_sig) {

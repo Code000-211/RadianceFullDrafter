@@ -55,12 +55,27 @@ __device__ __forceinline__ int r4d_g_dst(int k, int row16, int n16, int who) {
   return m * (2 * row16) + who * row16 + c;
 }
 
+// A tail makes rank 1's output start only 4-byte aligned. Keep vector loads and
+// scratch stores, but use scalar output stores rather than misaligned int4 stores.
+template<bool HasTail>
+__device__ __forceinline__ void r4d_g_put(int4* out4, int k, int row16, int n16,
+                                         int tail32, int who, int4 v) {
+  if (HasTail) {
+    uint32_t* dst = (uint32_t*)out4 + (size_t)who * (n16 * 4 + tail32) + k * 4;
+    dst[0] = (uint32_t)v.x; dst[1] = (uint32_t)v.y;
+    dst[2] = (uint32_t)v.z; dst[3] = (uint32_t)v.w;
+  } else {
+    out4[r4d_g_dst(k, row16, n16, who)] = v;
+  }
+}
+
 // Block b owns words [start,end) of the 16B-word space and drives its own flag handshake; no
 // cross-block sync, exactly as in the all-reduce.
+template<bool HasTail>
 __global__ void r4d_ar_gather_2rank_kernel(
     const int4* __restrict__ in4, int4* peer_base, const int4* my_base, int4* __restrict__ out4,
     unsigned int* peer_flags, unsigned int* my_flags, unsigned int* seq_ctrs,
-    int n16, int slot_stride16, int rank, int row16, int drain, int acq, unsigned int nbw) {
+    int n16, int tail32, int slot_stride16, int rank, int row16, int drain, int acq, unsigned int nbw) {
   const int b = blockIdx.x, nb = gridDim.x, tid = threadIdx.x, nt = blockDim.x;
   __shared__ unsigned int s_seq, s_slot;
   r4d_ar_seq_take(seq_ctrs, nbw, s_seq, s_slot);   // device-resident, replay-safe
@@ -80,12 +95,22 @@ __global__ void r4d_ar_gather_2rank_kernel(
     for (; k + 3 * nt < end; k += 4 * nt) {
       int4 v0 = in4[k], v1 = in4[k + nt], v2 = in4[k + 2 * nt], v3 = in4[k + 3 * nt];
       ps[k] = v0; ps[k + nt] = v1; ps[k + 2 * nt] = v2; ps[k + 3 * nt] = v3;
-      out4[r4d_g_dst(k,          row16, n16, rank)] = v0;
-      out4[r4d_g_dst(k + nt,     row16, n16, rank)] = v1;
-      out4[r4d_g_dst(k + 2 * nt, row16, n16, rank)] = v2;
-      out4[r4d_g_dst(k + 3 * nt, row16, n16, rank)] = v3;
+      r4d_g_put<HasTail>(out4, k,          row16, n16, tail32, rank, v0);
+      r4d_g_put<HasTail>(out4, k + nt,     row16, n16, tail32, rank, v1);
+      r4d_g_put<HasTail>(out4, k + 2 * nt, row16, n16, tail32, rank, v2);
+      r4d_g_put<HasTail>(out4, k + 3 * nt, row16, n16, tail32, rank, v3);
     }
-    for (; k < end; k += nt) { int4 v = in4[k]; ps[k] = v; out4[r4d_g_dst(k, row16, n16, rank)] = v; }
+    for (; k < end; k += nt) {
+      int4 v = in4[k]; ps[k] = v;
+      r4d_g_put<HasTail>(out4, k, row16, n16, tail32, rank, v);
+    }
+  }
+  // Block zero owns the 0..3 words after the last vector and its handshake.
+  if (HasTail && b == 0 && tid < tail32) {
+    const int k = n16 * 4 + tid;
+    const uint32_t v = ((const uint32_t*)in4)[k];
+    ((uint32_t*)ps)[k] = v;
+    ((uint32_t*)out4)[(size_t)rank * (n16 * 4 + tail32) + k] = v;
   }
   // Drain modes, identical to the all-reduce's: they order the pushes against the release flag so
   // the peer cannot see the flag before the data.
@@ -110,12 +135,18 @@ __global__ void r4d_ar_gather_2rank_kernel(
     const int who = 1 - rank;
     int k = start + tid;
     for (; k + 3 * nt < end; k += 4 * nt) {
-      out4[r4d_g_dst(k,          row16, n16, who)] = ms[k];
-      out4[r4d_g_dst(k + nt,     row16, n16, who)] = ms[k + nt];
-      out4[r4d_g_dst(k + 2 * nt, row16, n16, who)] = ms[k + 2 * nt];
-      out4[r4d_g_dst(k + 3 * nt, row16, n16, who)] = ms[k + 3 * nt];
+      r4d_g_put<HasTail>(out4, k,          row16, n16, tail32, who, ms[k]);
+      r4d_g_put<HasTail>(out4, k + nt,     row16, n16, tail32, who, ms[k + nt]);
+      r4d_g_put<HasTail>(out4, k + 2 * nt, row16, n16, tail32, who, ms[k + 2 * nt]);
+      r4d_g_put<HasTail>(out4, k + 3 * nt, row16, n16, tail32, who, ms[k + 3 * nt]);
     }
-    for (; k < end; k += nt) out4[r4d_g_dst(k, row16, n16, who)] = ms[k];
+    for (; k < end; k += nt)
+      r4d_g_put<HasTail>(out4, k, row16, n16, tail32, who, ms[k]);
+  }
+  if (HasTail && b == 0 && tid < tail32) {
+    const int k = n16 * 4 + tid;
+    ((uint32_t*)out4)[(size_t)(1 - rank) * (n16 * 4 + tail32) + k] =
+        ((const uint32_t*)ms)[k];
   }
 }
 
@@ -126,9 +157,10 @@ void r4d_ar_gather_2rank(long peer_scratch, long my_scratch, long peer_flags, lo
   hipStream_t st = (hipStream_t)stream_i;
   const int esize = (dtype == 2) ? 4 : 2;
   const long nbytes = (long)n_elem * esize;
-  if (nbytes % 16 != 0) throw std::runtime_error("all_gather: n_elem*esize not 16B-aligned");
+  if (nbytes % 4 != 0) throw std::runtime_error("all_gather: n_elem*esize not 4B-aligned");
   if (rank != 0 && rank != 1) throw std::runtime_error("all_gather: rank must be 0 or 1");
   const int n16 = (int)(nbytes / 16);
+  const int tail32 = (int)((nbytes % 16) / 4);
   // One row of this rank's contribution, in 16-byte words. Zero means "one row", which is the
   // plain concatenation; anything else has to divide evenly or a row would straddle a word.
   long rowb = (long)row_elems * esize;
@@ -137,7 +169,7 @@ void r4d_ar_gather_2rank(long peer_scratch, long my_scratch, long peer_flags, lo
   const int row16 = row_elems > 0 ? (int)(rowb / 16) : 0;
   int nb = (int)nblocks;
   if (nb < 1) nb = 1;
-  if (nb > n16) nb = n16;
+  if (nb > n16) nb = n16 > 0 ? n16 : 1;
   if (nb > R4D_AR_GATHER_MAX_BLOCKS) nb = R4D_AR_GATHER_MAX_BLOCKS;
   // The counter allocation's block capacity, shared with the all-reduce this rides beside
   // (r4d_ar_seq.h).
@@ -146,8 +178,15 @@ void r4d_ar_gather_2rank(long peer_scratch, long my_scratch, long peer_flags, lo
   int nt = (int)nthreads;
   if (nt < 64) nt = 64;
   if (nt > 1024) nt = 1024;
-  r4d_ar_gather_2rank_kernel<<<nb, nt, 0, st>>>(
-      (const int4*)inp, (int4*)peer_scratch, (const int4*)my_scratch, (int4*)out,
-      (unsigned*)peer_flags, (unsigned*)my_flags, (unsigned*)seq_ctrs, n16,
-      (int)slot_stride16, (int)rank, row16, (int)drain, (int)acq, nbw);
+  if (tail32) {
+    r4d_ar_gather_2rank_kernel<true><<<nb, nt, 0, st>>>(
+        (const int4*)inp, (int4*)peer_scratch, (const int4*)my_scratch, (int4*)out,
+        (unsigned*)peer_flags, (unsigned*)my_flags, (unsigned*)seq_ctrs, n16, tail32,
+        (int)slot_stride16, (int)rank, row16, (int)drain, (int)acq, nbw);
+  } else {
+    r4d_ar_gather_2rank_kernel<false><<<nb, nt, 0, st>>>(
+        (const int4*)inp, (int4*)peer_scratch, (const int4*)my_scratch, (int4*)out,
+        (unsigned*)peer_flags, (unsigned*)my_flags, (unsigned*)seq_ctrs, n16, 0,
+        (int)slot_stride16, (int)rank, row16, (int)drain, (int)acq, nbw);
+  }
 }

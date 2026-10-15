@@ -39,6 +39,13 @@ set(RAD_TESTS_WITH_GBNF_ORACLE sample_test gbnf_test)
 # side-by-side numbers.
 add_library(rad_legacy_toolparse STATIC ${CMAKE_CURRENT_SOURCE_DIR}/legacy/toolparse_legacy.cpp
                                         ${CMAKE_CURRENT_SOURCE_DIR}/legacy/chatdiff.cpp)
+
+# Shared library export for rad_drafter C-ABI execution and Python E2E parity harness
+add_library(rad_drafter SHARED ${CMAKE_CURRENT_SOURCE_DIR}/drafter_parity_test.cpp)
+target_link_libraries(rad_drafter PRIVATE rad_core)
+target_include_directories(rad_drafter PRIVATE ${CMAKE_SOURCE_DIR}/core ${CMAKE_SOURCE_DIR}/abi)
+target_compile_definitions(rad_drafter PRIVATE RAD_DRAFTER_SHARED_LIB=1)
+set_target_properties(rad_drafter PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(rad_legacy_toolparse PUBLIC rad_core)
 target_include_directories(rad_legacy_toolparse PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/legacy)
 set(RAD_TESTS_WITH_LEGACY chatparse_test)
@@ -55,6 +62,7 @@ set(RAD_TESTS_WITH_R4D_HOST relayout_parity_test)
 set(RAD_CHAT_FIXTURES ${CMAKE_CURRENT_SOURCE_DIR}/data/chat)
 set(RAD_MEDIA_FIXTURES ${CMAKE_CURRENT_SOURCE_DIR}/data/media)
 
+# Milestone 3: Paged KV-Cache Tree Rollback & Compaction unit test (kv_rollback_test)
 file(GLOB RAD_TESTS CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/*_test.cpp)
 foreach(t ${RAD_TESTS})
   get_filename_component(n ${t} NAME_WE)
@@ -92,7 +100,7 @@ foreach(t ${RAD_TESTS})
                                           RAD_MEDIA_FIXTURES="${RAD_MEDIA_FIXTURES}")
   # include/ normally arrives through rad_core's PUBLIC interface; a test that does not link it
   # still needs the ABI headers, since that is the whole surface it is testing against.
-  target_include_directories(${n} PRIVATE ${CMAKE_SOURCE_DIR}/core ${CMAKE_SOURCE_DIR}/abi
+  target_include_directories(${n} PRIVATE ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/core ${CMAKE_SOURCE_DIR}/abi
                                           ${CMAKE_BINARY_DIR}/rad_include)
   set_target_properties(${n} PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
   # The tier transfer test loads a kernel plugin that waits on a stream through the device API, so
@@ -150,6 +158,20 @@ if(RAD_HIP_FOUND AND TARGET r4d_selftest)
     LABELS "slow;gpu"
     TIMEOUT 900
     ENVIRONMENT "RADIANCE_HOME=${CMAKE_BINARY_DIR}/radiance_home")
+endif()
+
+# Compile the actual FullDrafter selector into a standalone HIP regression; no core or
+# teacher model is needed. Keep host-only and non-gfx1201 builds free of this target.
+if(RAD_HIP_FOUND AND "gfx1201" IN_LIST RAD_GPU_TARGETS)
+  add_executable(fulldrafter_markov_select_gpu_test fulldrafter_markov_select_gpu_test.hip)
+  set_source_files_properties(fulldrafter_markov_select_gpu_test.hip PROPERTIES LANGUAGE HIP)
+  target_link_libraries(fulldrafter_markov_select_gpu_test PRIVATE radiance::abi)
+  rad_hipify(fulldrafter_markov_select_gpu_test gfx1201)
+  set_target_properties(fulldrafter_markov_select_gpu_test PROPERTIES
+    HIP_STANDARD 17 HIP_STANDARD_REQUIRED ON RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+  add_test(NAME fulldrafter_markov_select_gpu_test COMMAND fulldrafter_markov_select_gpu_test)
+  set_tests_properties(fulldrafter_markov_select_gpu_test PROPERTIES
+    LABELS "gpu" SKIP_RETURN_CODE 77 TIMEOUT 180)
 endif()
 
 # ================================================================== the host kernels

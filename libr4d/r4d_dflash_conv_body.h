@@ -1,12 +1,16 @@
 // DFlash2 grouped dynamic depthwise convolution -- device math only.
 //
 // Deliberately free of <hip/hip_runtime.h> so the identical source can be compiled standalone to
-// gfx1201 assembly with a stock clang (no ROCm install) for ISA review, and as part of libr4d.so.
+// gfx1201 assembly with a stock clang (no ROCm install) for ISA review, and as part of r4d.so.
 //
 // The op, per DFlash2's _grouped_conv with taps=2, group_size=16:
 //
 //   out[t,h] = (base[0,h] + delta[t,0,g]) * x[t,h]
 //            + (base[1,h] + delta[t,1,g]) * x[t-1,h] * ((t % block) >= 1)     g = h / group
+//
+// The block position is t % block_size for ANY block size (block = 1 + num_speculative_tokens,
+// 7 at the 6-draft serve, 8 at 7): one scalar remainder per workgroup, hoisted out of the lane
+// work. An earlier build masked with block_size - 1 and refused non-powers of two.
 //
 // The reference builds this as ~6 full [T,H] elementwise passes plus a materialised
 // [T, taps, num_groups, group] coefficient tensor. Every one of those intermediates is consumed
@@ -50,8 +54,12 @@ R4D_DEV void r4d_dflash_conv_body(const r4d_u16* __restrict__ x,
                                   const r4d_u16* __restrict__ base,
                                   r4d_u16* __restrict__ out,
                                   int H, int dpitch, int NG, int vpr,
-                                  int blockmask, int t, int hv) {
+                                  int block_size, int t, int hv) {
     if (hv >= vpr) return;
+    // Position within the draft block: wave-uniform (t is the workgroup's y index), one scalar
+    // remainder. Powers of two lower to a mask by the compiler when block_size is a literal; at
+    // runtime it is one s_mul/s_sub pair either way.
+    const int bpos = t % block_size;
 
     // Split every address into a wave-uniform pointer and a lane offset the backend can keep in a
     // single 32-bit VGPR -- gfx12's saddr form. Two things are load-bearing:
@@ -93,7 +101,7 @@ R4D_DEV void r4d_dflash_conv_body(const r4d_u16* __restrict__ x,
         const r4d_u16* __restrict__ xprev = xrow - (long)tap * H;
         const r4d_u16* __restrict__ btap  = base + (long)tap * H;
         const r4d_u16* __restrict__ dtap  = drow + (long)tap * NG;
-        if ((t & blockmask) >= tap) {
+        if (bpos >= tap) {
             R4dV8 xs; xs.v = *(const r4d_u32x4*)(xprev + off);
             R4dV8 bt; bt.v = *(const r4d_u32x4*)(btap + off);
             const float dt = r4d_bf2f(dtap[g]);

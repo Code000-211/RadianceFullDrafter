@@ -136,6 +136,7 @@ static const RadOperandSpec oAttnPaged[] = {
     { "v_descale",   RAD_OPD_IN,  1 },
     { "cu_seqlens",  RAD_OPD_IN,  1 },   /* absent = one q_len for the whole batch */
     { "out",         RAD_OPD_OUT, 0 },
+    { "tree_ancestors", RAD_OPD_IN, 1 },  /* DARTree: 2D causal mask bitmasks */
 };
 
 /* attn_paged with gate_quant_fp8 folded into its merge: attn_paged's parameters and the two of
@@ -624,6 +625,21 @@ static const RadOperandSpec oDflashSelect[] = {
     { "pred",   RAD_OPD_WEIGHT, 0 },
     { "succ",   RAD_OPD_WEIGHT, 0 },
     { "tokens", RAD_OPD_OUT,    0 },
+};
+
+static const RadParamSpec pFulldrafterTwoStage[] = {
+    { "M",            RAD_P_INT, RAD_REQUIRED },
+    { "block_stride", RAD_P_INT, RAD_OPTIONAL },
+    { "dtype",        RAD_P_STR, RAD_REQUIRED },
+};
+static const RadOperandSpec oFulldrafterTwoStage[] = {
+    { "ktap0",       RAD_OPD_IN,  0 },
+    { "ktap1",       RAD_OPD_IN,  0 },
+    { "ktap2",       RAD_OPD_IN,  0 },
+    { "ktap_anc",    RAD_OPD_IN,  0 },
+    { "tokens_in",   RAD_OPD_IN,  0 },
+    { "gpu_params",  RAD_OPD_IN,  0 },
+    { "tokens_out",  RAD_OPD_OUT, 0 },
 };
 
 /* ------------------------------------------------------------------------------ collectives */
@@ -1975,6 +1991,8 @@ static const RadOpSchema kSchemas[] = {
            "positions, and the greedy walk that turns a block of independent top-k sets into one "
            "path. Only the K edges leaving the previous pick are scored, because the walk is "
            "serial and the other K-1 rows of the score matrix are never read."),
+    SCHEMA("fulldrafter_two_stage", pFulldrafterTwoStage, oFulldrafterTwoStage,
+           "FullDrafter discrete two-stage block drafter (K=12, 2x6) with Markov correction and Top-16 Selector."),
     SCHEMA("all_reduce", pAllReduce, oAllReduce,
            "sum over the tensor-parallel group. `exact` separates the exact sum from the "
            "quantised wire and a caller that does not declare it gets no kernel. At 4 and 8 ranks "
@@ -2394,7 +2412,7 @@ static const RadConstraint cGdnRecurrentUpdate[] = {
  * cache's own depth against the same bound. */
 static const RadConstraint cGdnConvRecurrentUpdate[] = {
     C_EQ("head_k", 128), C_EQ("head_v", 128), C_EQ("conv_width", 4), C_GE("q_len", 1),
-    C_LE("q_len", 8),
+    C_LE("q_len", 16),
 };
 static const RadConstraint cGdnGatedRmsNorm[] = {
     C_EQ("channels", 128),
@@ -2412,7 +2430,7 @@ static const RadConstraint cGdnGatedRmsNorm[] = {
  * one kernel for another. The ti8 wire needs no such key -- exact=0 already separates it, and it
  * serves its own small messages exactly. */
 /* ---- all-gather -------------------------------------------------------------------------------
- * The vocab-parallel sampler's candidate merge, and nothing else in the engine issues one. No
+ * The vocab-parallel sampler's candidate merge and QSA's query-row shards. No
  * `exact` key: a gather MOVES its payload and cannot be lossy, so there is no second row for it
  * to be told apart from. dtype is the element SIZE here -- the pairs it carries are half u32 --
  * and BOTH SPELLINGS of each type are listed because the two callers disagree: the arch blocks
@@ -2479,11 +2497,14 @@ static const RadConstraint cArTi8Ts4[] = {
  * body masks the position with block_size-1, so only powers of two are admissible, and that is a
  * property of the value rather than a bound a constraint can express. The entry point rejects it. */
 static const RadConstraint cDflashConv[] = {
-    C_EQ("taps", 2), C_EQ("group_size", 16), C_DIV("hidden_size", 128), C_IN("dtype", "bf16"),
+    C_EQ("taps", 2), C_EQ("group_size", 16), C_DIV("hidden_size", 64), C_IN("dtype", "bf16"),
 };
 static const RadConstraint cDflashSelect[] = {
     C_GE("steps", 1), C_GE("top_k", 1), C_LE("top_k", 32),
     C_DIV("rank", 32), C_LE("rank", 512), C_IN("dtype", "bf16"),
+};
+static const RadConstraint cFulldrafterTwoStage[] = {
+    C_IN("dtype", "bf16"),
 };
 
 /* ---- the routed mixture of experts ----------------------------------------------------------
@@ -3973,7 +3994,7 @@ static const RadKernelInfo kKernels[] = {
 { "ar_gather_2rank", "all_gather", "ar",
   "all-gather, one-shot push over P2P IPC scratch, per-block flag handshake",
   "exactly 2 ranks, peer-accessible; y is [2 * numel] with rank r's input at r * numel; "
-  "scratch sized by the full message; cudagraph-safe",
+  "message size must be a multiple of 4 bytes; scratch sized by the full message; cudagraph-safe",
   "any payload -- the bytes are moved, never summed, so the (u32 id, f32 logit) pairs the "
   "vocab-parallel sampler gathers survive intact",
   RAD_DOMAIN_DEVICE, R4D_PRIO_AR_ONESHOT,
@@ -4993,6 +5014,15 @@ static const RadKernelInfo kKernels[] = {
   ROW(cDflashSelect), NOTUNE,
   nullptr, nullptr, r4d_rad_dflash_select, nullptr, nullptr, nullptr,
   r4d_shape_dflash_select },
+
+{ "fulldrafter_two_stage_bf16", "fulldrafter_two_stage", "dflash",
+  "FullDrafter discrete two-stage block drafter (K=12, 2x6) with Markov correction and Top-16 Selector",
+  "M >= 1, dtype bf16",
+  "bf16 activations, bf16 weights, i32 output tokens",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cFulldrafterTwoStage), NOTUNE,
+  nullptr, nullptr, r4d_rad_fulldrafter_two_stage, r4d_rad_fulldrafter_two_stage_scratch,
+  nullptr, nullptr, nullptr },
 
 };
 

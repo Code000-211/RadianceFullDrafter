@@ -77,6 +77,7 @@ typedef struct RadBatch {
     int            n_spec;             /* draft tokens per sequence this step */
     const int32_t* num_accepted;       /* [n_seq] device, from the PREVIOUS verify */
     const int32_t* spec_parent;        /* [n_tok] device, tree layout; null for a linear chain */
+    const uint16_t* tree_ancestors;    /* [n_seq, 16] device; null for linear chain */
 
     /* THE DRAFT PASS. 0 is an ordinary step and the plugin runs the trunk; a non-zero value runs
      * ONLY the draft head, and the SIGN says which kind of pass:
@@ -149,6 +150,13 @@ typedef struct RadBatch {
      * would run the head's whole layer again over a row that pass has just computed. So each
      * drafting sequence's LAST history row is its round-1 row, and the pass ends in the lm_head
      * over those rows; the head's wide state at them is what round 2 continues from.
+     *
+     * ON A BLOCK DRAFTER'S QUERY PASS (RAD_DRAFT_BLOCK, draft_pass > 0) it is one a sequence of
+     * the pass, in its order, and indexes the TRUNK STEP's rows instead: the out_ids row of the
+     * last position that step committed -- first sampled row + accepted drafts -- which is where
+     * a buffer the trunk filled through `out_ids` holds the hidden state the anchor was sampled
+     * from. A drafter gathers through it rather than taking the host's row numbers, so its pass
+     * issues the same operands every step and replays.
      *
      * 0 on a history pass that drafts nothing, and on every other pass. */
     int64_t        n_draft_out;

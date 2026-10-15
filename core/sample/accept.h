@@ -51,6 +51,8 @@
 
 #include <cstdint>
 
+namespace radiance { class CandidateTree; }
+
 namespace rad {
 
 struct SpecAcceptParams {
@@ -72,6 +74,18 @@ struct SpecAcceptParams {
  * target's own answer, which is always correct to emit. */
 int accept_greedy(const int32_t* draft, int n_draft, const int32_t* target,
                   int32_t* out, int32_t* n_accepted);
+
+/* DARTree tree-structured candidate acceptance by agreement at temperature 0.0.
+ * `target_argmax` contains target model predictions following each candidate node.
+ * Writes accepted draft tokens into `out_accepted` [0..n_accepted-1] and bonus token at out_accepted[n_accepted].
+ * Sets *n_accepted and *out_bonus_token. Optionally writes best path node IDs into `out_best_nodes`. */
+int accept_tree_greedy(const radiance::CandidateTree& tree,
+                       const int32_t* target_argmax,
+                       int n_target,
+                       int32_t* out_accepted,
+                       int32_t* n_accepted,
+                       int32_t* out_bonus_token,
+                       int32_t* out_best_nodes = nullptr);
 
 /* Rejection sampling. `target_probs` is [(n_draft+1) * n_vocab], each row a NORMALISED
  * distribution as the sampler chain left it -- filtered, renormalised over the survivors, zero

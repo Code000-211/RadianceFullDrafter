@@ -175,13 +175,17 @@ __global__ __launch_bounds__(kThreads) void qsa_select_kernel(
     const int t = threadIdx.x;
     const int lane = t & (kWave - 1), wave = t >> 5;
 
-    if (t == 0) sh_seq = 0;
+    if (t == 0) sh_seq = -1;
     __syncthreads();
     const int gm = m + m_offset;
     for (int i = t; i < nseq; i += kThreads)
         if (gm >= cu[i] && gm < cu[i + 1]) sh_seq = i;
     __syncthreads();
     const int seq = sh_seq;
+    if (seq < 0) {
+        if (t == 0) { nsel[m] = 0; seqused[m] = 0; }
+        return;
+    }
     const int p   = pos ? pos[m] : 0;
     const int own = (p + 1) / ratio;            /* blocks entirely in THIS query's past */
     int n = nc[seq] < nb ? nc[seq] : nb;        /* complete blocks; the rest is at most a partial */
@@ -447,13 +451,17 @@ __global__ __launch_bounds__(kThreads) void qsa_select_wide_kernel(
     const int t = threadIdx.x;
     const int lane = t & (kWave - 1), wave = t >> 5;
 
-    if (t == 0) sh_seq = 0;
+    if (t == 0) sh_seq = -1;
     __syncthreads();
     const int gm = m + m_offset;
     for (int i = t; i < nseq; i += kThreads)
         if (gm >= cu[i] && gm < cu[i + 1]) sh_seq = i;
     __syncthreads();
     const int seq = sh_seq;
+    if (seq < 0) {
+        if (t == 0) { nsel[m] = 0; seqused[m] = 0; }
+        return;
+    }
     const int p   = pos ? pos[m] : 0;
     const int own = (p + 1) / ratio;
     int n = nc[seq] < nb ? nc[seq] : nb;
@@ -940,13 +948,14 @@ __global__ __launch_bounds__(kLocalThreads) void qsa_local_kernel(
     const int m = (int)blockIdx.y, c = (int)blockIdx.x;
     const int t = (int)threadIdx.x, lane = t & (kWave - 1), wave = t >> 5;
 
-    if (t == 0) { sh_seq = 0; cc[(size_t)m * kParWMax + c] = 0; }
+    if (t == 0) { sh_seq = -1; cc[(size_t)m * kParWMax + c] = 0; }
     __syncthreads();
     const int gm = m + m_offset;
     for (int i = t; i < nseq; i += LT)
         if (gm >= cu[i] && gm < cu[i + 1]) sh_seq = i;
     __syncthreads();
     const int seq = sh_seq;
+    if (seq < 0) return;  /* The merge pass zeros the padded row's outputs. */
     const int p   = pos ? pos[m] : 0;
     const int own = (p + 1) / ratio;
     int n = nc[seq] < nb ? nc[seq] : nb;
@@ -1015,13 +1024,17 @@ __global__ __launch_bounds__(kMergeThreads) void qsa_merge_kernel(
     const int m = (int)blockIdx.x;
     const int t = (int)threadIdx.x, lane = t & (kWave - 1), wave = t >> 5;
 
-    if (t == 0) sh_seq = 0;
+    if (t == 0) sh_seq = -1;
     __syncthreads();
     const int gm = m + m_offset;
     for (int i = t; i < nseq; i += NT)
         if (gm >= cu[i] && gm < cu[i + 1]) sh_seq = i;
     __syncthreads();
     const int seq = sh_seq;
+    if (seq < 0) {
+        if (t == 0) { nsel[m] = 0; seqused[m] = 0; }
+        return;
+    }
     const int p   = pos ? pos[m] : 0;
     const int own = (p + 1) / ratio;
     int n = nc[seq] < nb ? nc[seq] : nb;

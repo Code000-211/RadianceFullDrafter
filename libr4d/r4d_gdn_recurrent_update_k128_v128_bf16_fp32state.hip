@@ -259,7 +259,7 @@ struct RuConv {
 };
 // Tokens a sequence may bring to the folded convolution: the history and the step's inputs are
 // preloaded into registers and indexed at compile time, as in the standalone update.
-#define RU_CVT 8
+#define RU_CVT 16
 
 // A channel's conv state rewritten as gdn_conv_update rewrites it: shifted down by one, the tail of
 // the old history and then this step's tokens. The launcher requires the window split the
@@ -318,7 +318,7 @@ void r4d_gdn_recurrent_update_kernel(const unsigned short* __restrict__ q,
   if (empty && !ANC) return;
 
   const int tid = threadIdx.x;
-  const int row = (tid >> 1) + (VS > 1 ? blockIdx.z * NR : 0), half = tid & 1, k0 = half * RU_HK;
+  const int row = (tid >> 1) + (VS > 1 ? blockIdx.z * NR : 0), half = tid % 2, k0 = half * RU_HK;
   const int hk = hv / (H / Hg);
   /* The head's two constants, read here so their latency runs under the prologue's loads rather
    * than behind the barriers in front of the token loop. */
@@ -347,55 +347,10 @@ void r4d_gdn_recurrent_update_kernel(const unsigned short* __restrict__ q,
   __shared__ float sbt[CV ? RU_CVT : 1];
   __shared__ float seg[CV ? RU_CVT : 1];
   __shared__ unsigned short szg[CV ? RU_CVT * RU_V : 1];
-  float ca_b = 0.0f;
-  unsigned short czg[ZPT];
-  const int G = H / Hg;                                 // workgroups that read one key head
-  float cwa[CW], cwb[CW], cba = 0.0f, cbb = 0.0f;
-  unsigned short cha[CS], chb[CS], cxa[RU_CVT], cxb[RU_CVT];
-  unsigned short* spa = nullptr;
-  unsigned short* spb = nullptr;
-  unsigned int arrived = 0;
   if constexpr (CV) {
     if (!empty) {
       const int cslot = cv.cidx[(size_t)n * cv.ci_stride];
-      // A NEGATIVE slot is padding, as it is to gdn_conv_update, and nothing of the sequence runs:
-      // every workgroup of the sequence leaves here, so none of them arrives on the counter.
       if (cslot < 0) return;
-      const int off = naccept ? naccept[n] - 1 : 0;
-      const int ca = tid < RU_K ? hk * RU_K + tid : (Hg + hk) * RU_K + (tid - RU_K);
-      const int cb = (2 * Hg + hv) * RU_V + tid;
-      const unsigned short* xr = cv.x + (size_t)bos * cv.xpitch;
-#pragma unroll
-      for (int t = 0; t < RU_CVT; ++t)
-        if (t < T) cxa[t] = xr[(size_t)t * cv.xpitch + ca];
-      {
-        const ushort4 w4 = *(const ushort4*)(cv.w + (size_t)ca * CW);
-        cwa[0] = bf2f(w4.x); cwa[1] = bf2f(w4.y); cwa[2] = bf2f(w4.z); cwa[3] = bf2f(w4.w);
-        if (cv.b) cba = bf2f(cv.b[ca]);
-      }
-      spa = cv.cs + (size_t)cslot * cv.cs_seq + (size_t)ca * cv.cs_dim;
-#pragma unroll
-      for (int i = 0; i < CS; ++i) cha[i] = spa[(size_t)(off + i) * cv.cs_tok];
-      if (tid < RU_V) {
-#pragma unroll
-        for (int t = 0; t < RU_CVT; ++t)
-          if (t < T) cxb[t] = xr[(size_t)t * cv.xpitch + cb];
-        const ushort4 w4 = *(const ushort4*)(cv.w + (size_t)cb * CW);
-        cwb[0] = bf2f(w4.x); cwb[1] = bf2f(w4.y); cwb[2] = bf2f(w4.z); cwb[3] = bf2f(w4.w);
-        if (cv.b) cbb = bf2f(cv.b[cb]);
-        spb = cv.cs + (size_t)cslot * cv.cs_seq + (size_t)cb * cv.cs_dim;
-#pragma unroll
-        for (int i = 0; i < CS; ++i) chb[i] = spb[(size_t)(off + i) * cv.cs_tok];
-      }
-      if (tid < 2 * T)
-        ca_b = tid < T ? ru_ab<ABF16>(av, (size_t)(bos + tid) * ab_stride + hv)
-                       : ru_ab<ABF16>(bv, (size_t)(bos + tid - T) * ab_stride + hv);
-#pragma unroll
-      for (int i = 0; i < ZPT; ++i) {
-        const int zi = tid + i * THR;
-        if (zi < T * RU_V)
-          czg[i] = zg[(size_t)(bos + zi / RU_V) * zg_pitch + (size_t)hv * RU_V + (zi % RU_V)];
-      }
     }
   }
 
@@ -501,6 +456,97 @@ void r4d_gdn_recurrent_update_kernel(const unsigned short* __restrict__ q,
   if (si < 0) return;
   const int grp = row >> 5;                             // fixed 32-row group, see RU_FSTR
 
+  if constexpr (CV) {
+    if (!empty) {
+      const int G = H / Hg;
+      const int cslot = cv.cidx[(size_t)n * cv.ci_stride];
+      const int off = naccept ? naccept[n] - 1 : 0;
+      const int ca = tid < RU_K ? hk * RU_K + tid : (Hg + hk) * RU_K + (tid - RU_K);
+      const int cb = (2 * Hg + hv) * RU_V + tid;
+      const unsigned short* xr = cv.x + (size_t)bos * cv.xpitch;
+      float cwa[CW], cba = 0.0f;
+      unsigned short cha[CS];
+      unsigned short* spa = cv.cs + (size_t)cslot * cv.cs_seq + (size_t)ca * cv.cs_dim;
+      {
+        const ushort4 w4 = *(const ushort4*)(cv.w + (size_t)ca * CW);
+        cwa[0] = bf2f(w4.x); cwa[1] = bf2f(w4.y); cwa[2] = bf2f(w4.z); cwa[3] = bf2f(w4.w);
+        if (cv.b) cba = bf2f(cv.b[ca]);
+      }
+#pragma unroll
+      for (int i = 0; i < CS; ++i) cha[i] = spa[(size_t)(off + i) * cv.cs_tok];
+      auto conv_stream = [&](const float* wt, float bs, const unsigned short* hist,
+                             const unsigned short* xcol, unsigned short* dst) {
+        float win[CW];
+#pragma unroll
+        for (int i = 0; i < CS; ++i) win[i] = bf2f(hist[i]);
+        for (int t = 0; t < T; ++t) {
+          win[CW - 1] = bf2f(xcol[(size_t)t * cv.xpitch]);
+          float acc = bs;
+#pragma unroll
+          for (int i = 0; i < CW; ++i) acc += wt[i] * win[i];
+          dst[t * RU_K] = f2bf(cp_silu(acc));
+#pragma unroll
+          for (int i = 0; i < CW - 1; ++i) win[i] = win[i + 1];
+        }
+      };
+      auto rewrite_stream = [&](unsigned short* sp, const unsigned short* hist,
+                                const unsigned short* xcol) {
+        constexpr int NH = R4D_GDN_CONV_W - 2;
+#pragma unroll
+        for (int i = 0; i < NH; ++i) sp[(size_t)i * cv.cs_tok] = hist[i + 1];
+        for (int t = 0; t < T; ++t) sp[(size_t)(t + NH) * cv.cs_tok] = xcol[(size_t)t * cv.xpitch];
+      };
+      conv_stream(cwa, cba, cha, xr + ca, (tid < RU_K ? cvq : cvk) + (tid & (RU_K - 1)));
+      if (tid < RU_V) {
+        float cwb[CW], cbb = 0.0f;
+        unsigned short chb[CS];
+        const ushort4 w4 = *(const ushort4*)(cv.w + (size_t)cb * CW);
+        cwb[0] = bf2f(w4.x); cwb[1] = bf2f(w4.y); cwb[2] = bf2f(w4.z); cwb[3] = bf2f(w4.w);
+        if (cv.b) cbb = bf2f(cv.b[cb]);
+        unsigned short* spb = cv.cs + (size_t)cslot * cv.cs_seq + (size_t)cb * cv.cs_dim;
+#pragma unroll
+        for (int i = 0; i < CS; ++i) chb[i] = spb[(size_t)(off + i) * cv.cs_tok];
+        conv_stream(cwb, cbb, chb, xr + cb, cvv + tid);
+        rewrite_stream(spb, chb, xr + cb);
+      }
+      if (tid < 2 * T)
+        sab[tid] = tid < T ? ru_ab<ABF16>(av, (size_t)(bos + tid) * ab_stride + hv)
+                           : ru_ab<ABF16>(bv, (size_t)(bos + tid - T) * ab_stride + hv);
+      for (int i = 0; i < ZPT; ++i) {
+        const int zi = tid + i * THR;
+        if (zi < T * RU_V)
+          szg[zi] = zg[(size_t)(bos + zi / RU_V) * zg_pitch + (size_t)hv * RU_V + (zi % RU_V)];
+      }
+      __builtin_amdgcn_wave_barrier();
+      if (tid < T) {
+        const float ra = sab[tid];
+        const float rb = sab[T + tid];
+        const float alog_t = __expf(a_log_h);
+        const float g  = -alog_t * ru_softplus(ra + dtb, sp_thr);
+        const float bt = 1.0f / (1.0f + __expf(-rb));
+        const float eg = __expf(g);
+        sg[tid]  = g;
+        sbt[tid] = bt;
+        seg[tid] = eg;
+      }
+      __syncthreads();
+      if (G > 1) {
+        if (tid == 0) {
+          const unsigned int arrived = __hip_atomic_fetch_add(
+              cv.ctr + (size_t)n * Hg + hk, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
+          cvlast = arrived == (unsigned)(G - 1);
+          if (cvlast)
+            __hip_atomic_store(cv.ctr + (size_t)n * Hg + hk, 0u, __ATOMIC_RELAXED,
+                               __HIP_MEMORY_SCOPE_AGENT);
+        }
+        __syncthreads();
+        if (cvlast) rewrite_stream(spa, cha, xr + ca);
+      } else {
+        rewrite_stream(spa, cha, xr + ca);
+      }
+    }
+  }
+
   float h[RU_HK];
   {
     const ST* p = state + (size_t)si * st_slot + (size_t)hv * st_head
@@ -554,64 +600,14 @@ void r4d_gdn_recurrent_update_kernel(const unsigned short* __restrict__ q,
   }
   if (empty) return;
 
-  if constexpr (CV) {
-    // gdn_conv_update's token body, one channel a thread: the same taps in the same order and the
-    // same rounding, into LDS instead of q, k and v.
-    auto conv = [&](const float* wt, float bs, const unsigned short* hist,
-                    const unsigned short* xs, unsigned short* dst) {
-      float win[CW];
-#pragma unroll
-      for (int i = 0; i < CS; ++i) win[i] = bf2f(hist[i]);
-#pragma unroll
-      for (int t = 0; t < RU_CVT; ++t) {
-        if (t < T) {
-          win[CW - 1] = bf2f(xs[t]);
-          float acc = bs;
-#pragma unroll
-          for (int i = 0; i < CW; ++i) acc += wt[i] * win[i];
-          dst[t * RU_K] = f2bf(cp_silu(acc));
-#pragma unroll
-          for (int i = 0; i < CW - 1; ++i) win[i] = win[i + 1];
-        }
-      }
-    };
-    conv(cwa, cba, cha, cxa, (tid < RU_K ? cvq : cvk) + (tid & (RU_K - 1)));
-    if (tid < RU_V) {
-      conv(cwb, cbb, chb, cxb, cvv + tid);
-      ru_conv_rewrite(spb, chb, cxb, T, cv.cs_tok);
-    }
-    if (tid < 2 * T) sab[tid] = ca_b;
-#pragma unroll
-    for (int i = 0; i < ZPT; ++i) {
-      const int zi = tid + i * THR;
-      if (zi < T * RU_V) szg[zi] = czg[i];
-    }
-    __builtin_amdgcn_wave_barrier();
-    if (tid < T) {
-      const float ra = sab[tid];
-      const float rb = sab[T + tid];
-      const float alog_t = __expf(a_log_h);
-      const float g  = -alog_t * ru_softplus(ra + dtb, sp_thr);
-      const float bt = 1.0f / (1.0f + __expf(-rb));
-      const float eg = __expf(g);
-      sg[tid]  = g;
-      sbt[tid] = bt;
-      seg[tid] = eg;
-    }
-    // Every thread's history is consumed by now -- its taps are in LDS -- so after the barrier
-    // this workgroup no longer reads the key head's state and may be counted out.
-    __syncthreads();
-    if (G > 1 && tid == 0)
-      arrived = __hip_atomic_fetch_add(cv.ctr + (size_t)n * Hg + hk, 1u, __ATOMIC_RELAXED,
-                                       __HIP_MEMORY_SCOPE_AGENT);
-  }
+
 
   const float alog = CV ? 0.0f : __expf(a_log_h);
 
   if (STG) {
     // One lane per (token, half) does exactly the sum a v-row takes for itself on the STG=0 path.
     if (tid < 2 * T) {
-      const int ut = tid >> 1, uk0 = (tid & 1) * RU_HK;
+      const int ut = tid >> 1, uk0 = (tid % 2) * RU_HK;
       const unsigned short* qp = q + ((size_t)(bos + ut) * Hg + hk) * RU_K + uk0;
       const unsigned short* kp = k + ((size_t)(bos + ut) * Hg + hk) * RU_K + uk0;
       float ssq = 0.0f, ssk = 0.0f;
@@ -821,21 +817,7 @@ void r4d_gdn_recurrent_update_kernel(const unsigned short* __restrict__ q,
     }
   }
 
-  if constexpr (CV) {
-    // The key head's q and k channels, rewritten by the last of its readers to arrive. The count
-    // was taken before the token loop, so its latency is hidden behind it.
-    if (G > 1) {
-      if (tid == 0) {
-        cvlast = arrived == (unsigned)(G - 1);
-        if (cvlast)
-          __hip_atomic_store(cv.ctr + (size_t)n * Hg + hk, 0u, __ATOMIC_RELAXED,
-                             __HIP_MEMORY_SCOPE_AGENT);
-      }
-      __syncthreads();
-      if (!cvlast) return;
-    }
-    ru_conv_rewrite(spa, cha, cxa, T, cv.cs_tok);
-  }
+
 }
 
 // THE NON-TEMPORAL HINT on the state load and store (th:TH_STORE_NT / TH_LOAD_NT).
@@ -862,11 +844,8 @@ void r4d_gdn_recurrent_update_kernel(const unsigned short* __restrict__ q,
 // and stays clean across consecutive page crossings.  radiance_gdn.py reads THE SAME variable, so
 // the kernel and its caller cannot disagree about what the state cache means.
 static bool ru_anchor() {
-  static const bool v = [] {
-    const char* e = getenv("RADIANCE_GDN_ANCHOR");
-    return e && e[0] == '1';
-  }();
-  return v;
+  const char* e = getenv("RADIANCE_GDN_ANCHOR");
+  return e && e[0] == '1';
 }
 
 // Shared q/k l2 scales across the 128 v-rows of a head: bit-identical to computing them per row.
@@ -1309,12 +1288,15 @@ extern "C" int r4d_rad_gdn_conv_recurrent_update(const RadArgs* a, RadStream s) 
     }
 
     /* THE WINDOW, as gdn_conv_update derives it: the cache depth fixes max_query_len as
-     * state_len_max - (width - 2), and a sequence brings at most that many tokens. The fold holds
-     * them in registers, so the deployment's window has to fit RU_CVT. */
+    /* THE WINDOW SPLIT, as gdn_conv_update derives it: the standalone kernel is handed
+     * max_query_len = cache depth - (width - 2), NOT the step's token count, and this fold writes
+     * the same W - 2 split, so the two agree at any cache depth. That depth is the DEPLOYMENT's
+     * window (conv_width - 1 + n_spec), so it can exceed RU_CVT while a capped step brings far
+     * fewer tokens: the token count is T from cu, bounded by the RU_CVT register loop, and the
+     * band stops at eight tokens on its own. Gating on the depth would refuse the whole range for
+     * a deployment whose ceiling is RU_CVT (n_spec == RU_CVT), which is what B2 was. */
     if (r4d_geti_or(a, "conv_width", 0) != R4D_GDN_CONV_W) return R4D_NO(RAD_E_UNSUPPORTED);
-    const long long mql = cst->shape[2] - (R4D_GDN_CONV_W - 2);
-    if (mql < 1) return R4D_NO(RAD_E_SHAPE);
-    if (mql > RU_CVT) return R4D_NO(RAD_E_UNSUPPORTED);
+    if (cst->shape[2] < R4D_GDN_CONV_W - 1) return R4D_NO(RAD_E_SHAPE);
 
     /* The recurrent half's contract checks, as r4d_rad_gdn_recurrent_update makes them. */
     if (const char* sf = r4d_gets(a, "state_form")) {

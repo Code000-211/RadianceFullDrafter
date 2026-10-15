@@ -4,6 +4,12 @@
 #include "accept.h"
 #include "host_ref.h"
 
+#if __has_include("arch/common/rad_tree_candidate.h")
+#include "arch/common/rad_tree_candidate.h"
+#elif __has_include("../arch/common/rad_tree_candidate.h")
+#include "../arch/common/rad_tree_candidate.h"
+#endif
+
 #include <algorithm>
 #include <cmath>
 
@@ -26,6 +32,42 @@ int accept_greedy(const int32_t* draft, int n_draft, const int32_t* target,
      * acceptance rate looks a percent low. */
     out[i] = target[i];
     *n_accepted = i;
+    return RAD_OK;
+}
+
+int accept_tree_greedy(const radiance::CandidateTree& tree,
+                       const int32_t* target_argmax,
+                       int n_target,
+                       int32_t* out_accepted,
+                       int32_t* n_accepted,
+                       int32_t* out_bonus_token,
+                       int32_t* out_best_nodes)
+{
+    if (tree.empty() || !target_argmax || !out_accepted || !n_accepted || n_target <= 0) {
+        return RAD_E_INVAL;
+    }
+
+    auto vres = radiance::DARTreeVerifier::verify_tree_greedy(
+        tree, target_argmax, static_cast<size_t>(n_target)
+    );
+
+    const int32_t acc = vres.accepted_length;
+    for (int32_t j = 0; j < acc; ++j) {
+        out_accepted[j] = static_cast<int32_t>(vres.accepted_tokens[j]);
+    }
+    out_accepted[acc] = static_cast<int32_t>(vres.bonus_token);
+
+    if (out_best_nodes) {
+        for (int32_t j = 0; j <= acc; ++j) {
+            out_best_nodes[j] = vres.best_path_node_ids[j];
+        }
+    }
+
+    if (out_bonus_token) {
+        *out_bonus_token = static_cast<int32_t>(vres.bonus_token);
+    }
+
+    *n_accepted = acc;
     return RAD_OK;
 }
 

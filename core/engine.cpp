@@ -15,6 +15,18 @@
 #include "gen_config.h"
 #include "sample/accept.h"
 #include "sched/scheduler.h"
+
+#if __has_include("arch/common/rad_tree_candidate.h")
+#include "arch/common/rad_tree_candidate.h"
+#elif __has_include("../arch/common/rad_tree_candidate.h")
+#include "../arch/common/rad_tree_candidate.h"
+#endif
+
+#if __has_include("arch/common/rad_kv_compact.h")
+#include "arch/common/rad_kv_compact.h"
+#elif __has_include("../arch/common/rad_kv_compact.h")
+#include "../arch/common/rad_kv_compact.h"
+#endif
 #include "server/adapters.h"
 #include "server/server.h"
 #include "server/liveview.h"
@@ -60,6 +72,8 @@ Engine::~Engine() {
      * says nothing is worse than no flag at all. */
     if (cfg_.profile_ops) for (auto& r : ranks_) r->ctx.dump_profile();
     for (float* p : kld_host_) if (p) rad_dev_free(p, RAD_MEM_HOST_PINNED);
+    for (uint16_t* p : kld_tap_host_) if (p) rad_dev_free(p, RAD_MEM_HOST_PINNED);
+    if (kld_anchor_host_) rad_dev_free(kld_anchor_host_, RAD_MEM_HOST_PINNED);
     /* The disk thread first: it reads the host arena and writes the store, both of which go with
      * the ranks and kv_disk_ below. */
     if (pump_) pump_->io.stop();
@@ -466,7 +480,12 @@ int Engine::step_loop() {
      * collected, and a pass issued ahead would have overwritten them by then. */
     pipelining_ = !cfg_.kld() && drafter_.kind != RAD_DRAFT_BLOCK &&
                   (serial_drafting() || cfg_.n_spec <= 0);
-    const bool t_on = (int)log_level() >= (int)Log::Debug;
+    /* RADIANCE_PHASE_TIMING=1 turns the per-phase step timer on WITHOUT the rest of the debug level:
+     * -v / RADIANCE_LOG=debug also switches on grammar and sampler instrumentation, which halves
+     * decode throughput, so the phase split measured under it is not the split of a serving run.
+     * Off by default; the line is printed at info level when this is set. */
+    static const bool phase_env = std::getenv("RADIANCE_PHASE_TIMING") != nullptr;
+    const bool t_on = phase_env || (int)log_level() >= (int)Log::Debug;
     /* Read once. See the block in the idle branch below for what it is for. */
     /* "kv" | "arena" | "all" | "kv:<name>,<name>" -- the last narrows the KV scrub to named groups,
      * which is the level below "it is the pool" and the one that names the defect. */
@@ -848,11 +867,13 @@ int Engine::step_loop() {
         if (t_on) phase_mark(PH_SAVE);
         st = mark_trunk_end(b, so);
         if (st < 0) return fail_loop(st);
-        /* A SERIAL DRAFTER'S PASSES GO IN BEHIND THE STEP BEFORE ANYTHING WAITS FOR IT. The card
-         * works out the acceptance itself and every pass reads it from there (sched/advance.h),
-         * so the host has nothing to wait for until the step's last pass -- and the one wait below
-         * then covers the whole step. */
+        /* DRAFT PASSES GO IN BEHIND THE TRUNK BEFORE THE HOST WAITS FOR ITS TOKENS. The card
+         * computes acceptance itself (sched/advance.h), so these passes run while collect_step
+         * waits only for trunk_end_ and the host commits. step_end_ is waited after commit,
+         * before the proposals are published. */
         st = issue_serial_drafter(b->step, b, so);
+        if (st < 0) return fail_loop(st);
+        st = issue_block_drafter(b->step, b, so);
         if (st < 0) return fail_loop(st);
         st = mark_step_end(b, so);
         if (st < 0) return fail_loop(st);
@@ -926,29 +947,37 @@ int Engine::step_loop() {
         if (t_on) phase_mark(PH_COMMIT);
         if (st < 0) { RAD_ERR("commit: %s", rad_strerror(st)); return fail_loop(st); }
 
-        /* THE DRAFTER FOR THE NEXT STEP. A block drafter runs here, because its passes are staged
-         * from the committed sequence; a serial one already ran on the card behind the step, and
-         * what is left is to check its acceptance against the host's and publish its proposals.
-         *
-         * ONE SWITCH ON A DECLARED SHAPE, not on a model. Both drivers return RAD_OK immediately
-         * when the declared kind is not theirs, so a program with no drafter costs a compare. */
-        if (drafter_.kind == RAD_DRAFT_SERIAL) {
+        /* Commit and publication overlap a drafter already issued behind the trunk; its readback
+         * waits below. Stateful block drafters and prefill still run from the committed sequence.
+         * Keep the publication decision: finish_block_drafter clears block_preissued_. */
+        const bool publish_early = drafter_.kind == RAD_DRAFT_SERIAL || block_preissued_;
+        if (publish_early) {
+            drain_completed();
+            sched_.publish(/*idle=*/false);
+            /* Maintenance uses committed state, not the pending proposals. Tier copies fence on
+             * the compute stream; loan ticks only adjust offers while idle is false. */
+            tier_tick();
+            loan_tick(/*idle=*/false);
+            arena_tick(rad_mono_ns());
             st = rad_event_sync(step_end_);
             if (st < 0) return fail_loop(st);
         }
-        st = drafter_.kind == RAD_DRAFT_BLOCK ? run_block_drafter(b->step)
-                                              : finish_serial_drafter(so);
+        st = drafter_.kind == RAD_DRAFT_BLOCK
+                 ? (block_preissued_ ? finish_block_drafter(so) : run_block_drafter(b->step))
+                 : finish_serial_drafter(so);
         if (st < 0) return fail_loop(st);
         /* AND NOW THE STEP IS OVER. The draft rounds above are forward passes and they belong to
          * the step that paid for them; charging the step at commit would leave them in the gap
          * between one iteration and the next, which nothing measures. Scheduler::step_finished
          * says what that costs. */
         sched_.step_finished();
-        tier_tick();
-        loan_tick(/*idle=*/false);
-        arena_tick(rad_mono_ns());
-        drain_completed();
-        sched_.publish(/*idle=*/false);
+        if (!publish_early) {
+            tier_tick();
+            loan_tick(/*idle=*/false);
+            arena_tick(rad_mono_ns());
+            drain_completed();
+            sched_.publish(/*idle=*/false);
+        }
 
         /* ONE LINE EVERY 128 STEPS, and it adds up to the step. `ranks` is the enqueue, not the
          * execution: the device work is waited for in `collect`, which is the only host
@@ -959,7 +988,8 @@ int Engine::step_loop() {
             if (++phase_n_ == 128) {
                 double tot = 0;
                 for (int i = 0; i < PH_N; ++i) tot += phase_us_[i];
-                RAD_DEBUG("step %s: %.2f ms = plan %.2f begin %.2f build %.2f pre %.2f "
+                RAD_LOG_AT(phase_env ? Log::Info : Log::Debug,
+                          "step %s: %.2f ms = plan %.2f begin %.2f build %.2f pre %.2f "
                           "ranks %.2f save %.2f collect %.2f commit %.2f draft %.2f (mean/128)",
                           b->phase == RAD_PHASE_DECODE ? "decode" : "other", tot / 128000.0,
                           phase_us_[PH_PLAN] / 128000.0,  phase_us_[PH_BEGIN] / 128000.0,
@@ -988,7 +1018,7 @@ int Engine::collect_issue(const RadBatch* b, StepOut& so) {
         RAD_ERR("the sampler's token buffer has no address -- it was declared but never planned");
         return RAD_E_STATE;
     }
-    so.rb = readback_.reserve(so.n_rows);
+    so.rb = sample_readback_.reserve(so.n_rows);
     if (!so.rb) return RAD_E_NOMEM;
     RAD_TRY(rad_memcpy_async(so.rb, src, (int64_t)so.n_rows * 4, r0.ctx.stream()));
 
@@ -1019,8 +1049,8 @@ int Engine::mark_step_end(const RadBatch* b, StepOut& so) {
 }
 
 /* Wait for the sampled ids and turn them into the three per-sequence arrays the scheduler wants.
- * This is the ONE host synchronisation on the step path: the host needs the tokens to commit them
- * and to stream them. Everything else in a step is enqueued and never waited on (spec §5.4). */
+ * Only the trunk readback is needed here; the draft passes and their readbacks are waited after
+ * commit, so the host's acceptance and commit overlap their GPU work. */
 int Engine::collect_step(const RadBatch* b, StepOut& so) {
     const StepPlan& plan = sched_.plan();
     so.token.assign(plan.e.size(), 0);
@@ -1030,8 +1060,9 @@ int Engine::collect_step(const RadBatch* b, StepOut& so) {
 
     so.rows.resize((size_t)so.n_rows);
     if (!so.rb) return RAD_E_STATE;
-    /* The step's trunk wait: sync trunk_end_ (or step_end_) */
-    RAD_TRY(rad_event_sync(trunk_end_ ? trunk_end_ : step_end_));
+    /* Never wait for step_end_ here: that would put FullDrafter ahead of acceptance and commit.
+     * mark_trunk_end recorded this event after the sampled-token copy and before draft work. */
+    if (trunk_end_) RAD_TRY(rad_event_sync(trunk_end_));
     std::memcpy(so.rows.data(), so.rb, (size_t)so.n_rows * sizeof(int32_t));
     so.rb = nullptr;
     const std::vector<float>& lg = so.lg;
@@ -1096,7 +1127,98 @@ int Engine::collect_step(const RadBatch* b, StepOut& so) {
             if (!e.req) continue;
             int32_t out[RAD_SCHED_MAX_SPEC + 1] = { 0 };
             int32_t acc = 0;
-            RAD_TRY(accept_greedy(e.draft, e.n_spec, &so.rows[(size_t)so.first_row[i]], out, &acc));
+            int32_t bonus = 0;
+            int32_t best_nodes[RAD_SCHED_MAX_SPEC + 1] = { 0 };
+
+            radiance::ActiveTreeRecord trec;
+            const bool has_draft_tree = radiance::TreeRegistry::instance().get(e.seq, &trec);
+
+            if (has_draft_tree && !trec.tree.empty()) {
+                RAD_TRY(accept_tree_greedy(trec.tree,
+                                           &so.rows[(size_t)so.first_row[i]],
+                                           e.n_tokens,
+                                           out,
+                                           &acc,
+                                           &bonus,
+                                           best_nodes));
+
+                /* Check for EOG truncation before KV compaction and rollback */
+                for (int32_t j = 0; j <= acc; ++j) {
+                    if (vocab_ && vocab_->is_eog(out[j])) { acc = j; break; }
+                }
+
+                if (e.draft) {
+                    for (int32_t j = 0; j < acc; ++j) {
+                        const_cast<int32_t*>(e.draft)[j] = out[j];
+                    }
+                }
+
+                /* Winning branch KV cache compaction (Milestone 3):
+                 * Relocate non-identity candidate slots into contiguous sequence positions. */
+                if (acc > 0) {
+                    bool needs_compaction = false;
+                    for (int32_t k = 1; k <= acc; ++k) {
+                        if (best_nodes[k] != k) {
+                            needs_compaction = true;
+                            break;
+                        }
+                    }
+
+                    if (needs_compaction) {
+                        for (auto& rk : ranks_) {
+                            for (size_t g = 0; g < rk->kv.plans().size(); ++g) {
+                                const auto& plan = rk->kv.plans()[g];
+                                if (!plan.paged()) continue;
+
+                                const std::vector<int32_t>& bt = rk->kv.block_table(e.seq, static_cast<int32_t>(g));
+                                const int64_t first_pos = rk->kv.first_block_pos(e.seq, static_cast<int32_t>(g));
+                                const int32_t bs = static_cast<int32_t>(plan.block_size);
+
+                                radiance::RadKVSlotMove moves[RAD_KV_COMPACT_MAX_MOVES];
+                                const int32_t n_moves = radiance::rad_kv_compact_build_moves(
+                                    best_nodes,
+                                    acc,
+                                    static_cast<int64_t>(e.ctx_len),
+                                    bt,
+                                    first_pos,
+                                    bs,
+                                    moves,
+                                    RAD_KV_COMPACT_MAX_MOVES
+                                );
+
+                                if (n_moves > 0 && bs > 0) {
+                                    const int64_t block_bytes = plan.layer_bytes_per_block();
+                                    const int32_t n_heads = static_cast<int32_t>(plan.n_head_kv > 0 ? plan.n_head_kv : 1);
+                                    const int32_t tok_bytes = static_cast<int32_t>(block_bytes / (bs * n_heads));
+                                    const int64_t kv_head_stride = static_cast<int64_t>(bs) * tok_bytes;
+
+                                    RAD_TRY(radiance::rad_kv_compact_winning_branch(
+                                        plan.base,
+                                        plan.layer_stride(),
+                                        block_bytes,
+                                        kv_head_stride,
+                                        bs,
+                                        tok_bytes,
+                                        static_cast<int32_t>(plan.n_layers),
+                                        n_heads,
+                                        moves,
+                                        n_moves,
+                                        rk->ctx.stream()
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Scheduler::commit owns rollback, including the next_open_ guard.
+                radiance::TreeRegistry::instance().clear(e.seq);
+            } else {
+                if (has_draft_tree) {
+                    radiance::TreeRegistry::instance().clear(e.seq);
+                }
+                RAD_TRY(accept_greedy(e.draft, e.n_spec, &so.rows[(size_t)so.first_row[i]], out, &acc));
+            }
 
             /* THE TURN CAN END IN THE MIDDLE OF AN ACCEPTED RUN, and stopping only on the last
              * token of it is how the engine generates past the end of a turn. accept_greedy stops
@@ -1157,7 +1279,9 @@ int Engine::collect_step(const RadBatch* b, StepOut& so) {
         const StepEntry& e = plan.e[i];
         if (!e.req) continue;
         Request* r = const_cast<Request*>(e.req);
-        r->may_speculate = ranks_[0]->sampler.allows_speculation(r->id);
+        if (!ranks_.empty()) {
+            r->may_speculate = ranks_[0]->sampler.allows_speculation(r->id);
+        }
     }
     return RAD_OK;
 }

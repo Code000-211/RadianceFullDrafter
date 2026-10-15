@@ -153,6 +153,8 @@ int r4d_rad_gdn_conv_recurrent_update(const RadArgs*, RadStream);
 int r4d_rad_gdn_gated_rmsnorm   (const RadArgs*, RadStream);
 int r4d_rad_dflash_conv         (const RadArgs*, RadStream);
 int r4d_rad_dflash_select       (const RadArgs*, RadStream);
+int r4d_rad_fulldrafter_two_stage(const RadArgs*, RadStream);
+int64_t r4d_rad_fulldrafter_two_stage_scratch(const RadArgs*);
 
 /* -- the gated residual (r4d_hc_bf16.hip) -- */
 int     r4d_rad_hc_enter       (const RadArgs*, RadStream);

@@ -1380,15 +1380,14 @@ TEST(a_running_prefill_does_not_suppress_the_draft) {
     CHECK_EQ(f.sch.plan().e[0].n_spec, 4);
 }
 
-TEST(the_draft_depth_is_the_configured_one_whatever_the_acceptance_trace) {
+TEST(the_draft_depth_is_stable_whatever_the_acceptance_trace) {
     DraftController c;
     DraftController::Params p;
     p.max_depth = 8;
     CHECK_OK(c.configure(p));
-    CHECK_EQ(c.next_depth(), 8);
+    CHECK_EQ(c.next_depth(), 7);
 
-    /* A workload that rejects almost everything. A dynamic policy would collapse the depth here;
-     * this one does not move, which is the property being asserted -- the depth is the flag. */
+    /* Acceptance does not move the block-drafter ceiling; concurrency does. */
     uint64_t rng = 12345;
     auto coin = [&](double pr) {
         rng = rng * 6364136223846793005ull + 1442695040888963407ull;
@@ -1396,12 +1395,12 @@ TEST(the_draft_depth_is_the_configured_one_whatever_the_acceptance_trace) {
     };
     for (int t = 0; t < 4000; ++t) {
         int d = c.next_depth();
-        CHECK_EQ(d, 8);
+        CHECK_EQ(d, 7);
         int a = 0;
         while (a < d && coin(0.1)) ++a;
         c.observe(d, a);
     }
-    CHECK_EQ(c.next_depth(), 8);
+    CHECK_EQ(c.next_depth(), 7);
     CHECK(c.acceptance() > 0.0f && c.acceptance() < 0.3f);
 
     /* The accounting is exact and is charged per DRAFTED token, not per step: it is the number a
@@ -1424,6 +1423,40 @@ TEST(the_draft_depth_is_the_configured_one_whatever_the_acceptance_trace) {
     z.max_depth = 0;
     CHECK_OK(d3.configure(z));
     CHECK_EQ(d3.next_depth(), 0);
+}
+
+TEST(two_stage_draft_depth_policy) {
+    DraftController c;
+    DraftController::Params p;
+    p.max_depth = 7;
+    for (bool adaptive : {false, true}) {
+        p.adaptive = adaptive;
+        CHECK_OK(c.configure(p));
+        CHECK_EQ(c.next_depth(1), 7);
+        CHECK_EQ(c.next_depth(4), 7);
+        CHECK_EQ(c.next_depth(5), 3);
+        CHECK_EQ(c.next_depth(8), 3);
+    }
+
+    SchedReq r;
+    CHECK_EQ(r.suggest_depth(7, true, false, 7), 4);
+    r.accepted_streak = 2;
+    r.ema_accept = 3.0f;
+    r.last_accepted = 4;
+    CHECK_EQ(r.suggest_depth(7, true, false, 7), 7);
+    CHECK_EQ(r.suggest_depth(4, true, false, 7), 4);
+    CHECK_EQ(r.suggest_depth(7, true, true, 7), 3);
+    r.last_accepted = 3;
+    CHECK_EQ(r.suggest_depth(7, true, false, 7), 4);
+    r.accepted_streak = 0;
+    r.rejected_streak = 1;
+    CHECK_EQ(r.suggest_depth(7, true, false, 7), 4);
+    r.rejected_streak = 2;
+    CHECK_EQ(r.suggest_depth(7, true, false, 7), 3);
+    CHECK_EQ(r.suggest_depth(2, true, false, 7), 2);
+    CHECK_EQ(r.suggest_depth(7, false, false, 7), 7);
+    r.has_draft_tree = true;
+    CHECK_EQ(r.suggest_depth(7, true, false, 5), 3);
 }
 
 /* ================================================================== the step path */
@@ -1809,6 +1842,108 @@ TEST(a_block_drafter_context_pass_keeps_the_rows_of_a_finished_sequence) {
     const RadBatch* qb = f.sch.block_query(1);
     REQUIRE(qb != nullptr);
     CHECK_EQ(qb->n_seq, 1);
+    f.sch.block_end();
+}
+
+TEST(multistage_block_drafter_staging_geometry) {
+    Fixture f;
+    f.build(/*blocks=*/4096, /*states=*/64);
+    f.cfg.n_spec = 12;
+    f.cfg.adaptive_spec = true;
+    CHECK_OK(f.start());
+
+    uint64_t a = f.submit(160, 64);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain();
+
+    Scheduler::BlockRow rows[4];
+    // Multi-stage block drafter: block=7, depth=12 (2 * 6 = 12)
+    CHECK_EQ(f.sch.block_begin(7, 12, 0, 99, rows, 4), 1);
+    CHECK_EQ(rows[0].seq, a);
+
+    const RadBatch* cb = f.sch.block_context(1);
+    REQUIRE(cb != nullptr);
+    CHECK_EQ(cb->n_seq, 1);
+
+    const RadBatch* qb = f.sch.block_query(1);
+    REQUIRE(qb != nullptr);
+    CHECK_EQ(qb->n_seq, 1);
+    CHECK_EQ(qb->n_tok, 7);
+    CHECK_EQ(qb->draft_pass, 1);
+    CHECK_EQ(qb->n_spec, 4);          /* scheduled proposal depth, not verified query rows */
+    CHECK_EQ(f.sch.block_plan().e[0].n_spec, 0);
+    CHECK_EQ(f.sch.block_plan().e[0].hidden_n, 6);
+    CHECK_EQ(f.sch.block_plan().e[0].hidden_row, 1);
+    CHECK_EQ(f.sch.block_plan().e[0].n_tokens, 7);
+    CHECK_EQ(f.sch.block_plan().e[0].n_draft, 6);
+    f.sch.block_end();
+
+    // Invalid multi-stage geometry (non-divisible depth)
+    CHECK_EQ(f.sch.block_begin(7, 13, 0, 99, rows, 4), 0);
+    // Invalid block < 2
+    CHECK_EQ(f.sch.block_begin(1, 12, 0, 99, rows, 4), 0);
+    // Invalid geometry with depth < block: block=10, depth=3
+    CHECK_EQ(f.sch.block_begin(10, 3, 0, 99, rows, 4), 0);
+    // Single-stage block == depth + 1 (block=8, depth=7)
+    CHECK_EQ(f.sch.block_begin(8, 7, 0, 99, rows, 4), 1);
+    f.sch.block_end();
+    // Single-stage block == depth (block=7, depth=7)
+    CHECK_EQ(f.sch.block_begin(7, 7, 0, 99, rows, 4), 1);
+    f.sch.block_end();
+}
+
+/* THE QUERY PASS NAMES, A DRAFTING SEQUENCE, THE TRUNK ROW ITS ANCHOR WAS SAMPLED AT: the verify
+ * step's out_ids row of its last accepted position, first_row + n_accepted. A drafter that reads
+ * the trunk's tapped hidden states gathers through it (RadBatch::draft_out_ids), so the pass's
+ * operands are the same pointers every step and the recording replays. Reading row `s` instead
+ * takes the hidden state of whatever position happens to sit there. */
+TEST(a_block_query_pass_names_the_trunk_row_of_each_anchor) {
+    Fixture f;
+    f.build(/*blocks=*/4096, /*states=*/64);
+    f.cfg.n_spec = 4;
+    CHECK_OK(f.start());
+
+    uint64_t a = f.submit(160, 64);
+    uint64_t b = f.submit(160, 64);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain(11);
+
+    int32_t draft[4] = { 21, 22, 23, 24 };
+    CHECK_OK(f.sch.set_draft(a, draft, 4));
+    CHECK_OK(f.sch.set_draft(b, draft, 4));
+    const RadBatch* v = f.sch.step();
+    REQUIRE(v != nullptr);
+    CHECK_EQ(v->n_out, 10);                          /* 1 + 4 rows a sequence */
+    REQUIRE((int)f.sch.plan().e.size() == 2);
+    const bool a_first = f.sch.plan().e[0].seq == a;
+
+    int32_t acc[2] = { 2, 1 };                       /* drafts accepted, in plan order */
+    int32_t tok[2] = { 99, 98 };
+    uint8_t eos[2] = { 0, 0 };
+    Scheduler::StepResult r;
+    r.n_seq = 2; r.n_accepted = acc; r.token = tok; r.eos = eos;
+    CHECK_OK(f.sch.commit(r));
+
+    Scheduler::BlockRow rows[4];
+    CHECK_EQ(f.sch.block_begin(/*block=*/5, /*depth=*/4, /*window=*/0, /*mask=*/7, rows, 4), 2);
+    CHECK_EQ(rows[0].tap_row, 2);
+    CHECK_EQ(rows[1].tap_row, 5 + 1);
+    CHECK(rows[0].seq == (a_first ? a : b));
+
+    CHECK(f.sch.block_context(1) != nullptr);
+    const RadBatch* qb = f.sch.block_query(1);
+    REQUIRE(qb != nullptr);
+    /* The batch's staging crosses to the slab ASYNC -- a worker thread even on the host backend --
+     * so the device-side array holds the staged values only once the compute stream has drained. */
+    CHECK_EQ(rad_stream_sync(f.stream), RAD_OK);
+
+    CHECK_EQ(qb->n_seq, 2);
+    CHECK_EQ(qb->n_draft_out, 2);
+    CHECK_EQ(f.sch.block_plan().e[0].src_row, 2);
+    CHECK_EQ(f.sch.block_plan().e[1].src_row, 6);
+    REQUIRE(qb->draft_out_ids != nullptr);
+    CHECK_EQ(qb->draft_out_ids[0], 2);
+    CHECK_EQ(qb->draft_out_ids[1], 6);
     f.sch.block_end();
 }
 

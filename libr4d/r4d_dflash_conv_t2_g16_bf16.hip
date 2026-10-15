@@ -13,11 +13,11 @@ template <int TAPS, int GROUP>
 __global__ __launch_bounds__(DFC_THREADS) void r4d_dflash_conv_kernel(
     const r4d_u16* __restrict__ x, const r4d_u16* __restrict__ delta,
     const r4d_u16* __restrict__ base, r4d_u16* __restrict__ out,
-    int H, int dpitch, int NG, int vpr, int blockmask)
+    int H, int dpitch, int NG, int vpr, int block_size)
 {
   const int hv = blockIdx.x * DFC_THREADS + threadIdx.x;
   r4d_dflash_conv_body<TAPS, GROUP>(x, delta, base, out, H, dpitch, NG, vpr,
-                                    blockmask, blockIdx.y, hv);
+                                    block_size, blockIdx.y, hv);
 }
 
 // x     [T, H]        bf16, row pitch H
@@ -26,20 +26,22 @@ __global__ __launch_bounds__(DFC_THREADS) void r4d_dflash_conv_kernel(
 //                     silently reads the other side's coefficients; it is not a shape error.
 // base  [taps, H]     bf16, contiguous
 // out   [T, H]        bf16. Must not alias x -- tap 1 of row t reads row t-1 of the INPUT.
+// block_size          any positive value: the draft block is 1 + num_speculative_tokens, which
+//                     is 7 on a 6-draft serve; the position law is t % block_size.
 extern "C" int r4d_dflash_conv_t2_g16_bf16(
     const void* x, const void* delta, const void* base, void* out,
     int T, int H, int dpitch, int NG, int taps, int group, int block_size, void* stream)
 {
   if (taps != 2 || group != 16) return -1;
-  if (H % (group * DFC_VEC) || NG != H / group) return -1;
-  if (block_size < 1 || (block_size & (block_size - 1))) return -1;  // body masks: pow2 only
+  if (H % group || H % DFC_VEC || NG != H / group) return -1;
+  if (block_size < 1) return -1;
   if (T <= 0) return 0;
 
   const int vpr = H / DFC_VEC;
   dim3 grid((vpr + DFC_THREADS - 1) / DFC_THREADS, T), blk(DFC_THREADS);
   hipLaunchKernelGGL((r4d_dflash_conv_kernel<2, 16>), grid, blk, 0, (hipStream_t)stream,
                      (const r4d_u16*)x, (const r4d_u16*)delta, (const r4d_u16*)base,
-                     (r4d_u16*)out, H, dpitch, NG, vpr, block_size - 1);
+                     (r4d_u16*)out, H, dpitch, NG, vpr, block_size);
   return (int)hipGetLastError();
 }
 
@@ -78,11 +80,7 @@ extern "C" int r4d_rad_dflash_conv(const RadArgs* a, RadStream s) {
     const int NG    = (int)r4d_geti_or(a, "NG", 0);
     const int bsz   = (int)r4d_geti_or(a, "block_size", 0);
     if (NG <= 0 || bsz <= 0) return R4D_NO(RAD_E_INVAL);
-    /* block_size is masked with block_size-1 in the kernel body, so only a power of two is
-     * admissible. That is a property of the VALUE and not a bound a constraint can express, which
-     * is why libr4d's registry leaves it out of the predicates and the entry point rejects it --
-     * except that libr4d's entry point does not, so this shim does. */
-    if (bsz & (bsz - 1)) return R4D_NO(RAD_E_INVAL);
+    /* block_size can now be any positive integer: the position law is t % block_size. */
     if (dpitch != 2LL * taps * NG) return R4D_NO(RAD_E_STRIDE);
 
     return r4d_dflash_conv_t2_g16_bf16(x->data, d->data, bs->data, o->data,

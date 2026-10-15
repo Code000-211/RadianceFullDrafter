@@ -307,6 +307,10 @@ public:
     std::vector<RadNameMap>  name_map;
     std::vector<std::string> notes;
 
+    /* Architecture restrictions compose monotonically: a sparse block can veto
+     * branching without disabling dense architectures or linear speculation. */
+    bool branched_tree_supported = true;
+
     RadBuildCtx  ctx{};
     RadModelMeta meta{};
 
@@ -322,6 +326,17 @@ public:
      * RadDrafterDecl::name points into the plugin's own storage. */
     RadDrafterDecl drafter{};
     std::string    drafter_name;
+
+    /* THE TREE PROPOSAL THIS PLUGIN DECLARED (rad_declare_drafter_tree), beside the linear one
+     * the decl above carries. `drafter_tree_buf == 0` when it declared none. The capacity is
+     * kept beside the handle because it is the declaration's own fact -- the row width it asked
+     * for -- and a future consumer reads it here rather than re-deriving it from the buffer's
+     * shape and agreeing with the declare by accident. 0 when none was declared.
+     *
+     * THIS IS DECLARED METADATA AND NOT AN ENABLED PATH: `branched_tree_supported` is untouched
+     * by the declaration, and nothing serves a tree until a producer op and a verifier exist. */
+    rad_buf     drafter_tree_buf = 0;
+    int64_t     drafter_tree_capacity = 0;
 
     /* THE MEDIA ENCODER THIS PLUGIN DECLARED (rad_declare_encoder). `modalities == 0` when it
      * declared none, which is every text-only program and every deployment that asked for no
@@ -537,6 +552,18 @@ struct Request {
      * request -- SchedReq owns this Request, so it outlives it -- and is written beside n_draft,
      * in the same two places, for the reason the comment there gives. Null when n_draft is 0. */
     const int32_t*       draft = nullptr;
+    /* THE TOPOLOGY OF THAT WINDOW, when the proposal is a tree and not a chain. Indexed by
+     * NODE ID 0..n_draft, node 0 the root -- the last committed token, whose conditioning is the
+     * committed output itself. The sampler stages one row per node: node j's row is conditioned
+     * on the tokens of its ANCESTOR PATH (root's child down to j, j included) and draws at
+     * output position n_out + tree_depth[j]. The flattened row index carries none of that once
+     * two nodes share a parent -- sibling j's physical prefix is the other branch's history --
+     * so penalties, the RNG coordinate and the reasoning budget are all derived from the path.
+     * Both fields together or neither: null for every chain, which is the existing linear path
+     * untouched. Written beside n_draft/draft by the same writer (core/sched), so a topology
+     * dies with the window it described and never describes a later, linear one. */
+    const int32_t*       tree_parent = nullptr;  /* node j's parent node id; the root's is -1 */
+    const int32_t*       tree_depth  = nullptr;  /* node j's depth in the tree; the root's is 0 */
     int32_t              n_accepted = 0;      /* from the previous verify */
 
     /* MAY THIS REQUEST BE SPECULATED ON AT ALL. Written by the engine after every step, read by
@@ -742,6 +769,12 @@ struct Config {
     std::string kld_ref;                /* --kld-ref DIR */
     std::string kld_corpus;             /* --kld-corpus FILE, read by --kld-record only */
     std::string kld_out;                /* --kld-out FILE: the report as JSON, rows beside it */
+    /* --kld-taps L,L,...: makes --kld-record a TAPS recording (core/kld.h). The plugin copies the
+     * block input of each named layer (0-based) and the hidden state its lm_head reads into tap
+     * buffers, and the recording keeps those beside every row instead of the log-probabilities.
+     * Handed to the plugin's declare as RAD_KLD_TAPS, which config_parse sets from this flag and
+     * clears without it, so no serving run can inherit it from the environment. */
+    std::string kld_taps;
     bool kld() const { return !kld_record.empty() || !kld_ref.empty(); }
 
     /* ---------------- DIAGNOSIS (core/diag.h, core/engine_diagnose.cpp) ----------------

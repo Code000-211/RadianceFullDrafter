@@ -28,6 +28,8 @@
 #include <mutex>
 #include <unordered_map>
 
+#include "../../arch/common/rad_tree_candidate.h"
+
 namespace rad {
 
 /* The scheduler's own per-request state. Request (rad_core.h) is shared across components and
@@ -64,6 +66,23 @@ struct SchedReq {
     int32_t  last_accepted = 3;
     float    ema_accept = 2.8f;
 
+    /* DARTree Speculative Tree DAG metadata (owned by SchedReq, outliving StepPlan) */
+    radiance::CandidateTree draft_tree{};
+    bool     has_draft_tree = false;
+    uint16_t tree_ancestors[RAD_SCHED_MAX_SPEC] = {};
+    uint32_t tree_positions[RAD_SCHED_MAX_SPEC] = {};
+    int32_t  tree_parents[RAD_SCHED_MAX_SPEC] = {};
+    /* THE NODE-INDEXED TOPOLOGY THE REQUEST CARRIES (rad_core.h), root included: entry 0 is
+     * parent -1 at depth 0 and entry j node j's, so the sampler can derive every node's
+     * conditioning without a second copy of the tree. Filled by set_draft_tree beside the draft
+     * tokens; published while that window OR a branched parent-before-child prefix is verified
+     * (see scheduler.cpp). A later linear proposal must never inherit these pointers.
+     * `tree_branched` describes the stored proposal; a retained prefix may instead be a chain,
+     * which publishes nothing and keeps the flat sampler and its grammar walk. */
+    int32_t  tree_node_parent[RAD_SCHED_MAX_SPEC + 1] = {};
+    int32_t  tree_node_depth[RAD_SCHED_MAX_SPEC + 1]  = {};
+    bool     tree_branched = false;
+
     void observe_draft(int drafted, int accepted) {
         if (drafted <= 0) return;
         last_accepted = accepted;
@@ -84,31 +103,19 @@ struct SchedReq {
     }
 
     int suggest_depth(int default_depth, bool adaptive, bool multi_seq = false, int max_cap = 5) const {
+        if (has_draft_tree || max_cap >= 6) {
+            // Stage 2 is gated on-device from this step's hidden states, not past acceptance.
+            return std::min(default_depth, multi_seq ? 4 : 8);
+        }
         if (!adaptive) return default_depth;
-        /* In multi-sequence concurrency (C8), strictly lock depth to 3.
-         * Depth 3 yields peak concurrency throughput (534.8 tok/s in arm14_spec3_warm)
-         * without falling into the depth-2 under-speculation trap. */
         if (multi_seq) {
-            return std::min(default_depth, 3);
+            return std::min(default_depth, 4);
         } else {
-            /* Single-stream (batch=1):
-             * Dynamically promote to depth 4 and 5 on fluent acceptance:
-             * - Promote to depth 5 when:
-             *     (accepted_streak >= 2 && ema_accept >= 2.40f && last_accepted >= 3) ||
-             *     (accepted_streak >= 3 && ema_accept >= 2.30f && last_accepted >= 2)
-             * - Promote to depth 4 when:
-             *     (accepted_streak >= 1 && ema_accept >= 1.85f && last_accepted >= 2) ||
-             *     (accepted_streak >= 2 && ema_accept >= 1.70f)
-             * - Floor is strictly default_depth (3) to prevent regression on creative prose & summarization. */
             if ((accepted_streak >= 2 && ema_accept >= 2.40f && last_accepted >= 3) ||
                 (accepted_streak >= 3 && ema_accept >= 2.30f && last_accepted >= 2)) {
                 return std::min(max_cap, 5);
             }
-            if ((accepted_streak >= 1 && ema_accept >= 1.85f && last_accepted >= 2) ||
-                (accepted_streak >= 2 && ema_accept >= 1.70f)) {
-                return std::min(max_cap, 4);
-            }
-            return std::min(default_depth, 3);
+            return std::min(max_cap, 4);
         }
     }
 
@@ -164,6 +171,8 @@ struct SchedReq {
         rejected_streak = 0;
         last_accepted   = 3;
         ema_accept      = 2.8f;
+        has_draft_tree  = false;
+        tree_branched   = false;
     }
 
     int32_t  sched_tokens = 0;   /* tokens given to this request in the current step */
@@ -348,6 +357,7 @@ public:
 
     /* The drafter's proposal for a request's next step. n is clamped to the controller's depth. */
     int      set_draft(uint64_t id, const int32_t* tokens, int n);
+    int      set_draft_tree(uint64_t id, const radiance::CandidateTree& tree, uint32_t root_pos);
 
     /* ---------------------------------------------------------- media the encoder owes
      * A REQUEST CARRYING MEDIA IS ADMITTED ONLY ONCE EVERY ITEM IS ENCODED. Until then it keeps
@@ -456,9 +466,9 @@ public:
      * no chain of rounds. What replaces it is TWO passes with different shapes, and the scheduler's
      * half is telling each of them which rows it runs over.
      *
-     *   block_begin       right after commit(), while plan() still describes the step just run.
-     *                  Reserves the block of draft KV the query pass will write, and answers
-     *                  which sequences may draft.
+     *   block_begin       after commit(), or before it for a stateless decode query.
+     *                  Reserves the worst-case block of draft KV the query pass will write,
+     *                  and answers which sequences may draft.
      *   block_context     the CONTEXT pass, draft_pass -1. Its entries MIRROR that trunk step's --
      *                  same sequence, same ctx_len, same n_tokens -- because the drafter reads
      *                  the trunk's tapped hidden states positionally out of a buffer of its own,
@@ -481,18 +491,26 @@ public:
         uint64_t seq = 0;
         int32_t  slot = -1;
         int32_t  card = -1;
+        int32_t  anchor_token = -1; // Token 0 is valid; negative means absent.
+        int64_t  root_pos = -1;
+        /* The trunk step's out_ids row of the last accepted position: first_row + n_accepted.
+         * block_query() hands it to the drafter as RadBatch::draft_out_ids. */
+        int32_t  tap_row = -1;
     };
     /* `block` is the drafter's trained block in ROWS and `depth` how many tokens it proposes out
      * of them -- the head takes the last `depth` -- and `window` is its attention window (0 for
      * none); `mask` is the token id its masked query slots embed. Returns how many sequences may
      * draft, and fills `out` with those -- in the order block_query() will emit them. */
-    int block_begin(int block, int depth, int window, int32_t mask, BlockRow* out, int max);
+    int block_begin(int block, int depth, int window, int32_t mask, BlockRow* out, int max,
+                    bool pre_commit = false);
+    bool block_committed_anchor(uint64_t seq, int32_t slot, int32_t* token, int64_t* pos) const;
     const RadBatch* block_context(int step);
     const RadBatch* block_query(int step);
     void block_end();
 
     const StepPlan&      plan() const { return plan_; }
     const StepPlan&      plan_next() const { return plan_next_; }
+    const StepPlan&      block_plan() const { return block_plan_; }
     const ChunkGeometry& geometry() const { return geo_; }
     DraftController&     draft() { return draft_; }
     SchedMetrics         metrics() const;
@@ -660,6 +678,9 @@ private:
         int32_t        n_tokens = 0;
         int64_t        base_pos = 0;      /* the anchor's position: the sequence's next one */
         bool           can_draft = false;
+        int32_t        tap_row = -1;      /* BlockRow::tap_row; the query pass's StepEntry::src_row */
+        bool           dev = false;      /* pre-commit query: ADV_BLOCK supplies anchor and tap */
+        int32_t        dev_tok = 0;      /* the trunk's first logit/tap row for this sequence */
         /* A ROW KEPT ONLY TO HOLD ITS PLACE. The trunk step finished this sequence -- it ended,
          * failed or was cancelled at commit -- so its KV is gone and it drafts nothing. It is
          * still a row of the context pass, because the drafter reads the trunk's hidden states

@@ -470,6 +470,13 @@ int rad_decl_name_map(RadBuilder* b, const RadNameMap* m);
  * the first step. An embedding-only or encoder-only plugin declares none, deliberately. */
 int rad_declare_logits(RadBuilder* b, rad_buf logits);
 
+/* Restrict branched-tree verification for this entire Program. Monotone: no
+ * block may undo another block's veto. Dense attention retains its existing
+ * support; sparse attention without ancestor-mask forwarding must call this
+ * at declare, even if some short contexts can use its exact dense path.
+ * Linear speculation is unaffected. */
+int rad_disable_branched_tree(RadBuilder* b);
+
 
 /* ================================================================== the drafter */
 /* WHAT THE PLUGIN'S DRAFT HEAD IS, declared the same way and for the same reason the logits
@@ -544,6 +551,30 @@ typedef struct RadDrafterDecl {
 } RadDrafterDecl;
 
 int rad_declare_drafter(RadBuilder* b, const RadDrafterDecl* d);
+
+/* A DECLARED TREE PROPOSAL, BESIDE THE LINEAR ONE. OPTIONAL, and additive: the decl above
+ * stays exactly as it was and carries a chain, so the tree is a second, separately declared
+ * buffer rather than a reinterpretation of `RadDrafterDecl::proposal` -- whose bytes are
+ * linear token ids and stay linear.
+ *
+ * `tree` names an I32 rank-2 buffer with one fixed-size row a sequence:
+ * `[count, token[node_capacity], parent[node_capacity]]`. The root is node 0, included in
+ * `count`, and its parent is -1; every other parent is a node at a lower index. `node_capacity`
+ * is 1..16. Unused trailing entries of a row are ignored. Nothing on the wire is repeated that
+ * the core can derive from the topology -- positions, depth and ancestor masks come from the
+ * parent array, and no scores are carried: acceptance is sample-and-match.
+ *
+ * WHAT DECLARE CHECKS is the shape, not the content: the handle, the dtype, rank 2, the exact
+ * row width 1 + 2*node_capacity, the row count against RadBuildCtx::max_seqs, an existing
+ * RAD_DRAFT_BLOCK drafter, that no tree was declared yet, and the capacity bounds. The CONTENT --
+ * parent indices, vocabulary ids, the root matching the anchor -- is validated by the consumer,
+ * at readback, when there is one.
+ *
+ * DECLARING A TREE CLAIMS NO BRANCHING CAPABILITY. Whether a Program may verify a branched
+ * draft stays exactly where it was: `rad_disable_branched_tree` and the architecture's own
+ * vetoes, composing monotonically. A tree declared and never served is a declared buffer, not
+ * an enabled path. */
+int rad_declare_drafter_tree(RadBuilder* b, rad_buf tree, int64_t node_capacity);
 
 /* ================================================================== the encoder */
 /* A MEDIA ENCODER THE PLUGIN RUNS ON AN ENCODER PASS (RadBatch::enc), declared for the reason the

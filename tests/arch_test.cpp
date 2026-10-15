@@ -90,6 +90,10 @@ struct RadBuilder {
     RadEncoderDecl encoder{};
     std::string    encoder_name;
 
+    /* The drafter's declaration (rad_declare_drafter), when the plugin made one. */
+    RadDrafterDecl drafter{};
+    bool           has_drafter = false;
+
     /* What rad_weight_encoding answers: the first entry whose key the source name contains. Empty
      * is a builder with no model behind it, where every weight is plain in its declared dtype. */
     std::vector<std::pair<std::string, RadEncoding>> encs;
@@ -217,8 +221,14 @@ extern "C" int rad_weight_shard_span(RadBuilder* b, rad_weight w, int64_t lo, in
     rw.span_hi  = hi;
     return RAD_OK;
 }
+extern "C" int rad_disable_branched_tree(RadBuilder* b) {
+    return b ? RAD_OK : RAD_E_INVAL;
+}
 extern "C" int rad_declare_drafter(RadBuilder* b, const RadDrafterDecl* d) {
-    (void)b; (void)d;
+    if (b && d) {
+        b->drafter = *d;
+        b->has_drafter = true;
+    }
     return RAD_OK;
 }
 extern "C" int rad_declare_encoder(RadBuilder* b, const RadEncoderDecl* d) {
@@ -1750,6 +1760,147 @@ TEST(a_four_bit_layer_serves_its_plain_experts_beside_the_rest) {
     REQUIRE_EQ(qwen4exp_fp8::declare(&first, &meta, &c), RAD_OK);
     CHECK_EQ(qwen4exp_fp8::g_model[0].moecfg.expert_w4, 1);
     CHECK_EQ(qwen4exp_fp8::g_model[0].moecfg.expert_bf16, 0);
+}
+
+TEST(qwen4exp_teacher_taps_and_anchor) {
+    struct EnvGuard {
+        ~EnvGuard() {
+            unsetenv("RAD_KLD_TAPS");
+            unsetenv("RADIANCE_FULLDRAFTER_SIDECAR");
+            unsetenv("RADIANCE_TEACHER_TAPS");
+        }
+    } guard;
+    unsetenv("RAD_KLD_TAPS");
+    unsetenv("RADIANCE_FULLDRAFTER_SIDECAR");
+    unsetenv("RADIANCE_TEACHER_TAPS");
+
+    RadModelMeta meta = qwen4exp_meta();
+    meta.n_layers = 28;
+    std::string lt28;
+    for (int i = 0; i < 7; ++i) {
+        if (i > 0) lt28 += " ";
+        lt28 += "linear_attention linear_attention linear_attention full_attention";
+    }
+    std::vector<const char*> keys(meta.kv_key, meta.kv_key + meta.n_kv);
+    std::vector<const char*> vals(meta.kv_val, meta.kv_val + meta.n_kv);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (std::strcmp(keys[i], "layer_types") == 0) {
+            vals[i] = lt28.c_str();
+        }
+    }
+    meta.n_kv = (int)keys.size();
+    meta.kv_key = keys.data();
+    meta.kv_val = vals.data();
+
+    RadBuildCtx c = build_ctx(0, 1);
+    c.max_tok = 512;
+    c.max_seqs = 4;
+    c.max_spec = 0;
+
+    // 1. Explicit RAD_KLD_TAPS="1,23"
+    setenv("RAD_KLD_TAPS", "1,23", 1);
+    unsetenv("RADIANCE_FULLDRAFTER_SIDECAR");
+    unsetenv("RADIANCE_TEACHER_TAPS");
+    {
+        RadBuilder b;
+        REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &c), RAD_OK);
+        const qwen4exp_fp8::Model& m = qwen4exp_fp8::g_model[0];
+        CHECK_EQ(m.n_ktap, 2);
+        CHECK_EQ(m.ktap_layer[0], 1);
+        CHECK_EQ(m.ktap_layer[1], 23);
+        CHECK(m.b_ktap[0] != 0);
+        CHECK(m.b_ktap[1] != 0);
+        CHECK(m.b_ktap[2] != 0);
+        CHECK(m.b_ktap_anchor != 0);
+
+        auto find_buf = [&](const std::string& name) -> const RecBuf* {
+            for (const auto& buf : b.bufs) {
+                if (buf.name == name) return &buf;
+            }
+            return nullptr;
+        };
+        const RecBuf* b0 = find_buf("kld_tap0");
+        const RecBuf* b1 = find_buf("kld_tap1");
+        const RecBuf* b2 = find_buf("kld_tap2");
+        const RecBuf* ba = find_buf("kld_tap_anchor");
+        REQUIRE(b0 != nullptr);
+        REQUIRE(b1 != nullptr);
+        REQUIRE(b2 != nullptr);
+        REQUIRE(ba != nullptr);
+        CHECK_EQ(b0->d.shape[1], 2560);
+        CHECK_EQ(b1->d.shape[1], 2560);
+        CHECK_EQ(b2->d.shape[1], 2560);
+        CHECK_EQ(ba->d.shape[1], 2560);
+        CHECK_EQ(b0->d.shape[1] + b1->d.shape[1] + b2->d.shape[1], 7680);
+    }
+
+    // 2. Defaulting when RADIANCE_FULLDRAFTER_SIDECAR is set
+    unsetenv("RAD_KLD_TAPS");
+    setenv("RADIANCE_FULLDRAFTER_SIDECAR", "/dummy/path.safetensors", 1);
+    {
+        RadBuilder b;
+        REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &c), RAD_OK);
+        const qwen4exp_fp8::Model& m = qwen4exp_fp8::g_model[0];
+        CHECK_EQ(m.n_ktap, 2);
+        CHECK_EQ(m.ktap_layer[0], 1);
+        CHECK_EQ(m.ktap_layer[1], 23);
+        CHECK(m.b_ktap[0] != 0);
+        CHECK(m.b_ktap[1] != 0);
+        CHECK(m.b_ktap[2] != 0);
+        CHECK(m.b_ktap_anchor != 0);
+
+        // Verify FullDrafter geometry: 2 stages * (block - 1) == depth (2 * 6 = 12, block=7, depth=12)
+        CHECK(b.has_drafter);
+        CHECK_EQ(b.drafter.block, 7);
+        CHECK_EQ(b.drafter.depth, 12);
+        CHECK_EQ(b.drafter.kind, (int)RAD_DRAFT_BLOCK);
+
+        // Verify dflash_conv execution graph hook: H=64, block_size=7, taps=2, group_size=16, NG=4
+        const RecOp* conv_op = nullptr;
+        for (const auto& op : b.ops) {
+            if (op.op == "dflash_conv") {
+                conv_op = &op;
+                break;
+            }
+        }
+        REQUIRE(conv_op != nullptr);
+        auto get_param_int = [](const RecOp& o, const std::string& key) -> int64_t {
+            for (const auto& p : o.p) if (p.key == key) return p.ival;
+            return -1;
+        };
+        auto get_param_str = [](const RecOp& o, const std::string& key) -> std::string {
+            for (const auto& p : o.p) if (p.key == key) return p.sval;
+            return "";
+        };
+        CHECK_EQ(get_param_int(*conv_op, "hidden_size"), 64);
+        CHECK_EQ(get_param_int(*conv_op, "block_size"), 7);
+        CHECK_EQ(get_param_int(*conv_op, "taps"), 2);
+        CHECK_EQ(get_param_int(*conv_op, "group_size"), 16);
+        CHECK_EQ(get_param_int(*conv_op, "NG"), 4);
+        CHECK_EQ(get_param_str(*conv_op, "dtype"), "bf16");
+
+        // Verify no H=128-only kernels (e.g. dflash2_prep_h128) are called
+        for (const auto& op : b.ops) {
+            CHECK(op.op.find("h128") == std::string::npos);
+        }
+    }
+    unsetenv("RADIANCE_FULLDRAFTER_SIDECAR");
+
+    // 3. Defaulting when RADIANCE_TEACHER_TAPS is set
+    setenv("RADIANCE_TEACHER_TAPS", "1", 1);
+    {
+        RadBuilder b;
+        REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &c), RAD_OK);
+        const qwen4exp_fp8::Model& m = qwen4exp_fp8::g_model[0];
+        CHECK_EQ(m.n_ktap, 2);
+        CHECK_EQ(m.ktap_layer[0], 1);
+        CHECK_EQ(m.ktap_layer[1], 23);
+        CHECK(m.b_ktap[0] != 0);
+        CHECK(m.b_ktap[1] != 0);
+        CHECK(m.b_ktap[2] != 0);
+        CHECK(m.b_ktap_anchor != 0);
+    }
+    unsetenv("RADIANCE_TEACHER_TAPS");
 }
 
 TEST(a_sizing_declare_leaves_the_step_state_alone_and_shrinks_only_rows) {

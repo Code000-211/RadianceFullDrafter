@@ -134,7 +134,9 @@ set(R4D_UNITS
   "r4d_dequant_w4_bf16|"
   "r4d_rowtopk_bf16|"
   "r4d_dflash_conv_t2_g16_bf16|"
+  "r4d_dflash2_prep_h128|"
   "r4d_dflash_select_bf16|"
+  "r4d_fulldrafter|"
   # The routed mixture of experts: router, scatter, the grouped block-scaled fp8 GEMM and
   # gather, in one unit because the other three exist only to feed the GEMM.
   "r4d_moe|"
