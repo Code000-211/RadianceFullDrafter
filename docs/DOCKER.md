@@ -129,6 +129,8 @@ the cards the engine runs on.
 
 The container names are the files the README's model table downloads or converts.
 
+Both Flash-Next files serve `qwen-fixed-chat-template.jinja` (froggeric/Qwen-Fixed-Chat-Templates, v22.5, Apache-2.0) through `--override-chat-template`; it replaces the template the container carries. Drop the flag and the `volumes` entry to go back to the container's own.
+
 Copy the directory to the serving host and fill in `.env` from `.env.example`. It sets the image,
 the models directory (mounted read-only at `/models`), a writable state directory (`/data`, where
 the prefix cache's disk tier lives), the API key, the port, and the user and GPU groups the server
